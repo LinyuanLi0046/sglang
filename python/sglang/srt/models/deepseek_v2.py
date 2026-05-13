@@ -38,6 +38,7 @@ from sglang.srt.configs.model_config import (
     get_nsa_index_n_heads,
     get_nsa_index_topk,
     is_deepseek_nsa,
+    is_longcat_dsa,
 )
 from sglang.srt.distributed import (
     divide,
@@ -1289,7 +1290,7 @@ class DeepseekV2AttentionMLA(
         self.quant_config = quant_config
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
-        self.use_nsa = is_deepseek_nsa(config)
+        self.use_nsa = is_deepseek_nsa(config) or is_longcat_dsa(config)
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
             assert self.use_nsa, "CP currently only supports deepseek v3.2 model"
@@ -2300,7 +2301,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts()
-        self.use_nsa = is_deepseek_nsa(config)
+        self.use_nsa = is_deepseek_nsa(config) or is_longcat_dsa(config)
         self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -2338,7 +2339,9 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             self.cp_rank = self.cp_size = None
 
         q_lora_rank = config.q_lora_rank if hasattr(config, "q_lora_rank") else None
-        get_attn_tp_context().init_context(q_lora_rank, is_deepseek_nsa(config))
+        get_attn_tp_context().init_context(
+            q_lora_rank, is_deepseek_nsa(config) or is_longcat_dsa(config)
+        )
 
     @property
     def routed_experts_weights_of_layer(self):

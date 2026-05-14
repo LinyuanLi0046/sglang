@@ -152,14 +152,16 @@ class LongcatFlashProConfig(PretrainedConfig):
         self.oe_branch_num = (
             (oe_neighbor_num - 1) * oe_split_num if self.use_oe_embedding else 0
         )
-        self.oe_emb_dim = (
+        self.oe_hidden_dim = (
             hidden_size // self.oe_branch_num if self.oe_branch_num > 0 else None
         )
+        self.oe_emb_dim = self.oe_hidden_dim
         self.oe_vocab_base = (
             int(oe_vocab_size_ratio * vocab_size)
             if oe_vocab_size_ratio is not None
             else None
         )
+        self.oe_scale = 1 + self.oe_branch_num if self.use_oe_embedding else 1
         self.mtp_num_layers = mtp_num_layers
         self.mtp_replicate_modules = mtp_replicate_modules
         self.mtp_disable_over_tokenizer = mtp_disable_over_tokenizer

@@ -915,6 +915,9 @@ class LongcatFlashProForCausalLM(nn.Module):
         ):
             self._weight_requant_ue8m0()
 
+        if self.use_oe_embedding:
+            self.model.embed_tokens.process_weights_after_loading()
+
     def _weight_requant_ue8m0(self):
         weight_block_size = self.quant_config.weight_block_size
 
@@ -995,17 +998,27 @@ class LongcatFlashProForCausalLM(nn.Module):
                 if "mtp" in name:
                     continue
                 if self.use_oe_embedding:
-                    if name == "model.embed_tokens.weight":
+                    if name == "model.embed_tokens.weight" or ".embed_tokens." in name:
                         self.model.embed_tokens.load_weight(None, name, loaded_weight)
                         oe_base_embed_count += 1
                         continue
-                    if name.startswith("model.oe_embed_tokens"):
+                    if (
+                        name.startswith("model.oe_embed_tokens")
+                        or ".oe_embed_tokens" in name
+                    ):
                         self.model.embed_tokens.load_weight(None, name, loaded_weight)
                         oe_embed_token_count += 1
                         continue
-                    if name.startswith("model.oe_embed_proj"):
+                    if name.startswith("model.oe_embed_proj") or ".oe_embed_proj" in name:
                         self.model.embed_tokens.load_weight(None, name, loaded_weight)
                         oe_embed_proj_count += 1
+                        continue
+                    if ".ngram_embeddings" in name:
+                        self.model.embed_tokens.load_weight(None, name, loaded_weight)
+                        if ".embedders." in name:
+                            oe_embed_token_count += 1
+                        elif ".post_projs." in name:
+                            oe_embed_proj_count += 1
                         continue
                 elif self.use_ngram_embedding:
                     if ".embed_tokens." in name:
@@ -1183,18 +1196,16 @@ class LongcatFlashProForCausalLM(nn.Module):
 
     def get_embed_and_head(self):
         if self.use_oe_embedding:
-            return self.model.embed_tokens.word_embeder.weight, self.lm_head.weight
+            raise NotImplementedError(
+                "LongcatFlashPro OE embedding does not support get_embed_and_head sharing."
+            )
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
         if self.use_oe_embedding:
-            del self.model.embed_tokens.word_embeder.weight
-            del self.lm_head.weight
-            self.model.embed_tokens.word_embeder.weight = embed
-            self.lm_head.weight = head
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-            return
+            raise NotImplementedError(
+                "LongcatFlashPro OE embedding does not support set_embed_and_head sharing."
+            )
         del self.model.embed_tokens.weight
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed

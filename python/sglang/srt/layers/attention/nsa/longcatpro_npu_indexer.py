@@ -87,6 +87,132 @@ class LongcatProNPUIndexer(Indexer):
             prefix=add_prefix("weights_proj", prefix),
         )
 
+    def _build_token_seq_id(self, actual_seq_lengths_q: torch.Tensor):
+        q_lens = actual_seq_lengths_q.to(torch.int64).clone()
+        if q_lens.numel() > 1:
+            q_lens[1:] = q_lens[1:] - actual_seq_lengths_q[:-1].to(torch.int64)
+        q_start = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int64, device=actual_seq_lengths_q.device),
+                actual_seq_lengths_q[:-1].to(torch.int64),
+            ]
+        )
+        total_tokens = int(actual_seq_lengths_q[-1].item()) if q_lens.numel() > 0 else 0
+        seq_id = torch.zeros(
+            total_tokens, dtype=torch.int32, device=actual_seq_lengths_q.device
+        )
+        if total_tokens > 0:
+            seq_id.scatter_(0, q_start, torch.ones_like(q_start, dtype=torch.int32))
+            seq_id = seq_id.cumsum(0) - 1
+        return seq_id, q_lens, q_start
+
+    def _compose_longcat_topk(
+        self,
+        idx: torch.Tensor,
+        val: torch.Tensor,
+        kv_pos: torch.Tensor,
+        kv_init_end: torch.Tensor,
+        kv_local_start: torch.Tensor,
+    ) -> torch.Tensor:
+        candidate_slots = torch.arange(
+            val.shape[1], dtype=torch.int64, device=val.device
+        ).unsqueeze(0)
+        val = val.masked_fill(candidate_slots >= kv_pos.unsqueeze(1), float("-inf"))
+
+        valid_idx = (idx >= 0) & (idx < kv_pos.unsqueeze(1))
+        val = val.masked_fill(~valid_idx, float("-inf"))
+
+        forced = (
+            (idx < kv_init_end.unsqueeze(1)) | (idx >= kv_local_start.unsqueeze(1))
+        ) & valid_idx
+        val = val.masked_fill(forced, float("-inf"))
+
+        sparse_topk = max(
+            self.index_topk - self.num_init_tokens - self.num_local_tokens,
+            0,
+        )
+        if sparse_topk > 0:
+            sparse_val, sparse_sel = val.topk(sparse_topk, dim=1)
+            sparse_idx = torch.gather(idx, dim=1, index=sparse_sel)
+            sparse_idx = sparse_idx.masked_fill(torch.isneginf(sparse_val), -1)
+        else:
+            sparse_idx = torch.empty(
+                idx.shape[0], 0, dtype=idx.dtype, device=idx.device
+            )
+
+        base_init = torch.arange(
+            self.num_init_tokens, dtype=idx.dtype, device=idx.device
+        ).unsqueeze(0)
+        base_init = base_init.expand(idx.shape[0], -1)
+        init_res = torch.where(
+            base_init < kv_init_end.unsqueeze(1),
+            base_init,
+            torch.full_like(base_init, -1),
+        )
+
+        offset = torch.arange(
+            self.num_local_tokens, dtype=idx.dtype, device=idx.device
+        ).unsqueeze(0)
+        offset = offset.expand(idx.shape[0], -1)
+        local_vals = kv_local_start.unsqueeze(1) + offset
+        local_lens = kv_pos - kv_local_start
+        local_res = torch.where(
+            offset < local_lens.unsqueeze(1),
+            local_vals,
+            torch.full_like(local_vals, -1),
+        )
+
+        topk_indices = torch.cat([init_res, local_res, sparse_idx], dim=1)
+        mask_res = (topk_indices == -1).to(torch.float32)
+        _, order = torch.sort(mask_res, dim=1)
+        topk_indices = topk_indices.gather(1, order)
+        return topk_indices.to(torch.int32).unsqueeze(1)
+
+    def _get_full_candidate_count(self, actual_seq_lengths_kv: torch.Tensor) -> int:
+        if actual_seq_lengths_kv.numel() == 0:
+            return self.index_topk
+        return max(int(actual_seq_lengths_kv.max().item()), self.index_topk)
+
+    def _postprocess_longcat_topk_single_rank(
+        self,
+        topk_indices_local: torch.Tensor,
+        topk_values: torch.Tensor,
+        actual_seq_lengths_q: torch.Tensor,
+        actual_seq_lengths_kv: torch.Tensor,
+        is_prefill: bool,
+    ) -> torch.Tensor:
+        idx = topk_indices_local.squeeze(1).to(torch.int64)
+        val = topk_values.squeeze(1)
+        seq_id, q_lens, q_start = self._build_token_seq_id(actual_seq_lengths_q)
+        kv_lens = actual_seq_lengths_kv.to(torch.int64)
+
+        if idx.shape[0] == 0:
+            return idx.to(torch.int32).unsqueeze(1)
+
+        if is_prefill:
+            local_pos = torch.arange(idx.shape[0], device=idx.device) - q_start[seq_id]
+            kv_pos = kv_lens[seq_id] - q_lens[seq_id] + local_pos + 1
+        else:
+            kv_pos = kv_lens[seq_id]
+
+        kv_init_end = torch.minimum(
+            kv_pos,
+            torch.full_like(kv_pos, self.num_init_tokens),
+        )
+        local_keep = torch.minimum(
+            torch.clamp(kv_pos - kv_init_end, min=0),
+            torch.full_like(kv_pos, self.num_local_tokens),
+        )
+        kv_local_start = kv_pos - local_keep
+
+        return self._compose_longcat_topk(
+            idx=idx,
+            val=val,
+            kv_pos=kv_pos,
+            kv_init_end=kv_init_end,
+            kv_local_start=kv_local_start,
+        )
+
     def forward_npu(
         self,
         x: torch.Tensor,
@@ -236,9 +362,6 @@ class LongcatProNPUIndexer(Indexer):
             actual_seq_lengths_q = forward_batch.extend_seq_lens.cumsum(dim=0).to(
                 device=k.device, dtype=torch.int32
             )
-            actual_seq_lengths_kv = forward_batch.seq_lens.cumsum(dim=0).to(
-                device=k.device, dtype=torch.int32
-            )
         else:
             actual_seq_lengths_q = torch.arange(
                 1,
@@ -246,9 +369,9 @@ class LongcatProNPUIndexer(Indexer):
                 dtype=torch.int32,
                 device=k.device,
             )
-            actual_seq_lengths_kv = forward_batch.seq_lens.cumsum(dim=0).to(
-                device=k.device, dtype=torch.int32
-            )
+        actual_seq_lengths_kv = forward_batch.seq_lens.to(
+            device=k.device, dtype=torch.int32
+        )
 
         past_key_states = forward_batch.token_to_kv_pool.get_index_k_buffer(layer_id)
 
@@ -266,28 +389,25 @@ class LongcatProNPUIndexer(Indexer):
         block_table = forward_batch.attn_backend.forward_metadata.block_tables
         if is_prefill:
             block_table = block_table[: actual_seq_lengths_q.size(0)]
+        candidate_count = self._get_full_candidate_count(actual_seq_lengths_kv)
 
-        cur_seq_lengths_query = torch.cat(
-            [torch.tensor([0], device=k.device, dtype=torch.int32), actual_seq_lengths_q]
-        )
-        cur_seq_lengths_key = torch.cat(
-            [torch.tensor([0], device=k.device, dtype=torch.int32), actual_seq_lengths_kv]
-        )
-
-        topk_indices, _ = torch_npu.mlp_lightning_indexer(
-            q.view(-1, self.n_heads, self.head_dim),
-            past_key_states,
-            weights.to(torch.float32),
-            cur_seq_lengths_query=cur_seq_lengths_query,
-            cur_seq_lengths_key=cur_seq_lengths_key,
+        topk_indices_local, topk_values = torch_npu.npu_lightning_indexer(
+            query=q.view(-1, self.n_heads, self.head_dim),
+            key=past_key_states,
+            weights=weights.to(torch.bfloat16),
+            actual_seq_lengths_query=actual_seq_lengths_q,
+            actual_seq_lengths_key=actual_seq_lengths_kv,
             block_table=block_table,
             layout_query="TND",
             layout_key="PA_BSND",
-            sparse_count=self.index_topk,
-            kv_block_len=self.kv_block_size,
-            q_block_len=self.q_block_size,
-            init_num=self.num_init_tokens,
-            local_num=self.num_local_tokens,
+            sparse_count=candidate_count,
             sparse_mode=3,
+            return_value=True,
         )
-        return topk_indices
+        return self._postprocess_longcat_topk_single_rank(
+            topk_indices_local=topk_indices_local,
+            topk_values=topk_values,
+            actual_seq_lengths_q=actual_seq_lengths_q,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            is_prefill=is_prefill,
+        )

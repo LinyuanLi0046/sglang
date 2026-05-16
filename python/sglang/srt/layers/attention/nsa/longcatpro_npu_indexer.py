@@ -173,6 +173,88 @@ class LongcatProNPUIndexer(Indexer):
             return self.index_topk
         return max(int(actual_seq_lengths_kv.max().item()), self.index_topk)
 
+    def _logical_indices_to_pa_slots(
+        self,
+        topk_indices_local: torch.Tensor,
+        block_table: torch.Tensor,
+        actual_seq_lengths_q: torch.Tensor,
+        actual_seq_lengths_kv: torch.Tensor,
+        page_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        idx = topk_indices_local.squeeze(1).to(torch.int64)
+        if idx.numel() == 0:
+            return idx, torch.zeros_like(idx, dtype=torch.bool)
+
+        seq_id, _, _ = self._build_token_seq_id(actual_seq_lengths_q)
+        kv_lens = actual_seq_lengths_kv.to(torch.int64)
+        valid_mask = (idx >= 0) & (idx < kv_lens[seq_id].unsqueeze(1))
+
+        safe_idx = idx.clamp(min=0)
+        page_idx = torch.div(safe_idx, page_size, rounding_mode="floor")
+        page_offset = safe_idx.remainder(page_size)
+        req_block_table = block_table.index_select(0, seq_id.to(torch.int64))
+        physical_page = req_block_table.gather(1, page_idx)
+        slots = physical_page.to(torch.int64) * page_size + page_offset
+        return slots, valid_mask
+
+    def _gather_candidate_keys_pa_bsnd(
+        self,
+        past_key_states: torch.Tensor,
+        slots: torch.Tensor,
+    ) -> torch.Tensor:
+        flat_key_states = past_key_states.reshape(-1, self.head_dim)
+        candidate_k = flat_key_states.index_select(0, slots.reshape(-1).to(torch.int64))
+        return candidate_k.view(slots.shape[0], slots.shape[1], self.head_dim)
+
+    def _recompute_candidate_values_pa_bsnd(
+        self,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        past_key_states: torch.Tensor,
+        topk_indices_local: torch.Tensor,
+        block_table: torch.Tensor,
+        actual_seq_lengths_q: torch.Tensor,
+        actual_seq_lengths_kv: torch.Tensor,
+        page_size: int,
+        candidate_chunk_size: int = 128,
+    ) -> torch.Tensor:
+        idx = topk_indices_local.squeeze(1)
+        token_num = idx.shape[0]
+        candidate_num = idx.shape[1] if idx.dim() == 2 else 0
+        if token_num == 0 or candidate_num == 0:
+            return torch.empty(
+                token_num, 1, candidate_num, dtype=torch.float32, device=q.device
+            )
+
+        slots, valid_mask = self._logical_indices_to_pa_slots(
+            topk_indices_local=topk_indices_local,
+            block_table=block_table,
+            actual_seq_lengths_q=actual_seq_lengths_q,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            page_size=page_size,
+        )
+
+        q_fp32 = q.to(torch.float32)
+        weights_fp32 = weights.view(token_num, self.n_heads).to(torch.float32)
+        topk_values = torch.empty(
+            token_num, candidate_num, dtype=torch.float32, device=q.device
+        )
+
+        for start in range(0, candidate_num, candidate_chunk_size):
+            end = min(start + candidate_chunk_size, candidate_num)
+            candidate_k = self._gather_candidate_keys_pa_bsnd(
+                past_key_states=past_key_states,
+                slots=slots[:, start:end],
+            ).to(torch.float32)
+            logits = torch.einsum("thd,tcd->thc", q_fp32, candidate_k)
+            logits = torch.relu(logits)
+            topk_values[:, start:end] = (
+                logits * weights_fp32.unsqueeze(-1)
+            ).sum(dim=1)
+
+        topk_values.masked_fill_(~valid_mask, float("-inf"))
+        return topk_values.unsqueeze(1)
+
     def _postprocess_longcat_topk_single_rank(
         self,
         topk_indices_local: torch.Tensor,
@@ -391,7 +473,10 @@ class LongcatProNPUIndexer(Indexer):
             block_table = block_table[: actual_seq_lengths_q.size(0)]
         candidate_count = self._get_full_candidate_count(actual_seq_lengths_kv)
 
-        topk_indices_local, topk_values = torch_npu.npu_lightning_indexer(
+        # DeepSeek V3.2 路径只要 topk_indices,不需要 topk_values
+        # LongCat Pro 路径要 topk_indices + topk_values 所以传了 return_value=True
+        # 但 npu_lightning_indexer 算子明确不支持 layout_key="PA_BSND" 同时 return_value=True
+        topk_indices_local = torch_npu.npu_lightning_indexer(
             query=q.view(-1, self.n_heads, self.head_dim),
             key=past_key_states,
             weights=weights.to(torch.bfloat16),
@@ -402,7 +487,16 @@ class LongcatProNPUIndexer(Indexer):
             layout_key="PA_BSND",
             sparse_count=candidate_count,
             sparse_mode=3,
-            return_value=True,
+        )[0]
+        topk_values = self._recompute_candidate_values_pa_bsnd(
+            q=q.view(-1, self.n_heads, self.head_dim),
+            weights=weights,
+            past_key_states=past_key_states,
+            topk_indices_local=topk_indices_local,
+            block_table=block_table,
+            actual_seq_lengths_q=actual_seq_lengths_q,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            page_size=forward_batch.token_to_kv_pool.page_size,
         )
         return self._postprocess_longcat_topk_single_rank(
             topk_indices_local=topk_indices_local,

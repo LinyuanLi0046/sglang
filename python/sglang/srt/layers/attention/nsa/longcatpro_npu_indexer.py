@@ -169,9 +169,10 @@ class LongcatProNPUIndexer(Indexer):
         return topk_indices.to(torch.int32).unsqueeze(1)
 
     def _get_full_candidate_count(self, actual_seq_lengths_kv: torch.Tensor) -> int:
-        if actual_seq_lengths_kv.numel() == 0:
-            return self.index_topk
-        return max(int(actual_seq_lengths_kv.max().item()), self.index_topk)
+        # Ascend npu_lightning_indexer requires sparse_count <= 2048.
+        # For LongCat Pro we keep the candidate pool aligned with the model's
+        # configured topk budget instead of expanding it with sequence length.
+        return min(self.index_topk, 2048)
 
     def _logical_indices_to_pa_slots(
         self,

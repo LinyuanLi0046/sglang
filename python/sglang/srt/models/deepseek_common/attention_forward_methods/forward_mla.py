@@ -200,6 +200,10 @@ class DeepseekMLAForwardMixin:
                         -1, self.num_local_heads, self.qk_head_dim
                     )
                 if not self.skip_topk or prev_topk_indices is None:
+                    assert self.indexer is not None, (
+                        f"Indexer is required for layer {self.layer_id} when "
+                        "topk indices cannot be reused."
+                    )
                     topk_indices = self.indexer(
                         x=hidden_states,
                         q_lora=q_lora,
@@ -219,6 +223,10 @@ class DeepseekMLAForwardMixin:
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
                 if q_lora is not None:
                     if not self.skip_topk or prev_topk_indices is None:
+                        assert self.indexer is not None, (
+                            f"Indexer is required for layer {self.layer_id} when "
+                            "topk indices cannot be reused."
+                        )
                         topk_indices = self.indexer(
                             x=hidden_states,
                             q_lora=q_lora,

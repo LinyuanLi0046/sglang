@@ -1358,48 +1358,9 @@ class DeepseekV2AttentionMLA(
 
         self.skip_topk = None
         self.next_skip_topk = None
+        self.indexer = None
         if self.use_nsa:
             is_neox_style = not getattr(config, "indexer_rope_interleave", False)
-            if self.use_longcat_dsa:
-                self.indexer = LongcatProNPUIndexer(
-                    hidden_size=hidden_size,
-                    index_n_heads=get_nsa_index_n_heads(config),
-                    index_head_dim=get_nsa_index_head_dim(config),
-                    rope_head_dim=qk_rope_head_dim,
-                    index_topk=get_nsa_index_topk(config),
-                    index_k_norm_type=getattr(config, "index_k_norm_type", "rms"),
-                    q_lora_rank=q_lora_rank,
-                    max_position_embeddings=max_position_embeddings,
-                    rope_theta=rope_theta,
-                    scale_fmt="ue8m0",
-                    block_size=128,
-                    rope_scaling=rope_scaling,
-                    is_neox_style=is_neox_style,
-                    prefix=add_prefix("indexer", prefix),
-                    config=config,
-                    quant_config=quant_config,
-                    layer_id=layer_id,
-                    alt_stream=alt_stream,
-                )
-            else:
-                self.indexer = Indexer(
-                    hidden_size=hidden_size,
-                    index_n_heads=get_nsa_index_n_heads(config),
-                    index_head_dim=get_nsa_index_head_dim(config),
-                    rope_head_dim=qk_rope_head_dim,
-                    index_topk=get_nsa_index_topk(config),
-                    q_lora_rank=q_lora_rank,
-                    max_position_embeddings=max_position_embeddings,
-                    rope_theta=rope_theta,
-                    scale_fmt="ue8m0",
-                    block_size=128,
-                    rope_scaling=rope_scaling,
-                    is_neox_style=is_neox_style,
-                    prefix=add_prefix("indexer", prefix),
-                    quant_config=quant_config,
-                    layer_id=layer_id,
-                    alt_stream=alt_stream,
-                )
             # Refer: https://arxiv.org/abs/2603.12201 for more details.
             # skip_topk: when True, this layer will skip computation and reuse previous layer's topk indices.
             # next_skip_topk: when True, the next layer will skip computation and reuse this layer's topk indices.
@@ -1420,6 +1381,50 @@ class DeepseekV2AttentionMLA(
                         )
                     else:
                         self.next_skip_topk = False
+
+            # Longcat Pro's shared-topk layers reuse the previous attention's
+            # indices and do not ship standalone indexer weights.
+            if not self.skip_topk:
+                if self.use_longcat_dsa:
+                    self.indexer = LongcatProNPUIndexer(
+                        hidden_size=hidden_size,
+                        index_n_heads=get_nsa_index_n_heads(config),
+                        index_head_dim=get_nsa_index_head_dim(config),
+                        rope_head_dim=qk_rope_head_dim,
+                        index_topk=get_nsa_index_topk(config),
+                        index_k_norm_type=getattr(config, "index_k_norm_type", "rms"),
+                        q_lora_rank=q_lora_rank,
+                        max_position_embeddings=max_position_embeddings,
+                        rope_theta=rope_theta,
+                        scale_fmt="ue8m0",
+                        block_size=128,
+                        rope_scaling=rope_scaling,
+                        is_neox_style=is_neox_style,
+                        prefix=add_prefix("indexer", prefix),
+                        config=config,
+                        quant_config=quant_config,
+                        layer_id=layer_id,
+                        alt_stream=alt_stream,
+                    )
+                else:
+                    self.indexer = Indexer(
+                        hidden_size=hidden_size,
+                        index_n_heads=get_nsa_index_n_heads(config),
+                        index_head_dim=get_nsa_index_head_dim(config),
+                        rope_head_dim=qk_rope_head_dim,
+                        index_topk=get_nsa_index_topk(config),
+                        q_lora_rank=q_lora_rank,
+                        max_position_embeddings=max_position_embeddings,
+                        rope_theta=rope_theta,
+                        scale_fmt="ue8m0",
+                        block_size=128,
+                        rope_scaling=rope_scaling,
+                        is_neox_style=is_neox_style,
+                        prefix=add_prefix("indexer", prefix),
+                        quant_config=quant_config,
+                        layer_id=layer_id,
+                        alt_stream=alt_stream,
+                    )
 
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,

@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import torch
+
 from sglang.jit_kernel.utils import cache_once, load_jit
 from sglang.kernel_api_logging import debug_kernel_api
 
 if TYPE_CHECKING:
-    import torch
     from tvm_ffi.module import Module
 
 
@@ -88,10 +89,36 @@ def update_token_table(
         req_lens: request lengths
         ignore_tokens: tokens to be ignored (marked as negative in table)
     """
-    module = _jit_ngram_embedding_module()
     if ignore_tokens is None:
         # Create an empty tensor for ignore_tokens
         ignore_tokens = tokens.new_empty(0, dtype=tokens.dtype)
+
+    if tokens.device.type != "cuda":
+        # Mirror UpdateTokenTableKernel exactly: each request consumes a
+        # contiguous slice from `tokens` whose start is the sum of prior
+        # `req_lens`, then writes it into the token table at
+        # [row_indices[req_id], column_starts[req_id]:].
+        req_starts = torch.cumsum(req_lens, dim=0, dtype=torch.int32) - req_lens
+
+        for req_id in range(row_indices.numel()):
+            req_len = int(req_lens[req_id].item())
+            if req_len <= 0:
+                continue
+
+            src_start = int(req_starts[req_id].item())
+            src_end = src_start + req_len
+            row = int(row_indices[req_id].item())
+            col_start = int(column_starts[req_id].item())
+
+            values = tokens[src_start:src_end]
+            if ignore_tokens.numel() > 0:
+                ignore_mask = (values[:, None] == ignore_tokens[None, :]).any(dim=1)
+                values = torch.where(ignore_mask, -values, values)
+
+            ne_token_table[row, col_start : col_start + req_len] = values
+        return
+
+    module = _jit_ngram_embedding_module()
     module.update_token_table(
         tokens,
         ne_token_table,

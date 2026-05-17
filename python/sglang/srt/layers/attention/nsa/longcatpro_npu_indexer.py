@@ -452,7 +452,12 @@ class LongcatProNPUIndexer(Indexer):
                 dtype=torch.int32,
                 device=k.device,
             )
-        actual_seq_lengths_kv = forward_batch.seq_lens.to(
+        forward_metadata = forward_batch.attn_backend.forward_metadata
+        if forward_metadata.seq_lens_cpu_int is None:
+            actual_seq_lengths_kv = forward_metadata.seq_lens
+        else:
+            actual_seq_lengths_kv = forward_metadata.seq_lens_cpu_int
+        actual_seq_lengths_kv = actual_seq_lengths_kv.to(
             device=k.device, dtype=torch.int32
         )
 

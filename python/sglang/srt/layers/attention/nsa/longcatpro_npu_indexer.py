@@ -106,6 +106,28 @@ class LongcatProNPUIndexer(Indexer):
             seq_id = seq_id.cumsum(0) - 1
         return seq_id, q_lens, q_start
 
+    def _get_token_kv_limit(
+        self,
+        actual_seq_lengths_q: torch.Tensor,
+        actual_seq_lengths_kv: torch.Tensor,
+        is_prefill: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        seq_id, q_lens, q_start = self._build_token_seq_id(actual_seq_lengths_q)
+        kv_lens = actual_seq_lengths_kv.to(torch.int64)
+
+        if seq_id.numel() == 0:
+            return seq_id, kv_lens.new_empty((0,))
+
+        if is_prefill:
+            local_pos = torch.arange(
+                seq_id.numel(), device=seq_id.device, dtype=torch.int64
+            ) - q_start[seq_id]
+            kv_pos = kv_lens[seq_id] - q_lens[seq_id] + local_pos + 1
+        else:
+            kv_pos = kv_lens[seq_id]
+
+        return seq_id, kv_pos
+
     def _compose_longcat_topk(
         self,
         idx: torch.Tensor,
@@ -188,7 +210,7 @@ class LongcatProNPUIndexer(Indexer):
         kv_lens = actual_seq_lengths_kv.to(torch.int64)
         valid_mask = (idx >= 0) & (idx < kv_lens[seq_id].unsqueeze(1))
 
-        safe_idx = idx.clamp(min=0)
+        safe_idx = idx.masked_fill(~valid_mask, 0)
         page_idx = torch.div(safe_idx, page_size, rounding_mode="floor")
         page_offset = safe_idx.remainder(page_size)
         req_block_table = block_table.index_select(0, seq_id.to(torch.int64))
@@ -264,17 +286,14 @@ class LongcatProNPUIndexer(Indexer):
     ) -> torch.Tensor:
         idx = topk_indices_local.squeeze(1).to(torch.int64)
         val = topk_values.squeeze(1)
-        seq_id, q_lens, q_start = self._build_token_seq_id(actual_seq_lengths_q)
-        kv_lens = actual_seq_lengths_kv.to(torch.int64)
+        seq_id, kv_pos = self._get_token_kv_limit(
+            actual_seq_lengths_q=actual_seq_lengths_q,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            is_prefill=is_prefill,
+        )
 
         if idx.shape[0] == 0:
             return idx.to(torch.int32).unsqueeze(1)
-
-        if is_prefill:
-            local_pos = torch.arange(idx.shape[0], device=idx.device) - q_start[seq_id]
-            kv_pos = kv_lens[seq_id] - q_lens[seq_id] + local_pos + 1
-        else:
-            kv_pos = kv_lens[seq_id]
 
         kv_init_end = torch.minimum(
             kv_pos,
@@ -492,6 +511,20 @@ class LongcatProNPUIndexer(Indexer):
             sparse_count=candidate_count,
             sparse_mode=3,
         )[0]
+        idx = topk_indices_local.squeeze(1).to(torch.int64)
+        if idx.numel() != 0:
+            _, kv_pos = self._get_token_kv_limit(
+                actual_seq_lengths_q=actual_seq_lengths_q,
+                actual_seq_lengths_kv=actual_seq_lengths_kv,
+                is_prefill=is_prefill,
+            )
+            valid_candidate_count = torch.clamp(kv_pos, max=idx.shape[1])
+            candidate_rank = torch.arange(
+                idx.shape[1], device=idx.device, dtype=torch.int64
+            ).unsqueeze(0)
+            rank_valid_mask = candidate_rank < valid_candidate_count.unsqueeze(1)
+            idx = idx.masked_fill(~rank_valid_mask, -1)
+            topk_indices_local = idx.to(torch.int32).unsqueeze(1)
         topk_values = self._recompute_candidate_values_pa_bsnd(
             q=q.view(-1, self.n_heads, self.head_dim),
             weights=weights,

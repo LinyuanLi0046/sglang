@@ -75,7 +75,7 @@ class LongcatProNPUIndexer(Indexer):
         self.num_init_tokens = getattr(config, "index_init_tokens", 0)
         self.num_local_tokens = getattr(config, "index_local_tokens", 0)
         self.nsa_enable_prefill_cp = False
-        self.use_mlp_lightning_indexer = get_bool_env_var("SGLANG_NPU_LONGCATPRO_USE_MLP_LIGHTNING_INDEXER", true)
+        self.use_mlp_lightning_indexer = get_bool_env_var("SGLANG_NPU_LONGCATPRO_USE_MLP_LIGHTNING_INDEXER", "true")
 
         if index_k_norm_type == "rms":
             self.k_norm = RMSNorm(

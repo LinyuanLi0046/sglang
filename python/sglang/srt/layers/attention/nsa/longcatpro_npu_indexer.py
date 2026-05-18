@@ -340,12 +340,41 @@ class LongcatProNPUIndexer(Indexer):
                 "built and imported."
             )
 
+        cur_seq_lengths_query = self._build_cu_seqlens(actual_seq_lengths_q)
+        cur_seq_lengths_key = self._build_cu_seqlens(actual_seq_lengths_kv)
+        print(
+            "[mlp_lightning_indexer debug]",
+            {
+                "q_shape": tuple(q.shape),
+                "q_dtype": str(q.dtype),
+                "past_key_states_shape": tuple(past_key_states.shape),
+                "past_key_states_dtype": str(past_key_states.dtype),
+                "weights_shape": tuple(weights.shape),
+                "weights_dtype": str(weights.dtype),
+                "actual_seq_lengths_q": actual_seq_lengths_q.detach().cpu().tolist(),
+                "actual_seq_lengths_kv": actual_seq_lengths_kv.detach().cpu().tolist(),
+                "cur_seq_lengths_query": cur_seq_lengths_query.detach().cpu().tolist(),
+                "cur_seq_lengths_key": cur_seq_lengths_key.detach().cpu().tolist(),
+                "block_table_shape": tuple(block_table.shape),
+                "block_table_dtype": str(block_table.dtype),
+                "block_table_head": block_table[: min(2, block_table.shape[0]), : min(8, block_table.shape[1])]
+                .detach()
+                .cpu()
+                .tolist(),
+                "candidate_count": candidate_count,
+                "kv_block_len": self.kv_block_size,
+                "q_block_len": self.q_block_size,
+                "init_num": self.num_init_tokens,
+                "local_num": self.num_local_tokens,
+            },
+        )
+
         topk_indices_local, topk_values = torch.ops.npu.mlp_lightning_indexer(
             q,
             past_key_states,
             weights.to(torch.float32),
-            cur_seq_lengths_query=self._build_cu_seqlens(actual_seq_lengths_q),
-            cur_seq_lengths_key=self._build_cu_seqlens(actual_seq_lengths_kv),
+            cur_seq_lengths_query=cur_seq_lengths_query,
+            cur_seq_lengths_key=cur_seq_lengths_key,
             block_table=block_table,
             layout_query="TND",
             layout_key="PA_BSND",

@@ -256,8 +256,8 @@ class LongcatFlashMoE(nn.Module):
             use_grouped_topk=False,
             correction_bias=self.router.e_score_correction_bias.data,
             layer_id=layer_id,
-            routed_scaling_factor=self.routed_scaling_factor,
         )
+        self.topk.forward = self.topk.forward_native
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=self.num_experts,
@@ -304,8 +304,7 @@ class LongcatFlashMoE(nn.Module):
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
         final_hidden_states = self.experts(hidden_states, topk_output)
-        if not _is_npu:
-            final_hidden_states *= self.routed_scaling_factor
+        final_hidden_states *= self.routed_scaling_factor
 
         if (
             self.tp_size > 1

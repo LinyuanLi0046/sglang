@@ -114,11 +114,9 @@ class LongcatProNPUIndexer(Indexer):
         kv_init_end: torch.Tensor,
         kv_local_start: torch.Tensor,
     ) -> torch.Tensor:
-        candidate_slots = torch.arange(
-            val.shape[1], dtype=torch.int64, device=val.device
-        ).unsqueeze(0)
-        val = val.masked_fill(candidate_slots >= kv_pos.unsqueeze(1), float("-inf"))
-
+        # In the helper fallback path, `val` is recomputed from the returned
+        # candidate indices, so its column dimension is just candidate rank,
+        # not an absolute KV position. Only filter by the true candidate index.
         valid_idx = (idx >= 0) & (idx < kv_pos.unsqueeze(1))
         val = val.masked_fill(~valid_idx, float("-inf"))
 

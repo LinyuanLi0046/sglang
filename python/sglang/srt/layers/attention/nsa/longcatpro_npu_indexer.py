@@ -132,11 +132,19 @@ class LongcatProNPUIndexer(Indexer):
 
         return seq_id, kv_pos
 
-    def _build_cu_seqlens(self, actual_seq_lengths: torch.Tensor) -> torch.Tensor:
+    def _prepend_zero_to_cu_seqlens(self, cu_seqlens: torch.Tensor) -> torch.Tensor:
         return torch.cat(
             [
-                torch.zeros(1, dtype=torch.int64, device=actual_seq_lengths.device),
-                actual_seq_lengths.to(torch.int64),
+                torch.zeros(1, dtype=torch.int64, device=cu_seqlens.device),
+                cu_seqlens.to(torch.int64),
+            ]
+        )
+
+    def _build_cu_seqlens_from_lengths(self, seq_lens: torch.Tensor) -> torch.Tensor:
+        return torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int64, device=seq_lens.device),
+                torch.cumsum(seq_lens.to(torch.int64), dim=0),
             ]
         )
 
@@ -340,33 +348,11 @@ class LongcatProNPUIndexer(Indexer):
                 "built and imported."
             )
 
-        cur_seq_lengths_query = self._build_cu_seqlens(actual_seq_lengths_q)
-        cur_seq_lengths_key = self._build_cu_seqlens(actual_seq_lengths_kv)
-        print(
-            "[mlp_lightning_indexer debug]",
-            {
-                "q_shape": tuple(q.shape),
-                "q_dtype": str(q.dtype),
-                "past_key_states_shape": tuple(past_key_states.shape),
-                "past_key_states_dtype": str(past_key_states.dtype),
-                "weights_shape": tuple(weights.shape),
-                "weights_dtype": str(weights.dtype),
-                "actual_seq_lengths_q": actual_seq_lengths_q.detach().cpu().tolist(),
-                "actual_seq_lengths_kv": actual_seq_lengths_kv.detach().cpu().tolist(),
-                "cur_seq_lengths_query": cur_seq_lengths_query.detach().cpu().tolist(),
-                "cur_seq_lengths_key": cur_seq_lengths_key.detach().cpu().tolist(),
-                "block_table_shape": tuple(block_table.shape),
-                "block_table_dtype": str(block_table.dtype),
-                "block_table_head": block_table[: min(2, block_table.shape[0]), : min(8, block_table.shape[1])]
-                .detach()
-                .cpu()
-                .tolist(),
-                "candidate_count": candidate_count,
-                "kv_block_len": self.kv_block_size,
-                "q_block_len": self.q_block_size,
-                "init_num": self.num_init_tokens,
-                "local_num": self.num_local_tokens,
-            },
+        cur_seq_lengths_query = self._prepend_zero_to_cu_seqlens(
+            actual_seq_lengths_q
+        )
+        cur_seq_lengths_key = self._build_cu_seqlens_from_lengths(
+            actual_seq_lengths_kv
         )
 
         topk_indices_local, topk_values = torch.ops.npu.mlp_lightning_indexer(

@@ -5,8 +5,10 @@ from typing import Any, Dict, Optional
 import torch
 
 try:
+    import sgl_kernel_npu  # noqa: F401
     import torch_npu
-except ImportError:
+except (ImportError, OSError):
+    sgl_kernel_npu = None
     torch_npu = None
 
 from transformers import PretrainedConfig
@@ -72,6 +74,9 @@ class LongcatProNPUIndexer(Indexer):
         self.num_init_tokens = getattr(config, "index_init_tokens", 0)
         self.num_local_tokens = getattr(config, "index_local_tokens", 0)
         self.nsa_enable_prefill_cp = False
+        self.use_mlp_lightning_indexer = (
+            envs.SGLANG_NPU_LONGCATPRO_USE_MLP_LIGHTNING_INDEXER.get()
+        )
 
         if index_k_norm_type == "rms":
             self.k_norm = RMSNorm(
@@ -127,6 +132,19 @@ class LongcatProNPUIndexer(Indexer):
             kv_pos = kv_lens[seq_id]
 
         return seq_id, kv_pos
+
+    def _build_cu_seqlens(self, actual_seq_lengths: torch.Tensor) -> torch.Tensor:
+        return torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int64, device=actual_seq_lengths.device),
+                actual_seq_lengths.to(torch.int64),
+            ]
+        )
+
+    def _can_use_mlp_lightning_indexer(self) -> bool:
+        return hasattr(torch.ops, "npu") and hasattr(
+            torch.ops.npu, "mlp_lightning_indexer"
+        )
 
     def _compose_longcat_topk(
         self,
@@ -255,8 +273,11 @@ class LongcatProNPUIndexer(Indexer):
             page_size=page_size,
         )
 
-        q_fp32 = q.to(torch.float32)
-        weights_fp32 = weights.view(token_num, self.n_heads).to(torch.float32)
+        q_bf16 = q if q.dtype == torch.bfloat16 else q.to(torch.bfloat16)
+        weights_bf16 = weights.view(token_num, self.n_heads)
+        if weights_bf16.dtype != torch.bfloat16:
+            weights_bf16 = weights_bf16.to(torch.bfloat16)
+        weights_fp32 = weights_bf16.to(torch.float32)
         topk_values = torch.empty(
             token_num, candidate_num, dtype=torch.float32, device=q.device
         )
@@ -266,15 +287,121 @@ class LongcatProNPUIndexer(Indexer):
             candidate_k = self._gather_candidate_keys_pa_bsnd(
                 past_key_states=past_key_states,
                 slots=slots[:, start:end],
-            ).to(torch.float32)
-            logits = torch.einsum("thd,tcd->thc", q_fp32, candidate_k)
-            logits = torch.relu(logits)
+            )
+            if candidate_k.dtype != torch.bfloat16:
+                candidate_k = candidate_k.to(torch.bfloat16)
+            logits = torch.einsum("thd,tcd->thc", q_bf16, candidate_k)
+            logits = torch.relu(logits.to(torch.float32))
             topk_values[:, start:end] = (
                 logits * weights_fp32.unsqueeze(-1)
             ).sum(dim=1)
 
         topk_values.masked_fill_(~valid_mask, float("-inf"))
         return topk_values.unsqueeze(1)
+
+    def _mask_invalid_candidate_ranks(
+        self,
+        topk_indices_local: torch.Tensor,
+        actual_seq_lengths_q: torch.Tensor,
+        actual_seq_lengths_kv: torch.Tensor,
+        is_prefill: bool,
+    ) -> torch.Tensor:
+        idx = topk_indices_local.squeeze(1).to(torch.int64)
+        if idx.numel() == 0:
+            return topk_indices_local
+
+        _, kv_pos = self._get_token_kv_limit(
+            actual_seq_lengths_q=actual_seq_lengths_q,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            is_prefill=is_prefill,
+        )
+        valid_candidate_count = torch.clamp(kv_pos, max=idx.shape[1])
+        candidate_rank = torch.arange(
+            idx.shape[1], device=idx.device, dtype=torch.int64
+        ).unsqueeze(0)
+        rank_valid_mask = candidate_rank < valid_candidate_count.unsqueeze(1)
+        idx = idx.masked_fill(~rank_valid_mask, -1)
+        return idx.to(torch.int32).unsqueeze(1)
+
+    def _run_mlp_lightning_indexer_pa_bsnd(
+        self,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        past_key_states: torch.Tensor,
+        actual_seq_lengths_q: torch.Tensor,
+        actual_seq_lengths_kv: torch.Tensor,
+        block_table: torch.Tensor,
+        candidate_count: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self._can_use_mlp_lightning_indexer():
+            raise RuntimeError(
+                "SGLANG_NPU_LONGCATPRO_USE_MLP_LIGHTNING_INDEXER is enabled, "
+                "but torch.ops.npu.mlp_lightning_indexer is not available. "
+                "Please ensure sgl_kernel_npu with mlp_lightning_indexer is "
+                "built and imported."
+            )
+
+        topk_indices_local, topk_values = torch.ops.npu.mlp_lightning_indexer(
+            q,
+            past_key_states,
+            weights.to(torch.float32),
+            cur_seq_lengths_query=self._build_cu_seqlens(actual_seq_lengths_q),
+            cur_seq_lengths_key=self._build_cu_seqlens(actual_seq_lengths_kv),
+            block_table=block_table,
+            layout_query="TND",
+            layout_key="PA_BSND",
+            sparse_count=candidate_count,
+            kv_block_len=self.kv_block_size,
+            q_block_len=self.q_block_size,
+            init_num=self.num_init_tokens,
+            local_num=self.num_local_tokens,
+            sparse_mode=3,
+            return_value=True,
+        )
+        return topk_indices_local, topk_values.to(torch.float32)
+
+    def _run_lightning_indexer_fallback_pa_bsnd(
+        self,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        past_key_states: torch.Tensor,
+        actual_seq_lengths_q: torch.Tensor,
+        actual_seq_lengths_kv: torch.Tensor,
+        block_table: torch.Tensor,
+        candidate_count: int,
+        page_size: int,
+        is_prefill: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        weights_indexer = weights.to(torch.bfloat16)
+        topk_indices_local = torch_npu.npu_lightning_indexer(
+            query=q,
+            key=past_key_states,
+            weights=weights_indexer,
+            actual_seq_lengths_query=actual_seq_lengths_q,
+            actual_seq_lengths_key=actual_seq_lengths_kv,
+            block_table=block_table,
+            layout_query="TND",
+            layout_key="PA_BSND",
+            sparse_count=candidate_count,
+            sparse_mode=3,
+        )[0]
+        topk_indices_local = self._mask_invalid_candidate_ranks(
+            topk_indices_local=topk_indices_local,
+            actual_seq_lengths_q=actual_seq_lengths_q,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            is_prefill=is_prefill,
+        )
+        topk_values = self._recompute_candidate_values_pa_bsnd(
+            q=q,
+            weights=weights_indexer,
+            past_key_states=past_key_states,
+            topk_indices_local=topk_indices_local,
+            block_table=block_table,
+            actual_seq_lengths_q=actual_seq_lengths_q,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            page_size=page_size,
+        )
+        return topk_indices_local, topk_values
 
     def _postprocess_longcat_topk_single_rank(
         self,
@@ -495,46 +622,33 @@ class LongcatProNPUIndexer(Indexer):
         if is_prefill:
             block_table = block_table[: actual_seq_lengths_q.size(0)]
         candidate_count = self._get_full_candidate_count(actual_seq_lengths_kv)
+        q_indexer = q.view(-1, self.n_heads, self.head_dim)
 
-        # DeepSeek V3.2 路径只要 topk_indices,不需要 topk_values
-        # LongCat Pro 路径要 topk_indices + topk_values 所以传了 return_value=True
-        # 但 npu_lightning_indexer 算子明确不支持 layout_key="PA_BSND" 同时 return_value=True
-        topk_indices_local = torch_npu.npu_lightning_indexer(
-            query=q.view(-1, self.n_heads, self.head_dim),
-            key=past_key_states,
-            weights=weights.to(torch.bfloat16),
-            actual_seq_lengths_query=actual_seq_lengths_q,
-            actual_seq_lengths_key=actual_seq_lengths_kv,
-            block_table=block_table,
-            layout_query="TND",
-            layout_key="PA_BSND",
-            sparse_count=candidate_count,
-            sparse_mode=3,
-        )[0]
-        idx = topk_indices_local.squeeze(1).to(torch.int64)
-        if idx.numel() != 0:
-            _, kv_pos = self._get_token_kv_limit(
+        if self.use_mlp_lightning_indexer:
+            topk_indices_local, topk_values = self._run_mlp_lightning_indexer_pa_bsnd(
+                q=q_indexer,
+                weights=weights,
+                past_key_states=past_key_states,
                 actual_seq_lengths_q=actual_seq_lengths_q,
                 actual_seq_lengths_kv=actual_seq_lengths_kv,
-                is_prefill=is_prefill,
+                block_table=block_table,
+                candidate_count=candidate_count,
             )
-            valid_candidate_count = torch.clamp(kv_pos, max=idx.shape[1])
-            candidate_rank = torch.arange(
-                idx.shape[1], device=idx.device, dtype=torch.int64
-            ).unsqueeze(0)
-            rank_valid_mask = candidate_rank < valid_candidate_count.unsqueeze(1)
-            idx = idx.masked_fill(~rank_valid_mask, -1)
-            topk_indices_local = idx.to(torch.int32).unsqueeze(1)
-        topk_values = self._recompute_candidate_values_pa_bsnd(
-            q=q.view(-1, self.n_heads, self.head_dim),
-            weights=weights,
-            past_key_states=past_key_states,
-            topk_indices_local=topk_indices_local,
-            block_table=block_table,
-            actual_seq_lengths_q=actual_seq_lengths_q,
-            actual_seq_lengths_kv=actual_seq_lengths_kv,
-            page_size=forward_batch.token_to_kv_pool.page_size,
-        )
+        else:
+            topk_indices_local, topk_values = (
+                self._run_lightning_indexer_fallback_pa_bsnd(
+                    q=q_indexer,
+                    weights=weights,
+                    past_key_states=past_key_states,
+                    actual_seq_lengths_q=actual_seq_lengths_q,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    block_table=block_table,
+                    candidate_count=candidate_count,
+                    page_size=forward_batch.token_to_kv_pool.page_size,
+                    is_prefill=is_prefill,
+                )
+            )
+
         return self._postprocess_longcat_topk_single_rank(
             topk_indices_local=topk_indices_local,
             topk_values=topk_values,

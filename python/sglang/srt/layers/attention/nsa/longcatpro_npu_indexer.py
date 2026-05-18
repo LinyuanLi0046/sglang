@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+from sglang.python.sglang.srt.utils.common import get_bool_env_var
 import torch
 
 try:
@@ -74,9 +75,7 @@ class LongcatProNPUIndexer(Indexer):
         self.num_init_tokens = getattr(config, "index_init_tokens", 0)
         self.num_local_tokens = getattr(config, "index_local_tokens", 0)
         self.nsa_enable_prefill_cp = False
-        self.use_mlp_lightning_indexer = (
-            envs.SGLANG_NPU_LONGCATPRO_USE_MLP_LIGHTNING_INDEXER.get()
-        )
+        self.use_mlp_lightning_indexer = get_bool_env_var("SGLANG_NPU_LONGCATPRO_USE_MLP_LIGHTNING_INDEXER", true)
 
         if index_k_norm_type == "rms":
             self.k_norm = RMSNorm(
@@ -625,7 +624,7 @@ class LongcatProNPUIndexer(Indexer):
         q_indexer = q.view(-1, self.n_heads, self.head_dim)
 
         if self.use_mlp_lightning_indexer:
-            topk_indices_local, topk_values = self._run_mlp_lightning_indexer_pa_bsnd(
+            topk_indices_local, _ = self._run_mlp_lightning_indexer_pa_bsnd(
                 q=q_indexer,
                 weights=weights,
                 past_key_states=past_key_states,
@@ -634,20 +633,21 @@ class LongcatProNPUIndexer(Indexer):
                 block_table=block_table,
                 candidate_count=candidate_count,
             )
-        else:
-            topk_indices_local, topk_values = (
-                self._run_lightning_indexer_fallback_pa_bsnd(
-                    q=q_indexer,
-                    weights=weights,
-                    past_key_states=past_key_states,
-                    actual_seq_lengths_q=actual_seq_lengths_q,
-                    actual_seq_lengths_kv=actual_seq_lengths_kv,
-                    block_table=block_table,
-                    candidate_count=candidate_count,
-                    page_size=forward_batch.token_to_kv_pool.page_size,
-                    is_prefill=is_prefill,
-                )
+            return topk_indices_local
+
+        topk_indices_local, topk_values = (
+            self._run_lightning_indexer_fallback_pa_bsnd(
+                q=q_indexer,
+                weights=weights,
+                past_key_states=past_key_states,
+                actual_seq_lengths_q=actual_seq_lengths_q,
+                actual_seq_lengths_kv=actual_seq_lengths_kv,
+                block_table=block_table,
+                candidate_count=candidate_count,
+                page_size=forward_batch.token_to_kv_pool.page_size,
+                is_prefill=is_prefill,
             )
+        )
 
         return self._postprocess_longcat_topk_single_rank(
             topk_indices_local=topk_indices_local,

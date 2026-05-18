@@ -1,7 +1,13 @@
 import torch
 from torch import nn
 
+try:
+    import sgl_kernel_npu  # noqa: F401
+except (ImportError, OSError):
+    sgl_kernel_npu = None
+
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.utils import get_bool_env_var
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -18,6 +24,9 @@ class LongcatFlashProEmbedding(nn.Module):
         self.n_grams = (self.over_embedding_n - 1) * self.over_embedding_k
         self.oe_hidden_dim = config.oe_hidden_dim
         self.scale = 1 + self.n_grams
+        self.use_compute_n_gram_ids = get_bool_env_var(
+            "SGLANG_NPU_LONGCATPRO_USE_COMPUTE_N_GRAM_IDS", "true"
+        )
 
         self.word_embeder = VocabParallelEmbedding(
             self.num_embeddings,
@@ -45,11 +54,11 @@ class LongcatFlashProEmbedding(nn.Module):
         )
 
         oe_mods = torch.zeros(
-            [self.over_embedding_n - 1, self.over_embedding_k], dtype=torch.int64
+            [self.over_embedding_n - 1, self.over_embedding_k], dtype=torch.int32
         )
         oe_weights = torch.zeros(
             [self.over_embedding_n - 1, self.over_embedding_k, self.over_embedding_n],
-            dtype=torch.int64,
+            dtype=torch.int32,
         )
         for n in range(2, self.over_embedding_n + 1):
             for k in range(self.over_embedding_k):
@@ -61,6 +70,11 @@ class LongcatFlashProEmbedding(nn.Module):
                     oe_weights[n - 2][k][delta] = pow(self.num_embeddings, delta, mod)
         self.register_buffer("oe_mods", oe_mods, persistent=False)
         self.register_buffer("oe_weights", oe_weights, persistent=False)
+
+    def _can_use_compute_n_gram_ids(self) -> bool:
+        return hasattr(torch.ops, "npu") and hasattr(
+            torch.ops.npu, "compute_n_gram_ids"
+        )
 
     def init_buffers(
         self, max_running_requests: int, chunked_prefill_size: int, device: str
@@ -84,7 +98,7 @@ class LongcatFlashProEmbedding(nn.Module):
             result[prev_idx + n :] = tensor[prev_idx : tensor.shape[0] - n]
         return result
 
-    def _compute_fused_ngram_ids(
+    def _compute_fused_ngram_ids_torch(
         self, input_ids: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
         info = forward_batch.ngram_embedding_info
@@ -131,6 +145,41 @@ class LongcatFlashProEmbedding(nn.Module):
                     branch_idx += 1
             cursor += req_len
         return ngram_ids
+
+    def _compute_fused_ngram_ids_npu(
+        self, input_ids: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        info = forward_batch.ngram_embedding_info
+        if info is None:
+            raise ValueError("LongcatFlashProEmbedding requires ngram_embedding_info.")
+
+        return torch.ops.npu.compute_n_gram_ids(
+            self.oe_weights.to(device=input_ids.device, dtype=torch.int32),
+            self.oe_mods.to(device=input_ids.device, dtype=torch.int32),
+            self.exclusive_oe_embedder_size_sums.to(
+                device=input_ids.device, dtype=torch.int32
+            ),
+            input_ids.to(torch.int32),
+            torch.cumsum(info.req_lens, dim=0, dtype=torch.int32),
+            info.token_table.to(device=input_ids.device, dtype=torch.int32),
+            forward_batch.req_pool_indices.to(device=input_ids.device, dtype=torch.int64),
+            info.column_starts.to(device=input_ids.device, dtype=torch.int32),
+            batch_size=forward_batch.batch_size,
+            oe_n=self.over_embedding_n,
+            oe_k=self.over_embedding_k,
+            max_context_len=info.token_table.shape[1],
+        )
+
+    def _compute_fused_ngram_ids(
+        self, input_ids: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        if (
+            self.use_compute_n_gram_ids
+            and input_ids.device.type == "npu"
+            and self._can_use_compute_n_gram_ids()
+        ):
+            return self._compute_fused_ngram_ids_npu(input_ids, forward_batch)
+        return self._compute_fused_ngram_ids_torch(input_ids, forward_batch)
 
     def _load_oe_embedder_weight(self, index: int, loaded_weight: torch.Tensor):
         oe_weight_start = int(self.exclusive_oe_embedder_size_sums[index].item())

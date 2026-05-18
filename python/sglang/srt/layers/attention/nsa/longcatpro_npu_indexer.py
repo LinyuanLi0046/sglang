@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from sglang.python.sglang.srt.utils.common import get_bool_env_var
+from sglang.srt.utils import get_bool_env_var
 import torch
 
 try:

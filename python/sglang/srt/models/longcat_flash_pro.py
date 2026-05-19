@@ -280,6 +280,7 @@ class LongcatFlashMoE(nn.Module):
                 hidden_states,
                 router_logits,
             )
+            topk_weights = topk_weights * self.routed_scaling_factor
             if self.zero_expert_type is not None:
                 if not _is_npu:
                     zero_expert_result = zero_experts_compute_triton(
@@ -304,7 +305,6 @@ class LongcatFlashMoE(nn.Module):
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
         final_hidden_states = self.experts(hidden_states, topk_output)
-        final_hidden_states *= self.routed_scaling_factor
 
         if (
             self.tp_size > 1

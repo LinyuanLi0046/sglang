@@ -255,10 +255,9 @@ class LongcatFlashMoE(nn.Module):
             renormalize=False,
             use_grouped_topk=False,
             correction_bias=self.router.e_score_correction_bias.data,
-            routed_scaling_factor=self.routed_scaling_factor,
-            apply_routed_scaling_factor_on_output=False,
             layer_id=layer_id,
         )
+        self.topk.forward = self.topk.forward_native
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=self.num_experts,
@@ -281,6 +280,7 @@ class LongcatFlashMoE(nn.Module):
                 hidden_states,
                 router_logits,
             )
+            topk_weights = topk_weights * self.routed_scaling_factor
             if self.zero_expert_type is not None:
                 if not _is_npu:
                     zero_expert_result = zero_experts_compute_triton(

@@ -233,12 +233,10 @@ class DecodeInputBuffers(ForwardInputBuffers):
             ngram_embedding_info = (
                 NgramEmbeddingInfo(
                     token_table=ne_token_table,
-                    row_indices=torch.zeros([max_bs], dtype=torch.int64),
                     column_starts=torch.zeros([max_bs], dtype=torch.int32),
-                    req_lens=torch.zeros([max_bs], dtype=torch.int32),
-                    exclusive_req_len_sums=torch.zeros([max_bs], dtype=torch.int32),
+                    req_lens=torch.ones([max_bs], dtype=torch.int32),
                     out_column_starts=torch.zeros([max_bs], dtype=torch.int32),
-                    out_req_lens=torch.zeros([max_bs], dtype=torch.int32),
+                    out_req_lens=torch.ones([max_bs], dtype=torch.int32),
                 )
                 if ne_token_table is not None
                 else None
@@ -291,7 +289,6 @@ class DecodeInputBuffers(ForwardInputBuffers):
         if bs != raw_bs:
             self.seq_lens.fill_(seq_len_fill_value)
             self.out_cache_loc.zero_()
-            self.req_pool_indices[raw_bs:bs].zero_()
             # Padded SWA indices left over from a previous replay would point
             # into real SWA slots, so set_kv_buffer on padded tokens would
             # corrupt active requests' KV. Zero the whole buffer so padded
@@ -302,13 +299,6 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 self.mamba_track_indices.zero_()
             if self.mamba_track_mask is not None:
                 self.mamba_track_mask.fill_(False)
-            if self.ngram_embedding_info is not None:
-                self.ngram_embedding_info.row_indices[raw_bs:bs].zero_()
-                self.ngram_embedding_info.column_starts[raw_bs:bs].zero_()
-                self.ngram_embedding_info.req_lens[raw_bs:bs].zero_()
-                self.ngram_embedding_info.exclusive_req_len_sums[raw_bs:bs].zero_()
-                self.ngram_embedding_info.out_column_starts[raw_bs:bs].zero_()
-                self.ngram_embedding_info.out_req_lens[raw_bs:bs].zero_()
 
         # Build batched copy lists for all GPU tensors.
         dsts = [
@@ -328,19 +318,11 @@ class DecodeInputBuffers(ForwardInputBuffers):
 
         if self.ngram_embedding_info is not None:
             ngram_embedding_info = forward_batch.ngram_embedding_info
-            self.ngram_embedding_info.row_indices[:raw_bs].copy_(
-                ngram_embedding_info.row_indices
-            )
             self.ngram_embedding_info.column_starts[:raw_bs].copy_(
                 ngram_embedding_info.column_starts
             )
             self.ngram_embedding_info.req_lens[:raw_bs].copy_(
                 ngram_embedding_info.req_lens
-            )
-            self.ngram_embedding_info.exclusive_req_len_sums[:bs].copy_(
-                torch.cumsum(
-                    self.ngram_embedding_info.req_lens[:bs], dim=0, dtype=torch.int32
-                )
             )
 
         if (

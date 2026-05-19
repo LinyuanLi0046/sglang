@@ -39,6 +39,7 @@ def _update_token_table_single_token_npu_kernel(
     row_indices_ptr,
     column_starts_ptr,
     batch_size,
+    token_table_num_rows,
     max_context_len,
 ):
     pid = tl.program_id(0)
@@ -48,8 +49,13 @@ def _update_token_table_single_token_npu_kernel(
         row = tl.load(row_indices_ptr + req_id).to(tl.int32)
         col = tl.load(column_starts_ptr + req_id)
         value = tl.load(tokens_ptr + req_id)
-        out_idx = row * max_context_len + col
-        tl.store(token_table_ptr + out_idx, value)
+        valid = (row >= 0) & (row < token_table_num_rows) & (col >= 0) & (
+            col < max_context_len
+        )
+        safe_row = tl.where(valid, row, 0)
+        safe_col = tl.where(valid, col, 0)
+        out_idx = safe_row * max_context_len + safe_col
+        tl.store(token_table_ptr + out_idx, value, mask=valid)
 
 
 @triton.jit
@@ -130,6 +136,7 @@ def _update_token_table_single_token_npu_triton(
         row_indices,
         column_starts,
         batch_size,
+        ne_token_table.shape[0],
         ne_token_table.shape[1],
     )
 

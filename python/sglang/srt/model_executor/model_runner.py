@@ -35,7 +35,10 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from sglang.jit_kernel.ngram_embedding import update_token_table
+from sglang.jit_kernel.ngram_embedding import (
+    update_token_table,
+    update_token_table_single_token,
+)
 from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
@@ -2839,12 +2842,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         raw_bs = next_token_ids.shape[0]
         ngram_embedding_info.out_column_starts[:raw_bs] = forward_batch.seq_lens[:raw_bs]
         ngram_embedding_info.out_req_lens[:raw_bs] = 1
-        update_token_table(
+        update_token_table_single_token(
             ne_token_table=ngram_embedding_info.token_table,
             tokens=next_token_ids[:raw_bs].to(torch.int32),
             row_indices=forward_batch.req_pool_indices[:raw_bs],
             column_starts=ngram_embedding_info.out_column_starts[:raw_bs],
-            req_lens=ngram_embedding_info.out_req_lens[:raw_bs],
             ignore_tokens=None,
         )
 

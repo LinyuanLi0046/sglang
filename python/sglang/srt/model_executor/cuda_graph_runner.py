@@ -289,6 +289,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         if bs != raw_bs:
             self.seq_lens.fill_(seq_len_fill_value)
             self.out_cache_loc.zero_()
+            self.req_pool_indices[raw_bs:bs].zero_()
             # Padded SWA indices left over from a previous replay would point
             # into real SWA slots, so set_kv_buffer on padded tokens would
             # corrupt active requests' KV. Zero the whole buffer so padded
@@ -324,6 +325,11 @@ class DecodeInputBuffers(ForwardInputBuffers):
             self.ngram_embedding_info.req_lens[:raw_bs].copy_(
                 ngram_embedding_info.req_lens
             )
+            if bs != raw_bs:
+                self.ngram_embedding_info.column_starts[raw_bs:bs].zero_()
+                self.ngram_embedding_info.req_lens[raw_bs:bs].zero_()
+                self.ngram_embedding_info.out_column_starts[raw_bs:bs].zero_()
+                self.ngram_embedding_info.out_req_lens[raw_bs:bs].zero_()
 
         if (
             self.mamba_track_indices is not None

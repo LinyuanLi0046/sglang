@@ -72,28 +72,32 @@ def _update_token_table_torch_fallback(
     req_lens: torch.Tensor,
     ignore_tokens: torch.Tensor,
 ) -> None:
-    # Mirror UpdateTokenTableKernel exactly: each request consumes a
-    # contiguous slice from `tokens` whose start is the sum of prior
-    # `req_lens`, then writes it into the token table at
+    # Mirror UpdateTokenTableKernel semantics without scalar .item() reads.
+    # Each request consumes a contiguous slice from `tokens` and writes into
     # [row_indices[req_id], column_starts[req_id]:].
     req_starts = torch.cumsum(req_lens, dim=0, dtype=torch.int32) - req_lens
+    total_tokens = tokens.numel()
+    if total_tokens == 0 or row_indices.numel() == 0:
+        return
 
-    for req_id in range(row_indices.numel()):
-        req_len = int(req_lens[req_id].item())
-        if req_len <= 0:
-            continue
+    req_lens_i64 = req_lens.to(torch.int64)
+    req_ids = torch.repeat_interleave(
+        torch.arange(row_indices.numel(), device=tokens.device, dtype=torch.int64),
+        req_lens_i64,
+    )
+    req_starts_rep = req_starts.to(torch.int64).repeat_interleave(req_lens_i64)
+    token_offsets = torch.arange(total_tokens, device=tokens.device, dtype=torch.int64)
+    pos_in_req = token_offsets - req_starts_rep
 
-        src_start = int(req_starts[req_id].item())
-        src_end = src_start + req_len
-        row = int(row_indices[req_id].item())
-        col_start = int(column_starts[req_id].item())
+    rows = row_indices.to(torch.int64).index_select(0, req_ids)
+    cols = column_starts.to(torch.int64).index_select(0, req_ids) + pos_in_req
 
-        values = tokens[src_start:src_end]
-        if ignore_tokens.numel() > 0:
-            ignore_mask = (values[:, None] == ignore_tokens[None, :]).any(dim=1)
-            values = torch.where(ignore_mask, -values, values)
+    values = tokens
+    if ignore_tokens.numel() > 0:
+        ignore_mask = (values[:, None] == ignore_tokens[None, :]).any(dim=1)
+        values = torch.where(ignore_mask, -values, values)
 
-        ne_token_table[row, col_start : col_start + req_len] = values
+    ne_token_table[rows, cols] = values
 
 
 def _update_token_table_npu_triton(
@@ -115,14 +119,14 @@ def _update_token_table_npu_triton(
         return True
 
     req_starts = torch.cumsum(req_lens, dim=0, dtype=torch.int32) - req_lens
-    max_req_len = int(req_lens.max().item())
-    if max_req_len <= 0:
+    total_tokens = tokens.numel()
+    if total_tokens <= 0:
         return True
 
     block_size = 256
     grid = (
         row_indices.numel(),
-        triton.cdiv(max_req_len, block_size),
+        triton.cdiv(total_tokens, block_size),
     )
     _update_token_table_npu_kernel[grid](
         tokens,

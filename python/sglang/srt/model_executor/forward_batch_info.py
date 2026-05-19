@@ -238,8 +238,10 @@ class NgramEmbeddingInfo:
     """Ngram embedding state for LongCat models."""
 
     token_table: torch.Tensor
+    row_indices: torch.Tensor
     column_starts: torch.Tensor
     req_lens: torch.Tensor
+    exclusive_req_len_sums: torch.Tensor
     out_column_starts: torch.Tensor
     out_req_lens: torch.Tensor
 
@@ -249,27 +251,39 @@ class NgramEmbeddingInfo:
         token_table: torch.Tensor,
         batch_size: int,
         device: torch.device,
+        row_indices=None,
         column_starts=None,
         req_lens=None,
     ) -> NgramEmbeddingInfo:
         info = cls(
             token_table=token_table,
+            row_indices=torch.empty(batch_size, dtype=torch.int64, device=device),
             column_starts=torch.empty(batch_size, dtype=torch.int32, device=device),
             req_lens=torch.empty(batch_size, dtype=torch.int32, device=device),
+            exclusive_req_len_sums=torch.empty(
+                batch_size, dtype=torch.int32, device=device
+            ),
             out_column_starts=torch.empty(batch_size, dtype=torch.int32, device=device),
             out_req_lens=torch.empty(batch_size, dtype=torch.int32, device=device),
         )
+        if row_indices is not None:
+            info.row_indices[:] = row_indices
         if column_starts is not None:
             info.column_starts[:] = column_starts
         if req_lens is not None:
             info.req_lens[:] = req_lens
+            info.exclusive_req_len_sums[:] = torch.cumsum(
+                info.req_lens, dim=0, dtype=torch.int32
+            )
         return info
 
     def slice(self, bs: int) -> NgramEmbeddingInfo:
         return NgramEmbeddingInfo(
             token_table=self.token_table,
+            row_indices=self.row_indices[:bs],
             column_starts=self.column_starts[:bs],
             req_lens=self.req_lens[:bs],
+            exclusive_req_len_sums=self.exclusive_req_len_sums[:bs],
             out_column_starts=self.out_column_starts[:bs],
             out_req_lens=self.out_req_lens[:bs],
         )
@@ -692,6 +706,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             batch.ne_token_table,
             self.batch_size,
             device,
+            row_indices=self.req_pool_indices,
             column_starts=column_starts,
             req_lens=req_lens,
         )

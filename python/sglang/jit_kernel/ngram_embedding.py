@@ -60,31 +60,6 @@ def _update_token_table_torch_fallback(
 
 
 @debug_kernel_api
-def update_token_table_single_token(
-    tokens: torch.Tensor,
-    ne_token_table: torch.Tensor,
-    row_indices: torch.Tensor,
-    column_starts: torch.Tensor,
-    ignore_tokens: torch.Tensor | None = None,
-) -> None:
-    """Update one token per request without ragged request expansion."""
-    if ignore_tokens is None:
-        ignore_tokens = tokens.new_empty(0, dtype=tokens.dtype)
-    if tokens.numel() == 0 or row_indices.numel() == 0:
-        return
-
-    values = tokens
-    if ignore_tokens.numel() > 0:
-        ignore_mask = (values[:, None] == ignore_tokens[None, :]).any(dim=1)
-        values = torch.where(ignore_mask, -values, values)
-
-    rows = row_indices.to(torch.int64)
-    cols = column_starts.to(torch.int64)
-    flat_idx = rows * ne_token_table.stride(0) + cols * ne_token_table.stride(1)
-    ne_token_table.view(-1).scatter_(0, flat_idx, values.to(ne_token_table.dtype))
-
-
-@debug_kernel_api
 def compute_n_gram_ids(
     ne_n: int,
     ne_k: int,

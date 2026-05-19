@@ -7,6 +7,16 @@ import torch
 from sglang.jit_kernel.utils import cache_once, load_jit
 from sglang.kernel_api_logging import debug_kernel_api
 
+try:
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON = True
+except Exception:
+    triton = None
+    tl = None
+    _HAS_TRITON = False
+
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
@@ -21,6 +31,111 @@ def _jit_ngram_embedding_module() -> Module:
             ("update_token_table", "&NgramEmbeddingKernel::update_token_table"),
         ],
     )
+
+
+@triton.jit
+def _update_token_table_npu_kernel(
+    tokens_ptr,
+    ne_token_table_ptr,
+    row_indices_ptr,
+    column_starts_ptr,
+    req_lens_ptr,
+    req_starts_ptr,
+    ne_token_table_stride_0,
+    ne_token_table_stride_1,
+    BLOCK_SIZE: tl.constexpr,
+):
+    req_id = tl.program_id(0)
+    block_id = tl.program_id(1)
+
+    req_len = tl.load(req_lens_ptr + req_id)
+    offs = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < req_len
+
+    src_start = tl.load(req_starts_ptr + req_id)
+    row = tl.load(row_indices_ptr + req_id)
+    col_start = tl.load(column_starts_ptr + req_id)
+
+    src_idx = src_start + offs
+    values = tl.load(tokens_ptr + src_idx, mask=mask, other=0)
+
+    dst_cols = col_start + offs
+    dst_idx = row * ne_token_table_stride_0 + dst_cols * ne_token_table_stride_1
+    tl.store(ne_token_table_ptr + dst_idx, values, mask=mask)
+
+
+def _update_token_table_torch_fallback(
+    tokens: torch.Tensor,
+    ne_token_table: torch.Tensor,
+    row_indices: torch.Tensor,
+    column_starts: torch.Tensor,
+    req_lens: torch.Tensor,
+    ignore_tokens: torch.Tensor,
+) -> None:
+    # Mirror UpdateTokenTableKernel exactly: each request consumes a
+    # contiguous slice from `tokens` whose start is the sum of prior
+    # `req_lens`, then writes it into the token table at
+    # [row_indices[req_id], column_starts[req_id]:].
+    req_starts = torch.cumsum(req_lens, dim=0, dtype=torch.int32) - req_lens
+
+    for req_id in range(row_indices.numel()):
+        req_len = int(req_lens[req_id].item())
+        if req_len <= 0:
+            continue
+
+        src_start = int(req_starts[req_id].item())
+        src_end = src_start + req_len
+        row = int(row_indices[req_id].item())
+        col_start = int(column_starts[req_id].item())
+
+        values = tokens[src_start:src_end]
+        if ignore_tokens.numel() > 0:
+            ignore_mask = (values[:, None] == ignore_tokens[None, :]).any(dim=1)
+            values = torch.where(ignore_mask, -values, values)
+
+        ne_token_table[row, col_start : col_start + req_len] = values
+
+
+def _update_token_table_npu_triton(
+    tokens: torch.Tensor,
+    ne_token_table: torch.Tensor,
+    row_indices: torch.Tensor,
+    column_starts: torch.Tensor,
+    req_lens: torch.Tensor,
+    ignore_tokens: torch.Tensor,
+) -> bool:
+    # Preserve exact legacy semantics when ignore_tokens is used.
+    if ignore_tokens.numel() > 0:
+        return False
+    if not _HAS_TRITON:
+        return False
+    if tokens.device.type != "npu":
+        return False
+    if req_lens.numel() == 0:
+        return True
+
+    req_starts = torch.cumsum(req_lens, dim=0, dtype=torch.int32) - req_lens
+    max_req_len = int(req_lens.max().item())
+    if max_req_len <= 0:
+        return True
+
+    block_size = 256
+    grid = (
+        row_indices.numel(),
+        triton.cdiv(max_req_len, block_size),
+    )
+    _update_token_table_npu_kernel[grid](
+        tokens,
+        ne_token_table,
+        row_indices,
+        column_starts,
+        req_lens,
+        req_starts,
+        ne_token_table.stride(0),
+        ne_token_table.stride(1),
+        BLOCK_SIZE=block_size,
+    )
+    return True
 
 
 @debug_kernel_api
@@ -94,28 +209,23 @@ def update_token_table(
         ignore_tokens = tokens.new_empty(0, dtype=tokens.dtype)
 
     if tokens.device.type != "cuda":
-        # Mirror UpdateTokenTableKernel exactly: each request consumes a
-        # contiguous slice from `tokens` whose start is the sum of prior
-        # `req_lens`, then writes it into the token table at
-        # [row_indices[req_id], column_starts[req_id]:].
-        req_starts = torch.cumsum(req_lens, dim=0, dtype=torch.int32) - req_lens
-
-        for req_id in range(row_indices.numel()):
-            req_len = int(req_lens[req_id].item())
-            if req_len <= 0:
-                continue
-
-            src_start = int(req_starts[req_id].item())
-            src_end = src_start + req_len
-            row = int(row_indices[req_id].item())
-            col_start = int(column_starts[req_id].item())
-
-            values = tokens[src_start:src_end]
-            if ignore_tokens.numel() > 0:
-                ignore_mask = (values[:, None] == ignore_tokens[None, :]).any(dim=1)
-                values = torch.where(ignore_mask, -values, values)
-
-            ne_token_table[row, col_start : col_start + req_len] = values
+        if _update_token_table_npu_triton(
+            tokens=tokens,
+            ne_token_table=ne_token_table,
+            row_indices=row_indices,
+            column_starts=column_starts,
+            req_lens=req_lens,
+            ignore_tokens=ignore_tokens,
+        ):
+            return
+        _update_token_table_torch_fallback(
+            tokens=tokens,
+            ne_token_table=ne_token_table,
+            row_indices=row_indices,
+            column_starts=column_starts,
+            req_lens=req_lens,
+            ignore_tokens=ignore_tokens,
+        )
         return
 
     module = _jit_ngram_embedding_module()

@@ -254,10 +254,10 @@ class NgramEmbeddingInfo:
     ) -> NgramEmbeddingInfo:
         info = cls(
             token_table=token_table,
-            column_starts=torch.empty(batch_size, dtype=torch.int32, device=device),
-            req_lens=torch.empty(batch_size, dtype=torch.int32, device=device),
-            out_column_starts=torch.empty(batch_size, dtype=torch.int32, device=device),
-            out_req_lens=torch.empty(batch_size, dtype=torch.int32, device=device),
+            column_starts=torch.zeros(batch_size, dtype=torch.int32, device=device),
+            req_lens=torch.zeros(batch_size, dtype=torch.int32, device=device),
+            out_column_starts=torch.zeros(batch_size, dtype=torch.int32, device=device),
+            out_req_lens=torch.zeros(batch_size, dtype=torch.int32, device=device),
         )
         if column_starts is not None:
             info.column_starts[:] = column_starts

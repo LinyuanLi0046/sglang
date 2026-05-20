@@ -93,6 +93,28 @@ def update_token_table(
         # Create an empty tensor for ignore_tokens
         ignore_tokens = tokens.new_empty(0, dtype=tokens.dtype)
 
+    if row_indices.numel() == 0:
+        return
+
+    if tokens.device.type == "npu":
+        if ne_token_table.dtype != torch.int32:
+            raise ValueError("ne_token_table must be int32 for NPU update_oe_token_table")
+        if not ne_token_table.is_contiguous():
+            raise ValueError(
+                "ne_token_table must be contiguous for NPU update_oe_token_table"
+            )
+        torch.ops.npu.update_oe_token_table(
+            tokens.to(torch.int32).contiguous(),
+            req_lens.to(torch.int32).contiguous(),
+            row_indices.to(torch.int64).contiguous(),
+            column_starts.to(torch.int32).contiguous(),
+            ignore_tokens.to(torch.int32).contiguous(),
+            row_indices.numel(),
+            ne_token_table.shape[1],
+            ne_token_table,
+        )
+        return
+
     if tokens.device.type != "cuda":
         # Mirror UpdateTokenTableKernel exactly: each request consumes a
         # contiguous slice from `tokens` whose start is the sum of prior

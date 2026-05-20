@@ -234,9 +234,9 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 NgramEmbeddingInfo(
                     token_table=ne_token_table,
                     column_starts=torch.zeros([max_bs], dtype=torch.int32),
-                    req_lens=torch.ones([max_bs], dtype=torch.int32),
+                    req_lens=torch.zeros([max_bs], dtype=torch.int32),
                     out_column_starts=torch.zeros([max_bs], dtype=torch.int32),
-                    out_req_lens=torch.ones([max_bs], dtype=torch.int32),
+                    out_req_lens=torch.zeros([max_bs], dtype=torch.int32),
                 )
                 if ne_token_table is not None
                 else None
@@ -287,7 +287,10 @@ class DecodeInputBuffers(ForwardInputBuffers):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         if bs != raw_bs:
+            self.input_ids[raw_num_token : bs * num_tokens_per_bs].zero_()
+            self.req_pool_indices[raw_bs:bs].zero_()
             self.seq_lens.fill_(seq_len_fill_value)
+            self.positions[raw_num_token : bs * num_tokens_per_bs].zero_()
             self.out_cache_loc.zero_()
             # Padded SWA indices left over from a previous replay would point
             # into real SWA slots, so set_kv_buffer on padded tokens would
@@ -324,6 +327,11 @@ class DecodeInputBuffers(ForwardInputBuffers):
             self.ngram_embedding_info.req_lens[:raw_bs].copy_(
                 ngram_embedding_info.req_lens
             )
+            if bs != raw_bs:
+                self.ngram_embedding_info.column_starts[raw_bs:bs].zero_()
+                self.ngram_embedding_info.req_lens[raw_bs:bs].zero_()
+                self.ngram_embedding_info.out_column_starts[raw_bs:bs].zero_()
+                self.ngram_embedding_info.out_req_lens[raw_bs:bs].zero_()
 
         if (
             self.mamba_track_indices is not None

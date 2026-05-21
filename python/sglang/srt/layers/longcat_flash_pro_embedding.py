@@ -97,35 +97,6 @@ class LongcatFlashProEmbedding(nn.Module):
             result[prev_idx + n :] = tensor[prev_idx : tensor.shape[0] - n]
         return result
 
-    def _get_ngram_runtime_view(
-        self, input_ids: torch.Tensor, forward_batch: ForwardBatch
-    ) -> tuple[int, int, torch.Tensor, torch.Tensor, torch.Tensor]:
-        info = forward_batch.ngram_embedding_info
-        if info is None:
-            raise ValueError("LongcatFlashProEmbedding requires ngram_embedding_info.")
-
-        # Validation rollback: keep the real-* view logic for quick re-enable later.
-        # real_bs = getattr(forward_batch, "ngram_real_batch_size", None)
-        # if real_bs is None:
-        #     real_bs = forward_batch.batch_size
-        #
-        # real_num_tokens = getattr(forward_batch, "ngram_real_num_tokens", None)
-        # if real_num_tokens is None:
-        #     real_num_tokens = input_ids.shape[0]
-        # real_num_tokens = min(real_num_tokens, input_ids.shape[0])
-        #
-        # req_pool_indices = forward_batch.req_pool_indices[:real_bs]
-        # column_starts = info.column_starts[:real_bs]
-        # req_lens = info.req_lens[:real_bs]
-        # return real_bs, real_num_tokens, req_pool_indices, column_starts, req_lens
-
-        batch_size = forward_batch.batch_size
-        total_tokens = input_ids.shape[0]
-        req_pool_indices = forward_batch.req_pool_indices
-        column_starts = info.column_starts
-        req_lens = info.req_lens
-        return batch_size, total_tokens, req_pool_indices, column_starts, req_lens
-
     def _compute_fused_ngram_ids_torch(
         self, input_ids: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
@@ -133,14 +104,16 @@ class LongcatFlashProEmbedding(nn.Module):
         if info is None:
             raise ValueError("LongcatFlashProEmbedding requires ngram_embedding_info.")
 
-        real_bs, total_tokens, req_pool_indices, column_starts, req_lens = (
-            self._get_ngram_runtime_view(input_ids, forward_batch)
-        )
+        batch_size = forward_batch.batch_size
+        total_tokens = input_ids.shape[0]
+        req_pool_indices = forward_batch.req_pool_indices
+        column_starts = info.column_starts
+        req_lens = info.req_lens
         ngram_ids = torch.empty(
             total_tokens, self.n_grams, dtype=torch.int64, device=input_ids.device
         )
         cursor = 0
-        for batch_idx in range(real_bs):
+        for batch_idx in range(batch_size):
             row_idx = int(req_pool_indices[batch_idx].item())
             column_start = int(column_starts[batch_idx].item())
             req_len = int(req_lens[batch_idx].item())
@@ -183,13 +156,15 @@ class LongcatFlashProEmbedding(nn.Module):
         if info is None:
             raise ValueError("LongcatFlashProEmbedding requires ngram_embedding_info.")
 
-        real_bs, real_num_tokens, req_pool_indices, column_starts, req_lens = (
-            self._get_ngram_runtime_view(input_ids, forward_batch)
-        )
+        batch_size = forward_batch.batch_size
+        total_tokens = input_ids.shape[0]
+        req_pool_indices = forward_batch.req_pool_indices
+        column_starts = info.column_starts
+        req_lens = info.req_lens
 
-        assert req_pool_indices.numel() == real_bs
-        assert column_starts.numel() == real_bs
-        assert req_lens.numel() == real_bs
+        assert req_pool_indices.numel() == batch_size
+        assert column_starts.numel() == batch_size
+        assert req_lens.numel() == batch_size
 
         return torch.ops.npu.compute_n_gram_ids(
             self.oe_weights.to(device=input_ids.device, dtype=torch.int32),
@@ -197,12 +172,12 @@ class LongcatFlashProEmbedding(nn.Module):
             self.exclusive_oe_embedder_size_sums.to(
                 device=input_ids.device, dtype=torch.int32
             ),
-            input_ids[:real_num_tokens].to(torch.int32),
+            input_ids[:total_tokens].to(torch.int32),
             torch.cumsum(req_lens, dim=0, dtype=torch.int32),
             info.token_table.to(device=input_ids.device, dtype=torch.int32),
             req_pool_indices.to(device=input_ids.device, dtype=torch.int64),
             column_starts.to(device=input_ids.device, dtype=torch.int32),
-            batch_size=real_bs,
+            batch_size=batch_size,
             oe_n=self.over_embedding_n,
             oe_k=self.over_embedding_k,
             max_context_len=info.token_table.shape[1],

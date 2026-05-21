@@ -110,7 +110,7 @@ class LongcatFlashProEmbedding(nn.Module):
 
         real_num_tokens = getattr(forward_batch, "ngram_real_num_tokens", None)
         if real_num_tokens is None:
-            real_num_tokens = int(info.req_lens.sum().item())
+            real_num_tokens = input_ids.shape[0]
         real_num_tokens = min(real_num_tokens, input_ids.shape[0])
 
         req_pool_indices = forward_batch.req_pool_indices[:real_bs]

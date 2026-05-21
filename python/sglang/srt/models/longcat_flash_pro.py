@@ -132,6 +132,8 @@ else:
     pass
 
 logger = logging.getLogger(__name__)
+_LONGCAT_MOE_DEBUG_PRINT_LIMIT = 16
+_longcat_moe_debug_print_count = 0
 
 
 class LongcatFlashMLP(nn.Module):
@@ -280,6 +282,29 @@ class LongcatFlashMoE(nn.Module):
         if get_moe_a2a_backend().is_deepep() and num_token_non_padded_cpu is not None:
             real_num_tokens = max(0, min(num_token_non_padded_cpu, num_tokens))
             hidden_states = hidden_states[:real_num_tokens]
+
+        global _longcat_moe_debug_print_count
+        if (
+            get_attention_tp_rank() == 0
+            and _longcat_moe_debug_print_count < _LONGCAT_MOE_DEBUG_PRINT_LIMIT
+        ):
+            print(
+                "[longcat_moe debug]",
+                {
+                    "layer_id": int(self.layer_id),
+                    "is_deepep": bool(get_moe_a2a_backend().is_deepep()),
+                    "num_tokens": int(num_tokens),
+                    "real_num_tokens": int(real_num_tokens),
+                    "num_token_non_padded_cpu": (
+                        int(num_token_non_padded_cpu)
+                        if num_token_non_padded_cpu is not None
+                        else None
+                    ),
+                    "hidden_shape_after_trim": tuple(hidden_states.shape),
+                },
+                flush=True,
+            )
+            _longcat_moe_debug_print_count += 1
 
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)

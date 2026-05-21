@@ -6,10 +6,13 @@ try:
 except (ImportError, OSError):
     sgl_kernel_npu = None
 
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, is_dp_attention_enabled
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+_LONGCAT_EMBED_DEBUG_PRINT_LIMIT = 8
+_longcat_embed_debug_print_count = 0
 
 
 class LongcatFlashProEmbedding(nn.Module):
@@ -188,6 +191,40 @@ class LongcatFlashProEmbedding(nn.Module):
             assert column_starts.min().item() >= 0
             assert torch.all(column_starts + req_lens <= info.token_table.shape[1]).item()
         assert int(req_lens.sum().item()) == real_num_tokens
+
+        global _longcat_embed_debug_print_count
+        if (
+            get_attention_tp_rank() == 0
+            and _longcat_embed_debug_print_count < _LONGCAT_EMBED_DEBUG_PRINT_LIMIT
+        ):
+            print(
+                "[compute_n_gram_ids debug]",
+                {
+                    "batch_size": int(forward_batch.batch_size),
+                    "num_token_non_padded_cpu": (
+                        int(forward_batch.num_token_non_padded_cpu)
+                        if forward_batch.num_token_non_padded_cpu is not None
+                        else None
+                    ),
+                    "ngram_real_batch_size": int(real_bs),
+                    "ngram_real_num_tokens": int(real_num_tokens),
+                    "input_ids_len": int(input_ids.shape[0]),
+                    "req_pool_shape": tuple(req_pool_indices.shape),
+                    "column_starts_shape": tuple(column_starts.shape),
+                    "req_lens_shape": tuple(req_lens.shape),
+                    "token_table_shape": tuple(info.token_table.shape),
+                    "req_pool_head": req_pool_indices[:8].tolist(),
+                    "column_starts_head": column_starts[:8].tolist(),
+                    "req_lens_head": req_lens[:8].tolist(),
+                    "max_col_plus_req": (
+                        int((column_starts + req_lens).max().item())
+                        if real_bs > 0
+                        else None
+                    ),
+                },
+                flush=True,
+            )
+            _longcat_embed_debug_print_count += 1
 
         return torch.ops.npu.compute_n_gram_ids(
             self.oe_weights.to(device=input_ids.device, dtype=torch.int32),

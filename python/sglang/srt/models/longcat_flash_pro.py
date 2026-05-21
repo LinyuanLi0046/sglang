@@ -132,7 +132,7 @@ else:
     pass
 
 logger = logging.getLogger(__name__)
-_LONGCAT_MOE_DEBUG_PRINT_LIMIT = 64
+_LONGCAT_MOE_DEBUG_PRINT_LIMIT = 500
 _longcat_moe_debug_print_count = 0
 
 

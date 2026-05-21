@@ -2836,10 +2836,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ngram_embedding_info = forward_batch.ngram_embedding_info
         if ngram_embedding_info is None:
             return
-        real_bs = getattr(
-            forward_batch, "ngram_real_batch_size", next_token_ids.shape[0]
-        )
-        raw_bs = min(real_bs, next_token_ids.shape[0])
+        # Validation rollback: keep the real-batch write-back logic for quick re-enable later.
+        # real_bs = getattr(
+        #     forward_batch, "ngram_real_batch_size", next_token_ids.shape[0]
+        # )
+        # raw_bs = min(real_bs, next_token_ids.shape[0])
+        raw_bs = next_token_ids.shape[0]
         if raw_bs <= 0:
             return
         row_indices = forward_batch.req_pool_indices[:raw_bs]

@@ -98,6 +98,26 @@ class LongcatFlashProEmbedding(nn.Module):
             result[prev_idx + n :] = tensor[prev_idx : tensor.shape[0] - n]
         return result
 
+    def _get_ngram_runtime_view(
+        self, input_ids: torch.Tensor, forward_batch: ForwardBatch
+    ) -> tuple[int, int, torch.Tensor, torch.Tensor, torch.Tensor]:
+        info = forward_batch.ngram_embedding_info
+        if info is None:
+            raise ValueError("LongcatFlashProEmbedding requires ngram_embedding_info.")
+
+        real_bs = getattr(
+            forward_batch, "ngram_real_batch_size", forward_batch.batch_size
+        )
+        real_num_tokens = getattr(
+            forward_batch, "ngram_real_num_tokens", int(info.req_lens.sum().item())
+        )
+        real_num_tokens = min(real_num_tokens, input_ids.shape[0])
+
+        req_pool_indices = forward_batch.req_pool_indices[:real_bs]
+        column_starts = info.column_starts[:real_bs]
+        req_lens = info.req_lens[:real_bs]
+        return real_bs, real_num_tokens, req_pool_indices, column_starts, req_lens
+
     def _compute_fused_ngram_ids_torch(
         self, input_ids: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
@@ -105,15 +125,17 @@ class LongcatFlashProEmbedding(nn.Module):
         if info is None:
             raise ValueError("LongcatFlashProEmbedding requires ngram_embedding_info.")
 
-        total_tokens = input_ids.shape[0]
+        real_bs, total_tokens, req_pool_indices, column_starts, req_lens = (
+            self._get_ngram_runtime_view(input_ids, forward_batch)
+        )
         ngram_ids = torch.empty(
             total_tokens, self.n_grams, dtype=torch.int64, device=input_ids.device
         )
         cursor = 0
-        for batch_idx in range(forward_batch.batch_size):
-            row_idx = int(forward_batch.req_pool_indices[batch_idx].item())
-            column_start = int(info.column_starts[batch_idx].item())
-            req_len = int(info.req_lens[batch_idx].item())
+        for batch_idx in range(real_bs):
+            row_idx = int(req_pool_indices[batch_idx].item())
+            column_start = int(column_starts[batch_idx].item())
+            req_len = int(req_lens[batch_idx].item())
             seq_end = column_start + req_len
             full_seq = info.token_table[row_idx, :seq_end].to(
                 device=input_ids.device, dtype=torch.int64
@@ -153,18 +175,32 @@ class LongcatFlashProEmbedding(nn.Module):
         if info is None:
             raise ValueError("LongcatFlashProEmbedding requires ngram_embedding_info.")
 
+        real_bs, real_num_tokens, req_pool_indices, column_starts, req_lens = (
+            self._get_ngram_runtime_view(input_ids, forward_batch)
+        )
+
+        assert req_pool_indices.numel() == real_bs
+        assert column_starts.numel() == real_bs
+        assert req_lens.numel() == real_bs
+        if real_bs > 0:
+            assert req_pool_indices.min().item() >= 0
+            assert req_pool_indices.max().item() < info.token_table.shape[0]
+            assert column_starts.min().item() >= 0
+            assert torch.all(column_starts + req_lens <= info.token_table.shape[1]).item()
+        assert int(req_lens.sum().item()) == real_num_tokens
+
         return torch.ops.npu.compute_n_gram_ids(
             self.oe_weights.to(device=input_ids.device, dtype=torch.int32),
             self.oe_mods.to(device=input_ids.device, dtype=torch.int32),
             self.exclusive_oe_embedder_size_sums.to(
                 device=input_ids.device, dtype=torch.int32
             ),
-            input_ids.to(torch.int32),
-            torch.cumsum(info.req_lens, dim=0, dtype=torch.int32),
+            input_ids[:real_num_tokens].to(torch.int32),
+            torch.cumsum(req_lens, dim=0, dtype=torch.int32),
             info.token_table.to(device=input_ids.device, dtype=torch.int32),
-            forward_batch.req_pool_indices.to(device=input_ids.device, dtype=torch.int64),
-            info.column_starts.to(device=input_ids.device, dtype=torch.int32),
-            batch_size=forward_batch.batch_size,
+            req_pool_indices.to(device=input_ids.device, dtype=torch.int64),
+            column_starts.to(device=input_ids.device, dtype=torch.int32),
+            batch_size=real_bs,
             oe_n=self.over_embedding_n,
             oe_k=self.over_embedding_k,
             max_context_len=info.token_table.shape[1],
@@ -256,9 +292,17 @@ class LongcatFlashProEmbedding(nn.Module):
         if self.n_grams == 0:
             return hidden_states
 
-        oe_n_gram_ids = self._compute_fused_ngram_ids(input_ids, forward_batch)
+        real_num_tokens = getattr(
+            forward_batch, "ngram_real_num_tokens", input_ids.shape[0]
+        )
+        real_num_tokens = min(real_num_tokens, input_ids.shape[0])
+        oe_n_gram_ids = self._compute_fused_ngram_ids(
+            input_ids[:real_num_tokens], forward_batch
+        )
         oe_hidden_states = self.oe_embeder(
             oe_n_gram_ids.permute(1, 0).contiguous()
         ).to(self.oe_projection.dtype)
-        projected = torch.bmm(oe_hidden_states, self.oe_projection).sum(dim=0)
+        real_projected = torch.bmm(oe_hidden_states, self.oe_projection).sum(dim=0)
+        projected = torch.zeros_like(hidden_states)
+        projected[:real_num_tokens] = real_projected
         return hidden_states / self.scale + projected

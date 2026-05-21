@@ -436,6 +436,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
+    ngram_real_batch_size: Optional[int] = None
+    ngram_real_num_tokens: Optional[int] = None
 
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
@@ -695,6 +697,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             column_starts=column_starts,
             req_lens=req_lens,
         )
+        self.ngram_real_batch_size = self.batch_size
+        self.ngram_real_num_tokens = int(req_lens.sum().item())
 
     def compute_spec_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch

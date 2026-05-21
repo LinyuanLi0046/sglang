@@ -269,9 +269,17 @@ class LongcatFlashMoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        num_token_non_padded_cpu: Optional[int] = None,
+    ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+        real_num_tokens = num_tokens
+        if get_moe_a2a_backend().is_deepep() and num_token_non_padded_cpu is not None:
+            real_num_tokens = max(0, min(num_token_non_padded_cpu, num_tokens))
+            hidden_states = hidden_states[:real_num_tokens]
 
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
@@ -319,6 +327,16 @@ class LongcatFlashMoE(nn.Module):
 
         if self.zero_expert_type is not None and hidden_states.shape[0] > 0:
             final_hidden_states += zero_expert_result.to(final_hidden_states.device)
+
+        if real_num_tokens != num_tokens:
+            padded_hidden_states = torch.zeros(
+                (num_tokens, hidden_dim),
+                dtype=final_hidden_states.dtype,
+                device=final_hidden_states.device,
+            )
+            if real_num_tokens > 0:
+                padded_hidden_states[:real_num_tokens] = final_hidden_states
+            final_hidden_states = padded_hidden_states
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -513,7 +531,10 @@ class LongcatFlashProDecoderLayer(nn.Module):
         hidden_states, moe_residual = self.moe_layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        moe_hidden_states = self.mlp(hidden_states)
+        moe_hidden_states = self.mlp(
+            hidden_states,
+            num_token_non_padded_cpu=forward_batch.num_token_non_padded_cpu,
+        )
         moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
             moe_hidden_states, moe_residual, forward_batch
         )

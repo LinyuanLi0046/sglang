@@ -104,12 +104,13 @@ class LongcatFlashProEmbedding(nn.Module):
         if info is None:
             raise ValueError("LongcatFlashProEmbedding requires ngram_embedding_info.")
 
-        real_bs = getattr(
-            forward_batch, "ngram_real_batch_size", forward_batch.batch_size
-        )
-        real_num_tokens = getattr(
-            forward_batch, "ngram_real_num_tokens", int(info.req_lens.sum().item())
-        )
+        real_bs = getattr(forward_batch, "ngram_real_batch_size", None)
+        if real_bs is None:
+            real_bs = forward_batch.batch_size
+
+        real_num_tokens = getattr(forward_batch, "ngram_real_num_tokens", None)
+        if real_num_tokens is None:
+            real_num_tokens = int(info.req_lens.sum().item())
         real_num_tokens = min(real_num_tokens, input_ids.shape[0])
 
         req_pool_indices = forward_batch.req_pool_indices[:real_bs]
@@ -291,9 +292,9 @@ class LongcatFlashProEmbedding(nn.Module):
         if self.n_grams == 0:
             return hidden_states
 
-        real_num_tokens = getattr(
-            forward_batch, "ngram_real_num_tokens", input_ids.shape[0]
-        )
+        real_num_tokens = getattr(forward_batch, "ngram_real_num_tokens", None)
+        if real_num_tokens is None:
+            real_num_tokens = input_ids.shape[0]
         real_num_tokens = min(real_num_tokens, input_ids.shape[0])
         oe_n_gram_ids = self._compute_fused_ngram_ids(
             input_ids[:real_num_tokens], forward_batch

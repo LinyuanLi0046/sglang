@@ -321,35 +321,17 @@ class DecodeInputBuffers(ForwardInputBuffers):
 
         if self.ngram_embedding_info is not None:
             ngram_embedding_info = forward_batch.ngram_embedding_info
-            if ngram_embedding_info is None:
-                # DP-attention idle batches skip ngram info initialization.
-                # For LongCat graph replay, padded decode rows still need a
-                # decode-shaped ngram layout so compute_n_gram_ids sees one
-                # dummy token per captured batch row instead of zero-length rows.
-                self.ngram_embedding_info.column_starts[:bs].zero_()
-                self.ngram_embedding_info.req_lens[:bs].fill_(num_tokens_per_bs)
-                self.ngram_embedding_info.out_column_starts[:bs].zero_()
-                self.ngram_embedding_info.out_req_lens[:bs].zero_()
-            else:
-                self.ngram_embedding_info.column_starts[:raw_bs].copy_(
-                    ngram_embedding_info.column_starts
-                )
-                self.ngram_embedding_info.req_lens[:raw_bs].copy_(
-                    ngram_embedding_info.req_lens
-                )
-                self.ngram_embedding_info.out_column_starts[:raw_bs].copy_(
-                    ngram_embedding_info.out_column_starts
-                )
-                self.ngram_embedding_info.out_req_lens[:raw_bs].copy_(
-                    ngram_embedding_info.out_req_lens
-                )
-                if bs != raw_bs:
-                    self.ngram_embedding_info.column_starts[raw_bs:bs].zero_()
-                    self.ngram_embedding_info.req_lens[raw_bs:bs].fill_(
-                        num_tokens_per_bs
-                    )
-                    self.ngram_embedding_info.out_column_starts[raw_bs:bs].zero_()
-                    self.ngram_embedding_info.out_req_lens[raw_bs:bs].zero_()
+            self.ngram_embedding_info.column_starts[:raw_bs].copy_(
+                ngram_embedding_info.column_starts
+            )
+            self.ngram_embedding_info.req_lens[:raw_bs].copy_(
+                ngram_embedding_info.req_lens
+            )
+            if bs != raw_bs:
+                self.ngram_embedding_info.column_starts[raw_bs:bs].zero_()
+                self.ngram_embedding_info.req_lens[raw_bs:bs].zero_()
+                self.ngram_embedding_info.out_column_starts[raw_bs:bs].zero_()
+                self.ngram_embedding_info.out_req_lens[raw_bs:bs].zero_()
 
         if (
             self.mamba_track_indices is not None

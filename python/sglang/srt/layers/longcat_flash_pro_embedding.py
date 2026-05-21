@@ -1,5 +1,3 @@
-import logging
-
 import torch
 from torch import nn
 
@@ -8,13 +6,10 @@ try:
 except (ImportError, OSError):
     sgl_kernel_npu = None
 
-from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-
-logger = logging.getLogger(__name__)
 
 
 class LongcatFlashProEmbedding(nn.Module):
@@ -32,7 +27,6 @@ class LongcatFlashProEmbedding(nn.Module):
         self.use_compute_n_gram_ids = get_bool_env_var(
             "SGLANG_NPU_LONGCATPRO_USE_COMPUTE_N_GRAM_IDS", "true"
         )
-        self.oe_use_global_tp_under_dp = True
 
         self.word_embeder = VocabParallelEmbedding(
             self.num_embeddings,
@@ -52,10 +46,7 @@ class LongcatFlashProEmbedding(nn.Module):
         self.oe_embeder = VocabParallelEmbedding(
             num_embeddings=int(exclusive_sums[-1].item()),
             embedding_dim=self.oe_hidden_dim,
-            # Keep OE embedding sharded on the global TP group even when
-            # dp-attention is enabled, otherwise the fused OE vocabulary would
-            # be fully replicated on every rank and OOM during weight loading.
-            enable_tp=True,
+            enable_tp=not is_dp_attention_enabled(),
         )
         self.oe_projection = nn.Parameter(
             torch.empty(self.n_grams, self.oe_hidden_dim, self.embedding_dim),
@@ -92,27 +83,6 @@ class LongcatFlashProEmbedding(nn.Module):
 
     def process_weights_after_loading(self):
         self.oe_projection.data = self.oe_projection.data / self.scale
-        if is_dp_attention_enabled():
-            if not self.oe_use_global_tp_under_dp or not self.oe_embeder.enable_tp:
-                raise AssertionError(
-                    "LongCatPro OE embedding must remain globally TP-sharded "
-                    "when dp-attention is enabled."
-                )
-            tp_start = self.oe_embeder.shard_indices.org_vocab_start_index
-            tp_end = self.oe_embeder.shard_indices.org_vocab_end_index
-            if tp_end <= tp_start:
-                raise AssertionError(
-                    "Invalid LongCatPro OE embedding shard range under dp-attention."
-                )
-            logger.info(
-                "LongCatPro OE embedding keeps global TP sharding under dp-attention: "
-                "rows [%d, %d) of %d, shard_rows=%d, tp_size=%d",
-                tp_start,
-                tp_end,
-                self.oe_embeder.org_vocab_size,
-                self.oe_embeder.num_embeddings_per_partition,
-                self.oe_embeder.tp_size,
-            )
 
     def _shift_right_ignore_eos(self, tensor: torch.Tensor, n: int) -> torch.Tensor:
         result = torch.zeros_like(tensor)
@@ -234,12 +204,6 @@ class LongcatFlashProEmbedding(nn.Module):
         src_end = to_load_end - oe_weight_start
         dest_start = to_load_start - tp_start
         dest_end = to_load_end - tp_start
-        if tp_end <= tp_start:
-            raise AssertionError("Invalid TP shard range for LongCatPro OE embedding.")
-        if src_end < src_start or dest_end < dest_start:
-            raise AssertionError("Invalid LongCatPro OE embedding shard offsets.")
-        if (src_end - src_start) != (dest_end - dest_start):
-            raise AssertionError("Mismatched LongCatPro OE embedding shard copy size.")
         self.oe_embeder.weight.data[dest_start:dest_end] = loaded_weight[
             src_start:src_end
         ]
@@ -291,41 +255,8 @@ class LongcatFlashProEmbedding(nn.Module):
         hidden_states = self.word_embeder(input_ids).to(self.oe_projection.dtype)
         if self.n_grams == 0:
             return hidden_states
-        if forward_batch.forward_mode.is_idle():
-            # DP-attention idle batches are padded for collective alignment.
-            # Keep OE embedding on the same global-TP path with dummy ids so all
-            # ranks participate in the same collectives and avoid deadlock.
-            oe_n_gram_ids = torch.zeros(
-                (input_ids.shape[0], self.n_grams),
-                dtype=torch.int64,
-                device=input_ids.device,
-            )
-        elif forward_batch.ngram_embedding_info is None:
-            raise ValueError(
-                "LongcatFlashProEmbedding requires ngram_embedding_info "
-                "for non-idle forward."
-            )
-        else:
-            oe_n_gram_ids = self._compute_fused_ngram_ids(input_ids, forward_batch)
-        if self.oe_hidden_dim * self.n_grams != self.embedding_dim:
-            raise AssertionError(
-                "LongCatPro OE embedding dimension mismatch: "
-                f"{self.oe_hidden_dim} * {self.n_grams} != {self.embedding_dim}"
-            )
-        if oe_n_gram_ids.shape[0] != input_ids.shape[0]:
-            raise AssertionError(
-                "LongCatPro OE ngram id rows must match input token count."
-            )
-        if is_dp_attention_enabled():
-            if not self.oe_embeder.enable_tp:
-                raise AssertionError(
-                    "LongCatPro OE embedding must stay TP-sharded under dp-attention."
-                )
-            if get_attn_tp_context().input_scattered:
-                raise AssertionError(
-                    "LongCatPro OE embedding does not support input_scattered "
-                    "together with dp-attention."
-                )
+
+        oe_n_gram_ids = self._compute_fused_ngram_ids(input_ids, forward_batch)
         oe_hidden_states = self.oe_embeder(
             oe_n_gram_ids.permute(1, 0).contiguous()
         ).to(self.oe_projection.dtype)

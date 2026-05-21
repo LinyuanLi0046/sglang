@@ -495,7 +495,7 @@ class LongcatFlashProDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
         topk_indices = None
-        if hidden_states.shape[0] != 0:
+        if hidden_states.shape[0] != 0 and not forward_batch.forward_mode.is_idle():
             hidden_states, topk_indices = self._run_self_attn(
                 self.self_attn[0],
                 positions=positions,
@@ -561,7 +561,7 @@ class LongcatFlashProDecoderLayer(nn.Module):
         hidden_states, residual = self.mlp_layer_communicator[1].prepare_attn(
             hidden_states, residual, forward_batch
         )
-        if hidden_states.shape[0] != 0:
+        if hidden_states.shape[0] != 0 and not forward_batch.forward_mode.is_idle():
             hidden_states, _ = self._run_self_attn(
                 self.self_attn[1],
                 positions=positions,
@@ -682,7 +682,7 @@ class LongcatFlashProModel(nn.Module):
                     positions, hidden_states, forward_batch, residual, zero_allocator
                 )
 
-        if hidden_states.shape[0] != 0:
+        if hidden_states.shape[0] != 0 and not forward_batch.forward_mode.is_idle():
             if residual is None:
                 hidden_states = self.norm(hidden_states)
             else:

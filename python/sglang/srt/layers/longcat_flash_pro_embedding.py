@@ -292,17 +292,12 @@ class LongcatFlashProEmbedding(nn.Module):
         if self.n_grams == 0:
             return hidden_states
 
-        real_num_tokens = getattr(forward_batch, "ngram_real_num_tokens", None)
-        if real_num_tokens is None:
-            real_num_tokens = input_ids.shape[0]
-        real_num_tokens = min(real_num_tokens, input_ids.shape[0])
-        oe_n_gram_ids = self._compute_fused_ngram_ids(
-            input_ids[:real_num_tokens], forward_batch
-        )
+        oe_n_gram_ids = self._compute_fused_ngram_ids(input_ids, forward_batch)
         oe_hidden_states = self.oe_embeder(
             oe_n_gram_ids.permute(1, 0).contiguous()
         ).to(self.oe_projection.dtype)
         real_projected = torch.bmm(oe_hidden_states, self.oe_projection).sum(dim=0)
         projected = torch.zeros_like(hidden_states)
-        projected[:real_num_tokens] = real_projected
+        if real_projected.shape[0] > 0:
+            projected[: real_projected.shape[0]] = real_projected
         return hidden_states / self.scale + projected

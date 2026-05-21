@@ -2836,7 +2836,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ngram_embedding_info = forward_batch.ngram_embedding_info
         if ngram_embedding_info is None:
             return
-        raw_bs = next_token_ids.shape[0]
+        real_bs = getattr(
+            forward_batch, "ngram_real_batch_size", next_token_ids.shape[0]
+        )
+        raw_bs = min(real_bs, next_token_ids.shape[0])
+        if raw_bs <= 0:
+            return
         row_indices = forward_batch.req_pool_indices[:raw_bs]
         out_column_starts = ngram_embedding_info.out_column_starts[:raw_bs]
         out_req_lens = ngram_embedding_info.out_req_lens[:raw_bs]
@@ -2845,7 +2850,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         out_req_lens.fill_(1)
         update_token_table(
             ne_token_table=ngram_embedding_info.token_table,
-            tokens=next_token_ids.to(torch.int32),
+            tokens=next_token_ids[:raw_bs].to(torch.int32),
             row_indices=row_indices,
             column_starts=out_column_starts,
             req_lens=out_req_lens,

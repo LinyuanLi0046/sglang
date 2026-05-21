@@ -182,12 +182,6 @@ class LongcatFlashProEmbedding(nn.Module):
         assert req_pool_indices.numel() == real_bs
         assert column_starts.numel() == real_bs
         assert req_lens.numel() == real_bs
-        if real_bs > 0:
-            assert req_pool_indices.min().item() >= 0
-            assert req_pool_indices.max().item() < info.token_table.shape[0]
-            assert column_starts.min().item() >= 0
-            assert torch.all(column_starts + req_lens <= info.token_table.shape[1]).item()
-        assert int(req_lens.sum().item()) == real_num_tokens
 
         return torch.ops.npu.compute_n_gram_ids(
             self.oe_weights.to(device=input_ids.device, dtype=torch.int32),

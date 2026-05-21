@@ -11,7 +11,7 @@ from sglang.srt.utils import get_bool_env_var
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-_LONGCAT_EMBED_DEBUG_PRINT_LIMIT = 8
+_LONGCAT_EMBED_DEBUG_PRINT_LIMIT = 32
 _longcat_embed_debug_print_count = 0
 
 
@@ -195,11 +195,13 @@ class LongcatFlashProEmbedding(nn.Module):
         global _longcat_embed_debug_print_count
         if (
             get_attention_tp_rank() == 0
+            and forward_batch.forward_mode.is_decode()
             and _longcat_embed_debug_print_count < _LONGCAT_EMBED_DEBUG_PRINT_LIMIT
         ):
             print(
                 "[compute_n_gram_ids debug]",
                 {
+                    "forward_mode": str(forward_batch.forward_mode),
                     "batch_size": int(forward_batch.batch_size),
                     "num_token_non_padded_cpu": (
                         int(forward_batch.num_token_non_padded_cpu)

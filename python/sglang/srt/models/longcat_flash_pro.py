@@ -132,7 +132,7 @@ else:
     pass
 
 logger = logging.getLogger(__name__)
-_LONGCAT_MOE_DEBUG_PRINT_LIMIT = 16
+_LONGCAT_MOE_DEBUG_PRINT_LIMIT = 64
 _longcat_moe_debug_print_count = 0
 
 
@@ -286,6 +286,8 @@ class LongcatFlashMoE(nn.Module):
         global _longcat_moe_debug_print_count
         if (
             get_attention_tp_rank() == 0
+            and get_moe_a2a_backend().is_deepep()
+            and num_token_non_padded_cpu is not None
             and _longcat_moe_debug_print_count < _LONGCAT_MOE_DEBUG_PRINT_LIMIT
         ):
             print(

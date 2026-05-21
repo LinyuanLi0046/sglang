@@ -115,7 +115,6 @@ from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
-    get_attention_tp_rank,
     get_attention_tp_group,
     get_attention_tp_size,
     initialize_dp_attention,
@@ -286,8 +285,6 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 
 
 logger = logging.getLogger(__name__)
-_NGRAM_WRITE_DEBUG_PRINT_LIMIT = 16
-_ngram_write_debug_print_count = 0
 
 
 def resolve_language_model(model: nn.Module) -> nn.Module:
@@ -2848,29 +2845,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         row_indices = forward_batch.req_pool_indices[:raw_bs]
         out_column_starts = ngram_embedding_info.out_column_starts[:raw_bs]
         out_req_lens = ngram_embedding_info.out_req_lens[:raw_bs]
-
-        global _ngram_write_debug_print_count
-        if (
-            get_attention_tp_rank() == 0
-            and _ngram_write_debug_print_count < _NGRAM_WRITE_DEBUG_PRINT_LIMIT
-        ):
-            print(
-                "[ngram_write_back debug]",
-                {
-                    "next_token_ids_shape": tuple(next_token_ids.shape),
-                    "raw_bs": int(raw_bs),
-                    "ngram_real_batch_size": int(real_bs),
-                    "num_token_non_padded_cpu": (
-                        int(forward_batch.num_token_non_padded_cpu)
-                        if forward_batch.num_token_non_padded_cpu is not None
-                        else None
-                    ),
-                    "row_indices_head": row_indices[:8].tolist(),
-                    "seq_lens_head": forward_batch.seq_lens[:raw_bs][:8].tolist(),
-                },
-                flush=True,
-            )
-            _ngram_write_debug_print_count += 1
 
         out_column_starts.copy_(forward_batch.seq_lens[:raw_bs])
         out_req_lens.fill_(1)

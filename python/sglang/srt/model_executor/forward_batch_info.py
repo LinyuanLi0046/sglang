@@ -75,8 +75,6 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 _is_npu = is_npu()
-_FORWARD_BATCH_DEBUG_PRINT_LIMIT = 8
-_forward_batch_debug_print_count = 0
 
 
 class ForwardMode(IntEnum):
@@ -962,41 +960,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     model_runner, child.tbo_padded_len, child.batch_size
                 )
 
-        global _forward_batch_debug_print_count
-        if (
-            get_attention_tp_rank() == 0
-            and _forward_batch_debug_print_count < _FORWARD_BATCH_DEBUG_PRINT_LIMIT
-        ):
-            print(
-                "[prepare_mlp_sync_batch debug]",
-                {
-                    "forward_mode": str(self.forward_mode),
-                    "is_extend_in_batch": bool(self.is_extend_in_batch),
-                    "batch_size": int(self.batch_size),
-                    "num_token_non_padded_cpu": (
-                        int(self.num_token_non_padded_cpu)
-                        if self.num_token_non_padded_cpu is not None
-                        else None
-                    ),
-                    "global_num_tokens_cpu": list(self.global_num_tokens_cpu),
-                    "dp_padding_mode": str(self.dp_padding_mode),
-                    "input_ids_len": int(self.input_ids.shape[0]),
-                    "req_pool_indices_len": int(self.req_pool_indices.shape[0]),
-                    "seq_lens_len": int(self.seq_lens.shape[0]),
-                    "ngram_real_batch_size": (
-                        int(self.ngram_real_batch_size)
-                        if self.ngram_real_batch_size is not None
-                        else None
-                    ),
-                    "ngram_real_num_tokens": (
-                        int(self.ngram_real_num_tokens)
-                        if self.ngram_real_num_tokens is not None
-                        else None
-                    ),
-                },
-                flush=True,
-            )
-            _forward_batch_debug_print_count += 1
 
     def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
         # padding

@@ -291,6 +291,13 @@ class LongcatFlashProEmbedding(nn.Module):
         hidden_states = self.word_embeder(input_ids).to(self.oe_projection.dtype)
         if self.n_grams == 0:
             return hidden_states
+        if forward_batch.forward_mode.is_idle():
+            return hidden_states
+        if forward_batch.ngram_embedding_info is None:
+            raise ValueError(
+                "LongcatFlashProEmbedding requires ngram_embedding_info "
+                "for non-idle forward."
+            )
 
         oe_n_gram_ids = self._compute_fused_ngram_ids(input_ids, forward_batch)
         if self.oe_hidden_dim * self.n_grams != self.embedding_dim:

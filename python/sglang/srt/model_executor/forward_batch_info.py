@@ -698,7 +698,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             req_lens=req_lens,
         )
         self.ngram_real_batch_size = self.batch_size
-        self.ngram_real_num_tokens = int(req_lens.sum().item())
+        if torch.is_tensor(req_lens):
+            self.ngram_real_num_tokens = int(req_lens.sum().item())
+        else:
+            self.ngram_real_num_tokens = int(self.batch_size * req_lens)
 
     def compute_spec_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch

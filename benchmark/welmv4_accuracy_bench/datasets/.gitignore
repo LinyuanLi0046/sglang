@@ -1,0 +1,12 @@
+# Re-include benchmark dataset files that are normally ignored at repo root.
+# This .gitignore overrides the global *.jsonl / *.csv ignores for the
+# bundled OpenCompass datasets shipped with the welmv4 accuracy bench.
+
+!*.jsonl
+!*.csv
+!*.json
+!*.parquet
+
+# Always ignore macOS / editor cruft inside the bundled datasets.
+.DS_Store
+__pycache__/

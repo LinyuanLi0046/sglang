@@ -292,14 +292,21 @@ class LongcatFlashProEmbedding(nn.Module):
         if self.n_grams == 0:
             return hidden_states
         if forward_batch.forward_mode.is_idle():
-            return hidden_states
-        if forward_batch.ngram_embedding_info is None:
+            # DP-attention idle batches are padded for collective alignment.
+            # Keep OE embedding on the same global-TP path with dummy ids so all
+            # ranks participate in the same collectives and avoid deadlock.
+            oe_n_gram_ids = torch.zeros(
+                (input_ids.shape[0], self.n_grams),
+                dtype=torch.int64,
+                device=input_ids.device,
+            )
+        elif forward_batch.ngram_embedding_info is None:
             raise ValueError(
                 "LongcatFlashProEmbedding requires ngram_embedding_info "
                 "for non-idle forward."
             )
-
-        oe_n_gram_ids = self._compute_fused_ngram_ids(input_ids, forward_batch)
+        else:
+            oe_n_gram_ids = self._compute_fused_ngram_ids(input_ids, forward_batch)
         if self.oe_hidden_dim * self.n_grams != self.embedding_dim:
             raise AssertionError(
                 "LongCatPro OE embedding dimension mismatch: "

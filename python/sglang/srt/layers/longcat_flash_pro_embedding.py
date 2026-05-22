@@ -186,14 +186,15 @@ class LongcatFlashProEmbedding(nn.Module):
                 self._build_padded_ngram_metadata(input_ids, forward_batch, info)
             )
 
-            total_tokens = self._validate_ngram_inputs_npu(
-                input_ids,
-                batch_size,
-                req_pool_indices,
-                column_starts,
-                req_lens,
-                info.token_table,
-            )
+            # total_tokens = self._validate_ngram_inputs_npu(
+            #     input_ids,
+            #     batch_size,
+            #     req_pool_indices,
+            #     column_starts,
+            #     req_lens,
+            #     info.token_table,
+            # )
+            total_tokens = int(input_ids.numel())
 
         return torch.ops.npu.compute_n_gram_ids(
             self.oe_weights.to(device=input_ids.device, dtype=torch.int32),

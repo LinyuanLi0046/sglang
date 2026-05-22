@@ -321,17 +321,23 @@ class DecodeInputBuffers(ForwardInputBuffers):
 
         if self.ngram_embedding_info is not None:
             ngram_embedding_info = forward_batch.ngram_embedding_info
-            self.ngram_embedding_info.column_starts[:raw_bs].copy_(
-                ngram_embedding_info.column_starts
-            )
-            self.ngram_embedding_info.req_lens[:raw_bs].copy_(
-                ngram_embedding_info.req_lens
-            )
-            if bs != raw_bs:
-                self.ngram_embedding_info.column_starts[raw_bs:bs].zero_()
-                self.ngram_embedding_info.req_lens[raw_bs:bs].zero_()
-                self.ngram_embedding_info.out_column_starts[raw_bs:bs].zero_()
-                self.ngram_embedding_info.out_req_lens[raw_bs:bs].zero_()
+            if ngram_embedding_info is None:
+                self.ngram_embedding_info.column_starts[:bs].zero_()
+                self.ngram_embedding_info.req_lens[:bs].zero_()
+                self.ngram_embedding_info.out_column_starts[:bs].zero_()
+                self.ngram_embedding_info.out_req_lens[:bs].zero_()
+            else:
+                self.ngram_embedding_info.column_starts[:raw_bs].copy_(
+                    ngram_embedding_info.column_starts
+                )
+                self.ngram_embedding_info.req_lens[:raw_bs].copy_(
+                    ngram_embedding_info.req_lens
+                )
+                if bs != raw_bs:
+                    self.ngram_embedding_info.column_starts[raw_bs:bs].zero_()
+                    self.ngram_embedding_info.req_lens[raw_bs:bs].zero_()
+                    self.ngram_embedding_info.out_column_starts[raw_bs:bs].zero_()
+                    self.ngram_embedding_info.out_req_lens[raw_bs:bs].zero_()
 
         if (
             self.mamba_track_indices is not None

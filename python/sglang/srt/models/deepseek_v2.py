@@ -1356,17 +1356,11 @@ class DeepseekV2AttentionMLA(
                 prefix=add_prefix("kv_a_proj_with_mqa", prefix),
             )
 
-        attn_is_neox_style = not getattr(config, "rope_interleave", True)
-
         self.skip_topk = None
         self.next_skip_topk = None
         self.indexer = None
         if self.use_nsa:
-            if self.use_longcat_dsa:
-                # LongCatPro DSA indexer must match the attention RoPE layout.
-                is_neox_style = attn_is_neox_style
-            else:
-                is_neox_style = not getattr(config, "indexer_rope_interleave", False)
+            is_neox_style = not getattr(config, "indexer_rope_interleave", False)
             # Refer: https://arxiv.org/abs/2603.12201 for more details.
             # skip_topk: when True, this layer will skip computation and reuse previous layer's topk indices.
             # next_skip_topk: when True, the next layer will skip computation and reuse this layer's topk indices.
@@ -1455,7 +1449,7 @@ class DeepseekV2AttentionMLA(
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
         if not skip_rope:
-            is_neox_style = attn_is_neox_style
+            is_neox_style = not getattr(config, "rope_interleave", True)
             self.rotary_emb = get_rope_wrapper(
                 qk_rope_head_dim,
                 rotary_dim=qk_rope_head_dim,

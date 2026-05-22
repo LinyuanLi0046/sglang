@@ -9,7 +9,7 @@ except (ImportError, OSError):
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, NgramEmbeddingInfo
 
 class LongcatFlashProEmbedding(nn.Module):
     def __init__(self, config):
@@ -30,7 +30,7 @@ class LongcatFlashProEmbedding(nn.Module):
         self.word_embeder = VocabParallelEmbedding(
             self.num_embeddings,
             self.embedding_dim,
-            enable_tp=not is_dp_attention_enabled(),
+            use_attn_tp_group=is_dp_attention_enabled(),
         )
 
         exclusive_sums = torch.zeros(self.n_grams + 1, dtype=torch.int32)
@@ -45,7 +45,7 @@ class LongcatFlashProEmbedding(nn.Module):
         self.oe_embeder = VocabParallelEmbedding(
             num_embeddings=int(exclusive_sums[-1].item()),
             embedding_dim=self.oe_hidden_dim,
-            enable_tp=not is_dp_attention_enabled(),
+            use_attn_tp_group=is_dp_attention_enabled(),
         )
         self.oe_projection = nn.Parameter(
             torch.empty(self.n_grams, self.oe_hidden_dim, self.embedding_dim),
@@ -82,6 +82,22 @@ class LongcatFlashProEmbedding(nn.Module):
 
     def process_weights_after_loading(self):
         self.oe_projection.data = self.oe_projection.data / self.scale
+        if is_dp_attention_enabled():
+            if (
+                not self.word_embeder.enable_tp
+                or not self.word_embeder.use_attn_tp_group
+            ):
+                raise AssertionError(
+                    "LongCatPro word embedding must use attention TP group "
+                    "under dp-attention."
+                )
+            if not self.oe_embeder.enable_tp or not self.oe_embeder.use_attn_tp_group:
+                raise AssertionError(
+                    "LongCatPro OE embedding must use attention TP group "
+                    "under dp-attention."
+                )
+            if self.word_embeder.tp_size <= 1 or self.oe_embeder.tp_size <= 1:
+                raise AssertionError("Invalid embedding TP size under dp-attention.")
 
     def _shift_right_ignore_eos(self, tensor: torch.Tensor, n: int) -> torch.Tensor:
         result = torch.zeros_like(tensor)
@@ -162,9 +178,7 @@ class LongcatFlashProEmbedding(nn.Module):
         column_starts = info.column_starts
         req_lens = info.req_lens
 
-        assert req_pool_indices.numel() == batch_size
-        assert column_starts.numel() == batch_size
-        assert req_lens.numel() == batch_size
+        self._validate_ngram_inputs_npu(input_ids, forward_batch, info)
 
         return torch.ops.npu.compute_n_gram_ids(
             self.oe_weights.to(device=input_ids.device, dtype=torch.int32),
@@ -182,6 +196,74 @@ class LongcatFlashProEmbedding(nn.Module):
             oe_k=self.over_embedding_k,
             max_context_len=info.token_table.shape[1],
         )
+
+    def _validate_ngram_inputs_npu(
+        self,
+        input_ids: torch.Tensor,
+        forward_batch: ForwardBatch,
+        info: NgramEmbeddingInfo,
+    ) -> None:
+        batch_size = forward_batch.batch_size
+        req_pool_indices = forward_batch.req_pool_indices
+        column_starts = info.column_starts
+        req_lens = info.req_lens
+
+        if req_pool_indices.numel() != batch_size:
+            raise ValueError(
+                "compute_n_gram_ids contract violated: "
+                f"req_pool_indices has {req_pool_indices.numel()} entries, "
+                f"but batch_size is {batch_size}."
+            )
+        if column_starts.numel() != batch_size:
+            raise ValueError(
+                "compute_n_gram_ids contract violated: "
+                f"column_starts has {column_starts.numel()} entries, "
+                f"but batch_size is {batch_size}."
+            )
+        if req_lens.numel() != batch_size:
+            raise ValueError(
+                "compute_n_gram_ids contract violated: "
+                f"req_lens has {req_lens.numel()} entries, "
+                f"but batch_size is {batch_size}."
+            )
+        if batch_size == 0:
+            if input_ids.numel() != 0:
+                raise ValueError(
+                    "compute_n_gram_ids contract violated: batch_size is 0 but "
+                    f"input_ids has {input_ids.numel()} tokens."
+                )
+            return
+
+        exclusive_req_len_sums = torch.cumsum(req_lens, dim=0, dtype=torch.int32)
+        total_req_tokens = int(exclusive_req_len_sums[-1].item())
+        if total_req_tokens != int(input_ids.numel()):
+            raise ValueError(
+                "compute_n_gram_ids contract violated: "
+                f"cumsum(req_lens)[-1]={total_req_tokens}, "
+                f"input_ids.numel()={int(input_ids.numel())}."
+            )
+
+        max_context_len = info.token_table.shape[1]
+        if torch.any(req_lens < 0):
+            raise ValueError("compute_n_gram_ids contract violated: req_lens < 0.")
+        if torch.any(column_starts < 0):
+            raise ValueError(
+                "compute_n_gram_ids contract violated: column_starts < 0."
+            )
+        if torch.any(column_starts + req_lens > max_context_len):
+            raise ValueError(
+                "compute_n_gram_ids contract violated: column_starts + req_lens "
+                f"exceeds token_table width {max_context_len}."
+            )
+        if torch.any(req_pool_indices < 0):
+            raise ValueError(
+                "compute_n_gram_ids contract violated: req_pool_indices < 0."
+            )
+        if torch.any(req_pool_indices >= info.token_table.shape[0]):
+            raise ValueError(
+                "compute_n_gram_ids contract violated: req_pool_indices exceeds "
+                "token_table row count."
+            )
 
     def _compute_fused_ngram_ids(
         self, input_ids: torch.Tensor, forward_batch: ForwardBatch
@@ -208,6 +290,8 @@ class LongcatFlashProEmbedding(nn.Module):
 
         tp_start = self.oe_embeder.shard_indices.org_vocab_start_index
         tp_end = self.oe_embeder.shard_indices.org_vocab_end_index
+        if tp_end <= tp_start:
+            raise AssertionError("Invalid OE shard range.")
         to_load_start = max(oe_weight_start, tp_start)
         to_load_end = min(oe_weight_end, tp_end)
         if to_load_start >= to_load_end:
@@ -217,6 +301,8 @@ class LongcatFlashProEmbedding(nn.Module):
         src_end = to_load_end - oe_weight_start
         dest_start = to_load_start - tp_start
         dest_end = to_load_end - tp_start
+        if dest_end - dest_start != src_end - src_start:
+            raise AssertionError("OE shard copy size mismatch.")
         self.oe_embeder.weight.data[dest_start:dest_end] = loaded_weight[
             src_start:src_end
         ]

@@ -27,6 +27,9 @@ class LongcatFlashProEmbedding(nn.Module):
         self.use_compute_n_gram_ids = get_bool_env_var(
             "SGLANG_NPU_LONGCATPRO_USE_COMPUTE_N_GRAM_IDS", "true"
         )
+        self.validate_ngram_inputs_debug = get_bool_env_var(
+            "SGLANG_NPU_LONGCATPRO_VALIDATE_NGRAM_INPUTS", "false"
+        )
 
         self.word_embeder = VocabParallelEmbedding(
             self.num_embeddings,
@@ -182,26 +185,21 @@ class LongcatFlashProEmbedding(nn.Module):
             req_lens = info.req_lens[:batch_size]
             total_tokens = int(input_ids.numel())
         else:
-            # batch_size, req_pool_indices, column_starts, req_lens = (
-            #     self._build_padded_ngram_metadata(input_ids, forward_batch, info)
-            # )
+            batch_size, req_pool_indices, column_starts, req_lens = (
+                self._build_padded_ngram_metadata(input_ids, forward_batch, info)
+            )
 
-            # total_tokens = self._validate_ngram_inputs_npu(
-            #     input_ids,
-            #     batch_size,
-            #     req_pool_indices,
-            #     column_starts,
-            #     req_lens,
-            #     info.token_table,
-            # )
-
-            # total_tokens = int(input_ids.numel())
-
-            batch_size = int(forward_batch.batch_size)
-            req_pool_indices = forward_batch.req_pool_indices[:batch_size]
-            column_starts = info.column_starts[:batch_size]
-            req_lens = info.req_lens[:batch_size]
-            total_tokens = int(input_ids.numel())
+            if self.validate_ngram_inputs_debug:
+                total_tokens = self._validate_ngram_inputs_npu(
+                    input_ids,
+                    batch_size,
+                    req_pool_indices,
+                    column_starts,
+                    req_lens,
+                    info.token_table,
+                )
+            else:
+                total_tokens = int(input_ids.numel())
 
         return torch.ops.npu.compute_n_gram_ids(
             self.oe_weights.to(device=input_ids.device, dtype=torch.int32),

@@ -120,7 +120,7 @@ class LongcatFlashProEmbedding(nn.Module):
         if info is None:
             raise ValueError("LongcatFlashProEmbedding requires ngram_embedding_info.")
 
-        batch_size = forward_batch.batch_size
+        batch_size = int(info.req_lens.numel())
         req_pool_indices = forward_batch.req_pool_indices
         column_starts = info.column_starts
         req_lens = info.req_lens
@@ -172,9 +172,8 @@ class LongcatFlashProEmbedding(nn.Module):
         if info is None:
             raise ValueError("LongcatFlashProEmbedding requires ngram_embedding_info.")
 
-        batch_size = forward_batch.batch_size
-        total_tokens = input_ids.shape[0]
-        req_pool_indices = forward_batch.req_pool_indices
+        batch_size = int(info.req_lens.numel())
+        req_pool_indices = forward_batch.req_pool_indices[:batch_size]
         column_starts = info.column_starts
         req_lens = info.req_lens
 
@@ -203,33 +202,33 @@ class LongcatFlashProEmbedding(nn.Module):
         forward_batch: ForwardBatch,
         info: NgramEmbeddingInfo,
     ) -> int:
-        batch_size = forward_batch.batch_size
-        req_pool_indices = forward_batch.req_pool_indices
+        batch_size = int(info.req_lens.numel())
+        req_pool_indices = forward_batch.req_pool_indices[:batch_size]
         column_starts = info.column_starts
         req_lens = info.req_lens
 
-        if req_pool_indices.numel() != batch_size:
-            raise ValueError(
-                "compute_n_gram_ids contract violated: "
-                f"req_pool_indices has {req_pool_indices.numel()} entries, "
-                f"but batch_size is {batch_size}."
-            )
         if column_starts.numel() != batch_size:
             raise ValueError(
                 "compute_n_gram_ids contract violated: "
                 f"column_starts has {column_starts.numel()} entries, "
-                f"but batch_size is {batch_size}."
+                f"but metadata batch_size is {batch_size}."
             )
         if req_lens.numel() != batch_size:
             raise ValueError(
                 "compute_n_gram_ids contract violated: "
                 f"req_lens has {req_lens.numel()} entries, "
-                f"but batch_size is {batch_size}."
+                f"but metadata batch_size is {batch_size}."
+            )
+        if forward_batch.req_pool_indices.numel() < batch_size:
+            raise ValueError(
+                "compute_n_gram_ids contract violated: "
+                f"req_pool_indices has {forward_batch.req_pool_indices.numel()} entries, "
+                f"but metadata batch_size is {batch_size}."
             )
         if batch_size == 0:
             if input_ids.numel() != 0:
                 raise ValueError(
-                    "compute_n_gram_ids contract violated: batch_size is 0 but "
+                    "compute_n_gram_ids contract violated: metadata batch_size is 0 but "
                     f"input_ids has {input_ids.numel()} tokens."
                 )
             return 0

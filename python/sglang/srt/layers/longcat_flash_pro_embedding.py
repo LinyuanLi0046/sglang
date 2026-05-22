@@ -43,7 +43,7 @@ class LongcatFlashProEmbedding(nn.Module):
         )
 
         self.oe_embeder = VocabParallelEmbedding(
-            num_embeddings=int(exclusive_sums[-1].item()),
+            num_embeddings=int(exclusive_sums[-1].tolist()),
             embedding_dim=self.oe_hidden_dim,
             use_attn_tp_group=is_dp_attention_enabled(),
         )
@@ -104,8 +104,8 @@ class LongcatFlashProEmbedding(nn.Module):
         mask = tensor == self.eos_token_id
         indices = mask.nonzero(as_tuple=False).flatten()
         prev_idx = 0
-        for end_idx in indices:
-            end = int(end_idx.item()) + 1
+        for end_idx in indices.tolist():
+            end = int(end_idx) + 1
             if end - prev_idx > n:
                 result[prev_idx + n : end] = tensor[prev_idx : end - n]
             prev_idx = end
@@ -120,19 +120,21 @@ class LongcatFlashProEmbedding(nn.Module):
         if info is None:
             raise ValueError("LongcatFlashProEmbedding requires ngram_embedding_info.")
 
-        batch_size = int(info.req_lens.numel())
-        req_pool_indices = forward_batch.req_pool_indices
-        column_starts = info.column_starts
-        req_lens = info.req_lens
-        total_tokens = int(req_lens.sum().item())
+        batch_size, req_pool_indices, column_starts, req_lens = (
+            self._build_padded_ngram_metadata(input_ids, forward_batch, info)
+        )
+        total_tokens = int(input_ids.numel())
         ngram_ids = torch.empty(
             total_tokens, self.n_grams, dtype=torch.int64, device=input_ids.device
         )
         cursor = 0
+        req_pool_indices_list = req_pool_indices.tolist()
+        column_starts_list = column_starts.tolist()
+        req_lens_list = req_lens.tolist()
         for batch_idx in range(batch_size):
-            row_idx = int(req_pool_indices[batch_idx].item())
-            column_start = int(column_starts[batch_idx].item())
-            req_len = int(req_lens[batch_idx].item())
+            row_idx = int(req_pool_indices_list[batch_idx])
+            column_start = int(column_starts_list[batch_idx])
+            req_len = int(req_lens_list[batch_idx])
             seq_end = column_start + req_len
             full_seq = info.token_table[row_idx, :seq_end].to(
                 device=input_ids.device, dtype=torch.int64
@@ -172,12 +174,18 @@ class LongcatFlashProEmbedding(nn.Module):
         if info is None:
             raise ValueError("LongcatFlashProEmbedding requires ngram_embedding_info.")
 
-        batch_size = int(info.req_lens.numel())
-        req_pool_indices = forward_batch.req_pool_indices[:batch_size]
-        column_starts = info.column_starts
-        req_lens = info.req_lens
+        batch_size, req_pool_indices, column_starts, req_lens = (
+            self._build_padded_ngram_metadata(input_ids, forward_batch, info)
+        )
 
-        total_tokens = self._validate_ngram_inputs_npu(input_ids, forward_batch, info)
+        total_tokens = self._validate_ngram_inputs_npu(
+            input_ids,
+            batch_size,
+            req_pool_indices,
+            column_starts,
+            req_lens,
+            info.token_table,
+        )
 
         return torch.ops.npu.compute_n_gram_ids(
             self.oe_weights.to(device=input_ids.device, dtype=torch.int32),
@@ -196,75 +204,177 @@ class LongcatFlashProEmbedding(nn.Module):
             max_context_len=info.token_table.shape[1],
         )
 
-    def _validate_ngram_inputs_npu(
+    def _build_padded_ngram_metadata(
         self,
         input_ids: torch.Tensor,
         forward_batch: ForwardBatch,
         info: NgramEmbeddingInfo,
-    ) -> int:
-        batch_size = int(info.req_lens.numel())
-        req_pool_indices = forward_batch.req_pool_indices[:batch_size]
-        column_starts = info.column_starts
-        req_lens = info.req_lens
+    ) -> tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size = int(forward_batch.batch_size)
+        if batch_size < 0:
+            raise ValueError(f"Invalid batch_size: {batch_size}.")
 
+        total_input_tokens = int(input_ids.numel())
+        if batch_size == 0:
+            if total_input_tokens != 0:
+                raise ValueError(
+                    "compute_n_gram_ids contract violated: batch_size is 0 but "
+                    f"input_ids has {total_input_tokens} tokens."
+                )
+            empty_int32 = info.req_lens.new_zeros((0,))
+            empty_int64 = forward_batch.req_pool_indices.new_zeros((0,))
+            return 0, empty_int64, empty_int32, empty_int32
+
+        real_bs = int(info.req_lens.numel())
+        if real_bs > batch_size:
+            raise ValueError(
+                "compute_n_gram_ids contract violated: metadata batch_size "
+                f"{real_bs} exceeds execution batch_size {batch_size}."
+            )
+        if forward_batch.req_pool_indices.numel() < real_bs:
+            raise ValueError(
+                "compute_n_gram_ids contract violated: req_pool_indices has "
+                f"{forward_batch.req_pool_indices.numel()} entries, expected at least "
+                f"{real_bs}."
+            )
+
+        req_pool_indices = forward_batch.req_pool_indices[:real_bs].clone()
+        column_starts = info.column_starts.clone()
+        req_lens = info.req_lens.clone()
+
+        if req_pool_indices.numel() < batch_size:
+            req_pool_indices = torch.cat(
+                [
+                    req_pool_indices,
+                    req_pool_indices.new_zeros((batch_size - req_pool_indices.numel(),)),
+                ],
+                dim=0,
+            )
+        else:
+            req_pool_indices = req_pool_indices[:batch_size]
+
+        if column_starts.numel() < batch_size:
+            column_starts = torch.cat(
+                [
+                    column_starts,
+                    column_starts.new_zeros((batch_size - column_starts.numel(),)),
+                ],
+                dim=0,
+            )
+        else:
+            column_starts = column_starts[:batch_size]
+
+        if req_lens.numel() < batch_size:
+            req_lens = torch.cat(
+                [req_lens, req_lens.new_zeros((batch_size - req_lens.numel(),))], dim=0
+            )
+        else:
+            req_lens = req_lens[:batch_size]
+
+        total_req_tokens = int(req_lens.sum().tolist())
+        if total_req_tokens > total_input_tokens:
+            raise ValueError(
+                "compute_n_gram_ids contract violated: "
+                f"sum(req_lens)={total_req_tokens} exceeds "
+                f"input_ids.numel()={total_input_tokens}."
+            )
+
+        remaining_tokens = total_input_tokens - total_req_tokens
+        if remaining_tokens == 0:
+            return batch_size, req_pool_indices, column_starts, req_lens
+
+        max_context_len = info.token_table.shape[1]
+        fill_order = list(range(real_bs, batch_size)) + list(range(real_bs))
+        for row_idx in fill_order:
+            if remaining_tokens == 0:
+                break
+            capacity = max_context_len - column_starts[row_idx] - req_lens[row_idx]
+            if torch.is_nonzero(capacity <= 0):
+                continue
+            add = torch.minimum(
+                capacity, req_lens.new_tensor(remaining_tokens, dtype=req_lens.dtype)
+            )
+            add_int = int(add.tolist())
+            req_lens[row_idx] += add
+            remaining_tokens -= add_int
+
+        if remaining_tokens != 0:
+            raise ValueError(
+                "compute_n_gram_ids contract violated: unable to pad metadata to "
+                f"cover {total_input_tokens} input tokens with max_context_len="
+                f"{max_context_len}."
+            )
+
+        return batch_size, req_pool_indices, column_starts, req_lens
+
+    def _validate_ngram_inputs_npu(
+        self,
+        input_ids: torch.Tensor,
+        batch_size: int,
+        req_pool_indices: torch.Tensor,
+        column_starts: torch.Tensor,
+        req_lens: torch.Tensor,
+        token_table: torch.Tensor,
+    ) -> int:
+        if batch_size < 0:
+            raise ValueError(f"Invalid batch_size: {batch_size}.")
         if column_starts.numel() != batch_size:
             raise ValueError(
                 "compute_n_gram_ids contract violated: "
                 f"column_starts has {column_starts.numel()} entries, "
-                f"but metadata batch_size is {batch_size}."
+                f"but execution batch_size is {batch_size}."
             )
         if req_lens.numel() != batch_size:
             raise ValueError(
                 "compute_n_gram_ids contract violated: "
                 f"req_lens has {req_lens.numel()} entries, "
-                f"but metadata batch_size is {batch_size}."
+                f"but execution batch_size is {batch_size}."
             )
-        if forward_batch.req_pool_indices.numel() < batch_size:
+        if req_pool_indices.numel() != batch_size:
             raise ValueError(
                 "compute_n_gram_ids contract violated: "
-                f"req_pool_indices has {forward_batch.req_pool_indices.numel()} entries, "
-                f"but metadata batch_size is {batch_size}."
+                f"req_pool_indices has {req_pool_indices.numel()} entries, "
+                f"but execution batch_size is {batch_size}."
             )
         if batch_size == 0:
             if input_ids.numel() != 0:
                 raise ValueError(
-                    "compute_n_gram_ids contract violated: metadata batch_size is 0 but "
+                    "compute_n_gram_ids contract violated: execution batch_size is 0 but "
                     f"input_ids has {input_ids.numel()} tokens."
                 )
             return 0
 
-        exclusive_req_len_sums = torch.cumsum(req_lens, dim=0, dtype=torch.int32)
-        total_req_tokens = int(exclusive_req_len_sums[-1].item())
+        total_req_tokens = int(req_lens.sum().tolist())
         total_input_tokens = int(input_ids.numel())
-        if total_req_tokens > total_input_tokens:
+        if total_req_tokens != total_input_tokens:
             raise ValueError(
                 "compute_n_gram_ids contract violated: "
-                f"cumsum(req_lens)[-1]={total_req_tokens} exceeds "
+                f"sum(req_lens)={total_req_tokens}, "
                 f"input_ids.numel()={total_input_tokens}."
             )
 
-        max_context_len = info.token_table.shape[1]
-        if torch.any(req_lens < 0):
+        max_context_len = token_table.shape[1]
+        if torch.is_nonzero(torch.min(req_lens) < 0):
             raise ValueError("compute_n_gram_ids contract violated: req_lens < 0.")
-        if torch.any(column_starts < 0):
+        if torch.is_nonzero(torch.min(column_starts) < 0):
             raise ValueError(
                 "compute_n_gram_ids contract violated: column_starts < 0."
             )
-        if torch.any(column_starts + req_lens > max_context_len):
+        if torch.is_nonzero(torch.max(column_starts + req_lens) > max_context_len):
             raise ValueError(
                 "compute_n_gram_ids contract violated: column_starts + req_lens "
                 f"exceeds token_table width {max_context_len}."
             )
-        if torch.any(req_pool_indices < 0):
+        if torch.is_nonzero(torch.min(req_pool_indices) < 0):
             raise ValueError(
                 "compute_n_gram_ids contract violated: req_pool_indices < 0."
             )
-        if torch.any(req_pool_indices >= info.token_table.shape[0]):
+        if torch.is_nonzero(torch.max(req_pool_indices) >= token_table.shape[0]):
             raise ValueError(
                 "compute_n_gram_ids contract violated: req_pool_indices exceeds "
                 "token_table row count."
             )
-        return total_req_tokens
+        return total_input_tokens
 
     def _compute_fused_ngram_ids(
         self, input_ids: torch.Tensor, forward_batch: ForwardBatch
@@ -278,8 +388,8 @@ class LongcatFlashProEmbedding(nn.Module):
         return self._compute_fused_ngram_ids_torch(input_ids, forward_batch)
 
     def _load_oe_embedder_weight(self, index: int, loaded_weight: torch.Tensor):
-        oe_weight_start = int(self.exclusive_oe_embedder_size_sums[index].item())
-        oe_weight_end = int(self.exclusive_oe_embedder_size_sums[index + 1].item())
+        oe_weight_start = int(self.exclusive_oe_embedder_size_sums[index].tolist())
+        oe_weight_end = int(self.exclusive_oe_embedder_size_sums[index + 1].tolist())
         expected_rows = oe_weight_end - oe_weight_start
         if loaded_weight.shape[0] < expected_rows:
             raise ValueError(

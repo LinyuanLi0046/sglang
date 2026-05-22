@@ -1360,7 +1360,9 @@ class DeepseekV2AttentionMLA(
         self.next_skip_topk = None
         self.indexer = None
         if self.use_nsa:
-            is_neox_style = not getattr(config, "indexer_rope_interleave", False)
+            indexer_is_neox_style = not getattr(
+                config, "indexer_rope_interleave", False
+            )
             # Refer: https://arxiv.org/abs/2603.12201 for more details.
             # skip_topk: when True, this layer will skip computation and reuse previous layer's topk indices.
             # next_skip_topk: when True, the next layer will skip computation and reuse this layer's topk indices.
@@ -1386,6 +1388,9 @@ class DeepseekV2AttentionMLA(
             # indices and do not ship standalone indexer weights.
             if not self.skip_topk:
                 if self.use_longcat_dsa:
+                    indexer_is_neox_style = not getattr(
+                        config, "rope_interleave", True
+                    )
                     self.indexer = LongcatProNPUIndexer(
                         hidden_size=hidden_size,
                         index_n_heads=get_nsa_index_n_heads(config),
@@ -1399,7 +1404,7 @@ class DeepseekV2AttentionMLA(
                         scale_fmt="ue8m0",
                         block_size=128,
                         rope_scaling=rope_scaling,
-                        is_neox_style=is_neox_style,
+                        is_neox_style=indexer_is_neox_style,
                         prefix=add_prefix("indexer", prefix),
                         config=config,
                         quant_config=quant_config,
@@ -1419,7 +1424,7 @@ class DeepseekV2AttentionMLA(
                         scale_fmt="ue8m0",
                         block_size=128,
                         rope_scaling=rope_scaling,
-                        is_neox_style=is_neox_style,
+                        is_neox_style=indexer_is_neox_style,
                         prefix=add_prefix("indexer", prefix),
                         quant_config=quant_config,
                         layer_id=layer_id,

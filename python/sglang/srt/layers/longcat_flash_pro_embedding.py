@@ -121,10 +121,10 @@ class LongcatFlashProEmbedding(nn.Module):
             raise ValueError("LongcatFlashProEmbedding requires ngram_embedding_info.")
 
         batch_size = forward_batch.batch_size
-        total_tokens = input_ids.shape[0]
         req_pool_indices = forward_batch.req_pool_indices
         column_starts = info.column_starts
         req_lens = info.req_lens
+        total_tokens = int(req_lens.sum().item())
         ngram_ids = torch.empty(
             total_tokens, self.n_grams, dtype=torch.int64, device=input_ids.device
         )
@@ -178,7 +178,7 @@ class LongcatFlashProEmbedding(nn.Module):
         column_starts = info.column_starts
         req_lens = info.req_lens
 
-        self._validate_ngram_inputs_npu(input_ids, forward_batch, info)
+        total_tokens = self._validate_ngram_inputs_npu(input_ids, forward_batch, info)
 
         return torch.ops.npu.compute_n_gram_ids(
             self.oe_weights.to(device=input_ids.device, dtype=torch.int32),
@@ -202,7 +202,7 @@ class LongcatFlashProEmbedding(nn.Module):
         input_ids: torch.Tensor,
         forward_batch: ForwardBatch,
         info: NgramEmbeddingInfo,
-    ) -> None:
+    ) -> int:
         batch_size = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
         column_starts = info.column_starts
@@ -232,15 +232,16 @@ class LongcatFlashProEmbedding(nn.Module):
                     "compute_n_gram_ids contract violated: batch_size is 0 but "
                     f"input_ids has {input_ids.numel()} tokens."
                 )
-            return
+            return 0
 
         exclusive_req_len_sums = torch.cumsum(req_lens, dim=0, dtype=torch.int32)
         total_req_tokens = int(exclusive_req_len_sums[-1].item())
-        if total_req_tokens != int(input_ids.numel()):
+        total_input_tokens = int(input_ids.numel())
+        if total_req_tokens > total_input_tokens:
             raise ValueError(
                 "compute_n_gram_ids contract violated: "
-                f"cumsum(req_lens)[-1]={total_req_tokens}, "
-                f"input_ids.numel()={int(input_ids.numel())}."
+                f"cumsum(req_lens)[-1]={total_req_tokens} exceeds "
+                f"input_ids.numel()={total_input_tokens}."
             )
 
         max_context_len = info.token_table.shape[1]
@@ -264,6 +265,7 @@ class LongcatFlashProEmbedding(nn.Module):
                 "compute_n_gram_ids contract violated: req_pool_indices exceeds "
                 "token_table row count."
             )
+        return total_req_tokens
 
     def _compute_fused_ngram_ids(
         self, input_ids: torch.Tensor, forward_batch: ForwardBatch

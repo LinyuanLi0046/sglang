@@ -10,6 +10,7 @@ from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, NgramEmbeddingInfo
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
 class LongcatFlashProEmbedding(nn.Module):
     def __init__(self, config):
@@ -174,18 +175,25 @@ class LongcatFlashProEmbedding(nn.Module):
         if info is None:
             raise ValueError("LongcatFlashProEmbedding requires ngram_embedding_info.")
 
-        batch_size, req_pool_indices, column_starts, req_lens = (
-            self._build_padded_ngram_metadata(input_ids, forward_batch, info)
-        )
+        if get_is_capture_mode():
+            batch_size = int(forward_batch.batch_size)
+            req_pool_indices = forward_batch.req_pool_indices[:batch_size]
+            column_starts = info.column_starts[:batch_size]
+            req_lens = info.req_lens[:batch_size]
+            total_tokens = int(input_ids.numel())
+        else:
+            batch_size, req_pool_indices, column_starts, req_lens = (
+                self._build_padded_ngram_metadata(input_ids, forward_batch, info)
+            )
 
-        total_tokens = self._validate_ngram_inputs_npu(
-            input_ids,
-            batch_size,
-            req_pool_indices,
-            column_starts,
-            req_lens,
-            info.token_table,
-        )
+            total_tokens = self._validate_ngram_inputs_npu(
+                input_ids,
+                batch_size,
+                req_pool_indices,
+                column_starts,
+                req_lens,
+                info.token_table,
+            )
 
         return torch.ops.npu.compute_n_gram_ids(
             self.oe_weights.to(device=input_ids.device, dtype=torch.int32),

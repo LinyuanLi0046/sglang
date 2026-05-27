@@ -132,12 +132,7 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
             v_head_dim=config.v_head_dim,
             q_lora_rank=config.q_lora_rank,
             kv_lora_rank=config.kv_lora_rank,
-            rope_theta=(
-                config.rope_parameters["rope_theta"]
-                if hasattr(config, "rope_parameters")
-                and config.rope_parameters is not None
-                else config.rope_theta
-            ),
+            rope_theta=config.rope_parameters["rope_theta"],
             rope_scaling=None,
             max_position_embeddings=config.max_position_embeddings,
             quant_config=quant_config,
@@ -146,9 +141,6 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
             prefix=add_prefix(f"self_attn", prefix),
             alt_stream=self.alt_stream,
         )
-        if _is_npu:
-            self.self_attn.use_explicit_npu_interleaved_rope = True
-            self.self_attn.rotary_emb.use_explicit_npu_interleaved_rope = True
 
         self.mlp = LongcatFlashMLP(
             hidden_size=config.hidden_size,
@@ -175,7 +167,6 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
-            qkv_latent_func=self.self_attn.prepare_qkv_latent,
         )
 
     def forward(
@@ -300,7 +291,7 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
         self.config = config
         self.quant_config = (
             None
-            if "mtp" in getattr(config, "disable_quant_module", []) or (_is_npu and getattr(config, "quantize", "") == "w8a8_dynamic")
+            if "mtp" in getattr(config, "disable_quant_module", [])
             else quant_config
         )
         self.model = LongcatFlashModelNextN(config, self.quant_config)
@@ -423,10 +414,9 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
             self_attn.w_kc = bind_or_assign(
                 self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
             )
-            w_vc = w_vc.contiguous().transpose(1, 2)
-            if _is_npu:
-                w_vc = w_vc.contiguous()
-            self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc)
+            self_attn.w_vc = bind_or_assign(
+                self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
+            )
             if (
                 hasattr(self_attn.kv_b_proj, "weight_scale")
                 and self_attn.w_scale is None

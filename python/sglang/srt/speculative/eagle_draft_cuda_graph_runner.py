@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import bisect
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -26,10 +27,14 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.utils import (
+    is_npu,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
     require_mlp_tp_gather,
+)
+from sglang.srt.hardware_backend.npu.triton import (
+    draft_replay_pack_npu_triton_fused,
 )
 
 if TYPE_CHECKING:
@@ -77,6 +82,14 @@ class EAGLEDraftCudaGraphRunner:
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
+        self._enable_npu_triton_replay_pack = is_npu() and (
+            os.getenv("SGLANG_NPU_TRITON_DRAFT_REPLAY_PACK", "1") != "0"
+        )
+        self._enable_npu_triton_replay_pack_fused = is_npu() and (
+            os.getenv("SGLANG_NPU_TRITON_DRAFT_REPLAY_PACK_FUSED", "1") != "0"
+        )
+        self._npu_triton_replay_pack_fn = None
+        self._npu_triton_replay_pack_fused_fn = None
         self.enable_pdmux = False
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
@@ -373,23 +386,41 @@ class EAGLEDraftCudaGraphRunner:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
 
         bs = self.capture_bs[index]
-        if bs != raw_bs:
-            buffers.seq_lens.fill_(self.seq_len_fill_value)
-            buffers.out_cache_loc.zero_()
-            buffers.positions.zero_()
-
         num_tokens = bs * self.num_tokens_per_bs
 
-        # Common inputs
-        buffers.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
-        buffers.out_cache_loc[: raw_num_token * self.speculative_num_steps].copy_(
-            forward_batch.out_cache_loc
+        draft_replay_pack_npu_triton_fused(
+            dst_seq_lens=buffers.seq_lens,
+            src_seq_lens=forward_batch.seq_lens,
+            dst_out_cache_loc=buffers.out_cache_loc,
+            src_out_cache_loc=forward_batch.out_cache_loc,
+            dst_positions=buffers.positions,
+            src_positions=forward_batch.positions,
+            dst_topk_p=buffers.topk_p,
+            src_topk_p=forward_batch.spec_info.topk_p,
+            dst_topk_index=buffers.topk_index,
+            src_topk_index=forward_batch.spec_info.topk_index,
+            dst_req_pool_indices=buffers.req_pool_indices,
+            src_req_pool_indices=forward_batch.req_pool_indices,
+            raw_bs=raw_bs,
+            bs=bs,
+            topk=self.topk,
+            speculative_num_steps=self.speculative_num_steps,
+            seq_len_fill_value=self.seq_len_fill_value,
         )
-        buffers.positions[:raw_num_token].copy_(forward_batch.positions)
-        buffers.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
-        buffers.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
         buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
-        buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
+
+        # num_tokens = bs * self.num_tokens_per_bs
+
+        # # Common inputs
+        # buffers.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
+        # buffers.out_cache_loc[: raw_num_token * self.speculative_num_steps].copy_(
+        #     forward_batch.out_cache_loc
+        # )
+        # buffers.positions[:raw_num_token].copy_(forward_batch.positions)
+        # buffers.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
+        # buffers.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
+        # buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
+        # buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:

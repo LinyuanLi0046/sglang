@@ -31,7 +31,7 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_npu, get_bool_env_var
 import queue
 
 logger = logging.getLogger(__name__)
@@ -79,8 +79,13 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                 self._replay_update_done.set()
 
     def _init_arch_map(self):
+        use_FIA_V2 = get_bool_env_var("ASCEND_USE_FIA_V2", "false")
+        if use_FIA_V2:
+            kv_len_parm_name = "actual_seq_kvlen"
+        else:
+            kv_len_parm_name = "actual_seq_lengths_kv"
         self.attr_name: Dict[str, str] = {
-            AttentionArch.MLA: "actual_seq_lengths_kv",
+            AttentionArch.MLA: kv_len_parm_name,
             AttentionArch.MHA: "context_lens",
         }
         self.attr_type: Dict[str, Union[list, torch.Tensor]] = {
@@ -129,6 +134,12 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                 seq_lens_cpu = forward_batch.seq_lens_cpu + speculative_step_id + 1
                 seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
                 seq_lens_for_each_draft_step.append(seq_lens)
+            # thread = threading.Thread(
+            #     target=self._replay_update, args=(seq_lens_for_each_draft_step,)
+            # )
+            # thread.start()
+            # self.graphs[self.bs].replay()
+            # thread.join()
             self._replay_update_done.clear()
             self._replay_update_queue.put(seq_lens_for_each_draft_step)
             self.graphs[self.bs].replay()

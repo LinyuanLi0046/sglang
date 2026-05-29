@@ -517,3 +517,51 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
 def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:
     return tree_cache.available_and_evictable_str()
+
+def alloc_paged_token_slots_extend_and_assign(
+    tree_cache: BasePrefixCache,
+    prefix_lens: torch.Tensor,
+    prefix_lens_cpu: torch.Tensor,
+    seq_lens: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    extend_num_tokens: int,
+):
+    allocator = tree_cache.token_to_kv_pool_allocator
+    num_tokens = extend_num_tokens + len(seq_lens_cpu) * allocator.page_size
+    evict_from_tree_cache(tree_cache, num_tokens)
+
+    used_fused = False
+    if hasattr(allocator, "alloc_extend_and_assign"):
+        used_fused = allocator.alloc_extend_and_assign(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            req_pool_indices,
+            req_to_token,
+            extend_num_tokens,
+        )
+
+    if used_fused:
+        return
+    out_cache_loc = allocator.alloc_extend(
+        prefix_lens,
+        prefix_lens_cpu,
+        seq_lens,
+        seq_lens_cpu,
+        get_last_loc(req_to_token, req_pool_indices, prefix_lens),
+        extend_num_tokens,
+    )
+    if out_cache_loc is not None:
+        from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+
+        assign_req_to_token_pool_func(
+            req_pool_indices,
+            req_to_token,
+            prefix_lens,
+            seq_lens,
+            out_cache_loc,
+            len(req_pool_indices),
+        )

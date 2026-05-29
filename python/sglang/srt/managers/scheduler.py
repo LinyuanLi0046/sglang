@@ -237,6 +237,10 @@ from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from sglang.srt.utils.numa_utils import (
+    get_numa_node_if_available,
+    numa_bind_to_node,
+)
 
 if is_mps():
     CudaStreamContext = nullcontext
@@ -3633,6 +3637,16 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
+    if (
+        get_bool_env_var("SGLANG_SET_CPU_AFFINITY")
+        and _is_npu
+        and not _is_npu_before_atlas_a5
+        and get_bool_env_var("SGLANG_NPU_AFFINITY_EARLY_BIND")
+    ):
+        set_npu_david_proc_affinity(
+            server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
+        )
+
     dp_rank = configure_scheduler(
         server_args, tp_rank, attn_cp_rank, moe_dp_rank, moe_ep_rank, pp_rank, dp_rank
     )

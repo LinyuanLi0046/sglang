@@ -2181,6 +2181,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if draft_input.verify_done is not None:
                 draft_input.verify_done.synchronize()
 
+    def maybe_wait_verify_done(self):
+        if self.is_spec_v2:
+            draft_input: EagleDraftInput = self.spec_info
+            if draft_input.verify_done is not None:
+                draft_input.verify_done.synchronize()
+    def maybe_wait_verify_done_event(self):
+        if self.is_spec_v2:
+            draft_input: EagleDraftInput = self.spec_info
+            if draft_input.verify_done is not None:
+                torch.get_device_module(self.device).current_stream().wait_event(
+                    draft_input.verify_done
+                )
+
     def filter_batch(
         self,
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,

@@ -2075,6 +2075,21 @@ def set_npu_david_proc_affinity(
     nnodes: int,
     npu_id: int
 ):
+    def _get_env_int(name: str, default: int = 0) -> int:
+        value = os.getenv(name)
+        if value is None:
+            return default
+        try:
+            return int(value)
+        except ValueError:
+            logger.warning(
+                "Invalid integer value for %s=%s, fallback to %s",
+                name,
+                value,
+                default,
+            )
+            return default
+
     def _get_target_node_core_cpu_map(target_node):
         target_node_cores = {}
         result = subprocess.run(
@@ -2127,6 +2142,9 @@ def set_npu_david_proc_affinity(
 
     pid = os.getpid()
     p = psutil.Process(pid)
+    bind_all_threads = get_bool_env_var("SGLANG_NPU_AFFINITY_ALL_THREADS")
+    disable_smt = get_bool_env_var("SGLANG_NPU_AFFINITY_DISABLE_SMT")
+    max_pcores = _get_env_int("SGLANG_NPU_AFFINITY_PCORES_PER_PROC", 0)
     
     # TODO LKL: remove hard code after 910D released
     NPU_TO_NUMA = {
@@ -2150,18 +2168,35 @@ def set_npu_david_proc_affinity(
 
     total_node_cores = len(sorted_physical_cores)
     cores_per_npu = total_node_cores // min(total_npus_in_node, tp_size_per_node)
+    if max_pcores > 0:
+        cores_per_npu = min(cores_per_npu, max_pcores)
+    cores_per_npu = max(1, cores_per_npu)
     start_idx = (rank_in_node * cores_per_npu) % total_node_cores
     
-    if rank_in_node == total_npus_in_node - 1:
+    if max_pcores > 0:
+        end_idx = min(start_idx + cores_per_npu, total_node_cores)
+    elif rank_in_node == total_npus_in_node - 1:
         end_idx = total_node_cores
     else:
         end_idx = start_idx + cores_per_npu
 
     bind_cpus = []
     for core_id in sorted_physical_cores[start_idx:end_idx]:
-        bind_cpus.extend(target_node_cores[core_id])
+        sibling_cpus = sorted(target_node_cores[core_id])
+        if disable_smt:
+            bind_cpus.append(sibling_cpus[0])
+        else:
+            bind_cpus.extend(sibling_cpus)
 
-    p.cpu_affinity(sorted(bind_cpus))
+    bind_cpus = sorted(bind_cpus)
+    p.cpu_affinity(bind_cpus)
+
+    if bind_all_threads and hasattr(os, "sched_setaffinity"):
+        for thread in p.threads():
+            try:
+                os.sched_setaffinity(thread.id, bind_cpus)
+            except Exception as e:
+                logger.debug("Failed to set affinity for tid %s: %s", thread.id, e)
 
     mem_msg = "Not bind NUMA"
     # if sys.platform == "linux":
@@ -2173,7 +2208,8 @@ def set_npu_david_proc_affinity(
     logging.info(
         f"PID {pid} | NPU {npu_id} -> Bound to NUMA Node {target_node} | "
         f"Allocated {len(bind_cpus)} logical cores (Physical cores {sorted_physical_cores[start_idx]}~{sorted_physical_cores[end_idx-1]}) | "
-        f"Core list: {sorted(bind_cpus)[0]}...{sorted(bind_cpus)[-1]} | {mem_msg}"
+        f"Core list: {bind_cpus[0]}...{bind_cpus[-1]} | "
+        f"all_threads={bind_all_threads} | disable_smt={disable_smt} | {mem_msg}"
     )
 
 

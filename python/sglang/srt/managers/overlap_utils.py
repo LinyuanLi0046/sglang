@@ -144,12 +144,12 @@ class FutureMap:
             # caching allocator (torch GC) could reclaim the memory before
             # the GPU finishes reading it.
             indices.record_stream(torch.get_device_module(self.device).current_stream())
-            draft_input.topk_p = self.topk_p_buf[indices]
-            draft_input.topk_index = self.topk_index_buf[indices]
-            draft_input.verified_id = self.verified_id_buf[indices]
-            draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
+            draft_input.future_topk_p_buf = self.topk_p_buf
+            draft_input.future_topk_index_buf = self.topk_index_buf
+            draft_input.future_verified_id_buf = self.verified_id_buf
+            draft_input.future_new_seq_lens_buf = self.new_seq_lens_buf
             if spec_need_hidden_states():
-                draft_input.hidden_states = self.hidden_states_buf[indices]
+                draft_input.future_hidden_states_buf = self.hidden_states_buf
 
     def is_empty_slice(self, s: slice) -> bool:
         start, stop, step = s.indices(self.future_buffer_len)

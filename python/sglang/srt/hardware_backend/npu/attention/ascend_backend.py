@@ -26,6 +26,9 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_bool_env_var, is_npu_before_atlas_a5
+from sglang.srt.server_args import get_global_server_args
+
+_is_npu_before_atlas_a5 = is_npu_before_atlas_a5()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -34,7 +37,6 @@ if TYPE_CHECKING:
 import logging
 
 import numpy as np
-_is_npu_before_atlas_a5 = is_npu_before_atlas_a5()
 
 
 def _reshape_kv_for_fia_nz(
@@ -42,6 +44,19 @@ def _reshape_kv_for_fia_nz(
 ) -> torch.Tensor:
     """Reshapes a tensor for FIA NZ format."""
     return tensor.view(-1, 1, num_heads * head_dim // 16, page_size, 16)
+
+def _quantize_mla_query_for_fia_fp8(
+    query: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    query_shape = query.shape
+    query_fp8, dequant_scale_query = torch.ops.npu.npu_dynamic_quant(
+        query.reshape(-1, query_shape[-1]),
+        dst_type=torch.float8_e4m3fn,
+    )
+    return (
+        query_fp8.view(query_shape),
+        dequant_scale_query.view(query_shape[:-1]).to(torch.float32),
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -247,6 +262,8 @@ class AscendAttnBackend(AttentionBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.graph_mode = False
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        self.use_fia_v2 = get_bool_env_var("ASCEND_USE_FIA_V2", "False")
+        self.kv_cache_dtype = get_global_server_args().kv_cache_dtype
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
@@ -846,6 +863,121 @@ class AscendAttnBackend(AttentionBackend):
 
         return attn_out
 
+    # def forward_prefill_david(
+    #     self,
+    #     q: torch.Tensor,
+    #     k: torch.Tensor,
+    #     v: torch.Tensor,
+    #     forward_batch: ForwardBatch,
+    #     layer: RadixAttention,
+    # ):
+    #     num_token_padding = q.shape[0]
+    #     # current chunk q, k, v
+    #     q, k, v = [
+    #         data[: forward_batch.num_token_non_padded_cpu] for data in [q, k, v]
+    #     ]
+    #     q_nope, q_rope = q.split(
+    #         [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
+    #     )
+    #     k_nope, k_rope = k.split(
+    #         [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
+    #     )
+    #     num_tokens = q_nope.size(0)
+    #     attn_output = torch.empty(
+    #         num_tokens,
+    #         layer.tp_q_head_num,
+    #         layer.v_head_dim,
+    #         dtype=q_nope.dtype,
+    #         device=q_nope.device,
+    #     )
+    #     attn_lse = torch.empty(
+    #         layer.tp_q_head_num,
+    #         num_tokens,
+    #         dtype=torch.float32,
+    #         device=q_nope.device,
+    #     )
+
+    #     actual_seq_lengths = np.array(forward_batch.extend_seq_lens_cpu).cumsum().tolist()
+
+    #     common_kwargs = {
+    #         "query_rope": q_rope,
+    #         "key_rope": k_rope,
+    #         "num_query_heads": layer.tp_q_head_num,
+    #         "num_key_value_heads": layer.tp_k_head_num,
+    #         "input_layout": "TND",
+    #         "atten_mask": self.fia_mask,
+    #         "sparse_mode": 3,
+    #         "softmax_scale": layer.scaling,
+    #         "block_table": None,
+    #         "block_size": 0,
+    #         "actual_seq_qlen": actual_seq_lengths,
+    #         "actual_seq_kvlen": actual_seq_lengths,
+    #     }
+    #     torch_npu.npu_fused_infer_attention_score_v2.out(
+    #         q_nope,
+    #         k_nope,
+    #         v,
+    #         out=[attn_output, attn_lse],
+    #         **common_kwargs
+    #     )
+    #     attn_lse = attn_lse.to(torch.float32)
+    #     out_list = [attn_output.reshape(num_tokens * layer.tp_q_head_num, layer.v_head_dim)]
+    #     lse_list = [attn_lse.reshape(num_tokens * layer.tp_q_head_num)]
+
+    #     # current chunk q, historial k, v
+    #     k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+    #     v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(
+    #         layer.layer_id
+    #     )
+    #     kv_cached = torch.index_select(
+    #         k_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
+    #     )
+    #     k_rope_cached = torch.index_select(
+    #         v_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
+    #     ).flatten(0, 1)
+
+    #     assert layer.kv_b_proj is not None
+    #     kv = layer.kv_b_proj(kv_cached)[0].view(
+    #         -1, layer.tp_k_head_num, self.qk_nope_head_dim + layer.v_head_dim
+    #     )
+    #     k_nope, v = kv.split([self.qk_nope_head_dim, layer.v_head_dim], dim=-1)
+
+    #     k_rope = k_rope_cached.expand(-1, layer.tp_k_head_num, -1)
+
+    #     actual_seq_lengths_kv = np.array(self.forward_metadata.prefix_lens).cumsum().tolist()
+    #     common_kwargs["actual_seq_kvlen"] = actual_seq_lengths_kv
+    #     common_kwargs["key_rope"] = k_rope
+    #     prefix_attn_output = torch.empty_like(
+    #         q_nope, dtype=q_nope.dtype, device=q_nope.device
+    #     )
+    #     prefix_attn_lse = torch.empty_like(attn_lse)
+    #     torch_npu.npu_fused_infer_attention_score_v2.out(
+    #         q_nope,
+    #         k_nope,
+    #         v,
+    #         out=[prefix_attn_output, prefix_attn_lse],
+    #         **common_kwargs
+    #     )
+    #     prefix_attn_lse = prefix_attn_lse.to(torch.float32)
+
+    #     out_list.append(prefix_attn_output.reshape(num_tokens * layer.tp_q_head_num, layer.v_head_dim))
+    #     lse_list.append(prefix_attn_lse.reshape(num_tokens * layer.tp_q_head_num))
+    #     output, _ = torch_npu.npu_attention_update(tuple(lse_list), tuple(out_list), 0)
+    #     output = output.reshape(-1, layer.tp_q_head_num, layer.v_head_dim)
+
+    #     if num_token_padding != forward_batch.num_token_non_padded_cpu:
+    #         output = torch.cat(
+    #             [
+    #                 output,
+    #                 output.new_zeros(
+    #                     num_token_padding - output.shape[0],
+    #                     *output.shape[1:],
+    #                 ),
+    #             ],
+    #             dim=0,
+    #         )
+    #     return output
+
     def forward_prefill_david(
         self,
         q: torch.Tensor,
@@ -905,12 +1037,18 @@ class AscendAttnBackend(AttentionBackend):
         lse_list = [attn_lse.reshape(num_tokens * layer.tp_q_head_num)]
 
         # current chunk q, historial k, v
-        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        if self.kv_cache_dtype == "fp8_e4m3":
+            k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(torch.int8)
+            kv_cached = torch.index_select(
+                k_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
+            ).view(torch.float8_e4m3fn).to(torch.bfloat16)
+        else:
+            k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            kv_cached = torch.index_select(
+                k_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
+            )
         v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(
             layer.layer_id
-        )
-        kv_cached = torch.index_select(
-            k_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
         )
         k_rope_cached = torch.index_select(
             v_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
@@ -962,6 +1100,7 @@ class AscendAttnBackend(AttentionBackend):
         topk_indices: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
         slopes: Optional[torch.Tensor] = None,
+        dequant_scale_q_nope: Optional[torch.Tensor] = None,
     ):
         if is_mla_preprocess_enabled():
             # MLAPO and MLAPROLOG do save kv_cache
@@ -1003,6 +1142,7 @@ class AscendAttnBackend(AttentionBackend):
                 save_kv_cache,
                 q_rope=q_rope,
                 k_rope=k_rope,
+                dequant_scale_q_nope=dequant_scale_q_nope,
             )
 
         if not self.use_mla:
@@ -1227,8 +1367,8 @@ class AscendAttnBackend(AttentionBackend):
                 )
             else:
                 if not _is_npu_before_atlas_a5:
-                    attn_output = self.forward_prefill_david(q, k, v, forward_batch, layer)
-                    return attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+                   attn_output = self.forward_prefill_david(q, k, v, forward_batch, layer)
+                   return attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
                 num_token_padding = q.shape[0]
                 q, k, v = [
                     data[: forward_batch.num_token_non_padded_cpu] for data in [q, k, v]
@@ -1510,6 +1650,7 @@ class AscendAttnBackend(AttentionBackend):
         save_kv_cache: bool,
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
+        dequant_scale_q_nope: Optional[torch.Tensor] = None,
     ):
         if save_kv_cache:
             if self.use_mla:
@@ -1622,48 +1763,100 @@ class AscendAttnBackend(AttentionBackend):
                     self.speculative_num_draft_tokens,
                 )
 
-            workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
-                q_nope,
-                c_kv_cache,
-                c_kv_cache,
-                query_rope=q_rope,
-                key_rope=k_rope_cache,
-                num_heads=layer.tp_q_head_num,
-                num_key_value_heads=layer.tp_k_head_num,
-                input_layout="TND",
-                scale=layer.scaling,
-                antiquant_mode=0,
-                antiquant_scale=None,
-                block_table=self.forward_metadata.block_tables,
-                block_size=self.page_size,
-                sparse_mode=3,
-                atten_mask=self.mtp_mask,
-                actual_seq_lengths=actual_seq_lengths,
-                actual_seq_lengths_kv=actual_seq_lengths_kv,
-            )
-            attn_output = torch.empty_like(q_nope, dtype=q.dtype, device=q.device)
-            softmax_lse = torch.empty(1, dtype=q.dtype, device=q.device)
-            torch_npu.npu_fused_infer_attention_score.out(
-                q_nope,
-                c_kv_cache,
-                c_kv_cache,
-                query_rope=q_rope,
-                key_rope=k_rope_cache,
-                num_heads=layer.tp_q_head_num,
-                num_key_value_heads=layer.tp_k_head_num,
-                input_layout="TND",
-                scale=layer.scaling,
-                antiquant_mode=0,
-                antiquant_scale=None,
-                block_table=self.forward_metadata.block_tables,
-                block_size=self.page_size,
-                sparse_mode=3,
-                atten_mask=self.mtp_mask,
-                actual_seq_lengths=actual_seq_lengths,
-                actual_seq_lengths_kv=actual_seq_lengths_kv,
-                workspace=workspace,
-                out=[attn_output, softmax_lse],
-            )
+            if dequant_scale_q_nope is not None and self.kv_cache_dtype == "fp8_e4m3":
+                dequant_scale_q_nope = dequant_scale_q_nope.squeeze(2)
+
+            if self.use_fia_v2:
+                if self.kv_cache_dtype == "fp8_e4m3":
+                    q_fp8, dequant_scale_query = q_nope, dequant_scale_q_nope
+                    kv_scale = torch.ones(1, dtype=torch.float32, device=q_nope.device)
+                    attn_output = torch.empty_like(q_nope, dtype=torch.bfloat16, device=q_nope.device)
+                    softmax_lse = torch.empty(1, dtype=torch.bfloat16, device=q_nope.device)
+                    torch_npu.npu_fused_infer_attention_score_v2.out(
+                        q_fp8,
+                        c_kv_cache,
+                        c_kv_cache,
+                        query_rope=q_rope,
+                        key_rope=k_rope_cache,
+                        num_query_heads=layer.tp_q_head_num,
+                        num_key_value_heads=layer.tp_k_head_num,
+                        input_layout="TND",
+                        softmax_scale=layer.scaling,
+                        block_table=self.forward_metadata.block_tables,
+                        block_size=self.page_size,
+                        actual_seq_qlen=actual_seq_lengths,
+                        actual_seq_kvlen=actual_seq_lengths_kv,
+                        sparse_mode=3,
+                        atten_mask=self.mtp_mask,
+                        dequant_scale_query=dequant_scale_query,
+                        dequant_scale_key=kv_scale,
+                        dequant_scale_value=kv_scale,
+                        key_quant_mode=0,
+                        value_quant_mode=0,
+                        query_quant_mode=3,
+                        out=[attn_output, softmax_lse]
+                    )
+                else:
+                    attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                        q_nope,
+                        c_kv_cache,
+                        c_kv_cache,
+                        query_rope=q_rope,
+                        key_rope=k_rope_cache,
+                        actual_seq_qlen=actual_seq_lengths,
+                        actual_seq_kvlen=actual_seq_lengths_kv,
+                        block_table=self.forward_metadata.block_tables,
+                        block_size=self.page_size,
+                        num_query_heads=layer.tp_q_head_num,
+                        num_key_value_heads=layer.tp_k_head_num,
+                        input_layout="TND",
+                        softmax_scale=layer.scaling,
+                        sparse_mode=3,
+                        atten_mask=self.mtp_mask,
+                    )
+            else:
+                workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+                    q_nope,
+                    c_kv_cache,
+                    c_kv_cache,
+                    query_rope=q_rope,
+                    key_rope=k_rope_cache,
+                    num_heads=layer.tp_q_head_num,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    input_layout="TND",
+                    scale=layer.scaling,
+                    antiquant_mode=0,
+                    antiquant_scale=None,
+                    block_table=self.forward_metadata.block_tables,
+                    block_size=self.page_size,
+                    sparse_mode=3,
+                    atten_mask=self.mtp_mask,
+                    actual_seq_lengths=actual_seq_lengths,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                )
+                attn_output = torch.empty_like(q_nope, dtype=q.dtype, device=q.device)
+                softmax_lse = torch.empty(1, dtype=q.dtype, device=q.device)
+                torch_npu.npu_fused_infer_attention_score.out(
+                    q_nope,
+                    c_kv_cache,
+                    c_kv_cache,
+                    query_rope=q_rope,
+                    key_rope=k_rope_cache,
+                    num_heads=layer.tp_q_head_num,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    input_layout="TND",
+                    scale=layer.scaling,
+                    antiquant_mode=0,
+                    antiquant_scale=None,
+                    block_table=self.forward_metadata.block_tables,
+                    block_size=self.page_size,
+                    sparse_mode=3,
+                    atten_mask=self.mtp_mask,
+                    actual_seq_lengths=actual_seq_lengths,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    workspace=workspace,
+                    out=[attn_output, softmax_lse],
+                )
             attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             if (
                 not self.graph_mode
@@ -1692,6 +1885,7 @@ class AscendAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        dequant_scale_q_nope: Optional[torch.Tensor] = None,
     ):
         if save_kv_cache:
             if self.use_mla:
@@ -1821,48 +2015,135 @@ class AscendAttnBackend(AttentionBackend):
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
 
-            workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
-                q_nope,
-                c_kv_cache,
-                c_kv_cache,
-                query_rope=q_rope,
-                key_rope=k_rope_cache,
-                num_heads=self.q_head_num_padding,
-                num_key_value_heads=layer.tp_k_head_num,
-                block_table=self.forward_metadata.block_tables,
-                block_size=self.page_size,
-                input_layout="BSND",
-                scale=layer.scaling,
-                actual_seq_lengths_kv=actual_seq_len_kv,
-                antiquant_mode=0,
-                antiquant_scale=None,
-                sparse_mode=0,
-            )
-            output = torch.empty_like(q_nope, dtype=q.dtype, device=q.device)
-            softmax_lse = torch.empty(1, dtype=q.dtype, device=q.device)
+            if dequant_scale_q_nope is not None and self.kv_cache_dtype == "fp8_e4m3":
+                dequant_scale_q_nope = dequant_scale_q_nope.transpose(-1,-2)
 
-            torch_npu.npu_fused_infer_attention_score.out(
-                q_nope,
-                c_kv_cache,
-                c_kv_cache,
-                query_rope=q_rope,
-                key_rope=k_rope_cache,
-                num_heads=self.q_head_num_padding,
-                num_key_value_heads=layer.tp_k_head_num,
-                block_table=self.forward_metadata.block_tables,
-                block_size=self.page_size,
-                input_layout="BSND",
-                scale=layer.scaling,
-                actual_seq_lengths_kv=actual_seq_len_kv,
-                antiquant_mode=0,
-                antiquant_scale=None,
-                sparse_mode=0,
-                workspace=workspace,
-                out=[output, softmax_lse],
-            )
+            if self.use_fia_v2:
+                if self.kv_cache_dtype == "fp8_e4m3":
+                    q_fp8, dequant_scale_query = q_nope, dequant_scale_q_nope
+                    kv_scale = torch.ones(1, dtype=torch.float32, device=q_nope.device)
+                    output = torch.empty_like(q_nope, dtype=torch.bfloat16, device=q_nope.device)
+                    softmax_lse = torch.empty(1, dtype=torch.bfloat16, device=q_nope.device)
+                    torch_npu.npu_fused_infer_attention_score_v2.out(
+                        q_fp8,
+                        c_kv_cache,
+                        c_kv_cache,
+                        query_rope=q_rope,
+                        key_rope=k_rope_cache,
+                        num_query_heads=self.q_head_num_padding,
+                        num_key_value_heads=layer.tp_k_head_num,
+                        input_layout="BSND",
+                        softmax_scale=layer.scaling,
+                        block_table=self.forward_metadata.block_tables,
+                        block_size=self.page_size,
+                        actual_seq_kvlen=actual_seq_len_kv,
+                        sparse_mode=0,
+                        dequant_scale_query=dequant_scale_query,
+                        dequant_scale_key=kv_scale,
+                        dequant_scale_value=kv_scale,
+                        key_quant_mode=0,
+                        value_quant_mode=0,
+                        query_quant_mode=3,
+                        out=[output, softmax_lse]
+                    )
+                else:
+                    output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                        q_nope,
+                        c_kv_cache,
+                        c_kv_cache,
+                        query_rope=q_rope,
+                        key_rope=k_rope_cache,
+                        num_query_heads=self.q_head_num_padding,
+                        num_key_value_heads=layer.tp_k_head_num,
+                        block_table=self.forward_metadata.block_tables,
+                        block_size=self.page_size,
+                        input_layout="BSND",
+                        softmax_scale=layer.scaling,
+                        actual_seq_kvlen=actual_seq_len_kv,
+                        sparse_mode=0,
+                    )
 
-            output = output[:, :, : layer.tp_q_head_num, :]
-            return output.view(-1, layer.tp_q_head_num * self.kv_lora_rank)
+                output = output[:, :, : layer.tp_q_head_num, :]
+                return output.view(-1, layer.tp_q_head_num * self.kv_lora_rank)
+
+                # common_kwargs = {
+                #     "query_rope": q_rope,
+                #     "key_rope": k_rope_cache,
+                #     "num_query_heads": self.q_head_num_padding,
+                #     "num_key_value_heads": layer.tp_k_head_num,
+                #     "block_table": self.forward_metadata.block_tables,
+                #     "block_size": self.page_size,
+                #     "input_layout": "BSND",
+                #     "softmax_scale": layer.scaling,
+                #     "actual_seq_kvlen": actual_seq_len_kv,
+                #     "sparse_mode": 0,
+                # }
+
+                # workspace = torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(
+                #     q_nope,
+                #     c_kv_cache,
+                #     c_kv_cache,
+                #     **common_kwargs, 
+                # )
+
+                # output = torch.empty_like(q_nope, dtype=q.dtype, device=q.device)
+                # softmax_lse = torch.empty(1, dtype=q.dtype, device=q.device)
+
+                # torch_npu.npu_fused_infer_attention_score_v2.out(
+                #     q_nope,
+                #     c_kv_cache,
+                #     c_kv_cache,
+                #     **common_kwargs,
+                #     workspace=workspace,
+                #     out=[output, softmax_lse],
+                # )
+
+                # output = output[:, :, : layer.tp_q_head_num, :]
+                # return output.view(-1, layer.tp_q_head_num * self.kv_lora_rank)
+            
+            else:
+                workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+                    q_nope,
+                    c_kv_cache,
+                    c_kv_cache,
+                    query_rope=q_rope,
+                    key_rope=k_rope_cache,
+                    num_heads=self.q_head_num_padding,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    block_table=self.forward_metadata.block_tables,
+                    block_size=self.page_size,
+                    input_layout="BSND",
+                    scale=layer.scaling,
+                    actual_seq_lengths_kv=actual_seq_len_kv,
+                    antiquant_mode=0,
+                    antiquant_scale=None,
+                    sparse_mode=0,
+                )
+                output = torch.empty_like(q_nope, dtype=q.dtype, device=q.device)
+                softmax_lse = torch.empty(1, dtype=q.dtype, device=q.device)
+
+                torch_npu.npu_fused_infer_attention_score.out(
+                    q_nope,
+                    c_kv_cache,
+                    c_kv_cache,
+                    query_rope=q_rope,
+                    key_rope=k_rope_cache,
+                    num_heads=self.q_head_num_padding,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    block_table=self.forward_metadata.block_tables,
+                    block_size=self.page_size,
+                    input_layout="BSND",
+                    scale=layer.scaling,
+                    actual_seq_lengths_kv=actual_seq_len_kv,
+                    antiquant_mode=0,
+                    antiquant_scale=None,
+                    sparse_mode=0,
+                    workspace=workspace,
+                    out=[output, softmax_lse],
+                )
+
+                output = output[:, :, : layer.tp_q_head_num, :]
+                return output.view(-1, layer.tp_q_head_num * self.kv_lora_rank)
 
     def forward_decode(
         self,
@@ -1878,6 +2159,7 @@ class AscendAttnBackend(AttentionBackend):
         topk_indices: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
         slopes: Optional[torch.Tensor] = None,
+        dequant_scale_q_nope: Optional[torch.Tensor] = None,
     ):
         if is_mla_preprocess_enabled():
             # MLAPO does saving kv_cache
@@ -1906,6 +2188,7 @@ class AscendAttnBackend(AttentionBackend):
                 q_rope=q_rope,
                 k_rope=k_rope,
                 sinks=sinks,
+                dequant_scale_q_nope=dequant_scale_q_nope,
             )
 
         if not self.use_mla:
@@ -2071,24 +2354,83 @@ class AscendAttnBackend(AttentionBackend):
                     layer.tp_q_head_num,
                     self.qk_rope_head_dim,
                 )
-                attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
-                    q,
-                    kv_c,
-                    kv_c,
-                    query_rope=q_rope,
-                    key_rope=k_pe,
-                    num_heads=layer.tp_q_head_num,
-                    num_key_value_heads=layer.tp_k_head_num,
-                    input_layout="BSND",
-                    atten_mask=None,
-                    sparse_mode=0,
-                    scale=layer.scaling,
-                    antiquant_mode=0,
-                    antiquant_scale=None,
-                    block_table=self.forward_metadata.block_tables,
-                    block_size=self.page_size,
-                    actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int,
-                )
+
+                if dequant_scale_q_nope is not None and self.kv_cache_dtype == "fp8_e4m3":
+                    dequant_scale_q_nope = dequant_scale_q_nope.transpose(-1,-2)
+                    # print("q.shape", q.shape, flush=True)
+                    # print("dequant_scale_q_nope.shape", dequant_scale_q_nope.shape, flush=True)
+
+                if self.use_fia_v2:
+                    if self.forward_metadata.seq_lens_cpu_int is None:
+                        actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
+                    else:
+                        actual_seq_len_kv = (
+                            self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
+                        )
+
+                    if self.kv_cache_dtype == "fp8_e4m3":
+                        # q_fp8, dequant_scale_query = _quantize_mla_query_for_fia_fp8(q)
+                        q_fp8, dequant_scale_query = q, dequant_scale_q_nope
+                        kv_scale = torch.ones(1, dtype=torch.float32, device=q.device)
+                        attn_output = torch.empty_like(q, dtype=torch.bfloat16, device=q.device)
+                        softmax_lse = torch.empty(1, dtype=torch.bfloat16, device=q.device)
+                        torch_npu.npu_fused_infer_attention_score_v2.out(
+                            q_fp8,
+                            kv_c,
+                            kv_c,
+                            query_rope=q_rope,
+                            key_rope=k_pe,
+                            num_query_heads=layer.tp_q_head_num,
+                            num_key_value_heads=layer.tp_k_head_num,
+                            input_layout="BSND",
+                            softmax_scale=layer.scaling,
+                            block_table=self.forward_metadata.block_tables,
+                            block_size=self.page_size,
+                            actual_seq_kvlen=self.forward_metadata.seq_lens_cpu_int,
+                            sparse_mode=0,
+                            dequant_scale_query=dequant_scale_query,
+                            dequant_scale_key=kv_scale,
+                            dequant_scale_value=kv_scale,
+                            key_quant_mode=0,
+                            value_quant_mode=0,
+                            query_quant_mode=3,
+                            out=[attn_output, softmax_lse]
+                        )
+                    else:
+                        attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                            q,
+                            kv_c,
+                            kv_c,
+                            query_rope=q_rope,
+                            key_rope=k_pe,
+                            num_query_heads=layer.tp_q_head_num,
+                            num_key_value_heads=layer.tp_k_head_num,
+                            sparse_mode=0,
+                            input_layout="BSND",
+                            softmax_scale=layer.scaling,
+                            block_table=self.forward_metadata.block_tables,
+                            block_size=self.page_size,
+                            actual_seq_kvlen=actual_seq_len_kv,
+                        )
+                else:
+                    attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+                        q,
+                        kv_c,
+                        kv_c,
+                        query_rope=q_rope,
+                        key_rope=k_pe,
+                        num_heads=layer.tp_q_head_num,
+                        num_key_value_heads=layer.tp_k_head_num,
+                        input_layout="BSND",
+                        atten_mask=None,
+                        sparse_mode=0,
+                        scale=layer.scaling,
+                        antiquant_mode=0,
+                        antiquant_scale=None,
+                        block_table=self.forward_metadata.block_tables,
+                        block_size=self.page_size,
+                        actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int,
+                    )
             else:
                 assert (
                     self.graph_mode == False

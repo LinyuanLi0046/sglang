@@ -25,6 +25,7 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
     ):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.roundup = page_size - 1
+        self._num_new_pages_out_sum = None
 
     def alloc_extend(
         self,
@@ -104,6 +105,70 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
 
         self.free_pages = self.free_pages[num_new_pages_item:]
         return out_indices.int()
+
+    def alloc_extend_and_assign(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        req_to_token: torch.Tensor,
+        extend_num_tokens: int,
+    ) -> bool:
+        if _is_npu_before_atlas_a5:
+            return False
+
+        from sglang.srt.hardware_backend.npu.triton import (
+            FUSED_ALLOC_EXTEND_ASSIGN_MAX_BS,
+            alloc_extend_assign_req_to_token_pool_triton,
+            get_num_new_pages_triton,
+        )
+
+        batch_size = int(prefix_lens.shape[0])
+        if batch_size == 0:
+            return True
+
+        num_new_pages = (
+            (seq_lens + self.roundup) // self.page_size
+            - (prefix_lens + self.roundup) // self.page_size
+        ).sum()
+        num_new_pages_item = num_new_pages.item()
+
+        # if self._num_new_pages_out_sum is None:
+        #     self._num_new_pages_out_sum = torch.empty(
+        #         (1,), dtype=torch.int32, device=self.device
+        #     )
+        # num_new_pages = get_num_new_pages_triton(
+        #     seq_lens=seq_lens,
+        #     prefix_lens=prefix_lens,
+        #     page_size=self.page_size,
+        #     out_sum=self._num_new_pages_out_sum,
+        # )
+        # num_new_pages_item = int(num_new_pages.cpu().item())
+
+        if self.need_sort and num_new_pages_item > len(self.free_pages):
+            self.merge_and_sort_free()
+
+        if num_new_pages_item > len(self.free_pages):
+            return False
+
+        if num_new_pages_item >= 200:
+            return False
+
+        if batch_size > FUSED_ALLOC_EXTEND_ASSIGN_MAX_BS:
+            return False
+
+        alloc_extend_assign_req_to_token_pool_triton(
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
+            prefix_lens=prefix_lens,
+            seq_lens=seq_lens,
+            free_pages=self.free_pages,
+            page_size=self.page_size,
+        )
+        self.free_pages = self.free_pages[num_new_pages_item:]
+        return True
 
     def alloc_decode(
         self,

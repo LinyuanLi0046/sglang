@@ -67,6 +67,9 @@ class RotaryEmbedding(MultiPlatformOp):
         self.is_neox_style = is_neox_style
         self.dtype = dtype
 
+        self.register_buffer("cos_cached_total", None, persistent=False)
+        self.register_buffer("sin_cached_total", None, persistent=False)
+
         cache = self._compute_cos_sin_cache()
         # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability
         if not _is_cuda:

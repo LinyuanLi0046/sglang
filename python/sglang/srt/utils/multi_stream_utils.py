@@ -93,13 +93,31 @@ class Singleton(type):
 
 class MultiStreamUtils(metaclass=Singleton):
     def __init__(self):
+        import torch_npu
         if get_global_server_args().enable_longcat_double_stream:
             self.stream_moe = torch.npu.Stream()
-            torch.npu.set_stream_limit(self.stream_moe, 16, 32)
+            self.stream_attn = torch.npu.Stream()
+            # torch.npu.set_stream_limit(self.stream_moe, 16, 32)
+            # torch.npu.set_stream_limit(self.stream_attn, 12, 24)
             self.main_stream = None
             self.forward_moe_func = None
 
             self.first_attn_finished = torch.npu.Event()
-            self.mlp_attn0_finished = torch.npu.Event()
-            self.moe_dispatch_finished = torch.npu.Event()
-            self.moe_gemm_finished = torch.npu.Event()
+
+            self.mlapo_finished_event = torch.npu.Event()
+
+            self.fia_ffn_finished_event = torch.npu.Event()
+
+            self.mlp0_allreduce_finised = torch.npu.Event()
+
+            self.attn1_allreduce_finised = torch.npu.Event()
+
+            self.moe_allreduce_finished = torch.npu.Event()
+
+            # self.mlp_attn0_finished = torch.npu.Event()
+            # self.moe_dispatch_finished = torch.npu.Event()
+            # self.moe_gemm_finished = torch.npu.Event()
+
+            # self.mla_forward_finished_event = torch.npu.Event()
+            # self.moe_gemm_finished_event = torch_npu.npu.Event()
+

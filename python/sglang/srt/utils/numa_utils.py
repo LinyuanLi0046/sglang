@@ -16,6 +16,7 @@ import psutil
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_cuda
+from sglang.srt.utils.common import is_npu_before_atlas_a5
 
 _is_cuda = is_cuda()
 
@@ -34,6 +35,26 @@ def configure_subprocess(server_args: ServerArgs, gpu_id: int):
             with _mp_set_executable(executable=executable, debug_str=debug_str):
                 yield
                 return
+
+    npu_memory_preferred_bind = os.getenv(
+        "SGLANG_NPU_MEMORY_PREFERRED_BIND", ""
+    ).lower() in ("1", "true", "yes", "on")
+    if (
+        npu_memory_preferred_bind
+        and server_args.device == "npu"
+        and not is_npu_before_atlas_a5()
+    ):
+        if server_args.numa_node is not None:
+            numa_node = server_args.numa_node[gpu_id]
+        else:
+            # Keep the current David platform mapping unchanged for now.
+            numa_node = 0 if gpu_id < 4 else 2
+        executable, debug_str = _create_numactl_executable(
+            numactl_args=f"--preferred={numa_node}"
+        )
+        with _mp_set_executable(executable=executable, debug_str=debug_str):
+            yield
+            return
     yield
 
 

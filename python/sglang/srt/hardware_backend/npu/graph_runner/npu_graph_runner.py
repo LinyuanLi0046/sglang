@@ -111,15 +111,20 @@ class NPUGraphRunner(CudaGraphRunner):
                 self._replay_update_done.set()
 
     def _init_arch_map(self):
+        use_FIA_V2 = get_bool_env_var("ASCEND_USE_FIA_V2", "false")
+        if use_FIA_V2:
+            kv_len_parm_name = "actual_seq_kvlen"
+        else:
+            kv_len_parm_name = "actual_seq_lengths_kv"
         if self.is_dllm:
             self.attr_name: Dict[str, str] = {
-                AttentionArch.MLA: "actual_seq_lengths_kv",
-                AttentionArch.MHA: "actual_seq_lengths_kv",
+                AttentionArch.MLA: kv_len_parm_name,
+                AttentionArch.MHA: kv_len_parm_name,
             }
         else:
             self.attr_name: Dict[str, str] = {
-                AttentionArch.MLA: "actual_seq_lengths_kv",
-                AttentionArch.MHA: "context_lens",
+                AttentionArch.MLA: kv_len_parm_name,
+                AttentionArch.MHA: kv_len_parm_name,
             }
         self.attr_type: Dict[str, Union[list, torch.Tensor]] = {
             AttentionArch.MLA: [],
@@ -213,6 +218,10 @@ class NPUGraphRunner(CudaGraphRunner):
                 seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
                     self.bs - self.raw_bs
                 )
+            # thread = threading.Thread(target=self._replay_update, args=(seq_lens,))
+            # thread.start()
+            # self.graphs[self.bs].replay()
+            # thread.join()
             self._replay_update_done.clear()
             self._replay_update_queue.put(seq_lens)
             self.graphs[self.bs].replay()

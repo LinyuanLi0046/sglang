@@ -203,6 +203,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.index_head_dim = index_head_dim
+        self.k_store_dtype = self.store_dtype
+        self.v_store_dtype = self.store_dtype
+        if self.dtype == torch.float8_e4m3fn:
+            self.k_store_dtype = torch.float8_e4m3fn
+            self.v_store_dtype = torch.bfloat16
 
         self.custom_mem_pool = None
 
@@ -216,7 +221,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     1,
                     self.kv_lora_rank,
                 ),
-                dtype=self.store_dtype,
+                dtype=self.k_store_dtype,
                 device=self.device,
             )
             self.v_buffer = torch.zeros(
@@ -227,7 +232,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     1,
                     self.qk_rope_head_dim,
                 ),
-                dtype=self.store_dtype,
+                dtype=self.v_store_dtype,
                 device=self.device,
             )
             self.index_k_buffer = None
@@ -240,7 +245,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                         1,
                         self.index_head_dim,
                     ),
-                    dtype=self.store_dtype,
+                    dtype=self.k_store_dtype,
                     device=self.device,
                 )
 
@@ -272,7 +277,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
-        if self.store_dtype != self.dtype:
+        if self.k_store_dtype != self.dtype:
             return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.k_buffer[layer_id - self.start_layer]
 
@@ -280,7 +285,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
-        if self.store_dtype != self.dtype:
+        if self.v_store_dtype == self.store_dtype and self.store_dtype != self.dtype:
             return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.v_buffer[layer_id - self.start_layer]
 
@@ -324,18 +329,27 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         cache_v: torch.Tensor,
     ):
         layer_id = layer.layer_id
-        if cache_k.dtype != self.dtype:
-            cache_k = cache_k.to(self.dtype)
-            cache_v = cache_v.to(self.dtype)
-
-        if self.store_dtype != self.dtype:
-            cache_k = cache_k.view(self.store_dtype)
-            cache_v = cache_v.view(self.store_dtype)
-
         if cache_v is None:
             cache_k, cache_v = cache_k.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )
+
+        if self.dtype == torch.float8_e4m3fn:
+            kv_scale = getattr(layer, "k_scale", None)
+            if cache_k.dtype != self.dtype:
+                cache_k = cache_k.to(self.dtype)
+            if self.k_store_dtype != self.dtype:
+                cache_k = cache_k.view(self.k_store_dtype)
+            if cache_v.dtype != self.v_store_dtype: # BF16 ROPE
+                cache_v = cache_v.to(self.v_store_dtype)
+        else:
+            if cache_k.dtype != self.dtype:
+                cache_k = cache_k.to(self.dtype)
+                cache_v = cache_v.to(self.dtype)
+
+            if self.store_dtype != self.dtype:
+                cache_k = cache_k.view(self.store_dtype)
+                cache_v = cache_v.view(self.store_dtype)
 
         torch_npu.npu_scatter_nd_update_(
             self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.kv_lora_rank),

@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -29,6 +30,70 @@ def is_fia_nz() -> bool:
         ), "SGLANG_USE_FIA_NZ must be enable with SGLANG_NPU_USE_MLAPO"
     return is_fia_nz_
 
+
+# def _quantize_mla_query_for_mxfp8(
+#     query: torch.Tensor,
+# ) -> tuple[torch.Tensor, torch.Tensor]:
+#     query_shape = query.shape
+#     x = query.reshape(-1, query_shape[-1]).contiguous()
+#     x_mxfp8, x_scale = torch.ops.npu.npu_dynamic_mx_quant(
+#         x,
+#         axis=1,
+#         dst_type=torch.float8_e4m3fn,
+#         block_size=32,
+#         scale_alg=None,
+#     )
+
+#     return x_mxfp8, x_scale
+
+def _quantize_mla_query_for_mxfp8(
+    query: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    query_shape = query.shape
+    x = query.reshape(-1, query_shape[-1]).contiguous()
+
+    x_mxfp8, x_scale = torch.ops.npu.npu_dynamic_mx_quant(
+        x,
+        axis=1,
+        dst_type=torch.float8_e4m3fn,
+        block_size=32,
+        scale_alg=None,
+    )
+
+    # npu_dynamic_mx_quant 返回的 x_scale 常见 shape:
+    #   [num_tokens, He / 64, 2], dtype=torch.uint8
+    #
+    # npu_mla_prolog_v3 weight_quant_mode=3 期望 dequantScaleX:
+    #   [num_tokens, He / 32], dtype=torch.float8_e8m0fnu
+    if x_scale.dim() == 3 and x_scale.shape[-1] == 2:
+        x_scale = x_scale.contiguous().reshape(x_scale.shape[0], -1)
+    elif x_scale.dim() == 2:
+        x_scale = x_scale.contiguous()
+    else:
+        raise RuntimeError(
+            f"x_scale shape wrong: {tuple(x_scale.shape)}, "
+            f"expected [num_tokens, He/64, 2] or [num_tokens, He/32]"
+        )
+
+    expected_scale_last_dim = x.shape[-1] // 32
+    if x_scale.shape[-1] != expected_scale_last_dim:
+        raise RuntimeError(
+            f"x_scale packed shape wrong: {tuple(x_scale.shape)}, "
+            f"expected last dim={expected_scale_last_dim}, "
+            f"hidden_dim={x.shape[-1]}"
+        )
+
+    if x_scale.dtype == torch.uint8:
+        x_scale = x_scale.view(torch.float8_e8m0fnu)
+    elif x_scale.dtype == torch.float8_e8m0fnu:
+        pass
+    else:
+        raise RuntimeError(
+            f"x_scale dtype wrong: {x_scale.dtype}, "
+            f"expected torch.uint8 or torch.float8_e8m0fnu"
+        )
+
+    return x_mxfp8, x_scale
 
 def round_up(val: int, align: int) -> int:
     if align == 0:
@@ -98,6 +163,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         self.qk_rope_head_dim = qk_rope_head_dim  # 64
         self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
         self.v_head_dim = v_head_dim
+        self.kv_cache_dtype = get_global_server_args().kv_cache_dtype
         if not is_longcat_mla_preprocess_enabled():
             self.q_b_proj_weight_scale = self.q_b_proj.weight_scale.view(1, -1).to(
                 torch.float
@@ -240,25 +306,154 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             self.num_local_heads * (self.qk_nope_head_dim + self.qk_rope_head_dim)
         )
 
+    # def mlaprolog_preprocess_weight(self):
+    #     if is_longcat_mla_preprocess_enabled():
+    #         self.q_b_proj_weight = npu_format_cast(self.q_b_proj.weight.data.transpose(0, 1).clone())
+    #     self.qkv_a_proj.weight.data = self.qkv_a_proj.weight.data.transpose(0, 1)
+    #     qkv_a_proj_weight_q = self.qkv_a_proj.weight.data[:, : self.q_lora_rank].clone()
+    #     qkv_a_proj_weight_kv = self.qkv_a_proj.weight.data[
+    #         :, self.q_lora_rank :
+    #     ].clone()
+    #     self.q_a_proj_weight = npu_format_cast(qkv_a_proj_weight_q)
+    #     self.kv_a_proj_weight = npu_format_cast(qkv_a_proj_weight_kv)
+    #     if is_longcat_mla_preprocess_enabled():
+    #         self.qkv_a_proj.weight.data = self.qkv_a_proj.weight.data.transpose(0, 1)
+
+    # def mlaprolog_preprocess_weight(self):
+    #     if is_longcat_mla_preprocess_enabled():
+    #         self.q_b_proj_weight = npu_format_cast(
+    #             self.q_b_proj.weight.data.transpose(0, 1).clone()
+    #         )
+    #         if hasattr(self.q_b_proj, "weight_scale"):
+    #             self.q_b_proj_scale = (
+    #                 self.q_b_proj.weight_scale.data
+    #                 .clone()
+    #                 .view(torch.float8_e8m0fnu)
+    #             )
+
+    #     self.qkv_a_proj.weight.data = self.qkv_a_proj.weight.data.transpose(0, 1)
+
+    #     qkv_a_proj_weight_q = self.qkv_a_proj.weight.data[
+    #         :, : self.q_lora_rank
+    #     ].clone()
+    #     qkv_a_proj_weight_kv = self.qkv_a_proj.weight.data[
+    #         :, self.q_lora_rank :
+    #     ].clone()
+
+    #     self.q_a_proj_weight = npu_format_cast(qkv_a_proj_weight_q)
+    #     self.kv_a_proj_weight = npu_format_cast(qkv_a_proj_weight_kv)
+
+    #     if hasattr(self.qkv_a_proj, "weight_scale"):
+    #         self.qkv_a_proj_scale_q = (
+    #             self.qkv_a_proj.weight_scale.data[
+    #                 : self.q_lora_rank, :
+    #             ]
+    #             .clone()
+    #             .view(torch.float8_e8m0fnu)
+    #         )
+
+    #         self.qkv_a_proj_scale_kv = (
+    #             self.qkv_a_proj.weight_scale.data[
+    #                 self.q_lora_rank :, :
+    #             ]
+    #             .clone()
+    #             .view(torch.float8_e8m0fnu)
+    #         )
+
+    #     if is_longcat_mla_preprocess_enabled():
+    #         self.qkv_a_proj.weight.data = self.qkv_a_proj.weight.data.transpose(0, 1)
+
     def mlaprolog_preprocess_weight(self):
         if is_longcat_mla_preprocess_enabled():
-            self.q_b_proj_weight = npu_format_cast(self.q_b_proj.weight.data.transpose(0, 1).clone())
-        self.qkv_a_proj.weight.data = self.qkv_a_proj.weight.data.transpose(0, 1)
-        qkv_a_proj_weight_q = self.qkv_a_proj.weight.data[:, : self.q_lora_rank].clone()
-        qkv_a_proj_weight_kv = self.qkv_a_proj.weight.data[
-            :, self.q_lora_rank :
-        ].clone()
-        self.q_a_proj_weight = npu_format_cast(qkv_a_proj_weight_q)
-        self.kv_a_proj_weight = npu_format_cast(qkv_a_proj_weight_kv)
-        if is_longcat_mla_preprocess_enabled():
+            if hasattr(self.q_b_proj, "weight_scale"):
+                self.q_b_proj_weight = npu_format_cast(
+                    self.q_b_proj.weight_original.transpose(0, 1).clone()
+                )
+                self.q_b_proj_scale = (
+                    self.q_b_proj.weight_scale_original
+                    .clone()
+                    .view(torch.float8_e8m0fnu)
+                )
+            else:
+                self.q_b_proj_weight = npu_format_cast(
+                    self.q_b_proj.weight.data.transpose(0, 1).clone()
+                )
+
+        if hasattr(self.qkv_a_proj, "weight_scale"):
+            self.qkv_a_proj.weight_original = self.qkv_a_proj.weight_original.transpose(0, 1)
+            qkv_a_proj_weight_q = self.qkv_a_proj.weight_original[
+                :, : self.q_lora_rank
+            ].clone()
+            qkv_a_proj_weight_kv = self.qkv_a_proj.weight_original[
+                :, self.q_lora_rank :
+            ].clone()
+            self.q_a_proj_weight = npu_format_cast(qkv_a_proj_weight_q)
+            self.kv_a_proj_weight = npu_format_cast(qkv_a_proj_weight_kv)
+            self.qkv_a_proj_scale_q = (
+                self.qkv_a_proj.weight_scale_original[
+                    : self.q_lora_rank, :
+                ]
+                .clone()
+                .view(torch.float8_e8m0fnu)
+            )
+
+            self.qkv_a_proj_scale_kv = (
+                self.qkv_a_proj.weight_scale_original[
+                    self.q_lora_rank :, :
+                ]
+                .clone()
+                .view(torch.float8_e8m0fnu)
+            )
+        else:
+            self.qkv_a_proj.weight.data = self.qkv_a_proj.weight.data.transpose(0, 1)
+            qkv_a_proj_weight_q = self.qkv_a_proj.weight.data[
+                :, : self.q_lora_rank
+            ].clone()
+            qkv_a_proj_weight_kv = self.qkv_a_proj.weight.data[
+                :, self.q_lora_rank :
+            ].clone()
+            self.q_a_proj_weight = npu_format_cast(qkv_a_proj_weight_q)
+            self.kv_a_proj_weight = npu_format_cast(qkv_a_proj_weight_kv)
+
+        if not hasattr(self.qkv_a_proj, "weight_scale") and is_longcat_mla_preprocess_enabled():
             self.qkv_a_proj.weight.data = self.qkv_a_proj.weight.data.transpose(0, 1)
 
-    def get_sin_cos(self, positions):
-        cos_sin = self.rotary_emb.cos_sin_cache[positions]
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        cos = cos.repeat(1, 2)
-        sin = sin.repeat(1, 2)
+    # def get_sin_cos(self, positions):
+    #     cos_sin = self.rotary_emb.cos_sin_cache[positions]
+    #     cos, sin = cos_sin.chunk(2, dim=-1)
+    #     cos = cos.repeat(1, 2)
+    #     sin = sin.repeat(1, 2)
+    #     return cos, sin
+
+    def get_sin_cos_from_master_cache(self, positions, dtype):
+        # Read directly from the interleave-ready master cache to avoid
+        # chunk + repeat on cos_sin_cache for every layer.
+        pos = positions.flatten()
+        cos = self.rotary_emb.cos_cached_total.index_select(0, pos).to(
+            device=positions.device, dtype=dtype
+        )
+        sin = self.rotary_emb.sin_cached_total.index_select(0, pos).to(
+            device=positions.device, dtype=dtype
+        )
         return cos, sin
+
+    def refresh_mlaprolog_runtime_cache(self, positions, forward_batch, dtype):
+        cos, sin = self.get_sin_cos_from_master_cache(positions, dtype)
+        cache_index_i64 = forward_batch.out_cache_loc.to(dtype=torch.int64)
+        forward_batch._longcat_mlaprolog_runtime_cache = {
+            "cos": cos,
+            "sin": sin,
+            "cache_index_i64": cache_index_i64,
+        }
+        return cos, sin, cache_index_i64
+
+    def get_mlaprolog_runtime_cache(self, positions, forward_batch, dtype):
+        cache = getattr(forward_batch, "_longcat_mlaprolog_runtime_cache", None)
+        if self.layer_id == 0 or cache is None:
+            return self.refresh_mlaprolog_runtime_cache(
+                positions, forward_batch, dtype
+            )
+        return cache["cos"], cache["sin"], cache["cache_index_i64"]
 
     def get_kv_cache_and_cache_idx(self, forward_batch):
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(self.layer_id)
@@ -275,7 +470,10 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         bsz, _ = hidden_states.view(-1, hidden_states.shape[-1]).shape
         self.dtype = hidden_states.dtype
         if self.layer_id == 0:
-            self.cos, self.sin = self.get_sin_cos(positions)
+            # self.cos, self.sin = self.get_sin_cos(positions)
+            self.cos, self.sin = self.get_sin_cos_from_master_cache(
+                positions, hidden_states.dtype
+            )
             self.rotary_emb.cos_cached, self.rotary_emb.sin_cache = self.cos, self.sin
         else:
             self.cos, self.sin = self.rotary_emb.cos_cached, self.rotary_emb.sin_cache
@@ -354,7 +552,8 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             self.dtype = hidden_states.dtype
 
         if self.layer_id == 0:
-            cos, sin = self.get_sin_cos(positions)
+            # cos, sin = self.get_sin_cos(positions)
+            cos, sin = self.get_sin_cos_from_master_cache(positions, input_dtype)
             self.rotary_emb.cos_cached, self.rotary_emb.sin_cache = cos, sin
         else:
             cos, sin = self.rotary_emb.cos_cached, self.rotary_emb.sin_cache
@@ -433,14 +632,49 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         )
 
     def forward_mlaprolog(self, positions, hidden_states, forward_batch):
+        import torch_npu
         if not self.has_preprocess_weights:
             self.mlaprolog_preprocess_weight()
             self.has_preprocess_weights = True
-        self.cos, self.sin = self.get_sin_cos(positions)
-        k_cache, v_cache, slot_mapping = self.get_kv_cache_and_cache_idx(forward_batch)
+        # self.cos, self.sin = self.get_sin_cos(positions)
+        # k_cache, v_cache, slot_mapping = self.get_kv_cache_and_cache_idx(forward_batch)
+        self.cos, self.sin, cache_index_i64 = self.get_mlaprolog_runtime_cache(
+            positions, forward_batch, hidden_states.dtype
+        )
+        k_cache, v_cache, _ = self.get_kv_cache_and_cache_idx(forward_batch)
+
+        cache_mode = "PA_NZ" if is_fia_nz() else "PA_BSND"
+        if self.kv_cache_dtype == "fp8_e4m3":
+            kv_cache_quant_mode = 1
+            query_quant_mode = 1
+            kc_scale = 1.0
+            qc_qr_scale = 1.0
+            quant_scale_ckv = torch.ones(1, dtype=torch.float32, device=hidden_states.device)
+        else:
+            kv_cache_quant_mode = 0
+            query_quant_mode = 0
+            kc_scale = 1.0
+            qc_qr_scale = 1.0
+            quant_scale_ckv = None
+
+        if hasattr(self.qkv_a_proj, 'weight_scale'):
+            dequant_scale_w_dq = self.qkv_a_proj_scale_q
+            dequant_scale_w_uq_qr = self.q_b_proj_scale
+            dequant_scale_w_dkv_kr = self.qkv_a_proj_scale_kv
+            x, x_scale = _quantize_mla_query_for_mxfp8(hidden_states)
+            weight_quant_mode = 3
+            dequant_scale_x = x_scale.view(torch.float8_e8m0fnu)
+        else:
+            dequant_scale_w_dq = None
+            dequant_scale_w_uq_qr = None
+            dequant_scale_w_dkv_kr = None
+            dequant_scale_x = None
+            weight_quant_mode = 0
+            x = hidden_states
+        
         if is_longcat_mla_preprocess_enabled():
             mla_prolog_input_args = {
-                "token_x": hidden_states,
+                "token_x": x,
                 "weight_dq": self.q_a_proj_weight,
                 "weight_uq_qr": self.q_b_proj_weight,
                 "weight_uk": self.w_kc,
@@ -451,17 +685,34 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
                 "rope_cos": self.cos,
                 "kv_cache": k_cache,
                 "kr_cache": v_cache,
-                "cache_index": slot_mapping.to(dtype=torch.int64),
+                # "cache_index": slot_mapping.to(dtype=torch.int64),
+                "cache_index": cache_index_i64,
                 "rmsnorm_epsilon_cq": self.q_a_layernorm.variance_epsilon,
                 "rmsnorm_epsilon_ckv": self.kv_a_layernorm.variance_epsilon,
-                "cache_mode": "PA_BSND",
+                "cache_mode": cache_mode,
                 "query_norm_flag": True,
-                "weight_quant_mode": 0,  # 0:no quant; 1:uq_qr: quant; 2: weight_dq,weight_uq_qr,weight_dkv_kr: quant
+                "dequant_scale_w_dq": dequant_scale_w_dq,
+                "dequant_scale_w_uq_qr": dequant_scale_w_uq_qr,
+                "dequant_scale_w_dkv_kr": dequant_scale_w_dkv_kr,
+                "weight_quant_mode": weight_quant_mode,  # 0:no quant; 1:uq_qr: quant; 2: weight_dq,weight_uq_qr,weight_dkv_kr: quant
+                "dequant_scale_x": dequant_scale_x,
+                "kv_cache_quant_mode": kv_cache_quant_mode,
+                "query_quant_mode": query_quant_mode,
+                "kc_scale": kc_scale,
+                "qc_qr_scale": qc_qr_scale,
+                "quant_scale_ckv" : quant_scale_ckv,
+                "dequant_scale_w_uq_qr" : dequant_scale_w_uq_qr,
             }
-            import torch_npu
             q_nope, q_pe, dequant_scale_q_nope, qr, dequant_q_norm = (
                 torch_npu.npu_mla_prolog_v3(**mla_prolog_input_args)
             )
+
+            # print("q_nope", q_nope.shape, q_nope.dtype)
+            # print("q_pe", q_pe.shape, q_pe.dtype)
+            # print("dequant_scale_q_nope", dequant_scale_q_nope.shape, dequant_scale_q_nope.dtype)
+            # print("qr/query_norm_out", qr.shape, qr.dtype)
+            # print("dequant_q_norm", dequant_q_norm.shape, dequant_q_norm.dtype)
+
             return (
                 q_pe,
                 v_cache,
@@ -470,6 +721,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
                 qr,
                 forward_batch,
                 positions,
+                dequant_scale_q_nope,
             )
         else:
             mla_prolog_input_args = {
@@ -484,11 +736,12 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
                 "rope_cos": self.cos,
                 "kv_cache": k_cache,
                 "kr_cache": v_cache,
-                "cache_index": slot_mapping.to(dtype=torch.int64),
+                # "cache_index": slot_mapping.to(dtype=torch.int64),
+                "cache_index": cache_index_i64,
                 "dequant_scale_w_uq_qr": self.q_b_proj_weight_scale,
                 "rmsnorm_epsilon_cq": self.q_a_layernorm.variance_epsilon,
                 "rmsnorm_epsilon_ckv": self.kv_a_layernorm.variance_epsilon,
-                "cache_mode": "PA_BSND",
+                "cache_mode": cache_mode,
                 "query_norm_flag": True,
                 "weight_quant_mode": 1,  # 0:no quant; 1:uq_qr: quant; 2: weight_dq,weight_uq_qr,weight_dkv_kr: quant
             }
@@ -508,6 +761,12 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             )
 
     def forward(self, positions, hidden_states, forward_batch, zero_allocator):
+        # with the mlaprolog enabled, the kv_b_proj layers are unquantized
+        _is_mlaprolog = hasattr(self.quant_config, "ignore") and any(
+            re.fullmatch(r".*kv_b_proj", l) for l in self.quant_config.ignore
+        )
+        if _is_mlaprolog or is_longcat_mla_preprocess_enabled():
+            return self.forward_mlaprolog(positions, hidden_states, forward_batch)
         # assert self.quant_config and self.quant_config.get_name() == "modelslim"
         # route by `qkv_a_proj` quant type as MTP layers can be unquantized
         _is_w8a8 = (
@@ -515,10 +774,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             and self.qkv_a_proj.quant_method.quantization_config.get_name()
             == "modelslim"
         )
-        # with the mlaprolog enabled, the kv_b_proj layers are unquantized
-        _is_mlaprolog = hasattr(self.quant_config, "ignore") and any(
-            re.fullmatch(r".*kv_b_proj", l) for l in self.quant_config.ignore
-        )
+
         if _is_w8a8:
             return self.forward_mlapo(
                 positions, hidden_states, forward_batch, zero_allocator

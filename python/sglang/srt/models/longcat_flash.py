@@ -272,6 +272,16 @@ class LongcatFlashMoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
+    def get_router_weights(self):
+        if not hasattr(self.router.classifier, "weight"):
+            print("no prefetch moe router", flush=True)
+            return None
+        cache = [self.router.classifier.weight]
+        if getattr(self.router.classifier, "bias", None) is not None:
+            cache.append(self.router.classifier.bias)
+        cache.append(self.router.e_score_correction_bias)
+        return cache
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -496,36 +506,151 @@ class LongcatFlashDecoderLayer(nn.Module):
             mlp_residual = residual.clone()
         mlp_hidden_states = hidden_states.clone()
 
+        # ============= MOE放alt流 v1 ===============
+        # if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+        #     if _is_npu and not get_global_server_args().disable_piecewise_cuda_graph:
+        #         cache = self.mlp.get_router_weights()
+        #         _ = prepare_weight_cache(hidden_states, cache)
+        #     hidden_states, moe_residual = self.moe_layer_communicator.prepare_mlp(
+        #         hidden_states, residual, forward_batch
+        #     )
+
+        #     msu = MultiStreamUtils()
+        #     msu.main_stream.record_event(msu.first_attn_finished)
+
+        #     # mlp + mla + mlp
+        #     mlp_hidden_states, residual = self.forward_mlp(
+        #         mlp_hidden_states, positions, mlp_residual, forward_batch, zero_allocator,
+        #     )
+        #     if not self.is_last_layer and get_moe_a2a_backend().is_deepep():
+        #         mlp_hidden_states = mlp_hidden_states.tensor_split(self.attn_tp_size)[
+        #             self.attn_tp_rank
+        #         ]
+
+        #     # moe
+        #     with torch.npu.stream(msu.stream_moe):
+        #         msu.stream_moe.wait_event(msu.first_attn_finished)
+        #         if _is_npu and get_cmo_stream():
+        #             wait_cmo_stream()
+        #         moe_hidden_states = self.mlp(hidden_states)
+        #         moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
+        #                     moe_hidden_states, moe_residual, forward_batch
+        #                 )
+        #         moe_hidden_states.record_stream(msu.main_stream)
+
+        #     msu.main_stream.wait_stream(msu.stream_moe)
+
+        # ============= MOE放alt流 v2 ===============
         if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             hidden_states, moe_residual = self.moe_layer_communicator.prepare_mlp(
                 hidden_states, residual, forward_batch
             )
-            MultiStreamUtils().main_stream.record_event(MultiStreamUtils().first_attn_finished)
+            msu = MultiStreamUtils()
+            #msu.fia_ffn_finished_event = torch.npu.Event()
+            msu.main_stream.record_event(msu.first_attn_finished)
+
+            moe_hidden_states = None
+            def forward_moe_func():
+                nonlocal moe_hidden_states, hidden_states, moe_residual
+                with torch.npu.stream(MultiStreamUtils().stream_moe):
+                    MultiStreamUtils().first_attn_finished.wait()
+                    
+                    moe_hidden_states = self.mlp(hidden_states)
+
+                    #torch.npu.current_stream().wait_event(MultiStreamUtils().fia_ffn_finished_event)
+
+                    torch.npu.current_stream().wait_event(MultiStreamUtils().attn1_allreduce_finised)
+                    moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
+                        moe_hidden_states, moe_residual, forward_batch
+                    )
+                    moe_hidden_states.record_stream(msu.main_stream)
+                MultiStreamUtils().forward_moe_func = None
+            MultiStreamUtils().forward_moe_func = forward_moe_func
 
             # mlp + mla + mlp
             mlp_hidden_states, residual = self.forward_mlp(
-                mlp_hidden_states, positions, mlp_residual, forward_batch, zero_allocator
+                mlp_hidden_states, positions, mlp_residual, forward_batch, zero_allocator,
             )
+
+            # torch.npu.current_stream().record_event(MultiStreamUtils().fia_ffn_finished_event)
+
             if not self.is_last_layer and get_moe_a2a_backend().is_deepep():
                 mlp_hidden_states = mlp_hidden_states.tensor_split(self.attn_tp_size)[
                     self.attn_tp_rank
                 ]
-            # moe
-            with torch.npu.stream(MultiStreamUtils().stream_moe):
-                MultiStreamUtils().stream_moe.wait_event(MultiStreamUtils().first_attn_finished)
-                moe_hidden_states = self.mlp(hidden_states)
-            MultiStreamUtils().main_stream.wait_stream(MultiStreamUtils().stream_moe)
 
-            moe_hidden_states.record_stream(MultiStreamUtils().main_stream)
+            msu.main_stream.wait_stream(msu.stream_moe)
             
-            moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
-                moe_hidden_states, moe_residual, forward_batch
-            )
+        # ============= MOE放主流 ===============
+        # if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+        #     MultiStreamUtils().first_attn_finished
+        #     if _is_npu and not get_global_server_args().disable_piecewise_cuda_graph:
+        #         cache = self.mlp.get_router_weights()
+        #         _ = prepare_weight_cache(hidden_states, cache)
+        #     hidden_states, moe_residual = self.moe_layer_communicator.prepare_mlp(
+        #         hidden_states, residual, forward_batch
+        #     )
+
+        #     with torch.npu.stream(MultiStreamUtils().stream_attn):
+        #         # mlp + mla + mlp
+        #         MultiStreamUtils().first_attn_finished.wait()
+        #         mlp_hidden_states, residual = self.forward_mlp(
+        #             mlp_hidden_states, positions, mlp_residual, forward_batch, zero_allocator,
+        #         )
+        #         if not self.is_last_layer and get_moe_a2a_backend().is_deepep():
+        #             mlp_hidden_states = mlp_hidden_states.tensor_split(self.attn_tp_size)[
+        #                 self.attn_tp_rank
+        #             ]
+        #         mlp_hidden_states.record_stream(MultiStreamUtils().main_stream)
+
+            
+        #     if _is_npu and get_cmo_stream():
+        #         wait_cmo_stream()
+        #     moe_hidden_states = self.mlp(hidden_states)
+        #     moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
+        #         moe_hidden_states, moe_residual, forward_batch
+        #     )
+
+        #     MultiStreamUtils().main_stream.wait_stream(MultiStreamUtils().stream_attn)
+        # ============= 3条流 ===============
+        # if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+        #     MultiStreamUtils().first_attn_finished.record()
+        #     # moe
+        #     moe_hidden_states = None
+        #     def forward_moe_func():
+        #         nonlocal moe_hidden_states, hidden_states
+        #         with torch.npu.stream(MultiStreamUtils().stream_moe):
+        #             MultiStreamUtils().first_attn_finished.wait()
+        #             hidden_states, moe_residual = self.moe_layer_communicator.prepare_mlp(
+        #                 hidden_states, residual, forward_batch
+        #             )
+        #             moe_hidden_states = self.mlp(hidden_states)
+        #             moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
+        #                 moe_hidden_states, moe_residual, forward_batch
+        #             )
+        #         MultiStreamUtils().forward_moe_func = None
+        #     MultiStreamUtils().forward_moe_func = forward_moe_func
+        #     with torch.npu.stream(MultiStreamUtils().stream_attn):
+        #         MultiStreamUtils().first_attn_finished.wait()
+        #         hidden_states, residual = self.forward_mlp(
+        #             mlp_hidden_states, positions, mlp_residual, forward_batch, zero_allocator
+        #         )
+        #         if not self.is_last_layer and get_moe_a2a_backend().is_deepep():
+        #             hidden_states = hidden_states.tensor_split(self.attn_tp_size)[
+        #                 self.attn_tp_rank
+        #             ]
+        #     MultiStreamUtils().main_stream.wait_stream(MultiStreamUtils().stream_moe)
+        #     MultiStreamUtils().main_stream.wait_stream(MultiStreamUtils().stream_attn)
         else:
             # moe
+            if _is_npu and not get_global_server_args().disable_piecewise_cuda_graph:
+                cache = self.mlp.get_router_weights()
+                _ = prepare_weight_cache(hidden_states, cache)
             hidden_states, moe_residual = self.moe_layer_communicator.prepare_mlp(
                 hidden_states, residual, forward_batch
             )
+            if _is_npu and get_cmo_stream():
+                wait_cmo_stream()
             moe_hidden_states = self.mlp(hidden_states)
             moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
                 moe_hidden_states, moe_residual, forward_batch
@@ -538,6 +663,7 @@ class LongcatFlashDecoderLayer(nn.Module):
                 hidden_states = hidden_states.tensor_split(self.attn_tp_size)[
                     self.attn_tp_rank
                 ]
+        # hidden_states = moe_hidden_states + hidden_states
         if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             hidden_states = moe_hidden_states + mlp_hidden_states
         else:
@@ -545,7 +671,12 @@ class LongcatFlashDecoderLayer(nn.Module):
         return hidden_states, residual
 
     def forward_mlp(
-        self, hidden_states, positions, residual, forward_batch, zero_allocator
+        self,
+        hidden_states,
+        positions,
+        residual,
+        forward_batch,
+        zero_allocator,
     ):
         # first_mlp
         hidden_states, residual = self.mlp_layer_communicator[0].prepare_mlp(
@@ -558,6 +689,10 @@ class LongcatFlashDecoderLayer(nn.Module):
                 else None
             ),
         )
+        # ============= 3条流 ===============
+        # if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+        #     MultiStreamUtils().forward_moe_func()
+
         if _is_npu and get_cmo_stream():
             wait_cmo_stream()
         hidden_states = self.mlps[0](hidden_states)
@@ -579,6 +714,7 @@ class LongcatFlashDecoderLayer(nn.Module):
         hidden_states, residual = self.mlp_layer_communicator[1].prepare_attn(
             hidden_states, residual, forward_batch
         )
+
         if _is_npu and get_cmo_stream():
             wait_cmo_stream()
         if hidden_states.shape[0] != 0:
@@ -600,9 +736,15 @@ class LongcatFlashDecoderLayer(nn.Module):
                 else None
             ),
         )
+
+        if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+            torch.npu.current_stream().record_event(MultiStreamUtils().attn1_allreduce_finised)
+            MultiStreamUtils().forward_moe_func()
+
         if _is_npu and get_cmo_stream():
             wait_cmo_stream()
         hidden_states = self.mlps[1](hidden_states)
+
         # TP all_reduce
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 

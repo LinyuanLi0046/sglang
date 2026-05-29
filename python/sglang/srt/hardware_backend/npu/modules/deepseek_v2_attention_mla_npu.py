@@ -1,4 +1,5 @@
 import re
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -17,6 +18,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     nsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
+from sglang.srt.hardware_backend.npu.triton import batch_matmul_transpose
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -98,6 +100,14 @@ def forward_mha_prepare_npu(
         ckv_cache, k_rope_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
             m.layer_id
         )
+
+        if m.kv_cache_dtype == "fp8_e4m3":
+            k_rope_scale = None
+            c_kv_scale = torch.ones(1, dtype=torch.float32, device=q.device)
+        else:
+            k_rope_scale = None
+            c_kv_scale = None
+
         _, _, k_pe, kv_a = torch_npu.npu_kv_rmsnorm_rope_cache(
             latent_cache.view(-1, 1, 1, m.kv_lora_rank + m.qk_rope_head_dim),  # bnsd
             m.kv_a_layernorm.weight,
@@ -106,8 +116,8 @@ def forward_mha_prepare_npu(
             forward_batch.out_cache_loc.to(torch.int64),
             k_rope_cache,
             ckv_cache,
-            k_rope_scale=None,
-            c_kv_scale=None,
+            k_rope_scale=k_rope_scale,
+            c_kv_scale=c_kv_scale,
             k_rope_offset=None,
             c_kv_offset=None,
             epsilon=m.kv_a_layernorm.variance_epsilon,
@@ -186,6 +196,7 @@ def forward_mla_prepare_npu(
                 q_lora,
                 forward_batch,
                 positions,
+                dequant_scale_q_nope
             ) = m.mla_preprocess.forward(
                 positions, hidden_states, forward_batch, zero_allocator
             )
@@ -274,6 +285,7 @@ def forward_mla_prepare_npu(
         zero_allocator,
         positions,
         topk_indices,
+        dequant_scale_q_nope,
     )
 
 
@@ -287,7 +299,16 @@ def forward_mla_core_npu(
     zero_allocator: "BumpAllocator",
     positions: torch.Tensor,
     topk_indices: torch.Tensor,
+    dequant_scale_q_nope = None,
 ) -> torch.Tensor:
+    extra_kwargs = {}
+
+    if topk_indices is not None:
+        extra_kwargs["topk_indices"] = topk_indices
+
+    if dequant_scale_q_nope is not None:
+        extra_kwargs["dequant_scale_q_nope"] = dequant_scale_q_nope
+
     attn_output = m.attn_mqa(
         q_nope_out,
         k_nope,
@@ -295,7 +316,7 @@ def forward_mla_core_npu(
         forward_batch,
         q_rope=q_pe,
         k_rope=k_pe,
-        **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+        **extra_kwargs,
     )
 
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
@@ -306,15 +327,16 @@ def forward_mla_core_npu(
         device=attn_output.device,
     )
 
-    # attn_output = attn_output.contiguous()
-    # torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
-    torch.bmm(
-        attn_output.transpose(0, 1),
-        m.w_vc,
-        out=attn_bmm_output.view(-1, m.num_local_heads, m.v_head_dim).transpose(
-            0, 1
-        ),
-    )
+    attn_output = attn_output.contiguous()
+    batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
+
+    # torch.bmm(
+    #     attn_output.transpose(0, 1),
+    #     m.w_vc,
+    #     out=attn_bmm_output.view(-1, m.num_local_heads, m.v_head_dim).transpose(
+    #         0, 1
+    #     ),
+    # )
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
     output, _ = m.o_proj(attn_bmm_output)

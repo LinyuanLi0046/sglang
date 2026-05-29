@@ -107,6 +107,16 @@ else:
 logger = logging.getLogger(__name__)
 
 
+def _is_modelslim_quant_config(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    return (
+        quant_config is not None
+        and hasattr(quant_config, "get_name")
+        and quant_config.get_name() == "modelslim"
+    )
+
+
 class LongcatFlashDenseDecoderLayer(nn.Module):
 
     def __init__(
@@ -122,6 +132,11 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
         self.alt_stream = alt_stream
+        mlp_prefix = (
+            "transformer_layer.mlp"
+            if _is_modelslim_quant_config(quant_config)
+            else "mlps"
+        )
 
         self.self_attn = DeepseekV2AttentionMLA(
             config=config,
@@ -151,7 +166,7 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
-            prefix=add_prefix(f"mlps", prefix),
+            prefix=add_prefix(mlp_prefix, prefix),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -214,6 +229,8 @@ class LongcatFlashModelNextN(nn.Module):
         super().__init__()
         self.vocab_size = config.vocab_size
         self.alt_stream = torch.cuda.Stream()
+        use_modelslim_prefix = _is_modelslim_quant_config(quant_config)
+        mtp_layer_prefix = add_prefix("layers.0", prefix) if use_modelslim_prefix else ""
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -230,10 +247,14 @@ class LongcatFlashModelNextN(nn.Module):
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=add_prefix("eh_proj", ""),
+            prefix=add_prefix("eh_proj", mtp_layer_prefix),
         )
         self.decoder = LongcatFlashDenseDecoderLayer(
-            config, 0, quant_config=quant_config, alt_stream=self.alt_stream
+            config,
+            0,
+            quant_config=quant_config,
+            prefix=mtp_layer_prefix,
+            alt_stream=self.alt_stream,
         )
 
         self.final_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -296,10 +317,13 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
         self.config = config
         self.quant_config = (
             None
-            if "mtp" in getattr(config, "disable_quant_module", []) or _is_npu
+            if "mtp" in getattr(config, "disable_quant_module", [])
             else quant_config
         )
-        self.model = LongcatFlashModelNextN(config, self.quant_config)
+        model_prefix = "model.mtp" if _is_modelslim_quant_config(self.quant_config) else ""
+        self.model = LongcatFlashModelNextN(
+            config, self.quant_config, prefix=model_prefix
+        )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
@@ -523,6 +547,7 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
         weight_names_mapping = {
             "model.mtp.embed_tokens.weight": "embed_tokens.weight",
             "model.mtp.layers.0.eh_proj.weight": "eh_proj.weight",
+            "model.mtp.layers.0.eh_proj.weight_scale": "eh_proj.weight_scale",
             "model.mtp.layers.0.eh_proj.weight_scale_inv": "eh_proj.weight_scale_inv",
             "model.mtp.layers.0.enorm.m.weight": "enorm.weight",
             "model.mtp.layers.0.hnorm.m.weight": "hnorm.weight",
@@ -530,21 +555,29 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
             "model.mtp.layers.0.post_attention_layernorm.weight": "layers.0.post_attention_layernorm.weight",
             "model.mtp.layers.0.self_attn.kv_a_layernorm.weight": "layers.0.self_attn.kv_a_layernorm.weight",
             "model.mtp.layers.0.self_attn.kv_a_proj_with_mqa.weight": "layers.0.self_attn.kv_a_proj_with_mqa.weight",
+            "model.mtp.layers.0.self_attn.kv_a_proj_with_mqa.weight_scale": "layers.0.self_attn.kv_a_proj_with_mqa.weight_scale",
             "model.mtp.layers.0.self_attn.kv_a_proj_with_mqa.weight_scale_inv": "layers.0.self_attn.kv_a_proj_with_mqa.weight_scale_inv",
             "model.mtp.layers.0.self_attn.kv_b_proj.weight": "layers.0.self_attn.kv_b_proj.weight",
+            "model.mtp.layers.0.self_attn.kv_b_proj.weight_scale": "layers.0.self_attn.kv_b_proj.weight_scale",
             "model.mtp.layers.0.self_attn.kv_b_proj.weight_scale_inv": "layers.0.self_attn.kv_b_proj.weight_scale_inv",
             "model.mtp.layers.0.self_attn.o_proj.weight": "layers.0.self_attn.o_proj.weight",
+            "model.mtp.layers.0.self_attn.o_proj.weight_scale": "layers.0.self_attn.o_proj.weight_scale",
             "model.mtp.layers.0.self_attn.o_proj.weight_scale_inv": "layers.0.self_attn.o_proj.weight_scale_inv",
             "model.mtp.layers.0.self_attn.q_a_layernorm.weight": "layers.0.self_attn.q_a_layernorm.weight",
             "model.mtp.layers.0.self_attn.q_a_proj.weight": "layers.0.self_attn.q_a_proj.weight",
+            "model.mtp.layers.0.self_attn.q_a_proj.weight_scale": "layers.0.self_attn.q_a_proj.weight_scale",
             "model.mtp.layers.0.self_attn.q_a_proj.weight_scale_inv": "layers.0.self_attn.q_a_proj.weight_scale_inv",
             "model.mtp.layers.0.self_attn.q_b_proj.weight": "layers.0.self_attn.q_b_proj.weight",
+            "model.mtp.layers.0.self_attn.q_b_proj.weight_scale": "layers.0.self_attn.q_b_proj.weight_scale",
             "model.mtp.layers.0.self_attn.q_b_proj.weight_scale_inv": "layers.0.self_attn.q_b_proj.weight_scale_inv",
             "model.mtp.layers.0.transformer_layer.mlp.down_proj.weight": "layers.0.mlp.down_proj.weight",
+            "model.mtp.layers.0.transformer_layer.mlp.down_proj.weight_scale": "layers.0.mlp.down_proj.weight_scale",
             "model.mtp.layers.0.transformer_layer.mlp.down_proj.weight_scale_inv": "layers.0.mlp.down_proj.weight_scale_inv",
             "model.mtp.layers.0.transformer_layer.mlp.gate_proj.weight": "layers.0.mlp.gate_proj.weight",
+            "model.mtp.layers.0.transformer_layer.mlp.gate_proj.weight_scale": "layers.0.mlp.gate_proj.weight_scale",
             "model.mtp.layers.0.transformer_layer.mlp.gate_proj.weight_scale_inv": "layers.0.mlp.gate_proj.weight_scale_inv",
             "model.mtp.layers.0.transformer_layer.mlp.up_proj.weight": "layers.0.mlp.up_proj.weight",
+            "model.mtp.layers.0.transformer_layer.mlp.up_proj.weight_scale": "layers.0.mlp.up_proj.weight_scale",
             "model.mtp.layers.0.transformer_layer.mlp.up_proj.weight_scale_inv": "layers.0.mlp.up_proj.weight_scale_inv",
             "model.mtp.norm.weight": "layers.0.final_layernorm.weight",
         }

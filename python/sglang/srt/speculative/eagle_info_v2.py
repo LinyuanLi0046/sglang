@@ -12,6 +12,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.utils import get_alloc_len_per_decode
 from sglang.srt.mem_cache.common import (
+    alloc_paged_token_slots_extend_and_assign,
     alloc_paged_token_slots_extend,
     alloc_token_slots,
     get_last_loc,
@@ -30,7 +31,7 @@ from sglang.srt.speculative.spec_utils import (
     generate_simulated_accept_index,
 )
 from sglang.srt.utils.common import is_cuda, is_hip, is_npu, next_power_of_2, is_npu_before_atlas_a5
-from sglang.srt.hardware_backend.npu.triton import cache_loc_update
+from sglang.srt.hardware_backend.npu.triton import cache_loc_update, draft_future_replay_prepare_npu_triton
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -110,32 +111,27 @@ class EagleDraftInputV2Mixin:
 
         if page_size == 1:
             out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
+            assign_req_to_token_pool_func(
+                batch.req_pool_indices,
+                batch.req_to_token_pool.req_to_token,
+                cur_kv_lens_cpu.to(device=batch.device),
+                nxt_kv_lens_cpu.to(device=batch.device),
+                out_cache_loc,
+                bs,
+            )
         else:
             cur_kv_lens = cur_kv_lens_cpu.to(device=batch.device)
             nxt_kv_lens = nxt_kv_lens_cpu.to(device=batch.device)
-            last_loc = get_last_loc(
-                batch.req_to_token_pool.req_to_token,
-                batch.req_pool_indices,
-                cur_kv_lens,
-            )
-            out_cache_loc = alloc_paged_token_slots_extend(
+            alloc_paged_token_slots_extend_and_assign(
                 batch.tree_cache,
                 cur_kv_lens,
                 cur_kv_lens_cpu,
                 nxt_kv_lens,
                 nxt_kv_lens_cpu,
-                last_loc,
+                batch.req_pool_indices,
+                batch.req_to_token_pool.req_to_token,
                 num_needed_tokens,
             )
-
-        assign_req_to_token_pool_func(
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            cur_kv_lens_cpu.to(device=batch.device),
-            nxt_kv_lens_cpu.to(device=batch.device),
-            out_cache_loc,
-            bs,
-        )
 
         # FIXME(lsyin): make this sync optional
         batch.seq_lens_cpu = batch.seq_lens.cpu()
@@ -150,31 +146,104 @@ class EagleDraftInputV2Mixin:
         topk: int,
         num_steps: int,
     ):
+        bs = len(batch.seq_lens)
+        positions_prepared = False
         if not batch.forward_mode.is_idle():
-            bs = len(batch.seq_lens)
+            future_ready = (
+                self.future_indices is not None
+                and self.future_topk_p_buf is not None
+                and self.future_topk_index_buf is not None
+                and self.future_verified_id_buf is not None
+                and self.future_new_seq_lens_buf is not None
+                and self.future_hidden_states_buf is not None
+            )
 
-            # Assign cache locations
-            batch.out_cache_loc = torch.empty(
-                (bs * topk * num_steps,),
-                dtype=torch.int64,
-                device=batch.input_ids.device,
-            )
-            # FIXME(lsyin): align with the default code path
-            assign_draft_cache_locs_page_size_1[(bs,)](
-                batch.req_pool_indices,
-                req_to_token_pool.req_to_token,
-                batch.seq_lens,
-                batch.out_cache_loc,
-                req_to_token_pool.req_to_token.shape[1],
-                topk,
-                num_steps,
-            )
+            if future_ready:
+                batch.out_cache_loc = torch.empty(
+                    (bs * topk * num_steps,),
+                    dtype=torch.int64,
+                    device=batch.input_ids.device,
+                )
+                self.positions = torch.empty(
+                    (bs * topk,),
+                    dtype=torch.int64,
+                    device=batch.input_ids.device,
+                )
+                self.topk_p = torch.empty(
+                    (bs, topk),
+                    dtype=self.future_topk_p_buf.dtype,
+                    device=self.future_topk_p_buf.device,
+                )
+                self.topk_index = torch.empty(
+                    (bs, topk),
+                    dtype=self.future_topk_index_buf.dtype,
+                    device=self.future_topk_index_buf.device,
+                )
+                self.verified_id = torch.empty(
+                    (bs,),
+                    dtype=self.future_verified_id_buf.dtype,
+                    device=self.future_verified_id_buf.device,
+                )
+                self.new_seq_lens = torch.empty(
+                    (bs,),
+                    dtype=self.future_new_seq_lens_buf.dtype,
+                    device=self.future_new_seq_lens_buf.device,
+                )
+                self.hidden_states = torch.empty(
+                    (bs, self.future_hidden_states_buf.shape[1]),
+                    dtype=self.future_hidden_states_buf.dtype,
+                    device=self.future_hidden_states_buf.device,
+                )
+                draft_future_replay_prepare_npu_triton(
+                    future_indices=self.future_indices.indices,
+                    src_topk_p=self.future_topk_p_buf,
+                    src_topk_index=self.future_topk_index_buf,
+                    src_hidden_states=self.future_hidden_states_buf,
+                    src_verified_id=self.future_verified_id_buf,
+                    src_new_seq_lens=self.future_new_seq_lens_buf,
+                    src_seq_lens=batch.seq_lens,
+                    src_req_pool_indices=batch.req_pool_indices,
+                    req_to_token=req_to_token_pool.req_to_token,
+                    dst_topk_p=self.topk_p,
+                    dst_topk_index=self.topk_index,
+                    dst_hidden_states=self.hidden_states,
+                    dst_verified_id=self.verified_id,
+                    dst_new_seq_lens=self.new_seq_lens,
+                    dst_positions=self.positions,
+                    dst_out_cache_loc=batch.out_cache_loc,
+                    topk=topk,
+                    speculative_num_steps=num_steps,
+                )
+                positions_prepared = True
+                self.future_topk_p_buf = None
+                self.future_topk_index_buf = None
+                self.future_hidden_states_buf = None
+                self.future_verified_id_buf = None
+                self.future_new_seq_lens_buf = None
+            else:
+                # Assign cache locations
+                batch.out_cache_loc = torch.empty(
+                    (bs * topk * num_steps,),
+                    dtype=torch.int64,
+                    device=batch.input_ids.device,
+                )
+                # FIXME(lsyin): align with the default code path
+                assign_draft_cache_locs_page_size_1[(bs,)](
+                    batch.req_pool_indices,
+                    req_to_token_pool.req_to_token,
+                    batch.seq_lens,
+                    batch.out_cache_loc,
+                    req_to_token_pool.req_to_token.shape[1],
+                    topk,
+                    num_steps,
+                )
 
         # Get a forward batch
         self.num_tokens_per_req = topk
         self.num_tokens_for_logprob_per_req = topk
         batch.capture_hidden_mode = CaptureHiddenMode.LAST
-        self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
+        if not positions_prepared:
+            self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         return forward_batch, can_cuda_graph

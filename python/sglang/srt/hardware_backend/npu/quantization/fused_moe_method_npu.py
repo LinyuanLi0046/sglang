@@ -8,11 +8,15 @@ from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 
 from sglang.srt.utils import is_npu, is_npu_before_atlas_a5
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils.multi_stream_utils import MultiStreamUtils
 
 _is_npu = is_npu()
 _is_npu_before_atlas_a5 = is_npu_before_atlas_a5()
+
 if _is_npu:
     import torch_npu
+ASCEND_USE_GROUPED_MATMUL_SWIGLU_QUANT_V2 = get_bool_env_var("ASCEND_USE_GROUPED_MATMUL_SWIGLU_QUANT_V2", "false")
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -656,6 +660,14 @@ def npu_fused_experts_mxfp4(
         group_list=expert_tokens,
         output_dtype=original_dtype,
     )
+    # hidden_states, hidden_states_scale = torch.ops.npu.npu_swiglu_mx_quant(
+    #     hidden_states,
+    #     axis=1,
+    #     round_mode="rint",
+    #     dst_type=torch_npu.float4_e2m1fn_x2,
+    #     block_size=32,
+    #     scale_alg=0,
+    # )
     hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
     hidden_states = mxfp4_gmm_npu(
         input=hidden_states,
@@ -714,6 +726,61 @@ def npu_fused_experts_mxfp4_decode(
         )
     )
     expert_tokens = expert_tokens.to(torch.int64)
+    # if get_global_server_args().enable_longcat_double_stream:
+    #     MultiStreamUtils().mla_forward_finished_event.wait()
+    #     MultiStreamUtils().mla_forward_finished_event.reset(torch.get_device_module().current_stream())
+
+    # if ASCEND_USE_GROUPED_MATMUL_SWIGLU_QUANT_V2:
+    #     x, x_scale = torch.ops.npu.npu_dynamic_mx_quant(
+    #         hidden_states,
+    #         axis=1,
+    #         round_mode="rint",
+    #         dst_type=torch_npu.float4_e2m1fn_x2,
+    #         block_size=32,
+    #         scale_alg=None,
+    #     )
+    #     out, out_scale = torch_npu.npu_grouped_matmul_swiglu_quant_v2(
+    #         x=x,
+    #         weight=[w13],
+    #         group_list=expert_tokens,
+    #         weight_scale=[w13_weight_scale],
+    #         x_scale=x_scale,
+    #         dequant_mode=2,
+    #         quant_mode=2,
+    #         dequant_dtype=torch.float32,
+    #         quant_dtype=torch_npu.float4_e2m1fn_x2,
+    #         x_dtype=torch_npu.float4_e2m1fn_x2,
+    #         weight_dtype=torch_npu.float4_e2m1fn_x2,
+    #         group_list_type=group_list_type,
+    #         weight_scale_dtype=torch_npu.float8_e8m0fnu,
+    #         x_scale_dtype=torch_npu.float8_e8m0fnu,
+    #     )
+    #     hidden_states = torch.ops.npu.npu_grouped_matmul(
+    #         [out],
+    #         [w2],
+    #         scale=[w2_weight_scale],
+    #         per_token_scale=[out_scale],
+    #         split_item=2,
+    #         group_type=0,
+    #         group_list=expert_tokens,
+    #         group_list_type=group_list_type,
+    #         output_dtype=original_dtype,
+    #         scale_dtype=torch_npu.float8_e8m0fnu,
+    #         per_token_scale_dtype=torch_npu.float8_e8m0fnu,
+    #         x_dtype=torch_npu.float4_e2m1fn_x2,
+    #         weight_dtype=torch_npu.float4_e2m1fn_x2,
+    #     )[0]
+ 
+    #     assert original_shape is not None
+    #     final_hidden_states = torch.ops.npu.npu_moe_token_unpermute(
+    #         permuted_tokens=hidden_states,
+    #         sorted_indices=torch.abs(expanded_row_idx),
+    #         probs=topk_weights,
+    #     )
+
+    #     if len(original_shape) == 3:
+    #         final_hidden_states = final_hidden_states.view(original_shape)
+    #     return final_hidden_states
     
     hidden_states = mxfp4_gmm_npu(
         input=hidden_states,
@@ -724,6 +791,7 @@ def npu_fused_experts_mxfp4_decode(
         group_list=expert_tokens,
         output_dtype=original_dtype,
     )
+
     hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
     hidden_states = mxfp4_gmm_npu(
         input=hidden_states,
@@ -735,9 +803,13 @@ def npu_fused_experts_mxfp4_decode(
         output_dtype=original_dtype,
     )
 
+    # if get_global_server_args().enable_longcat_double_stream:
+    #     MultiStreamUtils().moe_gemm_finished_event.record()
+
     assert original_shape is not None
     final_hidden_states = torch.ops.npu.npu_moe_token_unpermute(
         permuted_tokens=hidden_states,
+        # sorted_indices=torch.abs(expanded_row_idx),
         sorted_indices=expanded_row_idx,
         probs=topk_weights,
     )
@@ -1308,15 +1380,27 @@ class NPUW4A4MxFp4DynamicMoEMethod(_NPUFusedMoEMethodBase):
         super().__init__()
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2)
-        layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2)
+        layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, 29).transpose(-1, -2)
+        layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, 29).transpose(-1, -2)
 
-        g_num, n_size, k_size = layer.w13_weight_scale.shape
-        layer.w13_weight_scale.data = layer.w13_weight_scale.data.reshape(g_num, n_size, k_size // 2, 2)
-        g_num, n_size, k_size = layer.w2_weight_scale.shape
-        layer.w2_weight_scale.data = layer.w2_weight_scale.data.reshape(g_num, n_size, k_size // 2, 2)
-        layer.w13_weight_scale.data = layer.w13_weight_scale.data.transpose(1, 2)
-        layer.w2_weight_scale.data = layer.w2_weight_scale.data.transpose(1, 2)
+        w13_weight_scale = layer.w13_weight_scale.data.transpose(1, 2)
+        w2_weight_scale = layer.w2_weight_scale.data.transpose(1, 2)
+
+        w13_weight_scale = w13_weight_scale.transpose(-1, -2).reshape(w13_weight_scale.shape[0], w13_weight_scale.shape[2], w13_weight_scale.shape[1] // 2, 2).transpose(1, 2)
+        w2_weight_scale = w2_weight_scale.transpose(-1, -2).reshape(w2_weight_scale.shape[0], w2_weight_scale.shape[2], w2_weight_scale.shape[1] // 2, 2).transpose(1, 2)
+
+        layer.w13_weight_scale.data = w13_weight_scale
+        layer.w2_weight_scale.data  = w2_weight_scale
+
+        # layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2)
+        # layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2)
+
+        # g_num, n_size, k_size = layer.w13_weight_scale.shape
+        # layer.w13_weight_scale.data = layer.w13_weight_scale.data.reshape(g_num, n_size, k_size // 2, 2)
+        # g_num, n_size, k_size = layer.w2_weight_scale.shape
+        # layer.w2_weight_scale.data = layer.w2_weight_scale.data.reshape(g_num, n_size, k_size // 2, 2)
+        # layer.w13_weight_scale.data = layer.w13_weight_scale.data.transpose(1, 2)
+        # layer.w2_weight_scale.data = layer.w2_weight_scale.data.transpose(1, 2)
 
     def apply(
         self,

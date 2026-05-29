@@ -11,6 +11,7 @@ if TYPE_CHECKING:
 
 _is_npu = is_npu()
 _is_npu_before_atlas_a5 = is_npu_before_atlas_a5()
+_use_fp8_mlaprologue = True
 if _is_npu:
     import torch_npu
 
@@ -67,6 +68,9 @@ class _NPULinearMethodBase(LinearMethodBase):
 
 class NPUW8A8MxFp8LinearMethod(_NPULinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module):
+        layer.weight_original = layer.weight.clone()
+        layer.weight_scale_original = layer.weight_scale.clone()
+
         layer.weight.data = layer.weight.data.transpose(-1, -2).contiguous()
         layer.weight.data = npu_format_cast(layer.weight.data)
         weight_scale = layer.weight_scale.data.transpose(
@@ -75,6 +79,11 @@ class NPUW8A8MxFp8LinearMethod(_NPULinearMethodBase):
         k32, n = weight_scale.shape
         weight_scale = weight_scale.view(k32 // 2, 2, n).permute(0, 2, 1).contiguous()
         layer.weight_scale.data = weight_scale
+
+        # layer.weight.data = npu_format_cast(layer.weight.data).transpose(-1, -2)
+        # weight_scale = layer.weight_scale.data
+        # weight_scale = weight_scale.reshape(weight_scale.shape[0], weight_scale.shape[1] // 2, 2).transpose(0, 1)
+        # layer.weight_scale.data = weight_scale
 
     def apply(
         self,

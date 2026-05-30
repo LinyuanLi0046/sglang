@@ -120,6 +120,13 @@ class SchedulerOutputProcessorMixin:
                     elem = elem.copy()
                 req.customized_info[k].append(elem)
 
+    def _ensure_generation_result_ready_for_output(
+        self: Scheduler, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> GenerationBatchResult:
+        if getattr(result, "delay_sample_func", None) is not None:
+            self.launch_batch_sample_if_needed(batch, result)
+        return result
+
     def process_batch_result_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -128,6 +135,7 @@ class SchedulerOutputProcessorMixin:
         skip_stream_req = None
 
         if self.is_generation:
+            result = self._ensure_generation_result_ready_for_output(batch, result)
             if result.copy_done is not None:
                 result.copy_done.synchronize()
 
@@ -364,6 +372,7 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
+        result = self._ensure_generation_result_ready_for_output(batch, result)
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
@@ -376,6 +385,7 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
+        result = self._ensure_generation_result_ready_for_output(batch, result)
         if result.copy_done is not None:
             result.copy_done.synchronize()
 

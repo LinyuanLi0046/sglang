@@ -10,6 +10,7 @@ from sglang.srt.utils import is_cuda, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.scheduler import GenerationBatchResult
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -40,6 +41,30 @@ else:
 class FutureIndices:
     indices: torch.Tensor
     interval: Optional[slice] = None
+
+
+@dataclass
+class SpecV2FutureRelay:
+    future_indices: FutureIndices
+    new_seq_lens: torch.Tensor
+    verify_done: Optional[torch.cuda.Event] = None
+
+    def apply_to_draft_input(self, draft_input: EagleDraftInput) -> EagleDraftInput:
+        draft_input.attach_future_indices(self.future_indices)
+        if draft_input.new_seq_lens is None:
+            draft_input.new_seq_lens = self.new_seq_lens
+        if draft_input.verify_done is None:
+            draft_input.verify_done = self.verify_done
+        return draft_input
+
+    def apply_to_batch(
+        self, batch: ScheduleBatch, draft_input: EagleDraftInput
+    ) -> EagleDraftInput:
+        batch.spec_info = self.apply_to_draft_input(draft_input)
+        # The future value is consumed during next decode preparation.
+        # Keep the current strict seq_lens synchronization semantics unchanged.
+        batch.seq_lens = self.new_seq_lens
+        return batch.spec_info
 
 
 class FutureMap:
@@ -131,25 +156,37 @@ class FutureMap:
         if self.spec_algo.is_none():
             _resolve_future_token_ids(model_worker_batch.input_ids, self.token_ids_buf)
         else:
-            # TODO(lsyin): write future indices into spec_info.future_indices
             draft_input: EagleDraftInput = model_worker_batch.spec_info
             if draft_input is None:
                 # FIXME(lsyin): No future exists, only for prefill batch, not compatible with mixed mode
                 return
-            indices = draft_input.future_indices.indices
-            # The indices tensor was allocated on the default stream but is
-            # used here on the forward stream. Meanwhile, the old spec_info
-            # holding this tensor will lose all Python references (replaced at
-            # model_worker_batch.spec_info and batch.spec_info), so the
-            # caching allocator (torch GC) could reclaim the memory before
-            # the GPU finishes reading it.
-            indices.record_stream(torch.get_device_module(self.device).current_stream())
-            draft_input.future_topk_p_buf = self.topk_p_buf
-            draft_input.future_topk_index_buf = self.topk_index_buf
-            draft_input.future_verified_id_buf = self.verified_id_buf
-            draft_input.future_new_seq_lens_buf = self.new_seq_lens_buf
-            if spec_need_hidden_states():
-                draft_input.future_hidden_states_buf = self.hidden_states_buf
+            self.attach_spec_future_buffers(draft_input)
+
+    def attach_spec_future_buffers(self, draft_input: EagleDraftInput):
+        indices = draft_input.future_indices.indices
+        # The indices tensor was allocated on the default stream but is
+        # used here on the forward stream. Meanwhile, the old spec_info
+        # holding this tensor will lose all Python references (replaced at
+        # model_worker_batch.spec_info and batch.spec_info), so the
+        # caching allocator (torch GC) could reclaim the memory before
+        # the GPU finishes reading it.
+        indices.record_stream(torch.get_device_module(self.device).current_stream())
+        draft_input.future_topk_p_buf = self.topk_p_buf
+        draft_input.future_topk_index_buf = self.topk_index_buf
+        draft_input.future_verified_id_buf = self.verified_id_buf
+        draft_input.future_new_seq_lens_buf = self.new_seq_lens_buf
+        if spec_need_hidden_states():
+            draft_input.future_hidden_states_buf = self.hidden_states_buf
+
+    def build_spec_v2_future_relay(
+        self, future_indices: FutureIndices, batch_result: GenerationBatchResult
+    ) -> SpecV2FutureRelay:
+        draft_input: EagleDraftInput = batch_result.next_draft_input
+        return SpecV2FutureRelay(
+            future_indices=future_indices,
+            new_seq_lens=draft_input.new_seq_lens,
+            verify_done=draft_input.verify_done,
+        )
 
     def is_empty_slice(self, s: slice) -> bool:
         start, stop, step = s.indices(self.future_buffer_len)

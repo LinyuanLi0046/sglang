@@ -664,6 +664,10 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
 
+    def attach_future_indices(self, future_indices: FutureIndices) -> "EagleDraftInput":
+        self.future_indices = future_indices
+        return self
+
     def prepare_for_extend(self, batch: ScheduleBatch):
 
         if batch.forward_mode.is_idle():

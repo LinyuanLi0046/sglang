@@ -1192,6 +1192,17 @@ class Scheduler(
             batch_result.schedule_copy_to_cpu(self._get_generation_copy_policy(batch))
             batch_result.record_copy_done()
 
+    def _relay_spec_v2_overlap_result(
+        self,
+        batch: ScheduleBatch,
+        batch_result: GenerationBatchResult,
+        future_indices,
+    ):
+        future_relay = self.future_map.build_spec_v2_future_relay(
+            future_indices, batch_result
+        )
+        future_relay.apply_to_batch(batch, batch_result.next_draft_input)
+
     def _maybe_prepare_ngram_embedding(
         self, batch: Optional[ScheduleBatch]
     ) -> Optional[ScheduleBatch]:
@@ -2758,20 +2769,9 @@ class Scheduler(
                 future_indices_or_next_token_ids = -future_indices.indices
 
                 if batch.is_spec_v2:
-                    # FIXME(lsyin): tmp code for spec v2
-                    # We only keep future indices for next draft input
-
-                    batch.spec_info = batch_result.next_draft_input
-                    batch.spec_info.future_indices = future_indices
-
-                    # batch.spec_info = EagleDraftInput(
-                    #     future_indices=future_indices,
-                    #     verify_done=batch_result.next_draft_input.verify_done,
-                    # )
-
-                    # The future value, usually for next batch preparation
-                    # Current implementation strictly synchronizes the seq_lens
-                    batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+                    self._relay_spec_v2_overlap_result(
+                        batch, batch_result, future_indices
+                    )
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids

@@ -621,6 +621,15 @@ class EagleDraftWorker(BaseDraftWorker):
             ret_hidden_states,
         )
 
+        next_draft_input.last_verified_ids = next_draft_input.verified_id
+        if self.topk == 1 and next_draft_input.topk_index is not None:
+            # Placeholder migration phase 3:
+            # expose a minimal worker-side token_list payload so the future
+            # state pool can be populated without changing the old relay path.
+            next_draft_input.token_list = next_draft_input.topk_index.to(
+                torch.int32
+            ).repeat(1, self.speculative_num_steps)
+
 
 class EAGLEWorkerV2(BaseSpecWorker):
     def __init__(

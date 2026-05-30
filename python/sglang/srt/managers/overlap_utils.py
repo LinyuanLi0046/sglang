@@ -106,6 +106,27 @@ class SpecFutureStatePool:
             draft_input.token_list,
         )
 
+    def store_resolved_state(
+        self,
+        handle: SpecFutureHandle,
+        last_verified_ids: Optional[torch.Tensor],
+        token_list: Optional[torch.Tensor],
+    ) -> None:
+        if (
+            last_verified_ids is None
+            or token_list is None
+            or handle.future_indices.interval is None
+        ):
+            return
+
+        intv = handle.future_indices.interval
+        if self.future_buffer_len == 0:
+            return
+
+        self.future_last_verified_ids[intv] = last_verified_ids.to(torch.int32)
+        self.future_token_list[intv] = token_list.to(torch.int32)
+        self.future_ready[intv] = True
+
 
 @dataclass
 class SpecV2FutureRelay:
@@ -249,6 +270,18 @@ class FutureMap:
         if self.spec_future_state_pool is None:
             return
         self.spec_future_state_pool.resolve_placeholder(draft_input)
+
+    def store_spec_future_state(
+        self, future_indices: FutureIndices, draft_input: Optional[EagleDraftInput]
+    ) -> None:
+        if self.spec_future_state_pool is None or draft_input is None:
+            return
+
+        self.spec_future_state_pool.store_resolved_state(
+            SpecFutureHandle(future_indices=future_indices),
+            last_verified_ids=draft_input.last_verified_ids,
+            token_list=draft_input.token_list,
+        )
 
     def attach_spec_future_buffers(self, draft_input: EagleDraftInput):
         indices = draft_input.future_indices.indices

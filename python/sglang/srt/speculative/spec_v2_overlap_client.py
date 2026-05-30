@@ -59,6 +59,9 @@ class SpecV2OverlapWorkerClient:
                     model_worker_batch
                     # here pp is not compatible with overlap
                 )
+            scheduler.future_map.store_spec_future_state(
+                future_indices, batch_result.next_draft_input
+            )
             if batch_result.delay_sample_func is None:
                 scheduler.future_map.store_to_map(future_indices, batch_result)
                 scheduler._schedule_generation_batch_result_copy(batch, batch_result)

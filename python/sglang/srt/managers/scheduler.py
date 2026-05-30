@@ -208,11 +208,12 @@ from sglang.srt.observability.scheduler_metrics_mixin import (
     SchedulerMetricsMixin,
 )
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+from sglang.srt.overlap.non_spec_overlap_executor import NonSpecOverlapExecutor
+from sglang.srt.overlap.spec_v2_overlap_executor import SpecV2OverlapExecutor
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_v2_overlap_client import SpecV2OverlapWorkerClient
 from sglang.srt.utils import (
     DynamicGradMode,
     broadcast_pyobj,
@@ -1142,7 +1143,8 @@ class Scheduler(
 
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
-        self.spec_v2_overlap_client = None
+        self.non_spec_overlap_executor = None
+        self.spec_v2_overlap_executor = None
 
         self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.forward_stream
@@ -1163,8 +1165,9 @@ class Scheduler(
             self.device,
             self.spec_algorithm,
         )
+        self.non_spec_overlap_executor = NonSpecOverlapExecutor(self)
         if self.spec_algorithm.supports_spec_v2():
-            self.spec_v2_overlap_client = SpecV2OverlapWorkerClient(self)
+            self.spec_v2_overlap_executor = SpecV2OverlapExecutor(self)
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
 
@@ -1212,37 +1215,15 @@ class Scheduler(
         batch: ScheduleBatch,
         model_worker_batch: ModelWorkerBatch,
     ) -> Tuple[GenerationBatchResult, torch.Tensor]:
+        executor = self.non_spec_overlap_executor
         if batch.is_spec_v2:
-            return self.spec_v2_overlap_client.submit(batch, model_worker_batch)
+            executor = self.spec_v2_overlap_executor
 
-        self.record_batch_in_overlap(model_worker_batch)
-
-        # Sampling info will be modified during forward, so we store a copy.
-        model_worker_batch.sampling_info = (
-            model_worker_batch.sampling_info.copy_for_forward()
+        exec_result = executor.submit(batch, model_worker_batch)
+        return (
+            exec_result.batch_result,
+            exec_result.future_indices_or_next_token_ids,
         )
-
-        bs = len(model_worker_batch.seq_lens)
-        future_indices = self.future_map.alloc_future_indices(bs)
-
-        with self.forward_stream_ctx, self.record_bubble_metrics(batch):
-            self.forward_stream.wait_stream(self.schedule_stream)
-            self.future_map.resolve_future(model_worker_batch)
-            with self.record_forward_metrics(batch):
-                batch_result = self.model_worker.forward_batch_generation(
-                    model_worker_batch
-                    # here pp is not compatible with overlap
-                )
-            if batch_result.delay_sample_func is None:
-                self.future_map.store_to_map(future_indices, batch_result)
-                self._schedule_generation_batch_result_copy(batch, batch_result)
-            else:
-                batch_result.copy_done = self.device_module.Event()
-                batch_result.future_indices = future_indices
-
-        # FIXME(lsyin): move this assignment elsewhere
-        future_indices_or_next_token_ids = -future_indices.indices
-        return batch_result, future_indices_or_next_token_ids
 
     def _finalize_generation_batch_result(
         self,

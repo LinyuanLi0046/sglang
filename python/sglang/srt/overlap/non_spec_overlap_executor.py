@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from sglang.srt.overlap.base_executor import OverlapExecutionResult
+from sglang.srt.overlap.tp_worker_client_v2 import TpWorkerClientV2
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
@@ -14,8 +15,20 @@ class NonSpecOverlapExecutor:
 
     def __init__(self, scheduler: "Scheduler"):
         self.scheduler = scheduler
+        self.worker_client: TpWorkerClientV2[OverlapExecutionResult] = TpWorkerClientV2(
+            "non-spec"
+        )
 
     def submit(
+        self,
+        batch: "ScheduleBatch",
+        model_worker_batch: "ModelWorkerBatch",
+    ) -> OverlapExecutionResult:
+        return self.worker_client.submit(
+            lambda: self._run_in_worker(batch, model_worker_batch)
+        )
+
+    def _run_in_worker(
         self,
         batch: "ScheduleBatch",
         model_worker_batch: "ModelWorkerBatch",

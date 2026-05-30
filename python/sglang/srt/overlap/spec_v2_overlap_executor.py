@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from sglang.srt.overlap.base_executor import OverlapExecutionResult
+from sglang.srt.overlap.base_executor import OverlapExecutionResult, PendingOverlapResult
 from sglang.srt.overlap.tp_worker_client_v2 import TpWorkerClientV2
 from sglang.srt.speculative.spec_v2_overlap_client import SpecV2OverlapWorkerClient
 
@@ -28,19 +28,38 @@ class SpecV2OverlapExecutor:
         batch: "ScheduleBatch",
         model_worker_batch: "ModelWorkerBatch",
     ) -> OverlapExecutionResult:
-        return self.worker_client.submit(
-            lambda: self._run_in_worker(batch, model_worker_batch)
+        scheduler = self.scheduler
+
+        scheduler.record_batch_in_overlap(model_worker_batch)
+
+        # Sampling info will be modified during forward, so we store a copy.
+        model_worker_batch.sampling_info = (
+            model_worker_batch.sampling_info.copy_for_forward()
+        )
+        bs = len(model_worker_batch.seq_lens)
+        future_indices = scheduler.future_map.alloc_future_indices(bs)
+        future_indices_or_next_token_ids = -future_indices.indices
+
+        pending_result = PendingOverlapResult(
+            async_handle=self.worker_client.submit_async(
+                lambda: self._run_in_worker(
+                    batch, model_worker_batch, future_indices
+                )
+            ),
+            future_indices_or_next_token_ids=future_indices_or_next_token_ids,
+        )
+        return OverlapExecutionResult(
+            batch_result=pending_result,
+            future_indices_or_next_token_ids=future_indices_or_next_token_ids,
         )
 
     def _run_in_worker(
         self,
         batch: "ScheduleBatch",
         model_worker_batch: "ModelWorkerBatch",
+        future_indices,
     ) -> OverlapExecutionResult:
-        batch_result, future_indices_or_next_token_ids = self.client.submit(
-            batch, model_worker_batch
+        batch_result = self.client.run_with_future_indices(
+            batch, model_worker_batch, future_indices
         )
-        return OverlapExecutionResult(
-            batch_result=batch_result,
-            future_indices_or_next_token_ids=future_indices_or_next_token_ids,
-        )
+        return batch_result

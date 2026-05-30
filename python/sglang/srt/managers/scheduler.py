@@ -208,6 +208,7 @@ from sglang.srt.observability.scheduler_metrics_mixin import (
     SchedulerMetricsMixin,
 )
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+from sglang.srt.overlap.base_executor import PendingOverlapResult
 from sglang.srt.overlap.non_spec_overlap_executor import NonSpecOverlapExecutor
 from sglang.srt.overlap.spec_v2_overlap_executor import SpecV2OverlapExecutor
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -1241,15 +1242,35 @@ class Scheduler(
         # modified by overlap schedule. So we have to copy them here so that
         # we can use the correct values in output processing.
         if batch.return_logprob:
-            batch_result.extend_input_len_per_req = [
-                req.extend_input_len for req in batch.reqs
-            ]
-            batch_result.extend_logprob_start_len_per_req = [
+            extend_input_len_per_req = [req.extend_input_len for req in batch.reqs]
+            extend_logprob_start_len_per_req = [
                 req.extend_logprob_start_len for req in batch.reqs
             ]
+            if isinstance(batch_result, PendingOverlapResult):
+                batch_result.set_logprob_metadata(
+                    extend_input_len_per_req, extend_logprob_start_len_per_req
+                )
+            else:
+                batch_result.extend_input_len_per_req = extend_input_len_per_req
+                batch_result.extend_logprob_start_len_per_req = (
+                    extend_logprob_start_len_per_req
+                )
         else:
-            batch_result.extend_input_len_per_req = None
-            batch_result.extend_logprob_start_len_per_req = None
+            if isinstance(batch_result, PendingOverlapResult):
+                batch_result.set_logprob_metadata(None, None)
+            else:
+                batch_result.extend_input_len_per_req = None
+                batch_result.extend_logprob_start_len_per_req = None
+
+    def _resolve_overlap_batch_result_if_needed(
+        self,
+        result: Optional[
+            Union[GenerationBatchResult, EmbeddingBatchResult, PendingOverlapResult]
+        ],
+    ) -> Optional[Union[GenerationBatchResult, EmbeddingBatchResult]]:
+        if isinstance(result, PendingOverlapResult):
+            return result.resolve()
+        return result
 
     def _maybe_prepare_ngram_embedding(
         self, batch: Optional[ScheduleBatch]
@@ -1450,12 +1471,20 @@ class Scheduler(
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.result_queue: Deque[
-            Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
+            Tuple[
+                ScheduleBatch,
+                Union[
+                    GenerationBatchResult,
+                    EmbeddingBatchResult,
+                    PendingOverlapResult,
+                ],
+            ]
         ] = deque()
 
         def pop_and_process():
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
+            tmp_result = self._resolve_overlap_batch_result_if_needed(tmp_result)
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
@@ -1494,6 +1523,7 @@ class Scheduler(
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
+                batch_result = self._resolve_overlap_batch_result_if_needed(batch_result)
                 self.launch_batch_sample_if_needed(batch_result)
 
             # Update last_batch

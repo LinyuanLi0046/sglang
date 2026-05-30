@@ -37,6 +37,19 @@ class SpecV2OverlapWorkerClient:
 
         bs = len(model_worker_batch.seq_lens)
         future_indices = scheduler.future_map.alloc_future_indices(bs)
+        batch_result = self.run_with_future_indices(
+            batch, model_worker_batch, future_indices
+        )
+        future_indices_or_next_token_ids = -future_indices.indices
+        return batch_result, future_indices_or_next_token_ids
+
+    def run_with_future_indices(
+        self,
+        batch: ScheduleBatch,
+        model_worker_batch: ModelWorkerBatch,
+        future_indices,
+    ) -> GenerationBatchResult:
+        scheduler = self.scheduler
 
         with scheduler.forward_stream_ctx, scheduler.record_bubble_metrics(batch):
             scheduler.forward_stream.wait_stream(scheduler.schedule_stream)
@@ -55,5 +68,4 @@ class SpecV2OverlapWorkerClient:
                 batch_result.future_indices = future_indices
 
         scheduler._relay_spec_v2_overlap_result(batch, batch_result, future_indices)
-        future_indices_or_next_token_ids = -future_indices.indices
-        return batch_result, future_indices_or_next_token_ids
+        return batch_result

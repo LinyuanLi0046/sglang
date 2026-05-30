@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from sglang.srt.overlap.base_executor import OverlapExecutionResult
+from sglang.srt.overlap.base_executor import OverlapExecutionResult, PendingOverlapResult
 from sglang.srt.overlap.tp_worker_client_v2 import TpWorkerClientV2
 
 if TYPE_CHECKING:
@@ -26,15 +26,6 @@ class NonSpecOverlapExecutor:
         batch: "ScheduleBatch",
         model_worker_batch: "ModelWorkerBatch",
     ) -> OverlapExecutionResult:
-        return self.worker_client.submit(
-            lambda: self._run_in_worker(batch, model_worker_batch)
-        )
-
-    def _run_in_worker(
-        self,
-        batch: "ScheduleBatch",
-        model_worker_batch: "ModelWorkerBatch",
-    ) -> OverlapExecutionResult:
         scheduler = self.scheduler
 
         scheduler.record_batch_in_overlap(model_worker_batch)
@@ -43,9 +34,28 @@ class NonSpecOverlapExecutor:
         model_worker_batch.sampling_info = (
             model_worker_batch.sampling_info.copy_for_forward()
         )
-
         bs = len(model_worker_batch.seq_lens)
         future_indices = scheduler.future_map.alloc_future_indices(bs)
+        future_indices_or_next_token_ids = -future_indices.indices
+
+        pending_result = PendingOverlapResult(
+            async_handle=self.worker_client.submit_async(
+                lambda: self._run_in_worker(batch, model_worker_batch, future_indices)
+            ),
+            future_indices_or_next_token_ids=future_indices_or_next_token_ids,
+        )
+        return OverlapExecutionResult(
+            batch_result=pending_result,
+            future_indices_or_next_token_ids=future_indices_or_next_token_ids,
+        )
+
+    def _run_in_worker(
+        self,
+        batch: "ScheduleBatch",
+        model_worker_batch: "ModelWorkerBatch",
+        future_indices,
+    ) -> OverlapExecutionResult:
+        scheduler = self.scheduler
 
         with scheduler.forward_stream_ctx, scheduler.record_bubble_metrics(batch):
             scheduler.forward_stream.wait_stream(scheduler.schedule_stream)
@@ -63,7 +73,4 @@ class NonSpecOverlapExecutor:
                     batch_result.copy_done = scheduler.device_module.Event()
                 batch_result.future_indices = future_indices
 
-        return OverlapExecutionResult(
-            batch_result=batch_result,
-            future_indices_or_next_token_ids=-future_indices.indices,
-        )
+        return batch_result

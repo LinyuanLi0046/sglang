@@ -1272,6 +1272,17 @@ class Scheduler(
             return result.resolve()
         return result
 
+    def _resolve_last_batch_before_next_schedule_if_needed(self):
+        if not self.result_queue:
+            return
+        queued_batch, queued_result = self.result_queue[0]
+        if not isinstance(queued_result, PendingOverlapResult):
+            return
+        if not queued_result.requires_resolve_before_next_schedule:
+            return
+        resolved_result = queued_result.resolve()
+        self.result_queue[0] = (queued_batch, resolved_result)
+
     def _maybe_prepare_ngram_embedding(
         self, batch: Optional[ScheduleBatch]
     ) -> Optional[ScheduleBatch]:
@@ -1493,6 +1504,8 @@ class Scheduler(
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
+
+            self._resolve_last_batch_before_next_schedule_if_needed()
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()

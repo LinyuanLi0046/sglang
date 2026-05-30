@@ -212,6 +212,7 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_v2_overlap_client import SpecV2OverlapWorkerClient
 from sglang.srt.utils import (
     DynamicGradMode,
     broadcast_pyobj,
@@ -1141,6 +1142,7 @@ class Scheduler(
 
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
+        self.spec_v2_overlap_client = None
 
         self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.forward_stream
@@ -1161,6 +1163,8 @@ class Scheduler(
             self.device,
             self.spec_algorithm,
         )
+        if self.spec_algorithm.supports_spec_v2():
+            self.spec_v2_overlap_client = SpecV2OverlapWorkerClient(self)
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
 
@@ -2740,38 +2744,40 @@ class Scheduler(
 
             if self.enable_overlap:
                 model_worker_batch = worker_batch_or_batch
-                self.record_batch_in_overlap(model_worker_batch)
-
-                # Sampling info will be modified during forward, so we store a copy.
-                model_worker_batch.sampling_info = (
-                    model_worker_batch.sampling_info.copy_for_forward()
-                )
-
-                bs = len(model_worker_batch.seq_lens)
-                future_indices = self.future_map.alloc_future_indices(bs)
-
-                with self.forward_stream_ctx, self.record_bubble_metrics(batch):
-                    self.forward_stream.wait_stream(self.schedule_stream)
-                    self.future_map.resolve_future(model_worker_batch)
-                    with self.record_forward_metrics(batch):
-                        batch_result = self.model_worker.forward_batch_generation(
-                            model_worker_batch
-                            # here pp is not compatible with overlap
-                        )
-                    if batch_result.delay_sample_func is None:
-                        self.future_map.store_to_map(future_indices, batch_result)
-                        self._schedule_generation_batch_result_copy(batch, batch_result)
-                    else:
-                        batch_result.copy_done = self.device_module.Event()
-                        batch_result.future_indices = future_indices
-
-                # FIXME(lsyin): move this assignment elsewhere
-                future_indices_or_next_token_ids = -future_indices.indices
-
                 if batch.is_spec_v2:
-                    self._relay_spec_v2_overlap_result(
-                        batch, batch_result, future_indices
+                    batch_result, future_indices_or_next_token_ids = (
+                        self.spec_v2_overlap_client.submit(batch, model_worker_batch)
                     )
+                else:
+                    self.record_batch_in_overlap(model_worker_batch)
+
+                    # Sampling info will be modified during forward, so we store a copy.
+                    model_worker_batch.sampling_info = (
+                        model_worker_batch.sampling_info.copy_for_forward()
+                    )
+
+                    bs = len(model_worker_batch.seq_lens)
+                    future_indices = self.future_map.alloc_future_indices(bs)
+
+                    with self.forward_stream_ctx, self.record_bubble_metrics(batch):
+                        self.forward_stream.wait_stream(self.schedule_stream)
+                        self.future_map.resolve_future(model_worker_batch)
+                        with self.record_forward_metrics(batch):
+                            batch_result = self.model_worker.forward_batch_generation(
+                                model_worker_batch
+                                # here pp is not compatible with overlap
+                            )
+                        if batch_result.delay_sample_func is None:
+                            self.future_map.store_to_map(future_indices, batch_result)
+                            self._schedule_generation_batch_result_copy(
+                                batch, batch_result
+                            )
+                        else:
+                            batch_result.copy_done = self.device_module.Event()
+                            batch_result.future_indices = future_indices
+
+                    # FIXME(lsyin): move this assignment elsewhere
+                    future_indices_or_next_token_ids = -future_indices.indices
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids

@@ -185,7 +185,11 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
 from sglang.srt.managers.session_controller import SessionController
-from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
+from sglang.srt.managers.utils import (
+    CopyPolicy,
+    GenerationBatchResult,
+    validate_input_length,
+)
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -1167,6 +1171,26 @@ class Scheduler(
             hf_config = self.tp_worker.model_config.hf_config
             self.ngram_embedding_n = hf_config.ngram_embedding_n
             self.ngram_embedding_k = hf_config.ngram_embedding_k
+
+    def _get_generation_copy_policy(self, batch: ScheduleBatch) -> CopyPolicy:
+        return CopyPolicy(
+            copy_next_token_ids=True,
+            copy_accept_lens=batch.is_spec_v2,
+            copy_hidden_states=batch.return_hidden_states,
+            copy_logprobs=batch.return_logprob,
+            copy_expert_metrics=self.enable_metrics,
+        )
+
+    def _schedule_generation_batch_result_copy(
+        self, batch: ScheduleBatch, batch_result: GenerationBatchResult
+    ):
+        if batch_result.copy_done is None:
+            batch_result.copy_done = self.device_module.Event()
+
+        with self.copy_stream_ctx:
+            self.copy_stream.wait_stream(self.forward_stream)
+            batch_result.schedule_copy_to_cpu(self._get_generation_copy_policy(batch))
+            batch_result.record_copy_done()
 
     def _maybe_prepare_ngram_embedding(
         self, batch: Optional[ScheduleBatch]
@@ -2723,12 +2747,11 @@ class Scheduler(
                             model_worker_batch
                             # here pp is not compatible with overlap
                         )
-                    # FIXME(lsyin): maybe move this to forward_batch_generation
-                    batch_result.copy_done = self.device_module.Event()
                     if batch_result.delay_sample_func is None:
                         self.future_map.store_to_map(future_indices, batch_result)
-                        batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
+                        self._schedule_generation_batch_result_copy(batch, batch_result)
                     else:
+                        batch_result.copy_done = self.device_module.Event()
                         batch_result.future_indices = future_indices
 
                 # FIXME(lsyin): move this assignment elsewhere
@@ -2834,7 +2857,7 @@ class Scheduler(
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
             self.future_map.store_to_map(batch_result.future_indices, batch_result)
-            batch_result.copy_to_cpu(return_logprob=self.cur_batch.return_logprob)
+        self._schedule_generation_batch_result_copy(self.cur_batch, batch_result)
 
         # Release the closure and large GPU tensors that are no longer needed.
         # The delay_sample_func closure captures forward_batch (which holds

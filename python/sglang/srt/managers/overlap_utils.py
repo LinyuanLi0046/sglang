@@ -44,6 +44,70 @@ class FutureIndices:
 
 
 @dataclass
+class SpecFutureHandle:
+    future_indices: FutureIndices
+
+
+class SpecFutureStatePool:
+    def __init__(
+        self,
+        future_buffer_len: int,
+        speculative_num_steps: int,
+        device: torch.device,
+    ):
+        self.future_buffer_len = future_buffer_len
+        self.speculative_num_steps = speculative_num_steps
+        self.device = device
+        self.future_last_verified_ids = torch.zeros(
+            (future_buffer_len,), dtype=torch.int32, device=device
+        )
+        self.future_token_list = torch.zeros(
+            (future_buffer_len, speculative_num_steps),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.future_ready = torch.zeros(
+            (future_buffer_len,), dtype=torch.bool, device=device
+        )
+
+    def alloc_handle(self, future_indices: FutureIndices) -> SpecFutureHandle:
+        if future_indices.interval is not None:
+            self.future_ready[future_indices.interval] = False
+        return SpecFutureHandle(future_indices=future_indices)
+
+    def create_placeholder_inputs(
+        self, handle: SpecFutureHandle
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        placeholder_ids = -handle.future_indices.indices.to(dtype=torch.int32)
+        placeholder_token_list = placeholder_ids.unsqueeze(1).repeat(
+            1, self.speculative_num_steps
+        )
+        return placeholder_ids, placeholder_token_list
+
+    def resolve_placeholder(self, draft_input: EagleDraftInput) -> None:
+        if (
+            not draft_input.uses_future_placeholder
+            or draft_input.last_verified_ids is None
+            or draft_input.token_list is None
+        ):
+            return
+
+        indices = torch.clamp(-draft_input.last_verified_ids.to(dtype=torch.int64), min=0)
+        ready_mask = self.future_ready[indices]
+
+        draft_input.last_verified_ids[:] = torch.where(
+            ready_mask & (draft_input.last_verified_ids < 0),
+            self.future_last_verified_ids[indices],
+            draft_input.last_verified_ids,
+        )
+        draft_input.token_list[:] = torch.where(
+            ready_mask.unsqueeze(1) & (draft_input.token_list < 0),
+            self.future_token_list[indices],
+            draft_input.token_list,
+        )
+
+
+@dataclass
 class SpecV2FutureRelay:
     future_indices: FutureIndices
     new_seq_lens: torch.Tensor
@@ -104,6 +168,7 @@ class FutureMap:
             # For speculative decoding, we lazily initialize the buffers
             # This is to make the shape derivation easier.
             self.buf_initialized = False
+            self.spec_future_state_pool: Optional[SpecFutureStatePool] = None
 
     def _lazy_init_buf(self, draft_input: EagleDraftInput):
         self.buf_initialized = True
@@ -161,6 +226,29 @@ class FutureMap:
                 # FIXME(lsyin): No future exists, only for prefill batch, not compatible with mixed mode
                 return
             self.attach_spec_future_buffers(draft_input)
+            self.resolve_spec_future_placeholder(draft_input)
+
+    def ensure_spec_future_state_pool(
+        self, speculative_num_steps: int
+    ) -> SpecFutureStatePool:
+        if self.spec_algo.is_none():
+            raise RuntimeError(
+                "SpecFutureStatePool is only available for speculative decoding."
+            )
+
+        if self.spec_future_state_pool is None:
+            self.spec_future_state_pool = SpecFutureStatePool(
+                future_buffer_len=self.future_buffer_len,
+                speculative_num_steps=speculative_num_steps,
+                device=self.device,
+            )
+
+        return self.spec_future_state_pool
+
+    def resolve_spec_future_placeholder(self, draft_input: EagleDraftInput) -> None:
+        if self.spec_future_state_pool is None:
+            return
+        self.spec_future_state_pool.resolve_placeholder(draft_input)
 
     def attach_spec_future_buffers(self, draft_input: EagleDraftInput):
         indices = draft_input.future_indices.indices

@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 from sglang.srt.overlap.base_executor import OverlapExecutionResult, PendingOverlapResult
 from sglang.srt.overlap.tp_worker_client_v2 import TpWorkerClientV2
+from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_v2_overlap_client import SpecV2OverlapWorkerClient
 
 if TYPE_CHECKING:
@@ -38,6 +39,7 @@ class SpecV2OverlapExecutor:
         )
         bs = len(model_worker_batch.seq_lens)
         future_indices = scheduler.future_map.alloc_future_indices(bs)
+        self._install_future_placeholder(batch, future_indices)
         future_indices_or_next_token_ids = -future_indices.indices
 
         pending_result = PendingOverlapResult(
@@ -65,3 +67,22 @@ class SpecV2OverlapExecutor:
             batch, model_worker_batch, future_indices
         )
         return batch_result
+
+    def _install_future_placeholder(self, batch: "ScheduleBatch", future_indices) -> None:
+        scheduler = self.scheduler
+        speculative_num_steps = max(
+            int(scheduler.server_args.speculative_num_steps or 0), 1
+        )
+        future_state_pool = scheduler.future_map.ensure_spec_future_state_pool(
+            speculative_num_steps
+        )
+        future_handle = future_state_pool.alloc_handle(future_indices)
+        last_verified_ids, token_list = future_state_pool.create_placeholder_inputs(
+            future_handle
+        )
+        batch.spec_info = EagleDraftInput.create_future_placeholder_input(
+            future_handle=future_handle,
+            last_verified_ids=last_verified_ids,
+            token_list=token_list,
+            new_seq_lens=batch.seq_lens.clone(),
+        )

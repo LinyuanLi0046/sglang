@@ -11,7 +11,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
-from sglang.srt.managers.overlap_utils import FutureIndices
+from sglang.srt.managers.overlap_utils import FutureIndices, SpecFutureHandle
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import (
@@ -657,6 +657,10 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     future_hidden_states_buf: Optional[torch.Tensor] = None
     future_verified_id_buf: Optional[torch.Tensor] = None
     future_new_seq_lens_buf: Optional[torch.Tensor] = None
+    uses_future_placeholder: bool = False
+    future_handle: Optional[SpecFutureHandle] = None
+    last_verified_ids: Optional[torch.Tensor] = None
+    token_list: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
@@ -666,6 +670,18 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
     def attach_future_indices(self, future_indices: FutureIndices) -> "EagleDraftInput":
         self.future_indices = future_indices
+        return self
+
+    def attach_future_placeholder(
+        self,
+        future_handle: SpecFutureHandle,
+        last_verified_ids: torch.Tensor,
+        token_list: torch.Tensor,
+    ) -> "EagleDraftInput":
+        self.uses_future_placeholder = True
+        self.future_handle = future_handle
+        self.last_verified_ids = last_verified_ids
+        self.token_list = token_list
         return self
 
     def prepare_for_extend(self, batch: ScheduleBatch):
@@ -703,6 +719,24 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             accept_length=torch.empty((0,), device=device, dtype=torch.int32),
             accept_length_cpu=[],
         )
+
+    @classmethod
+    def create_future_placeholder_input(
+        cls,
+        future_handle: SpecFutureHandle,
+        last_verified_ids: torch.Tensor,
+        token_list: torch.Tensor,
+        new_seq_lens: Optional[torch.Tensor] = None,
+        verify_done: Optional[torch.cuda.Event] = None,
+    ) -> "EagleDraftInput":
+        return cls(
+            new_seq_lens=new_seq_lens,
+            verify_done=verify_done,
+            uses_future_placeholder=True,
+            future_handle=future_handle,
+            last_verified_ids=last_verified_ids,
+            token_list=token_list,
+        ).attach_future_indices(future_handle.future_indices)
 
     def prepare_extend_after_decode(
         self,
@@ -771,6 +805,11 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if self.future_indices is not None:
             self.future_indices.indices = self.future_indices.indices[new_indices]
+            if self.uses_future_placeholder:
+                if self.last_verified_ids is not None:
+                    self.last_verified_ids = self.last_verified_ids[new_indices]
+                if self.token_list is not None:
+                    self.token_list = self.token_list[new_indices]
             return
 
         strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
@@ -803,6 +842,19 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                     [self.future_indices.indices, spec_info.future_indices.indices]
                 )
             )
+            if self.uses_future_placeholder or spec_info.uses_future_placeholder:
+                self.uses_future_placeholder = True
+                self.future_handle = None
+                if self.last_verified_ids is None:
+                    self.last_verified_ids = spec_info.last_verified_ids
+                elif spec_info.last_verified_ids is not None:
+                    self.last_verified_ids = torch.cat(
+                        [self.last_verified_ids, spec_info.last_verified_ids]
+                    )
+                if self.token_list is None:
+                    self.token_list = spec_info.token_list
+                elif spec_info.token_list is not None:
+                    self.token_list = torch.cat([self.token_list, spec_info.token_list])
             return
 
         if self.hidden_states is None:

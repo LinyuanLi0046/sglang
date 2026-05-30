@@ -1207,6 +1207,69 @@ class Scheduler(
         )
         future_relay.apply_to_batch(batch, batch_result.next_draft_input)
 
+    def _run_generation_batch_overlap(
+        self,
+        batch: ScheduleBatch,
+        model_worker_batch: ModelWorkerBatch,
+    ) -> Tuple[GenerationBatchResult, torch.Tensor]:
+        if batch.is_spec_v2:
+            return self.spec_v2_overlap_client.submit(batch, model_worker_batch)
+
+        self.record_batch_in_overlap(model_worker_batch)
+
+        # Sampling info will be modified during forward, so we store a copy.
+        model_worker_batch.sampling_info = (
+            model_worker_batch.sampling_info.copy_for_forward()
+        )
+
+        bs = len(model_worker_batch.seq_lens)
+        future_indices = self.future_map.alloc_future_indices(bs)
+
+        with self.forward_stream_ctx, self.record_bubble_metrics(batch):
+            self.forward_stream.wait_stream(self.schedule_stream)
+            self.future_map.resolve_future(model_worker_batch)
+            with self.record_forward_metrics(batch):
+                batch_result = self.model_worker.forward_batch_generation(
+                    model_worker_batch
+                    # here pp is not compatible with overlap
+                )
+            if batch_result.delay_sample_func is None:
+                self.future_map.store_to_map(future_indices, batch_result)
+                self._schedule_generation_batch_result_copy(batch, batch_result)
+            else:
+                batch_result.copy_done = self.device_module.Event()
+                batch_result.future_indices = future_indices
+
+        # FIXME(lsyin): move this assignment elsewhere
+        future_indices_or_next_token_ids = -future_indices.indices
+        return batch_result, future_indices_or_next_token_ids
+
+    def _finalize_generation_batch_result(
+        self,
+        batch: ScheduleBatch,
+        batch_result: GenerationBatchResult,
+        future_indices_or_next_token_ids,
+    ):
+        # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
+        #       which can probably be replaced by future_indices later [TODO(lsyin)].
+        #       we shall still keep the original outputs, e.g. next_token_ids
+        #       in the GenerationBatchOutput for processing after copy_done.
+        batch.output_ids = future_indices_or_next_token_ids
+
+        # These 2 values are needed for processing the output, but the values can be
+        # modified by overlap schedule. So we have to copy them here so that
+        # we can use the correct values in output processing.
+        if batch.return_logprob:
+            batch_result.extend_input_len_per_req = [
+                req.extend_input_len for req in batch.reqs
+            ]
+            batch_result.extend_logprob_start_len_per_req = [
+                req.extend_logprob_start_len for req in batch.reqs
+            ]
+        else:
+            batch_result.extend_input_len_per_req = None
+            batch_result.extend_logprob_start_len_per_req = None
+
     def _maybe_prepare_ngram_embedding(
         self, batch: Optional[ScheduleBatch]
     ) -> Optional[ScheduleBatch]:
@@ -2744,40 +2807,9 @@ class Scheduler(
 
             if self.enable_overlap:
                 model_worker_batch = worker_batch_or_batch
-                if batch.is_spec_v2:
-                    batch_result, future_indices_or_next_token_ids = (
-                        self.spec_v2_overlap_client.submit(batch, model_worker_batch)
-                    )
-                else:
-                    self.record_batch_in_overlap(model_worker_batch)
-
-                    # Sampling info will be modified during forward, so we store a copy.
-                    model_worker_batch.sampling_info = (
-                        model_worker_batch.sampling_info.copy_for_forward()
-                    )
-
-                    bs = len(model_worker_batch.seq_lens)
-                    future_indices = self.future_map.alloc_future_indices(bs)
-
-                    with self.forward_stream_ctx, self.record_bubble_metrics(batch):
-                        self.forward_stream.wait_stream(self.schedule_stream)
-                        self.future_map.resolve_future(model_worker_batch)
-                        with self.record_forward_metrics(batch):
-                            batch_result = self.model_worker.forward_batch_generation(
-                                model_worker_batch
-                                # here pp is not compatible with overlap
-                            )
-                        if batch_result.delay_sample_func is None:
-                            self.future_map.store_to_map(future_indices, batch_result)
-                            self._schedule_generation_batch_result_copy(
-                                batch, batch_result
-                            )
-                        else:
-                            batch_result.copy_done = self.device_module.Event()
-                            batch_result.future_indices = future_indices
-
-                    # FIXME(lsyin): move this assignment elsewhere
-                    future_indices_or_next_token_ids = -future_indices.indices
+                batch_result, future_indices_or_next_token_ids = (
+                    self._run_generation_batch_overlap(batch, model_worker_batch)
+                )
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
@@ -2794,26 +2826,9 @@ class Scheduler(
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
 
-            # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
-            #       which can probably be replaced by future_indices later [TODO(lsyin)].
-            #       we shall still keep the original outputs, e.g. next_token_ids
-            #       in the GenerationBatchOutput for processing after copy_done.
-            batch.output_ids = future_indices_or_next_token_ids
-
-            # These 2 values are needed for processing the output, but the values can be
-            # modified by overlap schedule. So we have to copy them here so that
-            # we can use the correct values in output processing.
-            if batch.return_logprob:
-                batch_result.extend_input_len_per_req = [
-                    req.extend_input_len for req in batch.reqs
-                ]
-                batch_result.extend_logprob_start_len_per_req = [
-                    req.extend_logprob_start_len for req in batch.reqs
-                ]
-            else:
-                batch_result.extend_input_len_per_req = None
-                batch_result.extend_logprob_start_len_per_req = None
-
+            self._finalize_generation_batch_result(
+                batch, batch_result, future_indices_or_next_token_ids
+            )
             ret = batch_result
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()

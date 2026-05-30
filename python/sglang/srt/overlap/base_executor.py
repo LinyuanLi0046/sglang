@@ -23,6 +23,7 @@ class OverlapExecutor(Protocol):
 class PendingOverlapResult:
     async_handle: AsyncResultHandle[GenerationBatchResult]
     future_indices_or_next_token_ids: torch.Tensor
+    requires_current_batch_resolve_for_sampling: bool = False
     extend_input_len_per_req: Optional[list[int]] = None
     extend_logprob_start_len_per_req: Optional[list[int]] = None
     _resolved_batch_result: Optional[GenerationBatchResult] = None

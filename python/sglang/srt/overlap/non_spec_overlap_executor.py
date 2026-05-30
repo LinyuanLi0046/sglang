@@ -37,12 +37,19 @@ class NonSpecOverlapExecutor:
         bs = len(model_worker_batch.seq_lens)
         future_indices = scheduler.future_map.alloc_future_indices(bs)
         future_indices_or_next_token_ids = -future_indices.indices
+        requires_current_batch_resolve_for_sampling = (
+            model_worker_batch.sampling_info is not None
+            and model_worker_batch.sampling_info.grammars is not None
+        )
 
         pending_result = PendingOverlapResult(
             async_handle=self.worker_client.submit_async(
                 lambda: self._run_in_worker(batch, model_worker_batch, future_indices)
             ),
             future_indices_or_next_token_ids=future_indices_or_next_token_ids,
+            requires_current_batch_resolve_for_sampling=(
+                requires_current_batch_resolve_for_sampling
+            ),
         )
         return OverlapExecutionResult(
             batch_result=pending_result,

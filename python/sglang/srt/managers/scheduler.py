@@ -1523,8 +1523,7 @@ class Scheduler(
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
-                batch_result = self._resolve_overlap_batch_result_if_needed(batch_result)
-                self.launch_batch_sample_if_needed(batch_result)
+                self.launch_batch_sample_if_needed(batch, batch_result)
 
             # Update last_batch
             self.last_batch = batch
@@ -2877,11 +2876,21 @@ class Scheduler(
         return ret
 
     def launch_batch_sample_if_needed(
-        self, batch_result: GenerationBatchResult
-    ) -> Union[GenerationBatchResult]:
+        self,
+        batch: Optional[ScheduleBatch],
+        batch_result: Optional[Union[GenerationBatchResult, PendingOverlapResult]],
+    ) -> Optional[GenerationBatchResult]:
         # TODO(lsyin): make the delayed sample a default behavior after
         # unifying the forward_batch_generation interface (related to spec V2).
-        if batch_result is None or batch_result.delay_sample_func is None:
+        if batch_result is None:
+            return
+
+        if isinstance(batch_result, PendingOverlapResult):
+            if not batch_result.requires_current_batch_resolve_for_sampling:
+                return
+            batch_result = batch_result.resolve()
+
+        if batch_result.delay_sample_func is None:
             return
 
         with self.forward_stream_ctx:
@@ -2889,7 +2898,7 @@ class Scheduler(
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
             self.future_map.store_to_map(batch_result.future_indices, batch_result)
-        self._schedule_generation_batch_result_copy(self.cur_batch, batch_result)
+        self._schedule_generation_batch_result_copy(batch, batch_result)
 
         # Release the closure and large GPU tensors that are no longer needed.
         # The delay_sample_func closure captures forward_batch (which holds
@@ -2900,6 +2909,7 @@ class Scheduler(
         batch_result.delay_sample_func = None
         if batch_result.logits_output is not None:
             batch_result.logits_output.next_token_logits = None
+        return batch_result
 
     def process_batch_result(
         self,

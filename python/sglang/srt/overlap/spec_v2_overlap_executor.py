@@ -18,7 +18,9 @@ class SpecV2OverlapExecutor:
         self.scheduler = scheduler
         self.client = SpecV2OverlapWorkerClient(scheduler)
         self.worker_client: TpWorkerClientV2[OverlapExecutionResult] = TpWorkerClientV2(
-            "spec-v2"
+            "spec-v2",
+            device=scheduler.device,
+            gpu_id=scheduler.gpu_id,
         )
 
     def submit(

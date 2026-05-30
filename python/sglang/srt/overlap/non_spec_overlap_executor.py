@@ -16,7 +16,9 @@ class NonSpecOverlapExecutor:
     def __init__(self, scheduler: "Scheduler"):
         self.scheduler = scheduler
         self.worker_client: TpWorkerClientV2[OverlapExecutionResult] = TpWorkerClientV2(
-            "non-spec"
+            "non-spec",
+            device=scheduler.device,
+            gpu_id=scheduler.gpu_id,
         )
 
     def submit(

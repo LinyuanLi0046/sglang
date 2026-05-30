@@ -5,6 +5,8 @@ import threading
 from dataclasses import dataclass
 from typing import Callable, Generic, Optional, TypeVar
 
+import torch
+
 T = TypeVar("T")
 
 
@@ -21,8 +23,16 @@ class TpWorkerClientV2(Generic[T]):
     control-plane work off the scheduler thread into a dedicated worker thread.
     """
 
-    def __init__(self, name: str):
+    def __init__(
+        self,
+        name: str,
+        *,
+        device: Optional[str] = None,
+        gpu_id: Optional[int] = None,
+    ):
         self.name = name
+        self.device = device
+        self.gpu_id = gpu_id
         self.input_queue: "queue.Queue[Optional[_WorkItem[T]]]" = queue.Queue()
         self._thread = threading.Thread(
             target=self._worker_loop,
@@ -40,6 +50,8 @@ class TpWorkerClientV2(Generic[T]):
         return result
 
     def _worker_loop(self):
+        if self.device is not None and self.gpu_id is not None:
+            torch.get_device_module(self.device).set_device(self.gpu_id)
         while True:
             item = self.input_queue.get()
             if item is None:

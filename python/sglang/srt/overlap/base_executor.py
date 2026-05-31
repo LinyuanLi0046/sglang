@@ -31,7 +31,6 @@ class PendingOverlapResult:
     relay_applied: bool = False
     future_indices: Optional[Any] = None
     next_token_ids: Optional[torch.Tensor] = None
-    schedule_safe_without_resolve: bool = False
     requires_current_batch_resolve_for_sampling: bool = False
     requires_resolve_before_next_schedule: bool = False
     extend_input_len_per_req: Optional[list[int]] = None

@@ -1297,12 +1297,6 @@ class Scheduler(
             return
         if not queued_result.requires_resolve_before_next_schedule:
             return
-        if queued_result.schedule_safe_without_resolve:
-            logger.debug(
-                "Phase6-C skip pre-schedule resolve for spec-v2 overlap batch."
-            )
-            return
-        logger.debug("Phase6-C force pre-schedule resolve for pending overlap batch.")
         resolved_result = queued_result.resolve()
         self._apply_pending_overlap_batch_relay_if_present(
             queued_batch, queued_result, resolved_result

@@ -37,6 +37,8 @@ class PendingOverlapResult:
     requires_resolve_before_mutation: bool = False
     is_resolved_for_mutation: bool = False
     requires_current_batch_resolve_for_sampling: bool = False
+    # Deprecated: keep the field for compatibility while scheduler resolve timing
+    # is migrated to mutation-time decisions.
     requires_resolve_before_next_schedule: bool = False
     extend_input_len_per_req: Optional[list[int]] = None
     extend_logprob_start_len_per_req: Optional[list[int]] = None
@@ -75,3 +77,8 @@ class PendingOverlapResult:
 
     def get_snapshot_batch(self) -> Optional[Any]:
         return self.batch_snapshot
+
+    def must_resolve_before_scheduler_mutation(self) -> bool:
+        return (
+            self.requires_resolve_before_mutation and self.has_unresolved_live_batch()
+        )

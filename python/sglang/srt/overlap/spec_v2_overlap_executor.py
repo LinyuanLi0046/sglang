@@ -55,7 +55,7 @@ class SpecV2OverlapExecutor:
             future_indices=future_indices,
             requires_resolve_before_mutation=True,
             requires_current_batch_resolve_for_sampling=False,
-            requires_resolve_before_next_schedule=True,
+            requires_resolve_before_next_schedule=False,
         )
         return OverlapExecutionResult(
             batch_result=pending_result,

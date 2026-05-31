@@ -1294,32 +1294,28 @@ class Scheduler(
         if isinstance(result, PendingOverlapResult):
             if result.batch_snapshot is not None:
                 snapshot_batch = result.batch_snapshot
-            resolved_result = result.resolve()
-            self._apply_pending_overlap_batch_relay_if_present(
-                snapshot_batch, result, resolved_result
+            return self._materialize_pending_overlap_result(
+                result, snapshot_batch=snapshot_batch
             )
-            return resolved_result
         return result
 
-    def _resolve_last_batch_before_next_schedule_if_needed(self):
-        queued_batch = None
-        queued_result = self.pending_overlap_state
-        if queued_result is None:
-            if not self.result_queue:
-                return
-            queued_batch, queued_result = self.result_queue[0]
-        else:
-            queued_batch = queued_result.batch_snapshot
-        if not isinstance(queued_result, PendingOverlapResult):
-            return
-        if not queued_result.requires_resolve_before_next_schedule:
-            return
-        resolved_result = queued_result.resolve()
+    def _materialize_pending_overlap_result(
+        self,
+        pending_result: PendingOverlapResult,
+        snapshot_batch: Optional[ScheduleBatch] = None,
+    ) -> GenerationBatchResult:
+        if snapshot_batch is None:
+            snapshot_batch = pending_result.get_snapshot_batch()
+        resolved_result = pending_result.resolve()
         self._apply_pending_overlap_batch_relay_if_present(
-            queued_batch, queued_result, resolved_result
+            snapshot_batch, pending_result, resolved_result
         )
-        if self.result_queue and self.result_queue[0][1] is queued_result:
-            self.result_queue[0] = (queued_batch, resolved_result)
+        if self.result_queue:
+            for i, (queued_batch, queued_result) in enumerate(self.result_queue):
+                if queued_result is pending_result:
+                    self.result_queue[i] = (queued_batch, resolved_result)
+                    break
+        return resolved_result
 
     def _has_unresolved_pending_overlap(self) -> bool:
         return (
@@ -1352,6 +1348,32 @@ class Scheduler(
         if self.pending_overlap_state is not None:
             return self.pending_overlap_state.live_batch_ref
         return self.last_batch
+
+    def _resolve_pending_overlap_for_batch_mutation_if_needed(
+        self, batch: Optional[ScheduleBatch]
+    ) -> None:
+        pending_result = self.pending_overlap_state
+        if batch is None or pending_result is None:
+            return
+        if pending_result.live_batch_ref is not batch:
+            return
+        if not pending_result.must_resolve_before_scheduler_mutation():
+            return
+        self._materialize_pending_overlap_result(pending_result)
+
+    def _can_overlap_with_unresolved_spec_pending(
+        self, batch: Optional[ScheduleBatch]
+    ) -> bool:
+        if not self._has_unresolved_pending_overlap():
+            return True
+        overlap_decision_batch = self._get_overlap_decision_batch()
+        if overlap_decision_batch is None or not overlap_decision_batch.is_spec_v2:
+            return True
+        if batch is None:
+            return True
+        if batch.is_spec_v2:
+            return False
+        return True
 
     def _get_merge_source_batch(self) -> Optional[ScheduleBatch]:
         if self._has_unresolved_pending_overlap():
@@ -1596,8 +1618,6 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
-            self._resolve_last_batch_before_next_schedule_if_needed()
-
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1677,16 +1697,14 @@ class Scheduler(
             and len(self.result_queue) > 0
         )
 
-        unresolved_spec_overlap = (
-            self._has_unresolved_pending_overlap()
-            and overlap_decision_batch is not None
-            and overlap_decision_batch.is_spec_v2
+        unresolved_spec_overlap_requires_sync = (
+            not self._can_overlap_with_unresolved_spec_pending(batch)
         )
 
         return (
             disable_overlap_for_batch
             or need_grammar_sync
-            or unresolved_spec_overlap
+            or unresolved_spec_overlap_requires_sync
         )
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
@@ -2550,6 +2568,9 @@ class Scheduler(
                 not self.running_batch.is_empty()
                 and not self.running_batch.is_prefill_only
             ):
+                self._resolve_pending_overlap_for_batch_mutation_if_needed(
+                    self.running_batch
+                )
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
@@ -2816,6 +2837,9 @@ class Scheduler(
             and new_batch.input_embeds is None
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
+            self._resolve_pending_overlap_for_batch_mutation_if_needed(
+                self.running_batch
+            )
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if not self.running_batch.is_empty():
                 self.running_batch.prepare_for_decode()
@@ -2831,6 +2855,11 @@ class Scheduler(
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
+        if not batch.is_mutation_safe:
+            raise RuntimeError(
+                "Scheduler.update_running_batch() requires a mutation-safe batch. "
+                "Resolve the pending overlap carrier before decode-side scheduler mutations."
+            )
         initial_bs = batch.batch_size()
 
         batch.filter_batch(v1_spec_info_filtered=True)

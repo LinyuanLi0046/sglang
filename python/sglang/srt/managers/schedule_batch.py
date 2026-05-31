@@ -2211,7 +2211,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             f"{operation}() is unsafe on an unresolved overlap batch "
             f"(forward_mode={forward_mode}, batch_size={self.batch_size()}, "
             f"is_spec_v2={self.is_spec_v2}, enable_overlap={self.enable_overlap}, "
-            f"has_grammar={has_grammar}, has_spec_info={self.spec_info is not None})."
+            f"has_grammar={has_grammar}, has_spec_info={self.spec_info is not None}). "
+            "Resolve the pending overlap carrier before scheduler-side mutations."
         )
 
     def filter_batch(

@@ -1477,20 +1477,7 @@ class Scheduler(
             return
         if not pending_result.must_resolve_before_scheduler_mutation():
             return
-        snapshot_batch = self._take_result_queue_entry_for_pending_if_present(
-            pending_result
-        )
-        resolved_result = self._materialize_pending_overlap_result(
-            pending_result, snapshot_batch=snapshot_batch
-        )
-        # Scheduler mutation depends on req.finished/release side effects already being
-        # reflected on the live running batch. Deferring finalize here makes the next
-        # decode scheduling round see stale req state and can relaunch finished work.
-        self._finalize_pending_result_immediately_for_scheduler_mutation(
-            pending_result,
-            resolved_result,
-            snapshot_batch=snapshot_batch,
-        )
+        self._materialize_pending_overlap_result(pending_result)
 
     def _can_overlap_with_unresolved_spec_pending(
         self, batch: Optional[ScheduleBatch]
@@ -1737,14 +1724,18 @@ class Scheduler(
         self.window_tail_candidate: Optional[MaterializedBatchResult] = None
         self._overlap_round_id = 0
 
-        def pop_and_materialize():
-            self._materialize_window_tail_from_queue_if_needed()
-
-        def finalize_window_tail():
-            self._finalize_window_tail_result_if_needed()
+        def process_last_batch_result():
+            if not self.result_queue:
+                return
+            snapshot_batch, queued_result = self.result_queue.popleft()
+            resolved_result = self._resolve_overlap_batch_result_if_needed(
+                queued_result, snapshot_batch=snapshot_batch
+            )
+            if resolved_result is None:
+                return
+            self.process_batch_result(snapshot_batch, resolved_result)
 
         while True:
-            self._overlap_round_id += 1
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -1755,14 +1746,13 @@ class Scheduler(
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+            processed_last_batch = False
 
             # If we do not need to overlap the current batch with the last batch,
-            # we can process the last batch immediately.
-            if disable_overlap_for_batch:
-                finalize_window_tail()
-                self._promote_window_tail_candidate_if_needed()
-                pop_and_materialize()
-                finalize_window_tail()
+            # process the last batch before launching the current batch.
+            if disable_overlap_for_batch and self.last_batch is not None:
+                process_last_batch_result()
+                processed_last_batch = True
 
             # Launch the current batch
             if batch:
@@ -1784,25 +1774,16 @@ class Scheduler(
                 self.cancel_bubble_timer()
 
             # Process the last batch
-            if self.result_queue:
-                if not disable_overlap_for_batch:
-                    pop_and_materialize()
-            elif self.window_tail_candidate is not None:
-                self._promote_window_tail_candidate_if_needed()
+            if self.last_batch is not None and not processed_last_batch:
+                process_last_batch_result()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
-            if self.must_finalize_materialized_result_before_sampling(
-                self.window_tail_result, batch, batch_result
-            ):
-                finalize_window_tail()
             if self.is_generation:
                 self.launch_batch_sample_if_needed(batch, batch_result)
-            if batch is None or self._window_tail_age_exceeded():
-                finalize_window_tail()
 
             # Update last_batch
             self.last_batch = batch
@@ -1844,18 +1825,11 @@ class Scheduler(
         unresolved_spec_overlap_requires_sync = (
             not self._can_overlap_with_unresolved_spec_pending(batch)
         )
-        window_tail_requires_sync = (
-            self.must_finalize_materialized_result_before_next_launch(
-                self.window_tail_result, batch
-            )
-            or self._window_tail_age_exceeded()
-        )
 
         return (
             disable_overlap_for_batch
             or need_grammar_sync
             or unresolved_spec_overlap_requires_sync
-            or window_tail_requires_sync
         )
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:

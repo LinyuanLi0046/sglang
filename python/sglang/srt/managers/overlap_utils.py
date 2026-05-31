@@ -211,13 +211,36 @@ class SpecV2FutureRelay:
     future_indices: FutureIndices
     new_seq_lens: torch.Tensor
     verify_done: Optional[torch.cuda.Event] = None
+    last_verified_ids: Optional[torch.Tensor] = None
+    token_list: Optional[torch.Tensor] = None
+    has_real_future_payload: Optional[bool] = None
+    topk_p: Optional[torch.Tensor] = None
+    topk_index: Optional[torch.Tensor] = None
+    hidden_states: Optional[torch.Tensor] = None
+    verified_id: Optional[torch.Tensor] = None
 
     def apply_to_draft_input(self, draft_input: EagleDraftInput) -> EagleDraftInput:
         draft_input.attach_future_indices(self.future_indices)
-        if draft_input.new_seq_lens is None:
+        if self.new_seq_lens is not None:
             draft_input.new_seq_lens = self.new_seq_lens
-        if draft_input.verify_done is None:
+        if self.verify_done is not None:
             draft_input.verify_done = self.verify_done
+        if self.last_verified_ids is not None:
+            draft_input.uses_future_placeholder = True
+            draft_input.last_verified_ids = self.last_verified_ids
+        if self.token_list is not None:
+            draft_input.uses_future_placeholder = True
+            draft_input.token_list = self.token_list
+        if self.has_real_future_payload is not None:
+            draft_input.has_real_future_payload = self.has_real_future_payload
+        if self.topk_p is not None:
+            draft_input.topk_p = self.topk_p
+        if self.topk_index is not None:
+            draft_input.topk_index = self.topk_index
+        if self.hidden_states is not None:
+            draft_input.hidden_states = self.hidden_states
+        if self.verified_id is not None:
+            draft_input.verified_id = self.verified_id
         return draft_input
 
     def apply_to_batch(
@@ -433,6 +456,13 @@ class FutureMap:
             future_indices=future_indices,
             new_seq_lens=draft_input.new_seq_lens,
             verify_done=draft_input.verify_done,
+            last_verified_ids=draft_input.last_verified_ids,
+            token_list=draft_input.token_list,
+            has_real_future_payload=draft_input.has_real_future_payload,
+            topk_p=draft_input.topk_p,
+            topk_index=draft_input.topk_index,
+            hidden_states=draft_input.hidden_states,
+            verified_id=draft_input.verified_id,
         )
 
     def is_empty_slice(self, s: slice) -> bool:

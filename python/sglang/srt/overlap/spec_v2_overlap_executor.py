@@ -50,12 +50,14 @@ class SpecV2OverlapExecutor:
             ),
             future_indices_or_next_token_ids=future_indices_or_next_token_ids,
             relay_target_batch=batch,
+            future_indices=future_indices,
             requires_current_batch_resolve_for_sampling=False,
             requires_resolve_before_next_schedule=True,
         )
         return OverlapExecutionResult(
             batch_result=pending_result,
             future_indices_or_next_token_ids=future_indices_or_next_token_ids,
+            future_indices=future_indices,
         )
 
     def _run_in_worker(

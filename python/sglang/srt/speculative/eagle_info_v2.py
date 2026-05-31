@@ -91,6 +91,56 @@ class EagleDraftInputV2Mixin:
         self.future_verified_id_buf = None
         self.future_new_seq_lens_buf = None
 
+    def _get_full_future_relay_prepare_fallback_reason(
+        self: EagleDraftInput,
+        topk: int,
+        num_steps: int,
+    ) -> str | None:
+        if self.future_indices is None:
+            return "missing_future_indices"
+        if not self.has_real_future_payload:
+            return "future_payload_not_real"
+        if self.new_seq_lens is None:
+            return "missing_new_seq_lens"
+        if self.last_verified_ids is None or self.token_list is None:
+            return "missing_placeholder_payload"
+        if (
+            self.topk_p is None
+            or self.topk_index is None
+            or self.hidden_states is None
+            or self.verified_id is None
+        ):
+            return "missing_full_relay_payload"
+        if self.last_verified_ids.ndim != 1 or self.token_list.ndim != 2:
+            return "invalid_placeholder_rank"
+        if self.token_list.shape[0] != self.last_verified_ids.shape[0]:
+            return "placeholder_batch_mismatch"
+        if self.token_list.shape[1] != num_steps:
+            return "placeholder_width_mismatch"
+        if self.topk_p.ndim != 2 or self.topk_index.ndim != 2:
+            return "invalid_full_relay_rank"
+        if self.topk_p.shape != self.topk_index.shape:
+            return "relay_topk_shape_mismatch"
+        if self.topk_p.shape[0] != self.last_verified_ids.shape[0]:
+            return "relay_topk_batch_mismatch"
+        if self.topk_p.shape[1] != topk:
+            return "relay_topk_width_mismatch"
+        if self.hidden_states.ndim != 2:
+            return "invalid_hidden_states_rank"
+        if self.hidden_states.shape[0] != self.last_verified_ids.shape[0]:
+            return "relay_hidden_batch_mismatch"
+        if self.verified_id.ndim != 1:
+            return "invalid_verified_id_rank"
+        if self.verified_id.shape[0] != self.last_verified_ids.shape[0]:
+            return "relay_verified_batch_mismatch"
+        if self.new_seq_lens.ndim != 1:
+            return "invalid_new_seq_lens_rank"
+        if self.new_seq_lens.shape[0] != self.last_verified_ids.shape[0]:
+            return "relay_new_seq_batch_mismatch"
+        if torch.any(self.last_verified_ids < 0) or torch.any(self.token_list < 0):
+            return "placeholder_not_resolved"
+        return None
+
     def _has_replay_prepare_payload(self: EagleDraftInput) -> bool:
         return (
             self.future_indices is not None
@@ -342,6 +392,51 @@ class EagleDraftInputV2Mixin:
             self._clear_future_replay_buffers()
         return True
 
+    def prepare_for_v2_draft_from_full_future_relay(
+        self: EagleDraftInput,
+        req_to_token_pool: ReqToTokenPool,
+        batch: ModelWorkerBatch,
+        topk: int,
+        num_steps: int,
+        clear_future_buffers: bool = True,
+    ) -> bool:
+        if (
+            self._get_full_future_relay_prepare_fallback_reason(
+                topk=topk,
+                num_steps=num_steps,
+            )
+            is not None
+        ):
+            return False
+
+        bs = len(batch.seq_lens)
+        device = batch.seq_lens.device
+        self.topk_p = self.topk_p.to(device=device)
+        self.topk_index = self.topk_index.to(device=device)
+        self.hidden_states = self.hidden_states.to(device=device)
+        self.verified_id = self.verified_id.to(device=device)
+        self.new_seq_lens = self.new_seq_lens.to(device=device)
+
+        if not batch.forward_mode.is_idle():
+            batch.out_cache_loc = torch.empty(
+                (bs * topk * num_steps,),
+                dtype=torch.int64,
+                device=device,
+            )
+            assign_draft_cache_locs_page_size_1[(bs,)](
+                batch.req_pool_indices,
+                req_to_token_pool.req_to_token,
+                batch.seq_lens,
+                batch.out_cache_loc,
+                req_to_token_pool.req_to_token.shape[1],
+                topk,
+                num_steps,
+            )
+
+        if clear_future_buffers:
+            self._clear_future_replay_buffers()
+        return True
+
     def _build_v2_draft_replay_prepare_state(
         self: EagleDraftInput,
         req_to_token_pool: ReqToTokenPool,
@@ -493,6 +588,8 @@ class EagleDraftInputV2Mixin:
             mismatch_messages.append(
                 f"topk_p dtype {self.topk_p.dtype} != {replay_state['topk_p'].dtype}"
             )
+        elif not torch.allclose(self.topk_p, replay_state["topk_p"]):
+            mismatch_messages.append("topk_p")
 
         if self.hidden_states.shape != replay_state["hidden_states"].shape:
             mismatch_messages.append(
@@ -506,13 +603,13 @@ class EagleDraftInputV2Mixin:
 
         if mismatch_messages:
             logger.warning(
-                "Phase5 E5 consumer compare mismatch at interval=%s: %s.",
+                "Phase6-B consumer compare mismatch at interval=%s: %s.",
                 self.future_indices.interval if self.future_indices is not None else None,
                 "; ".join(mismatch_messages),
             )
         else:
             logger.debug(
-                "Phase5 E5 consumer compare passed at interval=%s.",
+                "Phase6-B consumer compare passed at interval=%s.",
                 self.future_indices.interval if self.future_indices is not None else None,
             )
 
@@ -529,6 +626,22 @@ class EagleDraftInputV2Mixin:
         positions_prepared = False
         replay_prepare_state = None
         if not batch.forward_mode.is_idle():
+            full_relay_fallback_reason = (
+                self._get_full_future_relay_prepare_fallback_reason(
+                    topk=topk,
+                    num_steps=num_steps,
+                )
+            )
+            prepared_from_full_future_relay = (
+                full_relay_fallback_reason is None
+                and self.prepare_for_v2_draft_from_full_future_relay(
+                    req_to_token_pool=req_to_token_pool,
+                    batch=batch,
+                    topk=topk,
+                    num_steps=num_steps,
+                    clear_future_buffers=False,
+                )
+            )
             placeholder_fallback_reason = self._get_placeholder_prepare_fallback_reason(
                 draft_model_runner=draft_model_runner,
                 topk=topk,
@@ -547,9 +660,21 @@ class EagleDraftInputV2Mixin:
             )
             future_ready = self._has_replay_prepare_payload()
 
-            if prepared_from_placeholder_payload:
+            if prepared_from_full_future_relay:
                 logger.debug(
-                    "Phase5 E5 placeholder-native prepare hit at interval=%s.",
+                    "Phase6-B full-relay prepare hit at interval=%s.",
+                    self.future_indices.interval if self.future_indices is not None else None,
+                )
+                if future_ready:
+                    replay_prepare_state = self._build_v2_draft_replay_prepare_state(
+                        req_to_token_pool=req_to_token_pool,
+                        batch=batch,
+                        topk=topk,
+                        num_steps=num_steps,
+                    )
+            elif prepared_from_placeholder_payload:
+                logger.debug(
+                    "Phase6-B placeholder+replay prepare hit at interval=%s.",
                     self.future_indices.interval if self.future_indices is not None else None,
                 )
                 replay_prepare_state = self._build_v2_draft_replay_prepare_state(
@@ -568,8 +693,9 @@ class EagleDraftInputV2Mixin:
                 positions_prepared = True
                 if placeholder_fallback_reason is not None:
                     logger.debug(
-                        "Phase5 E5 replay fallback at interval=%s reason=%s.",
+                        "Phase6-B replay fallback at interval=%s full_relay_reason=%s placeholder_reason=%s.",
                         self.future_indices.interval if self.future_indices is not None else None,
+                        full_relay_fallback_reason,
                         placeholder_fallback_reason,
                     )
             else:
@@ -590,12 +716,15 @@ class EagleDraftInputV2Mixin:
                     num_steps,
                 )
                 if (
-                    placeholder_fallback_reason is not None
-                    and (self.future_indices is not None or self.uses_future_placeholder)
+                    full_relay_fallback_reason is not None
+                    or placeholder_fallback_reason is not None
+                ) and (
+                    self.future_indices is not None or self.uses_future_placeholder
                 ):
                     logger.debug(
-                        "Phase5 E5 default fallback at interval=%s reason=%s.",
+                        "Phase6-B default fallback at interval=%s full_relay_reason=%s placeholder_reason=%s.",
                         self.future_indices.interval if self.future_indices is not None else None,
+                        full_relay_fallback_reason,
                         placeholder_fallback_reason,
                     )
 

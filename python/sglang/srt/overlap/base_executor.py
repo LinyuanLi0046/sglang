@@ -14,6 +14,8 @@ class OverlapExecutionResult:
     batch_result: Union[GenerationBatchResult, "PendingOverlapResult"]
     future_indices_or_next_token_ids: torch.Tensor
     batch_relay: Optional[Any] = None
+    future_indices: Optional[Any] = None
+    next_token_ids: Optional[torch.Tensor] = None
 
 
 class OverlapExecutor(Protocol):
@@ -27,6 +29,8 @@ class PendingOverlapResult:
     batch_relay: Optional[Any] = None
     relay_target_batch: Optional[Any] = None
     relay_applied: bool = False
+    future_indices: Optional[Any] = None
+    next_token_ids: Optional[torch.Tensor] = None
     requires_current_batch_resolve_for_sampling: bool = False
     requires_resolve_before_next_schedule: bool = False
     extend_input_len_per_req: Optional[list[int]] = None

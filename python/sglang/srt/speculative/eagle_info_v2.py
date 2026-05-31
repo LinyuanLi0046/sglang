@@ -211,6 +211,105 @@ class EagleDraftInputV2Mixin:
             num_steps=num_steps,
         )
 
+    def _can_prepare_for_v2_draft_from_placeholder_payload(
+        self: EagleDraftInput,
+        draft_model_runner: ModelRunner,
+        topk: int,
+        num_steps: int,
+    ) -> bool:
+        if topk != 1:
+            return False
+        if not self.uses_future_placeholder or self.future_indices is None:
+            return False
+        if self.last_verified_ids is None or self.token_list is None:
+            return False
+        if self.last_verified_ids.ndim != 1 or self.token_list.ndim != 2:
+            return False
+        if self.token_list.shape[0] != self.last_verified_ids.shape[0]:
+            return False
+        if self.token_list.shape[1] != num_steps:
+            return False
+        if torch.any(self.last_verified_ids < 0) or torch.any(self.token_list < 0):
+            return False
+        if (
+            self.future_topk_p_buf is None
+            or self.future_hidden_states_buf is None
+            or self.future_new_seq_lens_buf is None
+        ):
+            return False
+        # Placeholder token_list stores real token ids. If a hot-token projection is
+        # active, the draft path still expects projected topk indices from replay.
+        if getattr(getattr(draft_model_runner, "model", None), "hot_token_id", None) is not None:
+            return False
+        return True
+
+    def prepare_for_v2_draft_from_placeholder_payload(
+        self: EagleDraftInput,
+        req_to_token_pool: ReqToTokenPool,
+        batch: ModelWorkerBatch,
+        draft_model_runner: ModelRunner,
+        topk: int,
+        num_steps: int,
+    ) -> bool:
+        if not self._can_prepare_for_v2_draft_from_placeholder_payload(
+            draft_model_runner=draft_model_runner,
+            topk=topk,
+            num_steps=num_steps,
+        ):
+            return False
+
+        bs = len(batch.seq_lens)
+        device = batch.seq_lens.device
+        indices = self.future_indices.indices
+
+        # Phase 5 front-half:
+        # consume the fields that phase 4 already audits as equivalent
+        # (`last_verified_ids`, `token_list[:, 0]`) from placeholder payload,
+        # while still reusing replay-only state (`topk_p`, `hidden_states`,
+        # `new_seq_lens`) until the later cleanup phase removes replay entirely.
+        self.topk_p = self.future_topk_p_buf[indices]
+        self.topk_index = self.token_list[:, :topk].to(
+            device=device,
+            dtype=(
+                self.future_topk_index_buf.dtype
+                if self.future_topk_index_buf is not None
+                else torch.int64
+            ),
+        )
+        self.hidden_states = self.future_hidden_states_buf[indices]
+        self.verified_id = self.last_verified_ids.to(
+            device=device,
+            dtype=(
+                self.future_verified_id_buf.dtype
+                if self.future_verified_id_buf is not None
+                else torch.int32
+            ),
+        )
+        self.new_seq_lens = self.future_new_seq_lens_buf[indices]
+
+        if not batch.forward_mode.is_idle():
+            batch.out_cache_loc = torch.empty(
+                (bs * topk * num_steps,),
+                dtype=torch.int64,
+                device=device,
+            )
+            assign_draft_cache_locs_page_size_1[(bs,)](
+                batch.req_pool_indices,
+                req_to_token_pool.req_to_token,
+                batch.seq_lens,
+                batch.out_cache_loc,
+                req_to_token_pool.req_to_token.shape[1],
+                topk,
+                num_steps,
+            )
+
+        self.future_topk_p_buf = None
+        self.future_topk_index_buf = None
+        self.future_hidden_states_buf = None
+        self.future_verified_id_buf = None
+        self.future_new_seq_lens_buf = None
+        return True
+
     def prepare_for_v2_draft(
         self: EagleDraftInput,
         req_to_token_pool: ReqToTokenPool,
@@ -223,6 +322,15 @@ class EagleDraftInputV2Mixin:
         bs = len(batch.seq_lens)
         positions_prepared = False
         if not batch.forward_mode.is_idle():
+            prepared_from_placeholder_payload = (
+                self.prepare_for_v2_draft_from_placeholder_payload(
+                    req_to_token_pool=req_to_token_pool,
+                    batch=batch,
+                    draft_model_runner=draft_model_runner,
+                    topk=topk,
+                    num_steps=num_steps,
+                )
+            )
             future_ready = (
                 self.future_indices is not None
                 and self.future_topk_p_buf is not None
@@ -232,7 +340,9 @@ class EagleDraftInputV2Mixin:
                 and self.future_hidden_states_buf is not None
             )
 
-            if future_ready:
+            if prepared_from_placeholder_payload:
+                pass
+            elif future_ready:
                 batch.out_cache_loc = torch.empty(
                     (bs * topk * num_steps,),
                     dtype=torch.int64,

@@ -78,6 +78,9 @@ class SpecV2OverlapWorkerClient:
         batch_result: GenerationBatchResult,
         future_indices: "FutureIndices",
     ) -> None:
+        if not self.scheduler.future_map.has_ready_spec_future_state(future_indices):
+            return
+
         placeholder_payload = self._extract_placeholder_audit_payload(batch_result)
         if placeholder_payload is None:
             return

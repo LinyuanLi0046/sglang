@@ -190,6 +190,21 @@ class SpecFutureStatePool:
         self.future_token_list[intv] = token_list.to(torch.int32)
         self.future_ready[intv] = True
 
+    def is_ready(self, future_indices: FutureIndices) -> bool:
+        if self.future_buffer_len == 0:
+            return False
+
+        intv = future_indices.interval
+        if intv is not None:
+            ready = self.future_ready[intv]
+        else:
+            indices = future_indices.indices
+            if indices.numel() == 0:
+                return False
+            ready = self.future_ready[indices]
+
+        return bool(ready.numel() > 0 and torch.all(ready).item())
+
 
 @dataclass
 class SpecV2FutureRelay:
@@ -359,6 +374,11 @@ class FutureMap:
             self.spec_future_state_pool.future_token_list[intv],
             self.spec_future_state_pool.future_ready[intv],
         )
+
+    def has_ready_spec_future_state(self, future_indices: FutureIndices) -> bool:
+        if self.spec_future_state_pool is None:
+            return False
+        return self.spec_future_state_pool.is_ready(future_indices)
 
     def peek_replay_future_state(
         self, future_indices: FutureIndices

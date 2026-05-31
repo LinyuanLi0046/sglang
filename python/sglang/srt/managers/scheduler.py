@@ -884,6 +884,10 @@ class Scheduler(
         self.cur_batch: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
+        # The unresolved overlap carrier that still owns the latest live batch state.
+        self.pending_overlap_state: Optional[PendingOverlapResult] = None
+        # The batch that is safe for scheduler-side filter/merge/retract mutations.
+        self.mutable_running_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self._pending_flush: Optional[Tuple[FlushCacheReqInput, float]] = None
@@ -1208,7 +1212,7 @@ class Scheduler(
     ) -> None:
         if pending_result.relay_applied or pending_result.batch_relay is None:
             return
-        target_batch = pending_result.relay_target_batch
+        target_batch = pending_result.live_batch_ref
         if target_batch is None:
             logger.warning(
                 "Spec v2 overlap relay target batch is missing; skip relay apply."
@@ -1221,6 +1225,12 @@ class Scheduler(
         pending_result.batch_relay.apply_to_batch(
             target_batch, batch_result.next_draft_input
         )
+        pending_result.resolved_live_batch = target_batch
+        pending_result.is_resolved_for_mutation = True
+        target_batch.is_mutation_safe = True
+        if self.pending_overlap_state is pending_result:
+            self.mutable_running_batch = target_batch
+            self.pending_overlap_state = None
         pending_result.relay_applied = True
 
     def _run_generation_batch_overlap(
@@ -1282,6 +1292,8 @@ class Scheduler(
         snapshot_batch: Optional[ScheduleBatch] = None,
     ) -> Optional[Union[GenerationBatchResult, EmbeddingBatchResult]]:
         if isinstance(result, PendingOverlapResult):
+            if result.batch_snapshot is not None:
+                snapshot_batch = result.batch_snapshot
             resolved_result = result.resolve()
             self._apply_pending_overlap_batch_relay_if_present(
                 snapshot_batch, result, resolved_result
@@ -1290,9 +1302,14 @@ class Scheduler(
         return result
 
     def _resolve_last_batch_before_next_schedule_if_needed(self):
-        if not self.result_queue:
-            return
-        queued_batch, queued_result = self.result_queue[0]
+        queued_batch = None
+        queued_result = self.pending_overlap_state
+        if queued_result is None:
+            if not self.result_queue:
+                return
+            queued_batch, queued_result = self.result_queue[0]
+        else:
+            queued_batch = queued_result.batch_snapshot
         if not isinstance(queued_result, PendingOverlapResult):
             return
         if not queued_result.requires_resolve_before_next_schedule:
@@ -1301,7 +1318,8 @@ class Scheduler(
         self._apply_pending_overlap_batch_relay_if_present(
             queued_batch, queued_result, resolved_result
         )
-        self.result_queue[0] = (queued_batch, resolved_result)
+        if self.result_queue and self.result_queue[0][1] is queued_result:
+            self.result_queue[0] = (queued_batch, resolved_result)
 
     def _maybe_prepare_ngram_embedding(
         self, batch: Optional[ScheduleBatch]
@@ -1542,7 +1560,20 @@ class Scheduler(
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
-                self.result_queue.append((batch.copy(), batch_result))
+                batch_snapshot = (
+                    batch_result.batch_snapshot
+                    if isinstance(batch_result, PendingOverlapResult)
+                    and batch_result.batch_snapshot is not None
+                    else batch.copy()
+                )
+                if (
+                    isinstance(batch_result, PendingOverlapResult)
+                    and batch_result.requires_resolve_before_mutation
+                ):
+                    batch.is_mutation_safe = False
+                    self.pending_overlap_state = batch_result
+                    self.mutable_running_batch = None
+                self.result_queue.append((batch_snapshot, batch_result))
             else:
                 batch_result = None
                 self.cancel_bubble_timer()
@@ -2392,34 +2423,46 @@ class Scheduler(
             # Reset batch_is_full so the scheduler can schedule more prefills.
             self.running_batch.batch_is_full = False
 
+        merge_source_batch = self.mutable_running_batch
+        if merge_source_batch is None and self.last_batch is not None:
+            unresolved_last_batch = (
+                self.pending_overlap_state is not None
+                and self.pending_overlap_state.live_batch_ref is self.last_batch
+                and not self.pending_overlap_state.is_resolved_for_mutation
+            )
+            if not unresolved_last_batch:
+                merge_source_batch = self.last_batch
+
         if (
             not self.enable_hisparse
-            and self.last_batch
-            and self.last_batch.forward_mode.is_extend()
+            and merge_source_batch is not None
+            and merge_source_batch.forward_mode.is_extend()
         ):
-            if self.last_batch.chunked_req is not None:
+            if merge_source_batch.chunked_req is not None:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
-                chunked_req_to_exclude.add(self.last_batch.chunked_req)
+                chunked_req_to_exclude.add(merge_source_batch.chunked_req)
 
-            if self.dllm_config is not None and self.last_batch.reqs:
-                chunked_req_to_exclude.update(self.last_batch.reqs)
+            if self.dllm_config is not None and merge_source_batch.reqs:
+                chunked_req_to_exclude.update(merge_source_batch.reqs)
 
             # Filter batch
-            last_bs = self.last_batch.batch_size()
-            self.last_batch.filter_batch(
+            last_bs = merge_source_batch.batch_size()
+            merge_source_batch.filter_batch(
                 chunked_req_to_exclude=list(chunked_req_to_exclude)
             )
-            if self.last_batch.batch_size() < last_bs:
+            if merge_source_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
             # Merge the new batch into the running batch.
-            if not self.last_batch.is_empty():
+            if not merge_source_batch.is_empty():
                 if self.running_batch.is_empty():
-                    self.running_batch = self.last_batch
+                    self.running_batch = merge_source_batch
                 else:
                     # Merge running_batch with prefill batch
-                    self.running_batch.merge_batch(self.last_batch)
+                    self.running_batch.merge_batch(merge_source_batch)
+            if merge_source_batch is self.mutable_running_batch:
+                self.mutable_running_batch = None
 
         # For prefill-only batch, filter out finished requests since they
         # won't go through the decode step. This keeps running_batch accurate
@@ -3450,6 +3493,9 @@ class Scheduler(
         if self.enable_overlap and self.last_batch:
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
+            tmp_result = self._resolve_overlap_batch_result_if_needed(
+                tmp_result, snapshot_batch=tmp_batch
+            )
             self.process_batch_result(tmp_batch, tmp_result)
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
@@ -3471,6 +3517,8 @@ class Scheduler(
                     self.running_batch.merge_batch(self.last_batch)
 
         self.last_batch = None
+        self.pending_overlap_state = None
+        self.mutable_running_batch = None
         self.cur_batch = None
 
         if recv_req.mode == "retract" and not self.running_batch.is_empty():

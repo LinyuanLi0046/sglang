@@ -192,9 +192,21 @@ class SpecV2OverlapWorkerClient:
         batch_result: GenerationBatchResult,
         future_indices: "FutureIndices",
     ) -> "SpecV2FutureRelay":
-        return self.scheduler.future_map.build_spec_v2_future_relay(
+        relay = self.scheduler.future_map.build_spec_v2_future_relay(
             future_indices, batch_result
         )
+        logger.debug(
+            "Spec-v2 pending relay built: future=[%s, %s), next_draft_bs=%s, has_real_payload=%s",
+            future_indices.start,
+            future_indices.end,
+            None
+            if batch_result.next_draft_input is None
+            else batch_result.next_draft_input.batch_size,
+            False
+            if batch_result.next_draft_input is None
+            else batch_result.next_draft_input.has_real_future_payload,
+        )
+        return relay
 
     def submit(
         self,

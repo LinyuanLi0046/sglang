@@ -30,6 +30,7 @@ class SpecV2OverlapExecutor:
         model_worker_batch: "ModelWorkerBatch",
     ) -> OverlapExecutionResult:
         scheduler = self.scheduler
+        batch_snapshot = batch.copy()
 
         scheduler.record_batch_in_overlap(model_worker_batch)
 
@@ -49,14 +50,17 @@ class SpecV2OverlapExecutor:
                 )
             ),
             future_indices_or_next_token_ids=future_indices_or_next_token_ids,
-            relay_target_batch=batch,
+            batch_snapshot=batch_snapshot,
+            live_batch_ref=batch,
             future_indices=future_indices,
+            requires_resolve_before_mutation=True,
             requires_current_batch_resolve_for_sampling=False,
             requires_resolve_before_next_schedule=True,
         )
         return OverlapExecutionResult(
             batch_result=pending_result,
             future_indices_or_next_token_ids=future_indices_or_next_token_ids,
+            batch_snapshot=batch_snapshot,
             future_indices=future_indices,
         )
 

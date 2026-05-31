@@ -27,6 +27,7 @@ class NonSpecOverlapExecutor:
         model_worker_batch: "ModelWorkerBatch",
     ) -> OverlapExecutionResult:
         scheduler = self.scheduler
+        batch_snapshot = batch.copy()
 
         scheduler.record_batch_in_overlap(model_worker_batch)
 
@@ -47,6 +48,8 @@ class NonSpecOverlapExecutor:
                 lambda: self._run_in_worker(batch, model_worker_batch, future_indices)
             ),
             future_indices_or_next_token_ids=future_indices_or_next_token_ids,
+            batch_snapshot=batch_snapshot,
+            live_batch_ref=batch,
             requires_current_batch_resolve_for_sampling=(
                 requires_current_batch_resolve_for_sampling
             ),
@@ -54,6 +57,7 @@ class NonSpecOverlapExecutor:
         return OverlapExecutionResult(
             batch_result=pending_result,
             future_indices_or_next_token_ids=future_indices_or_next_token_ids,
+            batch_snapshot=batch_snapshot,
         )
 
     def _run_in_worker(

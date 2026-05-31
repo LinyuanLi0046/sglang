@@ -1322,6 +1322,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # the check of whether to prefill new requests.
     # This is an optimization to reduce the overhead of the prefill check.
     batch_is_full: bool = False
+    # Whether scheduler-side filter/merge/retract can safely mutate this batch.
+    is_mutation_safe: bool = True
 
     # For chunked prefill in PP
     chunked_req: Optional[Req] = None
@@ -1951,6 +1953,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self, server_args: ServerArgs
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
+        self._assert_mutation_safe("retract_decode")
         sorted_indices = list(range(len(self.reqs)))
 
         # TODO(lsyin): improve retraction policy for radix cache
@@ -2194,6 +2197,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     draft_input.verify_done
                 )
 
+    def _assert_mutation_safe(self, operation: str) -> None:
+        if self.is_mutation_safe:
+            return
+        raise RuntimeError(
+            f"ScheduleBatch.{operation}() is unsafe on an unresolved overlap batch."
+        )
+
     def filter_batch(
         self,
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
@@ -2201,6 +2211,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # FIXME(lsyin): deprecate this API after spec v1 is deprecated
         v1_spec_info_filtered: Optional[bool] = False,
     ):
+        self._assert_mutation_safe("filter_batch")
         # FIXME(lsyin): used here to get the correct seq_lens
         # The batch has been launched but we need it verified to get correct next batch info
         self.maybe_wait_verify_done()
@@ -2276,6 +2287,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def merge_batch(self, other: "ScheduleBatch"):
+        self._assert_mutation_safe("merge_batch")
+        other._assert_mutation_safe("merge_batch(other)")
         # In the regular scheduler path:
         # 1) self is always prefill, whose seq_lens is not a future
         # 2) other is always decode, which is finished in previous step

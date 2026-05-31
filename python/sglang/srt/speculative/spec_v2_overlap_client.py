@@ -42,6 +42,16 @@ class SpecV2OverlapWorkerClient:
             return False
         return True
 
+    def _maybe_record_placeholder_audit_stub(
+        self, batch_result: GenerationBatchResult
+    ) -> None:
+        # Phase 4 hook:
+        # keep this as the single place to compare placeholder payload writes
+        # against the old heavy future replay path after both sides have been
+        # produced for the same batch_result. Phase 3 intentionally keeps this
+        # as a no-op so the main execution path is unchanged.
+        _ = batch_result
+
     def submit(
         self,
         batch: ScheduleBatch,
@@ -84,6 +94,7 @@ class SpecV2OverlapWorkerClient:
                 scheduler.future_map.store_spec_future_state(
                     future_indices, batch_result.next_draft_input
                 )
+            self._maybe_record_placeholder_audit_stub(batch_result)
             if batch_result.delay_sample_func is None:
                 scheduler.future_map.store_to_map(future_indices, batch_result)
                 scheduler._schedule_generation_batch_result_copy(batch, batch_result)

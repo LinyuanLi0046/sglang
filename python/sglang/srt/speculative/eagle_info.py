@@ -690,6 +690,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     future_handle: Optional[SpecFutureHandle] = None
     last_verified_ids: Optional[torch.Tensor] = None
     token_list: Optional[torch.Tensor] = None
+    # True only when worker-side proposal has produced a fully resolved future
+    # payload for the next step. This applies to both decode and prefill paths.
     has_real_future_payload: bool = False
 
     def __post_init__(self):

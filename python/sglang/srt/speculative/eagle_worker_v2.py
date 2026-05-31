@@ -529,6 +529,7 @@ class EagleDraftWorker(BaseDraftWorker):
             # draft mode is same with decode mode, only 1 token per req
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
+            has_real_future_payload=False,
         )
 
         batch.spec_info = next_draft_input
@@ -547,6 +548,16 @@ class EagleDraftWorker(BaseDraftWorker):
             probs, self.topk, dim=-1
         )
         next_draft_input.hidden_states = logits_output.hidden_states
+        next_draft_input.last_verified_ids = next_draft_input.verified_id
+        token_list, payload_is_real = self.propose_for_placeholder_prefill_v2(
+            batch, next_draft_input
+        )
+        if payload_is_real:
+            next_draft_input.token_list = token_list
+            next_draft_input.has_real_future_payload = True
+        else:
+            next_draft_input.token_list = None
+            next_draft_input.has_real_future_payload = False
         return next_draft_input
 
     def _snapshot_batch_for_placeholder_proposal_v2(
@@ -599,6 +610,37 @@ class EagleDraftWorker(BaseDraftWorker):
         )
         forward_batch, _ = (
             proposal_draft_input.prepare_for_placeholder_decode_proposal_v2(
+                req_to_token_pool=self.req_to_token_pool,
+                batch=batch,
+                draft_model_runner=self.draft_runner,
+                topk=self.topk,
+                num_steps=self.speculative_num_steps,
+            )
+        )
+        if (
+            not forward_batch.forward_mode.is_idle()
+            and self.speculative_num_steps > 1
+        ):
+            self.draft_attn_backend.init_forward_metadata(forward_batch)
+        return proposal_draft_input, forward_batch
+
+    def _build_placeholder_proposal_context_for_prefill_v2(
+        self,
+        batch: ModelWorkerBatch,
+        next_draft_input: EagleDraftInput,
+    ) -> tuple[EagleDraftInput, ForwardBatch]:
+        proposal_draft_input = EagleDraftInput(
+            verified_id=next_draft_input.verified_id,
+            hidden_states=next_draft_input.hidden_states,
+            topk_p=next_draft_input.topk_p,
+            topk_index=next_draft_input.topk_index,
+            new_seq_lens=next_draft_input.new_seq_lens,
+            num_tokens_per_req=self.topk,
+            num_tokens_for_logprob_per_req=self.topk,
+            has_real_future_payload=False,
+        )
+        forward_batch, _ = (
+            proposal_draft_input.prepare_for_placeholder_prefill_proposal_v2(
                 req_to_token_pool=self.req_to_token_pool,
                 batch=batch,
                 draft_model_runner=self.draft_runner,
@@ -712,6 +754,57 @@ class EagleDraftWorker(BaseDraftWorker):
         ):
             logger.warning(
                 "Skip storing placeholder proposal token_list because rollout produced "
+                "shape %s, expected (%d, %d).",
+                tuple(token_list.shape),
+                len(next_draft_input.verified_id),
+                self.speculative_num_steps,
+            )
+            return None, False
+        return token_list.to(torch.int32), True
+
+    def propose_for_placeholder_prefill_v2(
+        self,
+        batch: ModelWorkerBatch,
+        next_draft_input: EagleDraftInput,
+    ) -> tuple[Optional[torch.Tensor], bool]:
+        if (
+            self.topk != 1
+            or next_draft_input.topk_p is None
+            or next_draft_input.topk_index is None
+            or next_draft_input.hidden_states is None
+            or next_draft_input.verified_id is None
+            or next_draft_input.new_seq_lens is None
+        ):
+            return None, False
+        if batch.forward_mode.is_idle():
+            return (
+                torch.empty(
+                    (0, self.speculative_num_steps),
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                True,
+            )
+
+        snapshot = self._snapshot_batch_for_placeholder_proposal_v2(batch)
+        try:
+            proposal_draft_input, forward_batch = (
+                self._build_placeholder_proposal_context_for_prefill_v2(
+                    batch, next_draft_input
+                )
+            )
+            token_list = self._rollout_linear_placeholder_token_list_v2(
+                forward_batch, proposal_draft_input
+            )
+        finally:
+            self._restore_batch_for_placeholder_proposal_v2(batch, snapshot)
+
+        if token_list.ndim != 2 or token_list.shape != (
+            len(next_draft_input.verified_id),
+            self.speculative_num_steps,
+        ):
+            logger.warning(
+                "Skip storing placeholder prefill token_list because rollout produced "
                 "shape %s, expected (%d, %d).",
                 tuple(token_list.shape),
                 len(next_draft_input.verified_id),

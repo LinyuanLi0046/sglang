@@ -173,6 +173,44 @@ class EagleDraftInputV2Mixin:
             num_steps=num_steps,
         )
 
+    def prepare_for_placeholder_prefill_proposal_v2(
+        self: EagleDraftInput,
+        req_to_token_pool: ReqToTokenPool,
+        batch: ModelWorkerBatch,
+        draft_model_runner: ModelRunner,
+        topk: int,
+        num_steps: int,
+    ):
+        if self.new_seq_lens is None:
+            raise ValueError(
+                "prepare_for_placeholder_prefill_proposal_v2 requires new_seq_lens."
+            )
+
+        # Prefill proposal should consume the same decode-like proposal contract as
+        # the decode path: proposal runs on a clean batch without extend metadata.
+        batch.spec_info = self
+        batch.seq_lens = self.new_seq_lens
+        batch.seq_lens_cpu = self.new_seq_lens.detach().cpu()
+        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
+        batch.extend_seq_lens = None
+        batch.extend_prefix_lens = None
+        batch.extend_num_tokens = 0
+        batch.capture_hidden_mode = CaptureHiddenMode.LAST
+        batch.forward_mode = (
+            ForwardMode.IDLE
+            if batch.forward_mode.is_idle()
+            else ForwardMode.DECODE
+        )
+        batch.out_cache_loc = None
+        return self.prepare_for_v2_draft(
+            req_to_token_pool=req_to_token_pool,
+            batch=batch,
+            cuda_graph_runner=None,
+            draft_model_runner=draft_model_runner,
+            topk=topk,
+            num_steps=num_steps,
+        )
+
     def prepare_for_v2_draft(
         self: EagleDraftInput,
         req_to_token_pool: ReqToTokenPool,

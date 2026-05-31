@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -626,9 +625,6 @@ class EagleDraftInputV2Mixin:
         bs = len(batch.seq_lens)
         positions_prepared = False
         replay_prepare_state = None
-        prepare_compare_enabled = (
-            os.environ.get("SGLANG_SPEC_V2_ENABLE_PREPARE_COMPARE", "0") == "1"
-        )
         if not batch.forward_mode.is_idle():
             full_relay_fallback_reason = (
                 self._get_full_future_relay_prepare_fallback_reason(
@@ -669,7 +665,7 @@ class EagleDraftInputV2Mixin:
                     "Phase6-B full-relay prepare hit at interval=%s.",
                     self.future_indices.interval if self.future_indices is not None else None,
                 )
-                if future_ready and prepare_compare_enabled:
+                if future_ready:
                     replay_prepare_state = self._build_v2_draft_replay_prepare_state(
                         req_to_token_pool=req_to_token_pool,
                         batch=batch,
@@ -681,13 +677,12 @@ class EagleDraftInputV2Mixin:
                     "Phase6-B placeholder+replay prepare hit at interval=%s.",
                     self.future_indices.interval if self.future_indices is not None else None,
                 )
-                if prepare_compare_enabled:
-                    replay_prepare_state = self._build_v2_draft_replay_prepare_state(
-                        req_to_token_pool=req_to_token_pool,
-                        batch=batch,
-                        topk=topk,
-                        num_steps=num_steps,
-                    )
+                replay_prepare_state = self._build_v2_draft_replay_prepare_state(
+                    req_to_token_pool=req_to_token_pool,
+                    batch=batch,
+                    topk=topk,
+                    num_steps=num_steps,
+                )
             elif future_ready:
                 self.prepare_for_v2_draft_from_replay_payload(
                     req_to_token_pool=req_to_token_pool,
@@ -739,7 +734,7 @@ class EagleDraftInputV2Mixin:
         batch.capture_hidden_mode = CaptureHiddenMode.LAST
         if not positions_prepared:
             self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
-        if replay_prepare_state is not None and prepare_compare_enabled:
+        if replay_prepare_state is not None:
             self._compare_placeholder_prepare_against_replay_prepare(
                 batch=batch,
                 replay_state=replay_prepare_state,

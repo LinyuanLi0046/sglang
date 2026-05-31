@@ -42,11 +42,6 @@ class MaterializedBatchResult:
     result: Union[GenerationBatchResult, EmbeddingBatchResult]
     kind: str
     source_pending_result: Optional[Any] = None
-    created_round: int = 0
-    can_defer_across_round: bool = False
-    must_finalize_before_sampling: bool = False
-    must_finalize_before_next_launch: bool = False
-    defer_block_reason: Optional[str] = None
     skip_stream_req: Optional[Req] = None
     logits_output: Optional[LogitsProcessorOutput] = None
     next_token_ids: Optional[Union[List[int], List[List[int]]]] = None
@@ -62,85 +57,6 @@ class SchedulerOutputProcessorMixin:
     This class implements the output processing logic for Scheduler.
     We put them into a separate file to make the `scheduler.py` shorter.
     """
-
-    def _compute_materialized_result_defer_constraints(
-        self: Scheduler,
-        batch: ScheduleBatch,
-        result: Union[GenerationBatchResult, EmbeddingBatchResult],
-        kind: str,
-    ) -> dict[str, Any]:
-        has_delay_sample = getattr(result, "delay_sample_func", None) is not None
-        has_stream = getattr(batch, "has_stream", False)
-        has_grammar = batch.has_grammar
-
-        if kind != "decode_generation":
-            return {
-                "can_defer_across_round": False,
-                "must_finalize_before_sampling": has_delay_sample or has_grammar,
-                "must_finalize_before_next_launch": True,
-                "defer_block_reason": "non_decode_kind",
-            }
-
-        if not batch.is_spec_v2:
-            return {
-                "can_defer_across_round": False,
-                "must_finalize_before_sampling": has_delay_sample or has_grammar,
-                "must_finalize_before_next_launch": True,
-                "defer_block_reason": "non_spec_v2_decode",
-            }
-
-        if has_grammar:
-            return {
-                "can_defer_across_round": False,
-                "must_finalize_before_sampling": True,
-                "must_finalize_before_next_launch": True,
-                "defer_block_reason": "grammar",
-            }
-
-        if has_delay_sample:
-            return {
-                "can_defer_across_round": False,
-                "must_finalize_before_sampling": True,
-                "must_finalize_before_next_launch": True,
-                "defer_block_reason": "delay_sample",
-            }
-
-        if has_stream:
-            return {
-                "can_defer_across_round": False,
-                "must_finalize_before_sampling": False,
-                "must_finalize_before_next_launch": True,
-                "defer_block_reason": "stream_output",
-            }
-
-        return {
-            "can_defer_across_round": True,
-            "must_finalize_before_sampling": False,
-            "must_finalize_before_next_launch": False,
-            "defer_block_reason": None,
-        }
-
-    def _attach_materialized_result_constraints(
-        self: Scheduler,
-        materialized: MaterializedBatchResult,
-        batch: ScheduleBatch,
-        result: Union[GenerationBatchResult, EmbeddingBatchResult],
-    ) -> MaterializedBatchResult:
-        constraints = self._compute_materialized_result_defer_constraints(
-            batch=batch,
-            result=result,
-            kind=materialized.kind,
-        )
-        materialized.created_round = getattr(self, "_overlap_round_id", 0)
-        materialized.can_defer_across_round = constraints["can_defer_across_round"]
-        materialized.must_finalize_before_sampling = constraints[
-            "must_finalize_before_sampling"
-        ]
-        materialized.must_finalize_before_next_launch = constraints[
-            "must_finalize_before_next_launch"
-        ]
-        materialized.defer_block_reason = constraints["defer_block_reason"]
-        return materialized
 
     def _get_storage_backend_type(self) -> str:
         """Get storage backend type from tree_cache."""
@@ -269,19 +185,15 @@ class SchedulerOutputProcessorMixin:
                         v.tolist()
                         for v in logits_output.next_token_token_ids_logprobs_val
                     ]
-            return self._attach_materialized_result_constraints(
-                MaterializedBatchResult(
-                    batch=batch,
-                    result=result,
-                    kind="prefill_generation",
-                    logits_output=logits_output,
-                    next_token_ids=next_token_ids,
-                    extend_input_len_per_req=result.extend_input_len_per_req,
-                    extend_logprob_start_len_per_req=result.extend_logprob_start_len_per_req,
-                    can_run_cuda_graph=getattr(result, "can_run_cuda_graph", False),
-                ),
+            return MaterializedBatchResult(
                 batch=batch,
                 result=result,
+                kind="prefill_generation",
+                logits_output=logits_output,
+                next_token_ids=next_token_ids,
+                extend_input_len_per_req=result.extend_input_len_per_req,
+                extend_logprob_start_len_per_req=result.extend_logprob_start_len_per_req,
+                can_run_cuda_graph=getattr(result, "can_run_cuda_graph", False),
             )
 
         if result.copy_done is not None:
@@ -304,16 +216,12 @@ class SchedulerOutputProcessorMixin:
             else:
                 embeddings = [tensor.tolist() for tensor in embeddings]
 
-        return self._attach_materialized_result_constraints(
-            MaterializedBatchResult(
-                batch=batch,
-                result=result,
-                kind="prefill_embedding",
-                embeddings=embeddings,
-                can_run_cuda_graph=getattr(result, "can_run_cuda_graph", False),
-            ),
+        return MaterializedBatchResult(
             batch=batch,
             result=result,
+            kind="prefill_embedding",
+            embeddings=embeddings,
+            can_run_cuda_graph=getattr(result, "can_run_cuda_graph", False),
         )
 
     def _finalize_prefill_result_after_materialize(
@@ -493,11 +401,7 @@ class SchedulerOutputProcessorMixin:
         result = self._ensure_generation_result_ready_for_output(batch, result)
         if result.copy_done is not None:
             result.copy_done.synchronize()
-        return self._attach_materialized_result_constraints(
-            MaterializedBatchResult(batch=batch, result=result, kind="idle_generation"),
-            batch=batch,
-            result=result,
-        )
+        return MaterializedBatchResult(batch=batch, result=result, kind="idle_generation")
 
     def _finalize_idle_result_after_materialize(
         self: Scheduler, materialized: MaterializedBatchResult
@@ -551,18 +455,14 @@ class SchedulerOutputProcessorMixin:
                         for v in logits_output.next_token_token_ids_logprobs_val
                     ]
 
-        return self._attach_materialized_result_constraints(
-            MaterializedBatchResult(
-                batch=batch,
-                result=result,
-                kind="decode_generation",
-                logits_output=logits_output,
-                next_token_ids=next_token_ids,
-                next_token_logprobs=next_token_logprobs,
-                can_run_cuda_graph=result.can_run_cuda_graph,
-            ),
+        return MaterializedBatchResult(
             batch=batch,
             result=result,
+            kind="decode_generation",
+            logits_output=logits_output,
+            next_token_ids=next_token_ids,
+            next_token_logprobs=next_token_logprobs,
+            can_run_cuda_graph=result.can_run_cuda_graph,
         )
 
     def _finalize_decode_result_after_materialize(
@@ -686,35 +586,19 @@ class SchedulerOutputProcessorMixin:
             return self._materialize_decode_result_for_output(batch, result)
         if batch.forward_mode.is_extend():
             if batch.is_dllm():
-                return self._attach_materialized_result_constraints(
-                    MaterializedBatchResult(
-                        batch=batch, result=result, kind="direct_dllm"
-                    ),
-                    batch=batch,
-                    result=result,
+                return MaterializedBatchResult(
+                    batch=batch, result=result, kind="direct_dllm"
                 )
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                return self._attach_materialized_result_constraints(
-                    MaterializedBatchResult(
-                        batch=batch, result=result, kind="direct_disagg_prefill"
-                    ),
-                    batch=batch,
-                    result=result,
+                return MaterializedBatchResult(
+                    batch=batch, result=result, kind="direct_disagg_prefill"
                 )
             return self._materialize_prefill_result_for_output(batch, result)
         if batch.forward_mode.is_idle():
             return self._materialize_idle_result_for_output(batch, result)
         if batch.forward_mode.is_prebuilt():
-            return self._attach_materialized_result_constraints(
-                MaterializedBatchResult(batch=batch, result=result, kind="prebuilt"),
-                batch=batch,
-                result=result,
-            )
-        return self._attach_materialized_result_constraints(
-            MaterializedBatchResult(batch=batch, result=result, kind="direct_process"),
-            batch=batch,
-            result=result,
-        )
+            return MaterializedBatchResult(batch=batch, result=result, kind="prebuilt")
+        return MaterializedBatchResult(batch=batch, result=result, kind="direct_process")
 
     def finalize_materialized_batch_result(
         self: Scheduler, materialized: MaterializedBatchResult
@@ -750,7 +634,7 @@ class SchedulerOutputProcessorMixin:
             f"Unsupported materialized batch result kind: {materialized.kind}"
         )
 
-    def must_finalize_materialized_result_before_sampling(
+    def should_finalize_materialized_result_before_sampling(
         self: Scheduler,
         materialized: Optional[MaterializedBatchResult],
         current_batch: Optional[ScheduleBatch],
@@ -760,7 +644,7 @@ class SchedulerOutputProcessorMixin:
     ) -> bool:
         if materialized is None:
             return False
-        if materialized.must_finalize_before_sampling:
+        if materialized.batch.has_grammar:
             return True
         if current_batch is not None and current_batch.has_grammar:
             return True
@@ -770,24 +654,6 @@ class SchedulerOutputProcessorMixin:
         ):
             return True
         return False
-
-    def must_finalize_materialized_result_before_next_launch(
-        self: Scheduler,
-        materialized: Optional[MaterializedBatchResult],
-        next_batch: Optional[ScheduleBatch],
-    ) -> bool:
-        if materialized is None:
-            return False
-        if materialized.must_finalize_before_next_launch:
-            return True
-        if next_batch is None:
-            return False
-        return next_batch.has_grammar and next_batch.forward_mode.is_decode()
-
-    def can_defer_materialized_result_across_round(
-        self: Scheduler, materialized: Optional[MaterializedBatchResult]
-    ) -> bool:
-        return materialized is not None and materialized.can_defer_across_round
 
     def _handle_finished_req(
         self: Scheduler, req: Req, i: int, logits_output: LogitsProcessorOutput

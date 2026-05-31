@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import TYPE_CHECKING, Optional, Tuple
 
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -79,8 +78,6 @@ class SpecV2OverlapWorkerClient:
         batch_result: GenerationBatchResult,
         future_indices: "FutureIndices",
     ) -> None:
-        if os.environ.get("SGLANG_SPEC_V2_ENABLE_PLACEHOLDER_AUDIT", "0") != "1":
-            return
         if not self.scheduler.future_map.has_ready_spec_future_state(future_indices):
             return
 

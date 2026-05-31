@@ -40,10 +40,8 @@ class PendingOverlapResult:
     # Deprecated: keep the field for compatibility while scheduler resolve timing
     # is migrated to mutation-time decisions.
     requires_resolve_before_next_schedule: bool = False
-    became_mutation_ready: bool = False
     is_window_tail_materialized: bool = False
     is_window_tail_finalized: bool = False
-    window_tail_round_created: Optional[int] = None
     extend_input_len_per_req: Optional[list[int]] = None
     extend_logprob_start_len_per_req: Optional[list[int]] = None
     _resolved_batch_result: Optional[GenerationBatchResult] = None
@@ -92,9 +90,3 @@ class PendingOverlapResult:
 
     def mark_window_tail_finalized(self) -> None:
         self.is_window_tail_finalized = True
-
-    def mark_became_mutation_ready(self) -> None:
-        self.became_mutation_ready = True
-
-    def mark_window_tail_round(self, round_id: int) -> None:
-        self.window_tail_round_created = round_id

@@ -690,6 +690,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     future_handle: Optional[SpecFutureHandle] = None
     last_verified_ids: Optional[torch.Tensor] = None
     token_list: Optional[torch.Tensor] = None
+    has_real_future_payload: bool = False
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
@@ -714,6 +715,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         self.future_handle = future_handle
         self.last_verified_ids = last_verified_ids
         self.token_list = token_list
+        self.has_real_future_payload = False
         return self
 
     def prepare_for_extend(self, batch: ScheduleBatch):
@@ -750,6 +752,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             new_seq_lens=torch.empty((0,), device=device, dtype=torch.int32),
             accept_length=torch.empty((0,), device=device, dtype=torch.int32),
             accept_length_cpu=[],
+            has_real_future_payload=False,
         )
 
     @classmethod
@@ -773,6 +776,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             future_handle=future_handle,
             last_verified_ids=last_verified_ids,
             token_list=token_list,
+            has_real_future_payload=False,
         ).attach_future_indices(future_handle.future_indices)
 
     def prepare_extend_after_decode(
@@ -916,6 +920,9 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                     self.token_list = spec_info.token_list
                 elif spec_info.token_list is not None:
                     self.token_list = torch.cat([self.token_list, spec_info.token_list])
+                self.has_real_future_payload = (
+                    self.has_real_future_payload and spec_info.has_real_future_payload
+                )
                 if self.last_verified_ids is not None and self.token_list is not None:
                     _validate_future_placeholder_tensors(
                         self.last_verified_ids, self.token_list, "merge_batch(result)"

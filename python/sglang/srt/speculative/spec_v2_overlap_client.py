@@ -30,6 +30,8 @@ class SpecV2OverlapWorkerClient:
             return False
         if getattr(scheduler.server_args, "speculative_eagle_topk", None) != 1:
             return False
+        if not draft_input.has_real_future_payload:
+            return False
         if draft_input.last_verified_ids is None or draft_input.token_list is None:
             return False
         if draft_input.last_verified_ids.ndim != 1 or draft_input.token_list.ndim != 2:

@@ -172,6 +172,7 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_output_processor_mixin import (
+    MaterializedBatchResult,
     SchedulerOutputProcessorMixin,
 )
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
@@ -1317,6 +1318,42 @@ class Scheduler(
                     break
         return resolved_result
 
+    def _materialize_window_tail_result(
+        self,
+        batch: ScheduleBatch,
+        result: Union[GenerationBatchResult, EmbeddingBatchResult, PendingOverlapResult],
+    ) -> None:
+        if self.window_tail_result is not None:
+            raise RuntimeError("Window-tail materialization slot is already occupied.")
+
+        pending_result = result if isinstance(result, PendingOverlapResult) else None
+        resolved_result = self._resolve_overlap_batch_result_if_needed(
+            result, snapshot_batch=batch
+        )
+        if resolved_result is None:
+            return
+        self.window_tail_result = self.materialize_batch_result_for_output(
+            batch, resolved_result
+        )
+        if pending_result is not None:
+            self.window_tail_result.source_pending_result = pending_result
+            pending_result.mark_window_tail_materialized()
+
+    def _materialize_window_tail_from_queue_if_needed(self) -> None:
+        if self.window_tail_result is not None or not self.result_queue:
+            return
+        batch, result = self.result_queue.popleft()
+        self._materialize_window_tail_result(batch, result)
+
+    def _finalize_window_tail_result_if_needed(self) -> None:
+        if self.window_tail_result is None:
+            return
+        materialized = self.window_tail_result
+        self.finalize_materialized_batch_result(materialized)
+        self.window_tail_result = None
+        if materialized.source_pending_result is not None:
+            materialized.source_pending_result.mark_window_tail_finalized()
+
     def _has_unresolved_pending_overlap(self) -> bool:
         return (
             self.pending_overlap_state is not None
@@ -1333,6 +1370,7 @@ class Scheduler(
     def _clear_overlap_carriers(self) -> None:
         self.pending_overlap_state = None
         self.mutable_running_batch = None
+        self.window_tail_result = None
 
     def _get_mutable_running_batch(self) -> Optional[ScheduleBatch]:
         if self.mutable_running_batch is not None:
@@ -1602,14 +1640,13 @@ class Scheduler(
                 ],
             ]
         ] = deque()
+        self.window_tail_result: Optional[MaterializedBatchResult] = None
 
-        def pop_and_process():
-            # Process the results of the last batch
-            tmp_batch, tmp_result = self.result_queue.popleft()
-            tmp_result = self._resolve_overlap_batch_result_if_needed(
-                tmp_result, snapshot_batch=tmp_batch
-            )
-            self.process_batch_result(tmp_batch, tmp_result)
+        def pop_and_materialize():
+            self._materialize_window_tail_from_queue_if_needed()
+
+        def finalize_window_tail():
+            self._finalize_window_tail_result_if_needed()
 
         while True:
             # Receive requests
@@ -1626,7 +1663,9 @@ class Scheduler(
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
             if disable_overlap_for_batch:
-                pop_and_process()
+                finalize_window_tail()
+                pop_and_materialize()
+                finalize_window_tail()
 
             # Launch the current batch
             if batch:
@@ -1650,15 +1689,20 @@ class Scheduler(
             # Process the last batch
             if self.result_queue:
                 if not disable_overlap_for_batch:
-                    pop_and_process()
+                    pop_and_materialize()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
+            if self.should_finalize_materialized_result_before_sampling(
+                self.window_tail_result, batch, batch_result
+            ):
+                finalize_window_tail()
             if self.is_generation:
                 self.launch_batch_sample_if_needed(batch, batch_result)
+            finalize_window_tail()
 
             # Update last_batch
             self.last_batch = batch

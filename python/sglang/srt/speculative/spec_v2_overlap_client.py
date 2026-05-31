@@ -195,10 +195,11 @@ class SpecV2OverlapWorkerClient:
         relay = self.scheduler.future_map.build_spec_v2_future_relay(
             future_indices, batch_result
         )
+        future_interval = future_indices.interval
         logger.debug(
             "Spec-v2 pending relay built: future=[%s, %s), next_draft_bs=%s, has_real_payload=%s",
-            future_indices.start,
-            future_indices.end,
+            None if future_interval is None else future_interval.start,
+            None if future_interval is None else future_interval.stop,
             None
             if batch_result.next_draft_input is None
             else batch_result.next_draft_input.batch_size,

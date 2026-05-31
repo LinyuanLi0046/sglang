@@ -1321,6 +1321,21 @@ class Scheduler(
         if self.result_queue and self.result_queue[0][1] is queued_result:
             self.result_queue[0] = (queued_batch, resolved_result)
 
+    def _get_mutable_running_batch(self) -> Optional[ScheduleBatch]:
+        if self.mutable_running_batch is not None:
+            return self.mutable_running_batch
+        if self.pending_overlap_state is not None:
+            return self.pending_overlap_state.get_mutation_candidate_batch()
+        return self.last_batch
+
+    def _get_overlap_decision_batch(self) -> Optional[ScheduleBatch]:
+        mutation_candidate = self._get_mutable_running_batch()
+        if mutation_candidate is not None:
+            return mutation_candidate
+        if self.pending_overlap_state is not None:
+            return self.pending_overlap_state.live_batch_ref
+        return self.last_batch
+
     def _maybe_prepare_ngram_embedding(
         self, batch: Optional[ScheduleBatch]
     ) -> Optional[ScheduleBatch]:
@@ -1579,7 +1594,7 @@ class Scheduler(
                 self.cancel_bubble_timer()
 
             # Process the last batch
-            if self.last_batch:
+            if self.result_queue:
                 if not disable_overlap_for_batch:
                     pop_and_process()
             elif batch is None:
@@ -1608,7 +1623,8 @@ class Scheduler(
             is_extend = lambda b: b and b.forward_mode.is_extend()
 
         batch_is_extend = is_extend(batch)
-        last_batch_is_extend = is_extend(self.last_batch)
+        overlap_decision_batch = self._get_overlap_decision_batch()
+        last_batch_is_extend = is_extend(overlap_decision_batch)
 
         disable_overlap_for_batch = (
             envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.get()
@@ -1640,8 +1656,11 @@ class Scheduler(
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
 
         if self.recv_skipper is not None:
+            last_forward_batch = self._get_overlap_decision_batch()
             last_forward_mode = (
-                self.last_batch.forward_mode if self.last_batch is not None else None
+                last_forward_batch.forward_mode
+                if last_forward_batch is not None
+                else None
             )
             if not self.recv_skipper.handle(last_forward_mode):
                 return []
@@ -2423,15 +2442,7 @@ class Scheduler(
             # Reset batch_is_full so the scheduler can schedule more prefills.
             self.running_batch.batch_is_full = False
 
-        merge_source_batch = self.mutable_running_batch
-        if merge_source_batch is None and self.last_batch is not None:
-            unresolved_last_batch = (
-                self.pending_overlap_state is not None
-                and self.pending_overlap_state.live_batch_ref is self.last_batch
-                and not self.pending_overlap_state.is_resolved_for_mutation
-            )
-            if not unresolved_last_batch:
-                merge_source_batch = self.last_batch
+        merge_source_batch = self._get_mutable_running_batch()
 
         if (
             not self.enable_hisparse
@@ -3128,6 +3139,8 @@ class Scheduler(
             and self.chunked_req is None
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
+            and self.pending_overlap_state is None
+            and self.mutable_running_batch is None
             and (self.cur_batch is None or self.cur_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
@@ -3262,6 +3275,8 @@ class Scheduler(
         if self.is_fully_idle():
             self.cur_batch = None
             self.last_batch = None
+            self.pending_overlap_state = None
+            self.mutable_running_batch = None
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
@@ -3490,7 +3505,7 @@ class Scheduler(
             # manipulation logic and the accounting bugs that come with it.
             return
 
-        if self.enable_overlap and self.last_batch:
+        if self.enable_overlap and self.result_queue:
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
             tmp_result = self._resolve_overlap_batch_result_if_needed(
@@ -3498,9 +3513,10 @@ class Scheduler(
             )
             self.process_batch_result(tmp_batch, tmp_result)
 
-        if self.last_batch and self.last_batch.forward_mode.is_extend():
+        pause_merge_batch = self._get_mutable_running_batch()
+        if pause_merge_batch and pause_merge_batch.forward_mode.is_extend():
             chunked_req_to_exclude = set()
-            self.last_batch.filter_batch(
+            pause_merge_batch.filter_batch(
                 chunked_req_to_exclude=list(chunked_req_to_exclude)
             )
             # Skip merge for disagg prefill: completed prefill requests are
@@ -3508,13 +3524,13 @@ class Scheduler(
             # running_batch leaks them, since the prefill event loop never
             # calls update_running_batch to clean them up.
             if (
-                not self.last_batch.is_empty()
+                not pause_merge_batch.is_empty()
                 and self.disaggregation_mode != DisaggregationMode.PREFILL
             ):
                 if self.running_batch.is_empty():
-                    self.running_batch = self.last_batch
+                    self.running_batch = pause_merge_batch
                 else:
-                    self.running_batch.merge_batch(self.last_batch)
+                    self.running_batch.merge_batch(pause_merge_batch)
 
         self.last_batch = None
         self.pending_overlap_state = None

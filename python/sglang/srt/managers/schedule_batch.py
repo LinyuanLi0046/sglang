@@ -1873,6 +1873,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.SPLIT_PREFILL
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
+        self._assert_mutation_safe("mix_with_running")
+        running_batch._assert_mutation_safe("mix_with_running(running_batch)")
         self.forward_mode = ForwardMode.MIXED
         running_bs = running_batch.batch_size()
 
@@ -1942,6 +1944,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
     def retract_all(self, server_args: ServerArgs):
+        self._assert_mutation_safe("retract_all")
         retracted_reqs = self.reqs
         for idx in range(len(self.reqs)):
             self.release_req(idx, len(self.reqs) - idx, server_args)
@@ -2200,8 +2203,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def _assert_mutation_safe(self, operation: str) -> None:
         if self.is_mutation_safe:
             return
+        forward_mode = None if self.forward_mode is None else str(self.forward_mode)
         raise RuntimeError(
-            f"ScheduleBatch.{operation}() is unsafe on an unresolved overlap batch."
+            "ScheduleBatch."
+            f"{operation}() is unsafe on an unresolved overlap batch "
+            f"(forward_mode={forward_mode}, batch_size={self.batch_size()}, "
+            f"is_spec_v2={self.is_spec_v2})."
         )
 
     def filter_batch(

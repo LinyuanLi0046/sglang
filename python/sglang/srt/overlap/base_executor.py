@@ -64,3 +64,8 @@ class PendingOverlapResult:
             self.batch_relay = batch_relay
             self._resolved_batch_result = batch_result
         return self._resolved_batch_result
+
+    def get_mutation_candidate_batch(self) -> Optional[Any]:
+        if self.is_resolved_for_mutation and self.resolved_live_batch is not None:
+            return self.resolved_live_batch
+        return None

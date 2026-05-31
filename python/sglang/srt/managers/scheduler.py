@@ -1353,6 +1353,29 @@ class Scheduler(
         self.window_tail_candidate = materialized
         pending_result.mark_window_tail_materialized()
 
+    def _finalize_pending_result_immediately_for_scheduler_mutation(
+        self,
+        pending_result: PendingOverlapResult,
+        resolved_result: GenerationBatchResult,
+        snapshot_batch: Optional[ScheduleBatch] = None,
+    ) -> None:
+        if snapshot_batch is None:
+            snapshot_batch = self._take_result_queue_entry_for_pending_if_present(
+                pending_result
+            )
+        if snapshot_batch is None:
+            snapshot_batch = pending_result.get_snapshot_batch()
+        if snapshot_batch is None:
+            return
+        materialized = self.materialize_batch_result_for_output(
+            snapshot_batch, resolved_result
+        )
+        materialized.source_pending_result = pending_result
+        pending_result.mark_window_tail_materialized()
+        pending_result.mark_window_tail_round(getattr(self, "_overlap_round_id", 0))
+        self.finalize_materialized_batch_result(materialized)
+        pending_result.mark_window_tail_finalized()
+
     def _promote_window_tail_candidate_if_needed(self) -> None:
         if self.window_tail_result is not None or self.window_tail_candidate is None:
             return
@@ -1454,11 +1477,19 @@ class Scheduler(
             return
         if not pending_result.must_resolve_before_scheduler_mutation():
             return
-        resolved_result = self._materialize_pending_overlap_result(pending_result)
-        self._stash_pending_result_as_window_tail_candidate(
+        snapshot_batch = self._take_result_queue_entry_for_pending_if_present(
+            pending_result
+        )
+        resolved_result = self._materialize_pending_overlap_result(
+            pending_result, snapshot_batch=snapshot_batch
+        )
+        # Scheduler mutation depends on req.finished/release side effects already being
+        # reflected on the live running batch. Deferring finalize here makes the next
+        # decode scheduling round see stale req state and can relaunch finished work.
+        self._finalize_pending_result_immediately_for_scheduler_mutation(
             pending_result,
             resolved_result,
-            snapshot_batch=pending_result.get_snapshot_batch(),
+            snapshot_batch=snapshot_batch,
         )
 
     def _can_overlap_with_unresolved_spec_pending(

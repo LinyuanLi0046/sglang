@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -38,6 +39,9 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_npu_before_atlas_a5 = is_npu_before_atlas_a5()
+_ENABLE_SPECV2_PREPARE_COMPARE = (
+    os.getenv("SGLANG_ENABLE_SPECV2_PREPARE_COMPARE", "0") == "1"
+)
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -626,6 +630,10 @@ class EagleDraftInputV2Mixin:
         positions_prepared = False
         replay_prepare_state = None
         if not batch.forward_mode.is_idle():
+            future_ready = self._has_replay_prepare_payload()
+            should_shadow_compare = (
+                _ENABLE_SPECV2_PREPARE_COMPARE and future_ready
+            )
             full_relay_fallback_reason = (
                 self._get_full_future_relay_prepare_fallback_reason(
                     topk=topk,
@@ -639,7 +647,7 @@ class EagleDraftInputV2Mixin:
                     batch=batch,
                     topk=topk,
                     num_steps=num_steps,
-                    clear_future_buffers=False,
+                    clear_future_buffers=not should_shadow_compare,
                 )
             )
             placeholder_fallback_reason = self._get_placeholder_prepare_fallback_reason(
@@ -655,17 +663,16 @@ class EagleDraftInputV2Mixin:
                     draft_model_runner=draft_model_runner,
                     topk=topk,
                     num_steps=num_steps,
-                    clear_future_buffers=False,
+                    clear_future_buffers=not should_shadow_compare,
                 )
             )
-            future_ready = self._has_replay_prepare_payload()
 
             if prepared_from_full_future_relay:
                 logger.debug(
                     "Phase6-B full-relay prepare hit at interval=%s.",
                     self.future_indices.interval if self.future_indices is not None else None,
                 )
-                if future_ready:
+                if should_shadow_compare:
                     replay_prepare_state = self._build_v2_draft_replay_prepare_state(
                         req_to_token_pool=req_to_token_pool,
                         batch=batch,
@@ -677,12 +684,13 @@ class EagleDraftInputV2Mixin:
                     "Phase6-B placeholder+replay prepare hit at interval=%s.",
                     self.future_indices.interval if self.future_indices is not None else None,
                 )
-                replay_prepare_state = self._build_v2_draft_replay_prepare_state(
-                    req_to_token_pool=req_to_token_pool,
-                    batch=batch,
-                    topk=topk,
-                    num_steps=num_steps,
-                )
+                if should_shadow_compare:
+                    replay_prepare_state = self._build_v2_draft_replay_prepare_state(
+                        req_to_token_pool=req_to_token_pool,
+                        batch=batch,
+                        topk=topk,
+                        num_steps=num_steps,
+                    )
             elif future_ready:
                 self.prepare_for_v2_draft_from_replay_payload(
                     req_to_token_pool=req_to_token_pool,

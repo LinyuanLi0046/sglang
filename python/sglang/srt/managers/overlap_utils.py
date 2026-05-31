@@ -346,6 +346,49 @@ class FutureMap:
             token_list=draft_input.token_list,
         )
 
+    def peek_spec_future_state(
+        self, future_indices: FutureIndices
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if self.spec_future_state_pool is None:
+            return None, None, None
+        intv = future_indices.interval
+        if intv is None or self.is_empty_slice(intv):
+            return None, None, None
+        return (
+            self.spec_future_state_pool.future_last_verified_ids[intv],
+            self.spec_future_state_pool.future_token_list[intv],
+            self.spec_future_state_pool.future_ready[intv],
+        )
+
+    def peek_replay_future_state(
+        self, future_indices: FutureIndices
+    ) -> dict[str, Optional[torch.Tensor]]:
+        intv = future_indices.interval
+        if intv is None or self.is_empty_slice(intv):
+            return {
+                "topk_p": None,
+                "topk_index": None,
+                "verified_id": None,
+                "new_seq_lens": None,
+                "hidden_states": None,
+            }
+        hidden_states = None
+        if spec_need_hidden_states() and self.hidden_states_buf is not None:
+            hidden_states = self.hidden_states_buf[intv]
+        return {
+            "topk_p": None if self.topk_p_buf is None else self.topk_p_buf[intv],
+            "topk_index": None
+            if self.topk_index_buf is None
+            else self.topk_index_buf[intv],
+            "verified_id": None
+            if self.verified_id_buf is None
+            else self.verified_id_buf[intv],
+            "new_seq_lens": None
+            if self.new_seq_lens_buf is None
+            else self.new_seq_lens_buf[intv],
+            "hidden_states": hidden_states,
+        }
+
     def attach_spec_future_buffers(self, draft_input: EagleDraftInput):
         indices = draft_input.future_indices.indices
         # The indices tensor was allocated on the default stream but is

@@ -78,11 +78,54 @@ class SpecFutureStatePool:
     def create_placeholder_inputs(
         self, handle: SpecFutureHandle
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Negative values are future handles only. They are not valid
+        # speculative payloads until resolve_placeholder() replaces them
+        # with worker-produced data.
         placeholder_ids = -handle.future_indices.indices.to(dtype=torch.int32)
         placeholder_token_list = placeholder_ids.unsqueeze(1).repeat(
             1, self.speculative_num_steps
         )
         return placeholder_ids, placeholder_token_list
+
+    def _validate_resolved_state(
+        self,
+        handle: SpecFutureHandle,
+        last_verified_ids: Optional[torch.Tensor],
+        token_list: Optional[torch.Tensor],
+    ) -> None:
+        if handle.future_indices.interval is None:
+            raise ValueError("SpecFutureStatePool requires a concrete future interval.")
+        if last_verified_ids is None or token_list is None:
+            raise ValueError("Resolved future state requires last_verified_ids and token_list.")
+        if last_verified_ids.dtype.is_floating_point or last_verified_ids.dtype == torch.bool:
+            raise TypeError(
+                f"last_verified_ids must use an integer dtype, got {last_verified_ids.dtype}."
+            )
+        if token_list.dtype.is_floating_point or token_list.dtype == torch.bool:
+            raise TypeError(f"token_list must use an integer dtype, got {token_list.dtype}.")
+        if last_verified_ids.ndim != 1:
+            raise ValueError(
+                f"last_verified_ids must be rank-1, got ndim={last_verified_ids.ndim}."
+            )
+        if token_list.ndim != 2:
+            raise ValueError(f"token_list must be rank-2, got ndim={token_list.ndim}.")
+        if token_list.shape[0] != last_verified_ids.shape[0]:
+            raise ValueError(
+                "Resolved future state has inconsistent batch dimension: "
+                f"token_list.shape[0]={token_list.shape[0]} vs "
+                f"last_verified_ids.shape[0]={last_verified_ids.shape[0]}."
+            )
+        if token_list.shape[1] != self.speculative_num_steps:
+            raise ValueError(
+                "Resolved future state has inconsistent token width: "
+                f"token_list.shape[1]={token_list.shape[1]} vs "
+                f"speculative_num_steps={self.speculative_num_steps}."
+            )
+        if last_verified_ids.shape[0] != len(handle.future_indices.indices):
+            raise ValueError(
+                "Resolved future state batch size does not match future handle: "
+                f"{last_verified_ids.shape[0]} vs {len(handle.future_indices.indices)}."
+            )
 
     def resolve_placeholder(self, draft_input: EagleDraftInput) -> None:
         if (
@@ -92,16 +135,42 @@ class SpecFutureStatePool:
         ):
             return
 
+        if draft_input.last_verified_ids.ndim != 1:
+            raise ValueError(
+                "Future placeholder last_verified_ids must be rank-1, "
+                f"got ndim={draft_input.last_verified_ids.ndim}."
+            )
+        if draft_input.token_list.ndim != 2:
+            raise ValueError(
+                "Future placeholder token_list must be rank-2, "
+                f"got ndim={draft_input.token_list.ndim}."
+            )
+        if draft_input.token_list.shape[0] != draft_input.last_verified_ids.shape[0]:
+            raise ValueError(
+                "Future placeholder batch dimensions are inconsistent: "
+                f"token_list.shape[0]={draft_input.token_list.shape[0]} vs "
+                f"last_verified_ids.shape[0]={draft_input.last_verified_ids.shape[0]}."
+            )
+        if draft_input.token_list.shape[1] != self.speculative_num_steps:
+            raise ValueError(
+                "Future placeholder token width is inconsistent: "
+                f"token_list.shape[1]={draft_input.token_list.shape[1]} vs "
+                f"speculative_num_steps={self.speculative_num_steps}."
+            )
+
+        needs_resolve = draft_input.last_verified_ids < 0
         indices = torch.clamp(-draft_input.last_verified_ids.to(dtype=torch.int64), min=0)
         ready_mask = self.future_ready[indices]
 
         draft_input.last_verified_ids[:] = torch.where(
-            ready_mask & (draft_input.last_verified_ids < 0),
+            ready_mask & needs_resolve,
             self.future_last_verified_ids[indices],
             draft_input.last_verified_ids,
         )
         draft_input.token_list[:] = torch.where(
-            ready_mask.unsqueeze(1) & (draft_input.token_list < 0),
+            ready_mask.unsqueeze(1)
+            & needs_resolve.unsqueeze(1)
+            & (draft_input.token_list < 0),
             self.future_token_list[indices],
             draft_input.token_list,
         )
@@ -112,17 +181,11 @@ class SpecFutureStatePool:
         last_verified_ids: Optional[torch.Tensor],
         token_list: Optional[torch.Tensor],
     ) -> None:
-        if (
-            last_verified_ids is None
-            or token_list is None
-            or handle.future_indices.interval is None
-        ):
-            return
-
-        intv = handle.future_indices.interval
         if self.future_buffer_len == 0:
             return
+        self._validate_resolved_state(handle, last_verified_ids, token_list)
 
+        intv = handle.future_indices.interval
         self.future_last_verified_ids[intv] = last_verified_ids.to(torch.int32)
         self.future_token_list[intv] = token_list.to(torch.int32)
         self.future_ready[intv] = True

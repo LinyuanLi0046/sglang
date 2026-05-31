@@ -51,6 +51,30 @@ if is_cuda():
 logger = logging.getLogger(__name__)
 
 
+def _validate_future_placeholder_tensors(
+    last_verified_ids: Optional[torch.Tensor],
+    token_list: Optional[torch.Tensor],
+    context: str,
+) -> None:
+    if last_verified_ids is None or token_list is None:
+        raise ValueError(
+            f"{context} requires both last_verified_ids and token_list to be present."
+        )
+    if last_verified_ids.ndim != 1:
+        raise ValueError(
+            f"{context}: last_verified_ids must be rank-1, got ndim={last_verified_ids.ndim}."
+        )
+    if token_list.ndim != 2:
+        raise ValueError(
+            f"{context}: token_list must be rank-2, got ndim={token_list.ndim}."
+        )
+    if token_list.shape[0] != last_verified_ids.shape[0]:
+        raise ValueError(
+            f"{context}: token_list.shape[0]={token_list.shape[0]} does not match "
+            f"last_verified_ids.shape[0]={last_verified_ids.shape[0]}."
+        )
+
+
 @dataclass
 class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     draft_token: torch.Tensor
@@ -657,6 +681,11 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     future_hidden_states_buf: Optional[torch.Tensor] = None
     future_verified_id_buf: Optional[torch.Tensor] = None
     future_new_seq_lens_buf: Optional[torch.Tensor] = None
+    # Placeholder payload contract:
+    # - last_verified_ids is the verified starting token for the next verify step.
+    # - token_list is the real draft token sequence consumed by the next verify step.
+    # - when uses_future_placeholder=True and values are still negative, they are
+    #   future handles only and must not be treated as resolved speculative payload.
     uses_future_placeholder: bool = False
     future_handle: Optional[SpecFutureHandle] = None
     last_verified_ids: Optional[torch.Tensor] = None
@@ -678,6 +707,9 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         last_verified_ids: torch.Tensor,
         token_list: torch.Tensor,
     ) -> "EagleDraftInput":
+        _validate_future_placeholder_tensors(
+            last_verified_ids, token_list, "attach_future_placeholder"
+        )
         self.uses_future_placeholder = True
         self.future_handle = future_handle
         self.last_verified_ids = last_verified_ids
@@ -729,6 +761,11 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         new_seq_lens: Optional[torch.Tensor] = None,
         verify_done: Optional[torch.cuda.Event] = None,
     ) -> "EagleDraftInput":
+        # This constructor installs future handles only. The payload becomes
+        # semantically valid after overlap worker resolve replaces negative values.
+        _validate_future_placeholder_tensors(
+            last_verified_ids, token_list, "create_future_placeholder_input"
+        )
         return cls(
             new_seq_lens=new_seq_lens,
             verify_done=verify_done,
@@ -804,12 +841,19 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if self.future_indices is not None:
+            if self.uses_future_placeholder:
+                _validate_future_placeholder_tensors(
+                    self.last_verified_ids, self.token_list, "filter_batch(before)"
+                )
             self.future_indices.indices = self.future_indices.indices[new_indices]
             if self.uses_future_placeholder:
                 if self.last_verified_ids is not None:
                     self.last_verified_ids = self.last_verified_ids[new_indices]
                 if self.token_list is not None:
                     self.token_list = self.token_list[new_indices]
+                _validate_future_placeholder_tensors(
+                    self.last_verified_ids, self.token_list, "filter_batch(after)"
+                )
             return
 
         strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
@@ -843,6 +887,23 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                 )
             )
             if self.uses_future_placeholder or spec_info.uses_future_placeholder:
+                if self.uses_future_placeholder:
+                    _validate_future_placeholder_tensors(
+                        self.last_verified_ids, self.token_list, "merge_batch(lhs)"
+                    )
+                if spec_info.uses_future_placeholder:
+                    _validate_future_placeholder_tensors(
+                        spec_info.last_verified_ids,
+                        spec_info.token_list,
+                        "merge_batch(rhs)",
+                    )
+                if self.token_list is not None and spec_info.token_list is not None and (
+                    self.token_list.shape[1] != spec_info.token_list.shape[1]
+                ):
+                    raise ValueError(
+                        "merge_batch requires placeholder token_list width to match: "
+                        f"{self.token_list.shape[1]} vs {spec_info.token_list.shape[1]}."
+                    )
                 self.uses_future_placeholder = True
                 self.future_handle = None
                 if self.last_verified_ids is None:
@@ -855,6 +916,10 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                     self.token_list = spec_info.token_list
                 elif spec_info.token_list is not None:
                     self.token_list = torch.cat([self.token_list, spec_info.token_list])
+                if self.last_verified_ids is not None and self.token_list is not None:
+                    _validate_future_placeholder_tensors(
+                        self.last_verified_ids, self.token_list, "merge_batch(result)"
+                    )
             return
 
         if self.hidden_states is None:

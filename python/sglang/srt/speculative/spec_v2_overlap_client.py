@@ -21,6 +21,25 @@ class SpecV2OverlapWorkerClient:
     def __init__(self, scheduler: Scheduler):
         self.scheduler = scheduler
 
+    def _should_store_real_placeholder_state(
+        self, batch_result: GenerationBatchResult
+    ) -> bool:
+        scheduler = self.scheduler
+        draft_input = batch_result.next_draft_input
+        if draft_input is None:
+            return False
+        if getattr(scheduler.server_args, "speculative_eagle_topk", None) != 1:
+            return False
+        if draft_input.last_verified_ids is None or draft_input.token_list is None:
+            return False
+        if draft_input.last_verified_ids.ndim != 1 or draft_input.token_list.ndim != 2:
+            return False
+        if draft_input.token_list.shape[0] != draft_input.last_verified_ids.shape[0]:
+            return False
+        if draft_input.token_list.shape[1] != scheduler.server_args.speculative_num_steps:
+            return False
+        return True
+
     def submit(
         self,
         batch: ScheduleBatch,
@@ -59,9 +78,10 @@ class SpecV2OverlapWorkerClient:
                     model_worker_batch
                     # here pp is not compatible with overlap
                 )
-            scheduler.future_map.store_spec_future_state(
-                future_indices, batch_result.next_draft_input
-            )
+            if self._should_store_real_placeholder_state(batch_result):
+                scheduler.future_map.store_spec_future_state(
+                    future_indices, batch_result.next_draft_input
+                )
             if batch_result.delay_sample_func is None:
                 scheduler.future_map.store_to_map(future_indices, batch_result)
                 scheduler._schedule_generation_batch_result_copy(batch, batch_result)

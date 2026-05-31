@@ -545,6 +545,86 @@ class EagleDraftWorker(BaseDraftWorker):
         next_draft_input.hidden_states = logits_output.hidden_states
         return next_draft_input
 
+    def _build_real_placeholder_token_list_for_decode(
+        self,
+        batch: ModelWorkerBatch,
+        next_draft_input: EagleDraftInput,
+    ) -> Optional[torch.Tensor]:
+        if (
+            self.topk != 1
+            or next_draft_input.topk_p is None
+            or next_draft_input.topk_index is None
+            or next_draft_input.hidden_states is None
+            or next_draft_input.verified_id is None
+            or next_draft_input.new_seq_lens is None
+        ):
+            return None
+        if batch.forward_mode.is_idle():
+            return torch.empty(
+                (0, self.speculative_num_steps), dtype=torch.int32, device=self.device
+            )
+
+        temp_draft_input = EagleDraftInput(
+            verified_id=next_draft_input.verified_id,
+            hidden_states=next_draft_input.hidden_states,
+            topk_p=next_draft_input.topk_p,
+            topk_index=next_draft_input.topk_index,
+            new_seq_lens=next_draft_input.new_seq_lens,
+        )
+
+        original_spec_info = batch.spec_info
+        original_seq_lens = batch.seq_lens
+        original_seq_lens_cpu = batch.seq_lens_cpu
+        original_seq_lens_sum = batch.seq_lens_sum
+        original_capture_hidden_mode = batch.capture_hidden_mode
+        original_out_cache_loc = getattr(batch, "out_cache_loc", None)
+
+        try:
+            batch.spec_info = temp_draft_input
+            batch.seq_lens = next_draft_input.new_seq_lens
+            batch.seq_lens_cpu = next_draft_input.new_seq_lens.cpu()
+            batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
+            batch.capture_hidden_mode = CaptureHiddenMode.LAST
+
+            forward_batch, _ = temp_draft_input.prepare_for_v2_draft(
+                self.req_to_token_pool,
+                batch,
+                None,
+                self.draft_runner,
+                self.topk,
+                self.speculative_num_steps,
+            )
+            if (
+                not forward_batch.forward_mode.is_idle()
+                and self.speculative_num_steps > 1
+            ):
+                self.draft_attn_backend.init_forward_metadata(forward_batch)
+            _, _, draft_tokens = self.draft_forward(forward_batch)
+        finally:
+            batch.spec_info = original_spec_info
+            batch.seq_lens = original_seq_lens
+            batch.seq_lens_cpu = original_seq_lens_cpu
+            batch.seq_lens_sum = original_seq_lens_sum
+            batch.capture_hidden_mode = original_capture_hidden_mode
+            batch.out_cache_loc = original_out_cache_loc
+
+        if draft_tokens.ndim == 1:
+            draft_tokens = draft_tokens.reshape(len(batch.seq_lens), -1)
+        if draft_tokens.ndim != 2 or draft_tokens.shape != (
+            len(batch.seq_lens),
+            self.speculative_num_steps,
+        ):
+            logger.warning(
+                "Skip storing real placeholder token_list because draft rollout produced "
+                "shape %s, expected (%d, %d).",
+                tuple(draft_tokens.shape),
+                len(batch.seq_lens),
+                self.speculative_num_steps,
+            )
+            return None
+
+        return draft_tokens.to(torch.int32)
+
     def _draft_extend_for_decode(
         self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult
     ):
@@ -622,13 +702,9 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
         next_draft_input.last_verified_ids = next_draft_input.verified_id
-        if self.topk == 1 and next_draft_input.topk_index is not None:
-            # Placeholder migration phase 3:
-            # expose a minimal worker-side token_list payload so the future
-            # state pool can be populated without changing the old relay path.
-            next_draft_input.token_list = next_draft_input.topk_index.to(
-                torch.int32
-            ).repeat(1, self.speculative_num_steps)
+        next_draft_input.token_list = self._build_real_placeholder_token_list_for_decode(
+            batch, next_draft_input
+        )
 
 
 class EAGLEWorkerV2(BaseSpecWorker):

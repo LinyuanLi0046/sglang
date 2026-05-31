@@ -8,7 +8,7 @@ from sglang.srt.managers.utils import GenerationBatchResult
 if TYPE_CHECKING:
     import torch
 
-    from sglang.srt.managers.overlap_utils import FutureIndices
+    from sglang.srt.managers.overlap_utils import FutureIndices, SpecV2FutureRelay
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
     from sglang.srt.managers.scheduler import Scheduler
 
@@ -187,6 +187,15 @@ class SpecV2OverlapWorkerClient:
             future_indices=future_indices,
         )
 
+    def _build_overlap_batch_relay(
+        self,
+        batch_result: GenerationBatchResult,
+        future_indices: "FutureIndices",
+    ) -> "SpecV2FutureRelay":
+        return self.scheduler.future_map.build_spec_v2_future_relay(
+            future_indices, batch_result
+        )
+
     def submit(
         self,
         batch: ScheduleBatch,
@@ -214,7 +223,7 @@ class SpecV2OverlapWorkerClient:
         batch: ScheduleBatch,
         model_worker_batch: ModelWorkerBatch,
         future_indices,
-    ) -> GenerationBatchResult:
+    ) -> tuple[GenerationBatchResult, "SpecV2FutureRelay"]:
         scheduler = self.scheduler
 
         with scheduler.forward_stream_ctx, scheduler.record_bubble_metrics(batch):
@@ -236,5 +245,5 @@ class SpecV2OverlapWorkerClient:
                     batch_result.copy_done = scheduler.device_module.Event()
                 batch_result.future_indices = future_indices
 
-        scheduler._relay_spec_v2_overlap_result(batch, batch_result, future_indices)
-        return batch_result
+        batch_relay = self._build_overlap_batch_relay(batch_result, future_indices)
+        return batch_result, batch_relay

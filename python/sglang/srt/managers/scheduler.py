@@ -1200,16 +1200,15 @@ class Scheduler(
             batch_result.schedule_copy_to_cpu(self._get_generation_copy_policy(batch))
             batch_result.record_copy_done()
 
-    def _relay_spec_v2_overlap_result(
+    def _apply_overlap_batch_relay_if_present(
         self,
         batch: ScheduleBatch,
         batch_result: GenerationBatchResult,
-        future_indices,
-    ):
-        future_relay = self.future_map.build_spec_v2_future_relay(
-            future_indices, batch_result
-        )
-        future_relay.apply_to_batch(batch, batch_result.next_draft_input)
+        batch_relay,
+    ) -> None:
+        if batch_relay is None:
+            return
+        batch_relay.apply_to_batch(batch, batch_result.next_draft_input)
 
     def _run_generation_batch_overlap(
         self,
@@ -1264,12 +1263,17 @@ class Scheduler(
 
     def _resolve_overlap_batch_result_if_needed(
         self,
+        batch: ScheduleBatch,
         result: Optional[
             Union[GenerationBatchResult, EmbeddingBatchResult, PendingOverlapResult]
         ],
     ) -> Optional[Union[GenerationBatchResult, EmbeddingBatchResult]]:
         if isinstance(result, PendingOverlapResult):
-            return result.resolve()
+            resolved_result = result.resolve()
+            self._apply_overlap_batch_relay_if_present(
+                batch, resolved_result, result.batch_relay
+            )
+            return resolved_result
         return result
 
     def _resolve_last_batch_before_next_schedule_if_needed(self):
@@ -1281,6 +1285,9 @@ class Scheduler(
         if not queued_result.requires_resolve_before_next_schedule:
             return
         resolved_result = queued_result.resolve()
+        self._apply_overlap_batch_relay_if_present(
+            queued_batch, resolved_result, queued_result.batch_relay
+        )
         self.result_queue[0] = (queued_batch, resolved_result)
 
     def _maybe_prepare_ngram_embedding(
@@ -1495,7 +1502,9 @@ class Scheduler(
         def pop_and_process():
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
-            tmp_result = self._resolve_overlap_batch_result_if_needed(tmp_result)
+            tmp_result = self._resolve_overlap_batch_result_if_needed(
+                tmp_batch, tmp_result
+            )
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:

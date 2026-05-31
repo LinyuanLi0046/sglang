@@ -18,7 +18,7 @@ class SpecV2OverlapExecutor:
     def __init__(self, scheduler: "Scheduler"):
         self.scheduler = scheduler
         self.client = SpecV2OverlapWorkerClient(scheduler)
-        self.worker_client: TpWorkerClientV2[OverlapExecutionResult] = TpWorkerClientV2(
+        self.worker_client: TpWorkerClientV2[object] = TpWorkerClientV2(
             "spec-v2",
             device=scheduler.device,
             gpu_id=scheduler.gpu_id,
@@ -62,11 +62,11 @@ class SpecV2OverlapExecutor:
         batch: "ScheduleBatch",
         model_worker_batch: "ModelWorkerBatch",
         future_indices,
-    ) -> OverlapExecutionResult:
-        batch_result = self.client.run_with_future_indices(
+    ) -> object:
+        batch_result, batch_relay = self.client.run_with_future_indices(
             batch, model_worker_batch, future_indices
         )
-        return batch_result
+        return batch_result, batch_relay
 
     def _install_future_placeholder(self, batch: "ScheduleBatch", future_indices) -> None:
         scheduler = self.scheduler

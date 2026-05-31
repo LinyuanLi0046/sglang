@@ -2910,8 +2910,16 @@ class Scheduler(
             self.forward_stream.wait_stream(self.schedule_stream)
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
-            self.future_map.store_to_map(batch_result.future_indices, batch_result)
-        self._schedule_generation_batch_result_copy(batch, batch_result)
+            if (
+                self.spec_v2_overlap_executor is not None
+                and batch_result.future_indices is not None
+            ):
+                self.spec_v2_overlap_executor.client.finalize_delayed_batch_result(
+                    batch, batch_result
+                )
+            else:
+                self.future_map.store_to_map(batch_result.future_indices, batch_result)
+                self._schedule_generation_batch_result_copy(batch, batch_result)
 
         # Release the closure and large GPU tensors that are no longer needed.
         # The delay_sample_func closure captures forward_batch (which holds

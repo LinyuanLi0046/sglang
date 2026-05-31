@@ -155,6 +155,38 @@ class SpecV2OverlapWorkerClient:
                 spec_token_list.shape[1],
             )
 
+    def _finalize_overlap_future_write_and_audit(
+        self,
+        batch: "ScheduleBatch",
+        batch_result: GenerationBatchResult,
+        future_indices: "FutureIndices",
+    ) -> None:
+        scheduler = self.scheduler
+        batch_result.future_indices = future_indices
+        if self._should_store_real_placeholder_state(batch_result):
+            scheduler.future_map.store_spec_future_state(
+                future_indices, batch_result.next_draft_input
+            )
+        scheduler.future_map.store_to_map(future_indices, batch_result)
+        self._maybe_record_placeholder_audit(batch_result, future_indices)
+        scheduler._schedule_generation_batch_result_copy(batch, batch_result)
+
+    def finalize_delayed_batch_result(
+        self,
+        batch: "ScheduleBatch",
+        batch_result: GenerationBatchResult,
+    ) -> None:
+        future_indices = batch_result.future_indices
+        if future_indices is None:
+            raise ValueError(
+                "finalize_delayed_batch_result requires batch_result.future_indices."
+            )
+        self._finalize_overlap_future_write_and_audit(
+            batch=batch,
+            batch_result=batch_result,
+            future_indices=future_indices,
+        )
+
     def submit(
         self,
         batch: ScheduleBatch,
@@ -193,14 +225,12 @@ class SpecV2OverlapWorkerClient:
                     model_worker_batch
                     # here pp is not compatible with overlap
                 )
-            if self._should_store_real_placeholder_state(batch_result):
-                scheduler.future_map.store_spec_future_state(
-                    future_indices, batch_result.next_draft_input
-                )
             if batch_result.delay_sample_func is None:
-                scheduler.future_map.store_to_map(future_indices, batch_result)
-                self._maybe_record_placeholder_audit(batch_result, future_indices)
-                scheduler._schedule_generation_batch_result_copy(batch, batch_result)
+                self._finalize_overlap_future_write_and_audit(
+                    batch=batch,
+                    batch_result=batch_result,
+                    future_indices=future_indices,
+                )
             else:
                 if batch_result.copy_done is None:
                     batch_result.copy_done = scheduler.device_module.Event()

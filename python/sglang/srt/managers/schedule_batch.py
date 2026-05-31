@@ -2069,6 +2069,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return ret
 
     def prepare_for_decode(self):
+        self._assert_mutation_safe("prepare_for_decode")
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
         # Decode embeds the last output token via embed_tokens; clear the stale
@@ -2204,11 +2205,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.is_mutation_safe:
             return
         forward_mode = None if self.forward_mode is None else str(self.forward_mode)
+        has_grammar = any(req.grammar is not None for req in self.reqs)
         raise RuntimeError(
             "ScheduleBatch."
             f"{operation}() is unsafe on an unresolved overlap batch "
             f"(forward_mode={forward_mode}, batch_size={self.batch_size()}, "
-            f"is_spec_v2={self.is_spec_v2})."
+            f"is_spec_v2={self.is_spec_v2}, enable_overlap={self.enable_overlap}, "
+            f"has_grammar={has_grammar}, has_spec_info={self.spec_info is not None})."
         )
 
     def filter_batch(

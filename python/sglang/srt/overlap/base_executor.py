@@ -69,3 +69,9 @@ class PendingOverlapResult:
         if self.is_resolved_for_mutation and self.resolved_live_batch is not None:
             return self.resolved_live_batch
         return None
+
+    def has_unresolved_live_batch(self) -> bool:
+        return self.live_batch_ref is not None and not self.is_resolved_for_mutation
+
+    def get_snapshot_batch(self) -> Optional[Any]:
+        return self.batch_snapshot

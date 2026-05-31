@@ -196,16 +196,23 @@ class SpecV2OverlapWorkerClient:
             future_indices, batch_result
         )
         future_interval = future_indices.interval
+        next_draft_input = batch_result.next_draft_input
+        next_draft_bs = None
+        if next_draft_input is not None:
+            if next_draft_input.verified_id is not None:
+                next_draft_bs = len(next_draft_input.verified_id)
+            elif next_draft_input.new_seq_lens is not None:
+                next_draft_bs = len(next_draft_input.new_seq_lens)
+            elif next_draft_input.last_verified_ids is not None:
+                next_draft_bs = len(next_draft_input.last_verified_ids)
         logger.debug(
             "Spec-v2 pending relay built: future=[%s, %s), next_draft_bs=%s, has_real_payload=%s",
             None if future_interval is None else future_interval.start,
             None if future_interval is None else future_interval.stop,
-            None
-            if batch_result.next_draft_input is None
-            else batch_result.next_draft_input.batch_size,
+            next_draft_bs,
             False
-            if batch_result.next_draft_input is None
-            else batch_result.next_draft_input.has_real_future_payload,
+            if next_draft_input is None
+            else next_draft_input.has_real_future_payload,
         )
         return relay
 

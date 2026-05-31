@@ -190,8 +190,10 @@ class EagleDraftInputV2Mixin:
 
         bs = batch.batch_size()
 
-        # Now seq_lens is correct
-        batch.maybe_wait_verify_done()
+        # Phase6-C:
+        # this path only needs a stream dependency before GPU-side tensor work.
+        # avoid blocking the scheduler thread on CPU here.
+        batch.maybe_wait_verify_done_event()
 
         page_size = batch.token_to_kv_pool_allocator.page_size
         cur_kv_lens_cpu = []

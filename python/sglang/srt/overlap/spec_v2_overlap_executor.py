@@ -51,6 +51,9 @@ class SpecV2OverlapExecutor:
             future_indices_or_next_token_ids=future_indices_or_next_token_ids,
             relay_target_batch=batch,
             future_indices=future_indices,
+            schedule_safe_without_resolve=self._can_schedule_without_preschedule_resolve(
+                batch
+            ),
             requires_current_batch_resolve_for_sampling=False,
             requires_resolve_before_next_schedule=True,
         )
@@ -58,6 +61,16 @@ class SpecV2OverlapExecutor:
             batch_result=pending_result,
             future_indices_or_next_token_ids=future_indices_or_next_token_ids,
             future_indices=future_indices,
+        )
+
+    def _can_schedule_without_preschedule_resolve(self, batch: "ScheduleBatch") -> bool:
+        # Phase6-C first cut:
+        # only open the overlap window for the common spec-v2 decode path.
+        # Keep grammar / structured output and non-decode paths conservative.
+        return bool(
+            batch.is_spec_v2
+            and batch.forward_mode.is_decode()
+            and not batch.has_grammar
         )
 
     def _run_in_worker(

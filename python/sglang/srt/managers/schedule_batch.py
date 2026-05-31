@@ -2181,11 +2181,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if draft_input.verify_done is not None:
                 draft_input.verify_done.synchronize()
 
-    def maybe_wait_verify_done(self):
-        if self.is_spec_v2:
-            draft_input: EagleDraftInput = self.spec_info
-            if draft_input.verify_done is not None:
-                draft_input.verify_done.synchronize()
     def maybe_wait_verify_done_event(self):
         if self.is_spec_v2:
             draft_input: EagleDraftInput = self.spec_info
@@ -2203,7 +2198,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     ):
         # FIXME(lsyin): used here to get the correct seq_lens
         # The batch has been launched but we need it verified to get correct next batch info
-        self.maybe_wait_verify_done()
+        self.maybe_wait_verify_done_event()
 
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
@@ -2283,7 +2278,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # In disagg decode + overlap, merge_batch can be called before
         # filter_batch, so running_batch.seq_lens may still be a forward_stream
         # future. Synchronize here to avoid a cross-stream data race.
-        self.maybe_wait_verify_done()
+        self.maybe_wait_verify_done_event()
 
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it

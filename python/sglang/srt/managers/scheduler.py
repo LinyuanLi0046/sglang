@@ -1200,15 +1200,28 @@ class Scheduler(
             batch_result.schedule_copy_to_cpu(self._get_generation_copy_policy(batch))
             batch_result.record_copy_done()
 
-    def _apply_overlap_batch_relay_if_present(
+    def _apply_pending_overlap_batch_relay_if_present(
         self,
-        batch: ScheduleBatch,
+        snapshot_batch: ScheduleBatch,
+        pending_result: PendingOverlapResult,
         batch_result: GenerationBatchResult,
-        batch_relay,
     ) -> None:
-        if batch_relay is None:
+        if pending_result.relay_applied or pending_result.batch_relay is None:
             return
-        batch_relay.apply_to_batch(batch, batch_result.next_draft_input)
+        target_batch = pending_result.relay_target_batch
+        if target_batch is None:
+            logger.warning(
+                "Spec v2 overlap relay target batch is missing; skip relay apply."
+            )
+            return
+        if target_batch is not snapshot_batch:
+            logger.debug(
+                "Applying spec v2 overlap relay to live batch instead of output snapshot."
+            )
+        pending_result.batch_relay.apply_to_batch(
+            target_batch, batch_result.next_draft_input
+        )
+        pending_result.relay_applied = True
 
     def _run_generation_batch_overlap(
         self,
@@ -1263,15 +1276,15 @@ class Scheduler(
 
     def _resolve_overlap_batch_result_if_needed(
         self,
-        batch: ScheduleBatch,
         result: Optional[
             Union[GenerationBatchResult, EmbeddingBatchResult, PendingOverlapResult]
         ],
+        snapshot_batch: Optional[ScheduleBatch] = None,
     ) -> Optional[Union[GenerationBatchResult, EmbeddingBatchResult]]:
         if isinstance(result, PendingOverlapResult):
             resolved_result = result.resolve()
-            self._apply_overlap_batch_relay_if_present(
-                batch, resolved_result, result.batch_relay
+            self._apply_pending_overlap_batch_relay_if_present(
+                snapshot_batch, result, resolved_result
             )
             return resolved_result
         return result
@@ -1285,8 +1298,8 @@ class Scheduler(
         if not queued_result.requires_resolve_before_next_schedule:
             return
         resolved_result = queued_result.resolve()
-        self._apply_overlap_batch_relay_if_present(
-            queued_batch, resolved_result, queued_result.batch_relay
+        self._apply_pending_overlap_batch_relay_if_present(
+            queued_batch, queued_result, resolved_result
         )
         self.result_queue[0] = (queued_batch, resolved_result)
 
@@ -1503,7 +1516,7 @@ class Scheduler(
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
             tmp_result = self._resolve_overlap_batch_result_if_needed(
-                tmp_batch, tmp_result
+                tmp_result, snapshot_batch=tmp_batch
             )
             self.process_batch_result(tmp_batch, tmp_result)
 

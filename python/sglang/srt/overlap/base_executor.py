@@ -25,6 +25,8 @@ class PendingOverlapResult:
     async_handle: AsyncResultHandle[object]
     future_indices_or_next_token_ids: torch.Tensor
     batch_relay: Optional[Any] = None
+    relay_target_batch: Optional[Any] = None
+    relay_applied: bool = False
     requires_current_batch_resolve_for_sampling: bool = False
     requires_resolve_before_next_schedule: bool = False
     extend_input_len_per_req: Optional[list[int]] = None

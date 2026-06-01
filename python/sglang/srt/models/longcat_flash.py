@@ -550,24 +550,16 @@ class LongcatFlashDecoderLayer(nn.Module):
             msu.main_stream.record_event(msu.first_attn_finished)
 
             moe_hidden_states = None
-            def forward_moe_func():
-                nonlocal moe_hidden_states, hidden_states, moe_residual
-                with torch.npu.stream(MultiStreamUtils().stream_moe):
-                    with self._aclgraph_limit_core_scope(
-                        self.aclgraph_moe_aic_num, self.aclgraph_moe_aiv_num
-                    ):
-                        MultiStreamUtils().first_attn_finished.wait()
-                        moe_hidden_states = self.mlp(hidden_states)
-
-                        #torch.npu.current_stream().wait_event(MultiStreamUtils().fia_ffn_finished_event)
-
-                        torch.npu.current_stream().wait_event(MultiStreamUtils().attn1_allreduce_finised)
-                        moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
-                            moe_hidden_states, moe_residual, forward_batch
-                        )
-                        moe_hidden_states.record_stream(msu.main_stream)
-                MultiStreamUtils().forward_moe_func = None
-            MultiStreamUtils().forward_moe_func = forward_moe_func
+            with torch.npu.stream(msu.stream_moe):
+                with self._aclgraph_limit_core_scope(
+                    self.aclgraph_moe_aic_num, self.aclgraph_moe_aiv_num
+                ):
+                    MultiStreamUtils().first_attn_finished.wait()
+                    moe_hidden_states = self.mlp(hidden_states)
+                    moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
+                        moe_hidden_states, moe_residual, forward_batch
+                    )
+                    moe_hidden_states.record_stream(msu.main_stream)
 
             # mlp + mla + mlp
             with self._aclgraph_limit_core_scope(
@@ -710,10 +702,6 @@ class LongcatFlashDecoderLayer(nn.Module):
         hidden_states, residual = self.mlp_layer_communicator[1].prepare_mlp(
             hidden_states, residual, forward_batch
         )
-
-        if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
-            torch.npu.current_stream().record_event(MultiStreamUtils().attn1_allreduce_finised)
-            MultiStreamUtils().forward_moe_func()
 
         hidden_states = self.mlps[1](hidden_states)
 

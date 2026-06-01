@@ -258,9 +258,9 @@ class LongcatFlashMoE(nn.Module):
             renormalize=False,
             use_grouped_topk=False,
             correction_bias=self.router.e_score_correction_bias.data,
+            routed_scaling_factor=self.routed_scaling_factor,
             layer_id=layer_id,
         )
-        self.topk.forward = self.topk.forward_native
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=self.num_experts,
@@ -292,6 +292,8 @@ class LongcatFlashMoE(nn.Module):
             hidden_states,
             router_logits,
         )
+        if not _is_npu:
+            topk_weights *= self.routed_scaling_factor
         if self.zero_expert_type is not None:
             if not _is_npu:
                 zero_expert_result = zero_experts_compute_triton(
@@ -314,16 +316,12 @@ class LongcatFlashMoE(nn.Module):
         topk_output = StandardTopKOutput(topk_weights, topk_idx, _)
 
         final_hidden_states = self.experts(hidden_states, topk_output)
-        final_hidden_states *= self.routed_scaling_factor
-
-        if self.tp_size > 1 and get_moe_a2a_backend().is_deepep():
-            zero_expert_result *= self.tp_size
-
-        if self.zero_expert_type is not None and hidden_states.shape[0] > 0:
-            final_hidden_states += zero_expert_result.to(final_hidden_states.device)
 
         if self.tp_size > 1 and not get_moe_a2a_backend().is_deepep():
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        if self.zero_expert_type is not None and hidden_states.shape[0] > 0:
+            final_hidden_states += zero_expert_result.to(final_hidden_states.device)   
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -500,6 +498,11 @@ class LongcatFlashDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
                 zero_allocator=zero_allocator,
             )
+
+        if _is_npu and not get_global_server_args().disable_piecewise_cuda_graph and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+            cache=self._get_dense_mlp_weights(0)
+            _ = prepare_weight_cache(hidden_states, cache)
+
         if get_moe_a2a_backend().is_deepep() and not self.is_first_layer:
             mlp_residual = self.attn_tp_group.all_gather(residual.contiguous(), dim=0)
         else:
@@ -678,17 +681,6 @@ class LongcatFlashDecoderLayer(nn.Module):
         forward_batch,
         zero_allocator,
     ):
-        # first_mlp
-        hidden_states, residual = self.mlp_layer_communicator[0].prepare_mlp(
-            hidden_states,
-            residual,
-            forward_batch,
-            cache=(
-                self._get_dense_mlp_weights(0)
-                if _is_npu and not get_global_server_args().disable_piecewise_cuda_graph
-                else None
-            ),
-        )
         # ============= 3条流 ===============
         # if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
         #     MultiStreamUtils().forward_moe_func()

@@ -41,6 +41,27 @@ def fused_topk_npu(
             )
         topk_weights = topk_weights.to(torch.float32)
 
+    # LongCat-style ungrouped top-k with correction bias.
+    # Align with the reference implementation by using softmax gating
+    # directly in the NPU op and letting the op apply routed scaling.
+    elif (
+        not use_grouped_topk
+        and correction_bias is not None
+        and topk_config.custom_routing_function is None
+    ):
+        topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
+            router_logits.to(torch.float32),
+            k=topk_config.top_k,
+            bias=correction_bias.to(torch.float32),
+            renorm=0,
+            norm_type=0,
+            routed_scaling_factor=(
+                1 if renormalize else topk_config.routed_scaling_factor
+            ),
+            eps=float(1e-20),
+        )
+        topk_weights = topk_weights.to(torch.float32)
+
     # Grouped top-k with correction bias
     elif use_grouped_topk and correction_bias is not None:
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(

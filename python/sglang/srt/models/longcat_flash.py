@@ -127,7 +127,6 @@ elif _is_hip:
         awq_dequantize_triton as awq_dequantize,
     )
 elif _is_npu:
-    import torch_npu
     from sgl_kernel_npu.moe.zero_experts_compute_identity import zero_experts_compute_identity_triton
     from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
     from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
@@ -465,16 +464,6 @@ class LongcatFlashDecoderLayer(nn.Module):
             return None
         return [mlp.gate_up_proj.weight, mlp.down_proj.weight]
 
-    def _prefetch_attn_decode(self, attn_idx: int, dependency: torch.Tensor):
-        attn = self.self_attn[attn_idx]
-        if not hasattr(attn, "q_b_proj"):
-            return
-        torch_npu.npu_prefetch(
-            attn.q_b_proj.weight,
-            dependency,
-            attn.q_b_proj.weight.numel() * attn.q_b_proj.weight.element_size(),
-        )
-
     def forward(
         self,
         positions: torch.Tensor,
@@ -485,8 +474,6 @@ class LongcatFlashDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         if get_global_server_args().enable_longcat_double_stream and MultiStreamUtils().main_stream is None and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             MultiStreamUtils().main_stream = torch.npu.current_stream()
-        if _is_npu  and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
-            self._prefetch_attn_decode(0, hidden_states)
         # first_attn
         if get_moe_a2a_backend().is_deepep() and not self.is_first_layer:
             residual = residual.tensor_split(self.attn_tp_size)[self.attn_tp_rank]
@@ -689,9 +676,6 @@ class LongcatFlashDecoderLayer(nn.Module):
         if _is_npu and get_cmo_stream():
             wait_cmo_stream()
         hidden_states = self.mlps[0](hidden_states)
-
-        if _is_npu and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
-            self._prefetch_attn_decode(1, hidden_states)
 
         # TP all_reduce
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)

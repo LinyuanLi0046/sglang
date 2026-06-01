@@ -32,6 +32,7 @@
 
 import concurrent.futures
 import logging
+from contextlib import nullcontext
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -455,6 +456,25 @@ class LongcatFlashDecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm[0],
             qkv_latent_func=self.self_attn[0].prepare_qkv_latent,
         )
+        # Align with pure LongCat-Flash A5 (platform_version=950, enable_multi_stream=1)
+        # multi-stream core settings for aclgraph/npugraph_ex block-level limit_core_num.
+        self.aclgraph_moe_aic_num = 8
+        self.aclgraph_moe_aiv_num = 16
+        self.aclgraph_main_aic_num = 24
+        self.aclgraph_main_aiv_num = 48
+
+    def _aclgraph_limit_core_scope(self, aic_num: int, aiv_num: int):
+        if not _is_npu:
+            return nullcontext()
+        npugraph_ex = getattr(torch.npu, "npugraph_ex", None)
+        scope = getattr(npugraph_ex, "scope", None)
+        limit_core_num = getattr(scope, "limit_core_num", None)
+        if limit_core_num is None:
+            return nullcontext()
+        try:
+            return limit_core_num(aic_num, aiv_num)
+        except Exception:
+            return nullcontext()
 
     def forward(
         self,
@@ -533,31 +553,35 @@ class LongcatFlashDecoderLayer(nn.Module):
             def forward_moe_func():
                 nonlocal moe_hidden_states, hidden_states, moe_residual
                 with torch.npu.stream(MultiStreamUtils().stream_moe):
-                    MultiStreamUtils().first_attn_finished.wait()
-                    
-                    moe_hidden_states = self.mlp(hidden_states)
+                    with self._aclgraph_limit_core_scope(
+                        self.aclgraph_moe_aic_num, self.aclgraph_moe_aiv_num
+                    ):
+                        MultiStreamUtils().first_attn_finished.wait()
+                        moe_hidden_states = self.mlp(hidden_states)
 
-                    #torch.npu.current_stream().wait_event(MultiStreamUtils().fia_ffn_finished_event)
+                        #torch.npu.current_stream().wait_event(MultiStreamUtils().fia_ffn_finished_event)
 
-                    torch.npu.current_stream().wait_event(MultiStreamUtils().attn1_allreduce_finised)
-                    moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
-                        moe_hidden_states, moe_residual, forward_batch
-                    )
-                    moe_hidden_states.record_stream(msu.main_stream)
+                        torch.npu.current_stream().wait_event(MultiStreamUtils().attn1_allreduce_finised)
+                        moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
+                            moe_hidden_states, moe_residual, forward_batch
+                        )
+                        moe_hidden_states.record_stream(msu.main_stream)
                 MultiStreamUtils().forward_moe_func = None
             MultiStreamUtils().forward_moe_func = forward_moe_func
 
             # mlp + mla + mlp
-            mlp_hidden_states, residual = self.forward_mlp(
-                mlp_hidden_states, positions, mlp_residual, forward_batch, zero_allocator,
-            )
+            with self._aclgraph_limit_core_scope(
+                self.aclgraph_main_aic_num, self.aclgraph_main_aiv_num
+            ):
+                mlp_hidden_states, residual = self.forward_mlp(
+                    mlp_hidden_states, positions, mlp_residual, forward_batch, zero_allocator,
+                )
+                # torch.npu.current_stream().record_event(MultiStreamUtils().fia_ffn_finished_event)
 
-            # torch.npu.current_stream().record_event(MultiStreamUtils().fia_ffn_finished_event)
-
-            if not self.is_last_layer and get_moe_a2a_backend().is_deepep():
-                mlp_hidden_states = mlp_hidden_states.tensor_split(self.attn_tp_size)[
-                    self.attn_tp_rank
-                ]
+                if not self.is_last_layer and get_moe_a2a_backend().is_deepep():
+                    mlp_hidden_states = mlp_hidden_states.tensor_split(self.attn_tp_size)[
+                        self.attn_tp_rank
+                    ]
 
             msu.main_stream.wait_stream(msu.stream_moe)
             

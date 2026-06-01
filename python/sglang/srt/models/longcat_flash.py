@@ -127,10 +127,10 @@ elif _is_hip:
         awq_dequantize_triton as awq_dequantize,
     )
 elif _is_npu:
+    import torch_npu
     from sgl_kernel_npu.moe.zero_experts_compute_identity import zero_experts_compute_identity_triton
     from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
     from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
-    from sglang.srt.hardware_backend.npu.cmo import prepare_weight_cache
 else:
     pass
 
@@ -465,12 +465,52 @@ class LongcatFlashDecoderLayer(nn.Module):
             return None
         return [mlp.gate_up_proj.weight, mlp.down_proj.weight]
 
-    def _get_attn_weights_decode(self, attn_idx: int):
+    def _prefetch_attn_half_decode(self, attn_idx: int, dependency: torch.Tensor):
         attn = self.self_attn[attn_idx]
-        if not hasattr(attn, "fused_qkv_a_proj_with_mqa") or not hasattr(attn, "q_b_proj") or not hasattr(attn, "w_kc") or not hasattr(attn, "q_a_layernorm") or not hasattr(attn, "kv_a_layernorm"):
-            print("no prefetch attn", flush=True)
-            return None
-        return [attn.fused_qkv_a_proj_with_mqa.weight, attn.q_b_proj.weight, attn.w_kc.weight, attn.q_a_layernorm.weight, attn.kv_a_layernorm.weight]
+        if (
+            not hasattr(attn, "fused_qkv_a_proj_with_mqa")
+            or not hasattr(attn, "q_b_proj")
+            or not hasattr(attn, "q_lora_rank")
+            or not hasattr(attn, "kv_lora_rank")
+            or not hasattr(attn, "qk_rope_head_dim")
+        ):
+            return
+        fused_weight = attn.fused_qkv_a_proj_with_mqa.weight
+        fused_total_out_dim = attn.q_lora_rank + attn.kv_lora_rank + attn.qk_rope_head_dim
+        if fused_total_out_dim <= 0:
+            return
+        fused_q_a_bytes = (
+            fused_weight.numel()
+            * fused_weight.element_size()
+            * attn.q_lora_rank
+            // fused_total_out_dim
+        )
+        torch_npu.npu_prefetch(
+            fused_weight,
+            dependency,
+            fused_q_a_bytes,
+        )
+        torch_npu.npu_prefetch(
+            attn.q_b_proj.weight,
+            dependency,
+            attn.q_b_proj.weight.numel() * attn.q_b_proj.weight.element_size() // 2,
+        )
+
+    def _prefetch_attn_full_decode(self, attn_idx: int, dependency: torch.Tensor):
+        attn = self.self_attn[attn_idx]
+        if not hasattr(attn, "fused_qkv_a_proj_with_mqa") or not hasattr(attn, "q_b_proj"):
+            return
+        torch_npu.npu_prefetch(
+            attn.fused_qkv_a_proj_with_mqa.weight,
+            dependency,
+            attn.fused_qkv_a_proj_with_mqa.weight.numel()
+            * attn.fused_qkv_a_proj_with_mqa.weight.element_size(),
+        )
+        torch_npu.npu_prefetch(
+            attn.q_b_proj.weight,
+            dependency,
+            attn.q_b_proj.weight.numel() * attn.q_b_proj.weight.element_size(),
+        )
 
     def forward(
         self,
@@ -483,16 +523,13 @@ class LongcatFlashDecoderLayer(nn.Module):
         if get_global_server_args().enable_longcat_double_stream and MultiStreamUtils().main_stream is None and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             MultiStreamUtils().main_stream = torch.npu.current_stream()
         if _is_npu  and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
-            cache=self._get_attn_weights_decode(0)
-            _ = prepare_weight_cache(hidden_states, cache)
+            self._prefetch_attn_half_decode(0, hidden_states)
         # first_attn
         if get_moe_a2a_backend().is_deepep() and not self.is_first_layer:
             residual = residual.tensor_split(self.attn_tp_size)[self.attn_tp_rank]
         hidden_states, residual = self.moe_layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
-        if _is_npu and get_cmo_stream():
-            wait_cmo_stream()
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn[0](
                 positions=positions,
@@ -691,8 +728,7 @@ class LongcatFlashDecoderLayer(nn.Module):
         hidden_states = self.mlps[0](hidden_states)
 
         if _is_npu and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
-            cache=self._get_attn_weights_decode(1)
-            _ = prepare_weight_cache(hidden_states, cache)
+            self._prefetch_attn_full_decode(1, hidden_states)
 
         # TP all_reduce
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
@@ -708,8 +744,6 @@ class LongcatFlashDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        if _is_npu and get_cmo_stream():
-            wait_cmo_stream()
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn[1](
                 positions=positions,

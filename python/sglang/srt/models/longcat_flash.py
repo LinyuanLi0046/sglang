@@ -128,7 +128,6 @@ elif _is_hip:
     )
 elif _is_npu:
     from sgl_kernel_npu.moe.zero_experts_compute_identity import zero_experts_compute_identity_triton
-    from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
     from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 else:
     pass
@@ -457,13 +456,6 @@ class LongcatFlashDecoderLayer(nn.Module):
             qkv_latent_func=self.self_attn[0].prepare_qkv_latent,
         )
 
-    def _get_dense_mlp_weights(self, mlp_idx: int):
-        mlp = self.mlps[mlp_idx]
-        if not hasattr(mlp.gate_up_proj, "weight") or not hasattr(mlp.down_proj, "weight"):
-            print("no prefetch mlp", flush=True)
-            return None
-        return [mlp.gate_up_proj.weight, mlp.down_proj.weight]
-
     def forward(
         self,
         positions: torch.Tensor,
@@ -531,7 +523,10 @@ class LongcatFlashDecoderLayer(nn.Module):
         # ============= MOE放alt流 v2 ===============
         if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             hidden_states, moe_residual = self.moe_layer_communicator.prepare_mlp(
-                hidden_states, residual, forward_batch
+                hidden_states,
+                residual,
+                forward_batch,
+                cache=(self.mlp.get_router_weights() if _is_npu else None),
             )
             msu = MultiStreamUtils()
             #msu.fia_ffn_finished_event = torch.npu.Event()
@@ -661,20 +656,11 @@ class LongcatFlashDecoderLayer(nn.Module):
         zero_allocator,
     ):
         hidden_states, residual = self.mlp_layer_communicator[0].prepare_mlp(
-            hidden_states,
-            residual,
-            forward_batch,
-            cache=(
-                self._get_dense_mlp_weights(0)
-                if _is_npu else None
-            ),
+            hidden_states, residual, forward_batch
         )
         # ============= 3条流 ===============
         # if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
         #     MultiStreamUtils().forward_moe_func()
-
-        if _is_npu and get_cmo_stream():
-            wait_cmo_stream()
         hidden_states = self.mlps[0](hidden_states)
 
         # TP all_reduce
@@ -701,21 +687,13 @@ class LongcatFlashDecoderLayer(nn.Module):
 
         # second_mlp
         hidden_states, residual = self.mlp_layer_communicator[1].prepare_mlp(
-            hidden_states,
-            residual,
-            forward_batch,
-            cache=(
-                self._get_dense_mlp_weights(1)
-                if _is_npu else None
-            ),
+            hidden_states, residual, forward_batch
         )
 
         if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             torch.npu.current_stream().record_event(MultiStreamUtils().attn1_allreduce_finised)
             MultiStreamUtils().forward_moe_func()
 
-        if _is_npu and get_cmo_stream():
-            wait_cmo_stream()
         hidden_states = self.mlps[1](hidden_states)
 
         # TP all_reduce

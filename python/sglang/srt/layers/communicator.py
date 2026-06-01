@@ -573,8 +573,7 @@ class LayerCommunicator:
         forward_batch: ForwardBatch,
         cache=None,
     ):
-        if cache is not None:
-            self._context.cache = cache
+        self._context.cache = cache
 
         return self._communicate_with_all_reduce_and_layer_norm_fn(
             hidden_states=hidden_states,

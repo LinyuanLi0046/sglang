@@ -292,8 +292,7 @@ class LongcatFlashMoE(nn.Module):
             hidden_states,
             router_logits,
         )
-        if not _is_npu:
-            topk_weights *= self.routed_scaling_factor
+        topk_weights *= self.routed_scaling_factor
         if self.zero_expert_type is not None:
             if not _is_npu:
                 zero_expert_result = zero_experts_compute_triton(
@@ -499,10 +498,6 @@ class LongcatFlashDecoderLayer(nn.Module):
                 zero_allocator=zero_allocator,
             )
 
-        if _is_npu and not get_global_server_args().disable_piecewise_cuda_graph and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
-            cache=self._get_dense_mlp_weights(0)
-            _ = prepare_weight_cache(hidden_states, cache)
-
         if get_moe_a2a_backend().is_deepep() and not self.is_first_layer:
             mlp_residual = self.attn_tp_group.all_gather(residual.contiguous(), dim=0)
         else:
@@ -681,6 +676,16 @@ class LongcatFlashDecoderLayer(nn.Module):
         forward_batch,
         zero_allocator,
     ):
+        hidden_states, residual = self.mlp_layer_communicator[0].prepare_mlp(
+            hidden_states,
+            residual,
+            forward_batch,
+            cache=(
+                self._get_dense_mlp_weights(0)
+                if _is_npu and not get_global_server_args().disable_piecewise_cuda_graph
+                else None
+            ),
+        )
         # ============= 3条流 ===============
         # if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
         #     MultiStreamUtils().forward_moe_func()

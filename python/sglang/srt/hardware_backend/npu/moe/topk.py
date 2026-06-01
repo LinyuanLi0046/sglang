@@ -55,9 +55,7 @@ def fused_topk_npu(
             bias=correction_bias.to(torch.float32),
             renorm=0,
             norm_type=0,
-            routed_scaling_factor=(
-                1 if renormalize else topk_config.routed_scaling_factor
-            ),
+            routed_scaling_factor=1,
             eps=float(1e-20),
         )
         topk_weights = topk_weights.to(torch.float32)

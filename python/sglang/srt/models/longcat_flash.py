@@ -523,10 +523,7 @@ class LongcatFlashDecoderLayer(nn.Module):
         # ============= MOE放alt流 v2 ===============
         if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             hidden_states, moe_residual = self.moe_layer_communicator.prepare_mlp(
-                hidden_states,
-                residual,
-                forward_batch,
-                cache=(self.mlp.get_router_weights() if _is_npu else None),
+                hidden_states, residual, forward_batch
             )
             msu = MultiStreamUtils()
             #msu.fia_ffn_finished_event = torch.npu.Event()

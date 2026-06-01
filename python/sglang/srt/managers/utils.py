@@ -22,15 +22,6 @@ logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
-class CopyPolicy:
-    copy_next_token_ids: bool = True
-    copy_accept_lens: bool = True
-    copy_hidden_states: bool = False
-    copy_logprobs: bool = False
-    copy_expert_metrics: bool = False
-
-
-@dataclasses.dataclass
 class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput] = None
     pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
@@ -58,71 +49,48 @@ class GenerationBatchResult:
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
 
-    def schedule_copy_to_cpu(self, copy_policy: CopyPolicy):
-        """Schedule async D2H copies on the caller's current device stream."""
-        logits_output = self.logits_output
-
-        if copy_policy.copy_logprobs and logits_output is not None:
-            if logits_output.next_token_logprobs is not None:
-                logits_output.next_token_logprobs = logits_output.next_token_logprobs.to(
-                    "cpu", non_blocking=True
+    def copy_to_cpu(self, return_logprob: bool):
+        """Copy tensors to CPU in overlap scheduling.
+        Only the tensors which are needed for processing results are copied,
+        e.g., next_token_ids, logits outputs
+        """
+        if return_logprob:
+            if self.logits_output.next_token_logprobs is not None:
+                self.logits_output.next_token_logprobs = (
+                    self.logits_output.next_token_logprobs.to("cpu", non_blocking=True)
                 )
-            if logits_output.input_token_logprobs is not None:
-                logits_output.input_token_logprobs = logits_output.input_token_logprobs.to(
-                    "cpu", non_blocking=True
+            if self.logits_output.input_token_logprobs is not None:
+                self.logits_output.input_token_logprobs = (
+                    self.logits_output.input_token_logprobs.to("cpu", non_blocking=True)
                 )
-            if logits_output.next_token_top_logprobs_val is not None:
-                logits_output.next_token_top_logprobs_val = [
+            if self.logits_output.next_token_top_logprobs_val is not None:
+                self.logits_output.next_token_top_logprobs_val = [
                     v.to("cpu", non_blocking=True) if torch.is_tensor(v) else v
-                    for v in logits_output.next_token_top_logprobs_val
+                    for v in self.logits_output.next_token_top_logprobs_val
                 ]
-            if logits_output.next_token_top_logprobs_idx is not None:
-                logits_output.next_token_top_logprobs_idx = [
+            if self.logits_output.next_token_top_logprobs_idx is not None:
+                self.logits_output.next_token_top_logprobs_idx = [
                     x.to("cpu", non_blocking=True) if torch.is_tensor(x) else x
-                    for x in logits_output.next_token_top_logprobs_idx
+                    for x in self.logits_output.next_token_top_logprobs_idx
                 ]
-            if logits_output.next_token_token_ids_logprobs_val is not None:
-                logits_output.next_token_token_ids_logprobs_val = [
+            if self.logits_output.next_token_token_ids_logprobs_val is not None:
+                self.logits_output.next_token_token_ids_logprobs_val = [
                     v.to("cpu", non_blocking=True) if torch.is_tensor(v) else v
-                    for v in logits_output.next_token_token_ids_logprobs_val
+                    for v in self.logits_output.next_token_token_ids_logprobs_val
                 ]
-
-        if (
-            copy_policy.copy_hidden_states
-            and logits_output is not None
-            and logits_output.hidden_states is not None
-        ):
-            logits_output.hidden_states = logits_output.hidden_states.to(
+        if self.logits_output.hidden_states is not None:
+            self.logits_output.hidden_states = self.logits_output.hidden_states.to(
                 "cpu", non_blocking=True
             )
+        self.next_token_ids = self.next_token_ids.to("cpu", non_blocking=True)
 
-        if copy_policy.copy_next_token_ids and self.next_token_ids is not None:
-            self.next_token_ids = self.next_token_ids.to("cpu", non_blocking=True)
-
-        if copy_policy.copy_accept_lens and self.accept_lens is not None:
+        if self.accept_lens is not None:
             self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
 
-        if copy_policy.copy_expert_metrics and (
-            x := self.expert_distribution_metrics
-        ) is not None:
+        if (x := self.expert_distribution_metrics) is not None:
             x.copy_to_cpu()
 
-    def record_copy_done(self):
-        if self.copy_done is not None:
-            self.copy_done.record()
-
-    def copy_to_cpu(self, return_logprob: bool):
-        """Backward-compatible wrapper for overlap scheduling."""
-        self.schedule_copy_to_cpu(
-            CopyPolicy(
-                copy_next_token_ids=True,
-                copy_accept_lens=True,
-                copy_hidden_states=True,
-                copy_logprobs=return_logprob,
-                copy_expert_metrics=True,
-            )
-        )
-        self.record_copy_done()
+        self.copy_done.record()
 
     @classmethod
     def from_pp_proxy(

@@ -172,7 +172,6 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_output_processor_mixin import (
-    MaterializedBatchResult,
     SchedulerOutputProcessorMixin,
 )
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
@@ -186,11 +185,7 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
 from sglang.srt.managers.session_controller import SessionController
-from sglang.srt.managers.utils import (
-    CopyPolicy,
-    GenerationBatchResult,
-    validate_input_length,
-)
+from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -209,9 +204,6 @@ from sglang.srt.observability.scheduler_metrics_mixin import (
     SchedulerMetricsMixin,
 )
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
-from sglang.srt.overlap.base_executor import PendingOverlapResult
-from sglang.srt.overlap.non_spec_overlap_executor import NonSpecOverlapExecutor
-from sglang.srt.overlap.spec_v2_overlap_executor import SpecV2OverlapExecutor
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
@@ -885,10 +877,6 @@ class Scheduler(
         self.cur_batch: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
-        # The unresolved overlap carrier that still owns the latest live batch state.
-        self.pending_overlap_state: Optional[PendingOverlapResult] = None
-        # The batch that is safe for scheduler-side filter/merge/retract mutations.
-        self.mutable_running_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self._pending_flush: Optional[Tuple[FlushCacheReqInput, float]] = None
@@ -1149,8 +1137,6 @@ class Scheduler(
 
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
-        self.non_spec_overlap_executor = None
-        self.spec_v2_overlap_executor = None
 
         self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.forward_stream
@@ -1171,9 +1157,6 @@ class Scheduler(
             self.device,
             self.spec_algorithm,
         )
-        self.non_spec_overlap_executor = NonSpecOverlapExecutor(self)
-        if self.spec_algorithm.supports_spec_v2():
-            self.spec_v2_overlap_executor = SpecV2OverlapExecutor(self)
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
 
@@ -1184,253 +1167,6 @@ class Scheduler(
             hf_config = self.tp_worker.model_config.hf_config
             self.ngram_embedding_n = hf_config.ngram_embedding_n
             self.ngram_embedding_k = hf_config.ngram_embedding_k
-
-    def _get_generation_copy_policy(self, batch: ScheduleBatch) -> CopyPolicy:
-        return CopyPolicy(
-            copy_next_token_ids=True,
-            copy_accept_lens=batch.is_spec_v2,
-            copy_hidden_states=batch.return_hidden_states,
-            copy_logprobs=batch.return_logprob,
-            copy_expert_metrics=self.enable_metrics,
-        )
-
-    def _schedule_generation_batch_result_copy(
-        self, batch: ScheduleBatch, batch_result: GenerationBatchResult
-    ):
-        if batch_result.copy_done is None:
-            batch_result.copy_done = self.device_module.Event()
-
-        with self.copy_stream_ctx:
-            self.copy_stream.wait_stream(self.forward_stream)
-            batch_result.schedule_copy_to_cpu(self._get_generation_copy_policy(batch))
-            batch_result.record_copy_done()
-
-    def _apply_pending_overlap_batch_relay_if_present(
-        self,
-        snapshot_batch: ScheduleBatch,
-        pending_result: PendingOverlapResult,
-        batch_result: GenerationBatchResult,
-    ) -> None:
-        if pending_result.relay_applied or pending_result.batch_relay is None:
-            return
-        target_batch = pending_result.live_batch_ref
-        if target_batch is None:
-            logger.warning(
-                "Spec v2 overlap relay target batch is missing; skip relay apply."
-            )
-            return
-        if target_batch is not snapshot_batch:
-            logger.debug(
-                "Applying spec v2 overlap relay to live batch instead of output snapshot."
-            )
-        pending_result.batch_relay.apply_to_batch(
-            target_batch, batch_result.next_draft_input
-        )
-        pending_result.resolved_live_batch = target_batch
-        pending_result.is_resolved_for_mutation = True
-        target_batch.is_mutation_safe = True
-        if self.pending_overlap_state is pending_result:
-            self.mutable_running_batch = target_batch
-            self.pending_overlap_state = None
-        pending_result.relay_applied = True
-
-    def _run_generation_batch_overlap(
-        self,
-        batch: ScheduleBatch,
-        model_worker_batch: ModelWorkerBatch,
-    ) -> Tuple[GenerationBatchResult, torch.Tensor]:
-        executor = self.non_spec_overlap_executor
-        if batch.is_spec_v2:
-            executor = self.spec_v2_overlap_executor
-
-        exec_result = executor.submit(batch, model_worker_batch)
-        return (
-            exec_result.batch_result,
-            exec_result.future_indices_or_next_token_ids,
-        )
-
-    def _finalize_generation_batch_result(
-        self,
-        batch: ScheduleBatch,
-        batch_result: GenerationBatchResult,
-        future_indices_or_next_token_ids,
-    ):
-        # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
-        #       which can probably be replaced by future_indices later [TODO(lsyin)].
-        #       we shall still keep the original outputs, e.g. next_token_ids
-        #       in the GenerationBatchOutput for processing after copy_done.
-        batch.output_ids = future_indices_or_next_token_ids
-
-        # These 2 values are needed for processing the output, but the values can be
-        # modified by overlap schedule. So we have to copy them here so that
-        # we can use the correct values in output processing.
-        if batch.return_logprob:
-            extend_input_len_per_req = [req.extend_input_len for req in batch.reqs]
-            extend_logprob_start_len_per_req = [
-                req.extend_logprob_start_len for req in batch.reqs
-            ]
-            if isinstance(batch_result, PendingOverlapResult):
-                batch_result.set_logprob_metadata(
-                    extend_input_len_per_req, extend_logprob_start_len_per_req
-                )
-            else:
-                batch_result.extend_input_len_per_req = extend_input_len_per_req
-                batch_result.extend_logprob_start_len_per_req = (
-                    extend_logprob_start_len_per_req
-                )
-        else:
-            if isinstance(batch_result, PendingOverlapResult):
-                batch_result.set_logprob_metadata(None, None)
-            else:
-                batch_result.extend_input_len_per_req = None
-                batch_result.extend_logprob_start_len_per_req = None
-
-    def _resolve_overlap_batch_result_if_needed(
-        self,
-        result: Optional[
-            Union[GenerationBatchResult, EmbeddingBatchResult, PendingOverlapResult]
-        ],
-        snapshot_batch: Optional[ScheduleBatch] = None,
-    ) -> Optional[Union[GenerationBatchResult, EmbeddingBatchResult]]:
-        if isinstance(result, PendingOverlapResult):
-            if result.batch_snapshot is not None:
-                snapshot_batch = result.batch_snapshot
-            return self._materialize_pending_overlap_result(
-                result, snapshot_batch=snapshot_batch
-            )
-        return result
-
-    def _materialize_pending_overlap_result(
-        self,
-        pending_result: PendingOverlapResult,
-        snapshot_batch: Optional[ScheduleBatch] = None,
-    ) -> GenerationBatchResult:
-        if snapshot_batch is None:
-            snapshot_batch = pending_result.get_snapshot_batch()
-        resolved_result = pending_result.resolve()
-        self._apply_pending_overlap_batch_relay_if_present(
-            snapshot_batch, pending_result, resolved_result
-        )
-        if self.result_queue:
-            for i, (queued_batch, queued_result) in enumerate(self.result_queue):
-                if queued_result is pending_result:
-                    self.result_queue[i] = (queued_batch, resolved_result)
-                    break
-        return resolved_result
-
-    def _materialize_window_tail_result(
-        self,
-        batch: ScheduleBatch,
-        result: Union[GenerationBatchResult, EmbeddingBatchResult, PendingOverlapResult],
-    ) -> None:
-        if self.window_tail_result is not None:
-            raise RuntimeError("Window-tail materialization slot is already occupied.")
-
-        pending_result = result if isinstance(result, PendingOverlapResult) else None
-        resolved_result = self._resolve_overlap_batch_result_if_needed(
-            result, snapshot_batch=batch
-        )
-        if resolved_result is None:
-            return
-        self.window_tail_result = self.materialize_batch_result_for_output(
-            batch, resolved_result
-        )
-        if pending_result is not None:
-            self.window_tail_result.source_pending_result = pending_result
-            pending_result.mark_window_tail_materialized()
-
-    def _materialize_window_tail_from_queue_if_needed(self) -> None:
-        if self.window_tail_result is not None or not self.result_queue:
-            return
-        batch, result = self.result_queue.popleft()
-        self._materialize_window_tail_result(batch, result)
-
-    def _finalize_window_tail_result_if_needed(self) -> None:
-        if self.window_tail_result is None:
-            return
-        materialized = self.window_tail_result
-        self.finalize_materialized_batch_result(materialized)
-        self.window_tail_result = None
-        if materialized.source_pending_result is not None:
-            materialized.source_pending_result.mark_window_tail_finalized()
-
-    def _has_unresolved_pending_overlap(self) -> bool:
-        return (
-            self.pending_overlap_state is not None
-            and self.pending_overlap_state.has_unresolved_live_batch()
-        )
-
-    def _set_pending_overlap_state(
-        self, pending_result: PendingOverlapResult, batch: ScheduleBatch
-    ) -> None:
-        batch.is_mutation_safe = False
-        self.pending_overlap_state = pending_result
-        self.mutable_running_batch = None
-
-    def _clear_overlap_carriers(self) -> None:
-        self.pending_overlap_state = None
-        self.mutable_running_batch = None
-        self.window_tail_result = None
-
-    def _get_mutable_running_batch(self) -> Optional[ScheduleBatch]:
-        if self.mutable_running_batch is not None:
-            return self.mutable_running_batch
-        if self.pending_overlap_state is not None:
-            return self.pending_overlap_state.get_mutation_candidate_batch()
-        return self.last_batch
-
-    def _get_overlap_decision_batch(self) -> Optional[ScheduleBatch]:
-        mutation_candidate = self._get_mutable_running_batch()
-        if mutation_candidate is not None:
-            return mutation_candidate
-        if self.pending_overlap_state is not None:
-            return self.pending_overlap_state.live_batch_ref
-        return self.last_batch
-
-    def _resolve_pending_overlap_for_batch_mutation_if_needed(
-        self, batch: Optional[ScheduleBatch]
-    ) -> None:
-        pending_result = self.pending_overlap_state
-        if batch is None or pending_result is None:
-            return
-        if pending_result.live_batch_ref is not batch:
-            return
-        if not pending_result.must_resolve_before_scheduler_mutation():
-            return
-        self._materialize_pending_overlap_result(pending_result)
-
-    def _can_overlap_with_unresolved_spec_pending(
-        self, batch: Optional[ScheduleBatch]
-    ) -> bool:
-        if not self._has_unresolved_pending_overlap():
-            return True
-        overlap_decision_batch = self._get_overlap_decision_batch()
-        if overlap_decision_batch is None or not overlap_decision_batch.is_spec_v2:
-            return True
-        if batch is None:
-            return True
-        if batch.is_spec_v2:
-            return False
-        return True
-
-    def _get_merge_source_batch(self) -> Optional[ScheduleBatch]:
-        if self._has_unresolved_pending_overlap():
-            return None
-        return self._get_mutable_running_batch()
-
-    def _merge_mutable_batch_into_running_if_needed(
-        self, batch: Optional[ScheduleBatch]
-    ) -> None:
-        if batch is None or not batch.forward_mode.is_extend():
-            return
-        chunked_req_to_exclude = set()
-        batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
-        if batch.is_empty() or self.disaggregation_mode == DisaggregationMode.PREFILL:
-            return
-        if self.running_batch.is_empty():
-            self.running_batch = batch
-        else:
-            self.running_batch.merge_batch(batch)
 
     def _maybe_prepare_ngram_embedding(
         self, batch: Optional[ScheduleBatch]
@@ -1631,22 +1367,13 @@ class Scheduler(
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.result_queue: Deque[
-            Tuple[
-                ScheduleBatch,
-                Union[
-                    GenerationBatchResult,
-                    EmbeddingBatchResult,
-                    PendingOverlapResult,
-                ],
-            ]
+            Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
-        self.window_tail_result: Optional[MaterializedBatchResult] = None
 
-        def pop_and_materialize():
-            self._materialize_window_tail_from_queue_if_needed()
-
-        def finalize_window_tail():
-            self._finalize_window_tail_result_if_needed()
+        def pop_and_process():
+            # Process the results of the last batch
+            tmp_batch, tmp_result = self.result_queue.popleft()
+            self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
             # Receive requests
@@ -1663,46 +1390,28 @@ class Scheduler(
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
             if disable_overlap_for_batch:
-                finalize_window_tail()
-                pop_and_materialize()
-                finalize_window_tail()
+                pop_and_process()
 
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
-                batch_snapshot = (
-                    batch_result.batch_snapshot
-                    if isinstance(batch_result, PendingOverlapResult)
-                    and batch_result.batch_snapshot is not None
-                    else batch.copy()
-                )
-                if (
-                    isinstance(batch_result, PendingOverlapResult)
-                    and batch_result.requires_resolve_before_mutation
-                ):
-                    self._set_pending_overlap_state(batch_result, batch)
-                self.result_queue.append((batch_snapshot, batch_result))
+                self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
                 self.cancel_bubble_timer()
 
             # Process the last batch
-            if self.result_queue:
+            if self.last_batch:
                 if not disable_overlap_for_batch:
-                    pop_and_materialize()
+                    pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
-            if self.should_finalize_materialized_result_before_sampling(
-                self.window_tail_result, batch, batch_result
-            ):
-                finalize_window_tail()
             if self.is_generation:
-                self.launch_batch_sample_if_needed(batch, batch_result)
-            finalize_window_tail()
+                self.launch_batch_sample_if_needed(batch_result)
 
             # Update last_batch
             self.last_batch = batch
@@ -1721,8 +1430,7 @@ class Scheduler(
             is_extend = lambda b: b and b.forward_mode.is_extend()
 
         batch_is_extend = is_extend(batch)
-        overlap_decision_batch = self._get_overlap_decision_batch()
-        last_batch_is_extend = is_extend(overlap_decision_batch)
+        last_batch_is_extend = is_extend(self.last_batch)
 
         disable_overlap_for_batch = (
             envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.get()
@@ -1741,15 +1449,7 @@ class Scheduler(
             and len(self.result_queue) > 0
         )
 
-        unresolved_spec_overlap_requires_sync = (
-            not self._can_overlap_with_unresolved_spec_pending(batch)
-        )
-
-        return (
-            disable_overlap_for_batch
-            or need_grammar_sync
-            or unresolved_spec_overlap_requires_sync
-        )
+        return disable_overlap_for_batch or need_grammar_sync
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -1762,11 +1462,8 @@ class Scheduler(
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
 
         if self.recv_skipper is not None:
-            last_forward_batch = self._get_overlap_decision_batch()
             last_forward_mode = (
-                last_forward_batch.forward_mode
-                if last_forward_batch is not None
-                else None
+                self.last_batch.forward_mode if self.last_batch is not None else None
             )
             if not self.recv_skipper.handle(last_forward_mode):
                 return []
@@ -2548,38 +2245,34 @@ class Scheduler(
             # Reset batch_is_full so the scheduler can schedule more prefills.
             self.running_batch.batch_is_full = False
 
-        merge_source_batch = self._get_merge_source_batch()
-
         if (
             not self.enable_hisparse
-            and merge_source_batch is not None
-            and merge_source_batch.forward_mode.is_extend()
+            and self.last_batch
+            and self.last_batch.forward_mode.is_extend()
         ):
-            if merge_source_batch.chunked_req is not None:
+            if self.last_batch.chunked_req is not None:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
-                chunked_req_to_exclude.add(merge_source_batch.chunked_req)
+                chunked_req_to_exclude.add(self.last_batch.chunked_req)
 
-            if self.dllm_config is not None and merge_source_batch.reqs:
-                chunked_req_to_exclude.update(merge_source_batch.reqs)
+            if self.dllm_config is not None and self.last_batch.reqs:
+                chunked_req_to_exclude.update(self.last_batch.reqs)
 
             # Filter batch
-            last_bs = merge_source_batch.batch_size()
-            merge_source_batch.filter_batch(
+            last_bs = self.last_batch.batch_size()
+            self.last_batch.filter_batch(
                 chunked_req_to_exclude=list(chunked_req_to_exclude)
             )
-            if merge_source_batch.batch_size() < last_bs:
+            if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
             # Merge the new batch into the running batch.
-            if not merge_source_batch.is_empty():
+            if not self.last_batch.is_empty():
                 if self.running_batch.is_empty():
-                    self.running_batch = merge_source_batch
+                    self.running_batch = self.last_batch
                 else:
                     # Merge running_batch with prefill batch
-                    self.running_batch.merge_batch(merge_source_batch)
-            if merge_source_batch is self.mutable_running_batch:
-                self.mutable_running_batch = None
+                    self.running_batch.merge_batch(self.last_batch)
 
         # For prefill-only batch, filter out finished requests since they
         # won't go through the decode step. This keeps running_batch accurate
@@ -2612,9 +2305,6 @@ class Scheduler(
                 not self.running_batch.is_empty()
                 and not self.running_batch.is_prefill_only
             ):
-                self._resolve_pending_overlap_for_batch_mutation_if_needed(
-                    self.running_batch
-                )
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
@@ -2881,9 +2571,6 @@ class Scheduler(
             and new_batch.input_embeds is None
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
-            self._resolve_pending_overlap_for_batch_mutation_if_needed(
-                self.running_batch
-            )
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if not self.running_batch.is_empty():
                 self.running_batch.prepare_for_decode()
@@ -2899,11 +2586,6 @@ class Scheduler(
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
-        if not batch.is_mutation_safe:
-            raise RuntimeError(
-                "Scheduler.update_running_batch() requires a mutation-safe batch. "
-                "Resolve the pending overlap carrier before decode-side scheduler mutations."
-            )
         initial_bs = batch.batch_size()
 
         batch.filter_batch(v1_spec_info_filtered=True)
@@ -3023,9 +2705,50 @@ class Scheduler(
 
             if self.enable_overlap:
                 model_worker_batch = worker_batch_or_batch
-                batch_result, future_indices_or_next_token_ids = (
-                    self._run_generation_batch_overlap(batch, model_worker_batch)
+                self.record_batch_in_overlap(model_worker_batch)
+
+                # Sampling info will be modified during forward, so we store a copy.
+                model_worker_batch.sampling_info = (
+                    model_worker_batch.sampling_info.copy_for_forward()
                 )
+
+                bs = len(model_worker_batch.seq_lens)
+                future_indices = self.future_map.alloc_future_indices(bs)
+
+                with self.forward_stream_ctx, self.record_bubble_metrics(batch):
+                    self.forward_stream.wait_stream(self.schedule_stream)
+                    self.future_map.resolve_future(model_worker_batch)
+                    with self.record_forward_metrics(batch):
+                        batch_result = self.model_worker.forward_batch_generation(
+                            model_worker_batch
+                            # here pp is not compatible with overlap
+                        )
+                    # FIXME(lsyin): maybe move this to forward_batch_generation
+                    batch_result.copy_done = self.device_module.Event()
+                    if batch_result.delay_sample_func is None:
+                        self.future_map.store_to_map(future_indices, batch_result)
+                        batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
+                    else:
+                        batch_result.future_indices = future_indices
+
+                # FIXME(lsyin): move this assignment elsewhere
+                future_indices_or_next_token_ids = -future_indices.indices
+
+                if batch.is_spec_v2:
+                    # FIXME(lsyin): tmp code for spec v2
+                    # We only keep future indices for next draft input
+
+                    batch.spec_info = batch_result.next_draft_input
+                    batch.spec_info.future_indices = future_indices
+
+                    # batch.spec_info = EagleDraftInput(
+                    #     future_indices=future_indices,
+                    #     verify_done=batch_result.next_draft_input.verify_done,
+                    # )
+
+                    # The future value, usually for next batch preparation
+                    # Current implementation strictly synchronizes the seq_lens
+                    batch.seq_lens = batch_result.next_draft_input.new_seq_lens
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
@@ -3042,9 +2765,26 @@ class Scheduler(
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
 
-            self._finalize_generation_batch_result(
-                batch, batch_result, future_indices_or_next_token_ids
-            )
+            # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
+            #       which can probably be replaced by future_indices later [TODO(lsyin)].
+            #       we shall still keep the original outputs, e.g. next_token_ids
+            #       in the GenerationBatchOutput for processing after copy_done.
+            batch.output_ids = future_indices_or_next_token_ids
+
+            # These 2 values are needed for processing the output, but the values can be
+            # modified by overlap schedule. So we have to copy them here so that
+            # we can use the correct values in output processing.
+            if batch.return_logprob:
+                batch_result.extend_input_len_per_req = [
+                    req.extend_input_len for req in batch.reqs
+                ]
+                batch_result.extend_logprob_start_len_per_req = [
+                    req.extend_logprob_start_len for req in batch.reqs
+                ]
+            else:
+                batch_result.extend_input_len_per_req = None
+                batch_result.extend_logprob_start_len_per_req = None
+
             ret = batch_result
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
@@ -3082,37 +2822,19 @@ class Scheduler(
         return ret
 
     def launch_batch_sample_if_needed(
-        self,
-        batch: Optional[ScheduleBatch],
-        batch_result: Optional[Union[GenerationBatchResult, PendingOverlapResult]],
-    ) -> Optional[GenerationBatchResult]:
+        self, batch_result: GenerationBatchResult
+    ) -> Union[GenerationBatchResult]:
         # TODO(lsyin): make the delayed sample a default behavior after
         # unifying the forward_batch_generation interface (related to spec V2).
-        if batch_result is None:
-            return
-
-        if isinstance(batch_result, PendingOverlapResult):
-            if not batch_result.requires_current_batch_resolve_for_sampling:
-                return
-            batch_result = batch_result.resolve()
-
-        if batch_result.delay_sample_func is None:
+        if batch_result is None or batch_result.delay_sample_func is None:
             return
 
         with self.forward_stream_ctx:
             self.forward_stream.wait_stream(self.schedule_stream)
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
-            if (
-                self.spec_v2_overlap_executor is not None
-                and batch_result.future_indices is not None
-            ):
-                self.spec_v2_overlap_executor.client.finalize_delayed_batch_result(
-                    batch, batch_result
-                )
-            else:
-                self.future_map.store_to_map(batch_result.future_indices, batch_result)
-                self._schedule_generation_batch_result_copy(batch, batch_result)
+            self.future_map.store_to_map(batch_result.future_indices, batch_result)
+            batch_result.copy_to_cpu(return_logprob=self.cur_batch.return_logprob)
 
         # Release the closure and large GPU tensors that are no longer needed.
         # The delay_sample_func closure captures forward_batch (which holds
@@ -3123,7 +2845,6 @@ class Scheduler(
         batch_result.delay_sample_func = None
         if batch_result.logits_output is not None:
             batch_result.logits_output.next_token_logits = None
-        return batch_result
 
     def process_batch_result(
         self,
@@ -3256,8 +2977,6 @@ class Scheduler(
             and self.chunked_req is None
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
-            and self.pending_overlap_state is None
-            and self.mutable_running_batch is None
             and (self.cur_batch is None or self.cur_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
@@ -3392,7 +3111,6 @@ class Scheduler(
         if self.is_fully_idle():
             self.cur_batch = None
             self.last_batch = None
-            self._clear_overlap_carriers()
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
@@ -3621,19 +3339,30 @@ class Scheduler(
             # manipulation logic and the accounting bugs that come with it.
             return
 
-        if self.enable_overlap and self.result_queue:
+        if self.enable_overlap and self.last_batch:
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
-            tmp_result = self._resolve_overlap_batch_result_if_needed(
-                tmp_result, snapshot_batch=tmp_batch
-            )
             self.process_batch_result(tmp_batch, tmp_result)
 
-        pause_merge_batch = self._get_merge_source_batch()
-        self._merge_mutable_batch_into_running_if_needed(pause_merge_batch)
+        if self.last_batch and self.last_batch.forward_mode.is_extend():
+            chunked_req_to_exclude = set()
+            self.last_batch.filter_batch(
+                chunked_req_to_exclude=list(chunked_req_to_exclude)
+            )
+            # Skip merge for disagg prefill: completed prefill requests are
+            # already in disagg_prefill_inflight_queue. Merging them into
+            # running_batch leaks them, since the prefill event loop never
+            # calls update_running_batch to clean them up.
+            if (
+                not self.last_batch.is_empty()
+                and self.disaggregation_mode != DisaggregationMode.PREFILL
+            ):
+                if self.running_batch.is_empty():
+                    self.running_batch = self.last_batch
+                else:
+                    self.running_batch.merge_batch(self.last_batch)
 
         self.last_batch = None
-        self._clear_overlap_carriers()
         self.cur_batch = None
 
         if recv_req.mode == "retract" and not self.running_batch.is_empty():

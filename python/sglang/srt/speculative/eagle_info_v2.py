@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import logging
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -39,10 +37,6 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_npu_before_atlas_a5 = is_npu_before_atlas_a5()
-_ENABLE_SPECV2_PREPARE_COMPARE = (
-    os.getenv("SGLANG_ENABLE_SPECV2_PREPARE_COMPARE", "0") == "1"
-)
-logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
@@ -88,105 +82,6 @@ def assign_draft_cache_locs_page_size_1(
 
 @dataclass
 class EagleDraftInputV2Mixin:
-    def _clear_future_replay_buffers(self: EagleDraftInput) -> None:
-        self.future_topk_p_buf = None
-        self.future_topk_index_buf = None
-        self.future_hidden_states_buf = None
-        self.future_verified_id_buf = None
-        self.future_new_seq_lens_buf = None
-
-    def _get_full_future_relay_prepare_fallback_reason(
-        self: EagleDraftInput,
-        topk: int,
-        num_steps: int,
-    ) -> str | None:
-        if self.future_indices is None:
-            return "missing_future_indices"
-        if not self.has_real_future_payload:
-            return "future_payload_not_real"
-        if self.new_seq_lens is None:
-            return "missing_new_seq_lens"
-        if self.last_verified_ids is None or self.token_list is None:
-            return "missing_placeholder_payload"
-        if (
-            self.topk_p is None
-            or self.topk_index is None
-            or self.hidden_states is None
-            or self.verified_id is None
-        ):
-            return "missing_full_relay_payload"
-        if self.last_verified_ids.ndim != 1 or self.token_list.ndim != 2:
-            return "invalid_placeholder_rank"
-        if self.token_list.shape[0] != self.last_verified_ids.shape[0]:
-            return "placeholder_batch_mismatch"
-        if self.token_list.shape[1] != num_steps:
-            return "placeholder_width_mismatch"
-        if self.topk_p.ndim != 2 or self.topk_index.ndim != 2:
-            return "invalid_full_relay_rank"
-        if self.topk_p.shape != self.topk_index.shape:
-            return "relay_topk_shape_mismatch"
-        if self.topk_p.shape[0] != self.last_verified_ids.shape[0]:
-            return "relay_topk_batch_mismatch"
-        if self.topk_p.shape[1] != topk:
-            return "relay_topk_width_mismatch"
-        if self.hidden_states.ndim != 2:
-            return "invalid_hidden_states_rank"
-        if self.hidden_states.shape[0] != self.last_verified_ids.shape[0]:
-            return "relay_hidden_batch_mismatch"
-        if self.verified_id.ndim != 1:
-            return "invalid_verified_id_rank"
-        if self.verified_id.shape[0] != self.last_verified_ids.shape[0]:
-            return "relay_verified_batch_mismatch"
-        if self.new_seq_lens.ndim != 1:
-            return "invalid_new_seq_lens_rank"
-        if self.new_seq_lens.shape[0] != self.last_verified_ids.shape[0]:
-            return "relay_new_seq_batch_mismatch"
-        if torch.any(self.last_verified_ids < 0) or torch.any(self.token_list < 0):
-            return "placeholder_not_resolved"
-        return None
-
-    def _has_replay_prepare_payload(self: EagleDraftInput) -> bool:
-        return (
-            self.future_indices is not None
-            and self.future_topk_p_buf is not None
-            and self.future_topk_index_buf is not None
-            and self.future_verified_id_buf is not None
-            and self.future_new_seq_lens_buf is not None
-            and self.future_hidden_states_buf is not None
-        )
-
-    def _get_placeholder_prepare_fallback_reason(
-        self: EagleDraftInput,
-        draft_model_runner: ModelRunner,
-        topk: int,
-        num_steps: int,
-    ) -> str | None:
-        if topk != 1:
-            return "topk_not_1"
-        if not self.uses_future_placeholder:
-            return "placeholder_contract_disabled"
-        if self.future_indices is None:
-            return "missing_future_indices"
-        if self.last_verified_ids is None or self.token_list is None:
-            return "missing_placeholder_payload"
-        if self.last_verified_ids.ndim != 1 or self.token_list.ndim != 2:
-            return "invalid_placeholder_rank"
-        if self.token_list.shape[0] != self.last_verified_ids.shape[0]:
-            return "placeholder_batch_mismatch"
-        if self.token_list.shape[1] != num_steps:
-            return "placeholder_width_mismatch"
-        if torch.any(self.last_verified_ids < 0) or torch.any(self.token_list < 0):
-            return "placeholder_not_resolved"
-        if (
-            self.future_topk_p_buf is None
-            or self.future_hidden_states_buf is None
-            or self.future_new_seq_lens_buf is None
-        ):
-            return "replay_only_state_incomplete"
-        if getattr(getattr(draft_model_runner, "model", None), "hot_token_id", None) is not None:
-            return "hot_token_projection_enabled"
-        return None
-
     def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
         batch.maybe_evict_swa()
 
@@ -242,381 +137,6 @@ class EagleDraftInputV2Mixin:
         batch.seq_lens_cpu = batch.seq_lens.cpu()
         batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
 
-    def prepare_for_placeholder_decode_proposal_v2(
-        self: EagleDraftInput,
-        req_to_token_pool: ReqToTokenPool,
-        batch: ModelWorkerBatch,
-        draft_model_runner: ModelRunner,
-        topk: int,
-        num_steps: int,
-    ):
-        if self.new_seq_lens is None:
-            raise ValueError(
-                "prepare_for_placeholder_decode_proposal_v2 requires new_seq_lens."
-            )
-
-        batch.spec_info = self
-        batch.seq_lens = self.new_seq_lens
-        batch.seq_lens_cpu = self.new_seq_lens.detach().cpu()
-        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
-        batch.extend_seq_lens = None
-        batch.extend_prefix_lens = None
-        batch.extend_num_tokens = 0
-        batch.capture_hidden_mode = CaptureHiddenMode.LAST
-        batch.forward_mode = (
-            ForwardMode.IDLE
-            if batch.forward_mode.is_idle()
-            else ForwardMode.DECODE
-        )
-        batch.out_cache_loc = None
-        return self.prepare_for_v2_draft(
-            req_to_token_pool=req_to_token_pool,
-            batch=batch,
-            cuda_graph_runner=None,
-            draft_model_runner=draft_model_runner,
-            topk=topk,
-            num_steps=num_steps,
-        )
-
-    def prepare_for_placeholder_prefill_proposal_v2(
-        self: EagleDraftInput,
-        req_to_token_pool: ReqToTokenPool,
-        batch: ModelWorkerBatch,
-        draft_model_runner: ModelRunner,
-        topk: int,
-        num_steps: int,
-    ):
-        if self.new_seq_lens is None:
-            raise ValueError(
-                "prepare_for_placeholder_prefill_proposal_v2 requires new_seq_lens."
-            )
-
-        # Prefill proposal should consume the same decode-like proposal contract as
-        # the decode path: proposal runs on a clean batch without extend metadata.
-        batch.spec_info = self
-        batch.seq_lens = self.new_seq_lens
-        batch.seq_lens_cpu = self.new_seq_lens.detach().cpu()
-        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
-        batch.extend_seq_lens = None
-        batch.extend_prefix_lens = None
-        batch.extend_num_tokens = 0
-        batch.capture_hidden_mode = CaptureHiddenMode.LAST
-        batch.forward_mode = (
-            ForwardMode.IDLE
-            if batch.forward_mode.is_idle()
-            else ForwardMode.DECODE
-        )
-        batch.out_cache_loc = None
-        return self.prepare_for_v2_draft(
-            req_to_token_pool=req_to_token_pool,
-            batch=batch,
-            cuda_graph_runner=None,
-            draft_model_runner=draft_model_runner,
-            topk=topk,
-            num_steps=num_steps,
-        )
-
-    def _can_prepare_for_v2_draft_from_placeholder_payload(
-        self: EagleDraftInput,
-        draft_model_runner: ModelRunner,
-        topk: int,
-        num_steps: int,
-    ) -> bool:
-        return (
-            self._get_placeholder_prepare_fallback_reason(
-                draft_model_runner=draft_model_runner,
-                topk=topk,
-                num_steps=num_steps,
-            )
-            is None
-        )
-
-    def prepare_for_v2_draft_from_placeholder_payload(
-        self: EagleDraftInput,
-        req_to_token_pool: ReqToTokenPool,
-        batch: ModelWorkerBatch,
-        draft_model_runner: ModelRunner,
-        topk: int,
-        num_steps: int,
-        clear_future_buffers: bool = True,
-    ) -> bool:
-        if not self._can_prepare_for_v2_draft_from_placeholder_payload(
-            draft_model_runner=draft_model_runner,
-            topk=topk,
-            num_steps=num_steps,
-        ):
-            return False
-
-        bs = len(batch.seq_lens)
-        device = batch.seq_lens.device
-        indices = self.future_indices.indices
-
-        # Phase 5 front-half:
-        # consume the fields that phase 4 already audits as equivalent
-        # (`last_verified_ids`, `token_list[:, 0]`) from placeholder payload,
-        # while still reusing replay-only state (`topk_p`, `hidden_states`,
-        # `new_seq_lens`) until the later cleanup phase removes replay entirely.
-        self.topk_p = self.future_topk_p_buf[indices]
-        self.topk_index = self.token_list[:, :topk].to(
-            device=device,
-            dtype=(
-                self.future_topk_index_buf.dtype
-                if self.future_topk_index_buf is not None
-                else torch.int64
-            ),
-        )
-        self.hidden_states = self.future_hidden_states_buf[indices]
-        self.verified_id = self.last_verified_ids.to(
-            device=device,
-            dtype=(
-                self.future_verified_id_buf.dtype
-                if self.future_verified_id_buf is not None
-                else torch.int32
-            ),
-        )
-        self.new_seq_lens = self.future_new_seq_lens_buf[indices]
-
-        if not batch.forward_mode.is_idle():
-            batch.out_cache_loc = torch.empty(
-                (bs * topk * num_steps,),
-                dtype=torch.int64,
-                device=device,
-            )
-            assign_draft_cache_locs_page_size_1[(bs,)](
-                batch.req_pool_indices,
-                req_to_token_pool.req_to_token,
-                batch.seq_lens,
-                batch.out_cache_loc,
-                req_to_token_pool.req_to_token.shape[1],
-                topk,
-                num_steps,
-            )
-
-        if clear_future_buffers:
-            self._clear_future_replay_buffers()
-        return True
-
-    def prepare_for_v2_draft_from_full_future_relay(
-        self: EagleDraftInput,
-        req_to_token_pool: ReqToTokenPool,
-        batch: ModelWorkerBatch,
-        topk: int,
-        num_steps: int,
-        clear_future_buffers: bool = True,
-    ) -> bool:
-        if (
-            self._get_full_future_relay_prepare_fallback_reason(
-                topk=topk,
-                num_steps=num_steps,
-            )
-            is not None
-        ):
-            return False
-
-        bs = len(batch.seq_lens)
-        device = batch.seq_lens.device
-        self.topk_p = self.topk_p.to(device=device)
-        self.topk_index = self.topk_index.to(device=device)
-        self.hidden_states = self.hidden_states.to(device=device)
-        self.verified_id = self.verified_id.to(device=device)
-        self.new_seq_lens = self.new_seq_lens.to(device=device)
-
-        if not batch.forward_mode.is_idle():
-            batch.out_cache_loc = torch.empty(
-                (bs * topk * num_steps,),
-                dtype=torch.int64,
-                device=device,
-            )
-            assign_draft_cache_locs_page_size_1[(bs,)](
-                batch.req_pool_indices,
-                req_to_token_pool.req_to_token,
-                batch.seq_lens,
-                batch.out_cache_loc,
-                req_to_token_pool.req_to_token.shape[1],
-                topk,
-                num_steps,
-            )
-
-        if clear_future_buffers:
-            self._clear_future_replay_buffers()
-        return True
-
-    def _build_v2_draft_replay_prepare_state(
-        self: EagleDraftInput,
-        req_to_token_pool: ReqToTokenPool,
-        batch: ModelWorkerBatch,
-        topk: int,
-        num_steps: int,
-    ) -> dict[str, torch.Tensor] | None:
-        if not self._has_replay_prepare_payload():
-            return None
-
-        bs = len(batch.seq_lens)
-        device = batch.input_ids.device
-        replay_state = {
-            "out_cache_loc": torch.empty(
-                (bs * topk * num_steps,),
-                dtype=torch.int64,
-                device=device,
-            ),
-            "positions": torch.empty(
-                (bs * topk,),
-                dtype=torch.int64,
-                device=device,
-            ),
-            "topk_p": torch.empty(
-                (bs, topk),
-                dtype=self.future_topk_p_buf.dtype,
-                device=self.future_topk_p_buf.device,
-            ),
-            "topk_index": torch.empty(
-                (bs, topk),
-                dtype=self.future_topk_index_buf.dtype,
-                device=self.future_topk_index_buf.device,
-            ),
-            "verified_id": torch.empty(
-                (bs,),
-                dtype=self.future_verified_id_buf.dtype,
-                device=self.future_verified_id_buf.device,
-            ),
-            "new_seq_lens": torch.empty(
-                (bs,),
-                dtype=self.future_new_seq_lens_buf.dtype,
-                device=self.future_new_seq_lens_buf.device,
-            ),
-            "hidden_states": torch.empty(
-                (bs, self.future_hidden_states_buf.shape[1]),
-                dtype=self.future_hidden_states_buf.dtype,
-                device=self.future_hidden_states_buf.device,
-            ),
-        }
-        draft_future_replay_prepare_npu_triton(
-            future_indices=self.future_indices.indices,
-            src_topk_p=self.future_topk_p_buf,
-            src_topk_index=self.future_topk_index_buf,
-            src_hidden_states=self.future_hidden_states_buf,
-            src_verified_id=self.future_verified_id_buf,
-            src_new_seq_lens=self.future_new_seq_lens_buf,
-            src_seq_lens=batch.seq_lens,
-            src_req_pool_indices=batch.req_pool_indices,
-            req_to_token=req_to_token_pool.req_to_token,
-            dst_topk_p=replay_state["topk_p"],
-            dst_topk_index=replay_state["topk_index"],
-            dst_hidden_states=replay_state["hidden_states"],
-            dst_verified_id=replay_state["verified_id"],
-            dst_new_seq_lens=replay_state["new_seq_lens"],
-            dst_positions=replay_state["positions"],
-            dst_out_cache_loc=replay_state["out_cache_loc"],
-            topk=topk,
-            speculative_num_steps=num_steps,
-        )
-        return replay_state
-
-    def prepare_for_v2_draft_from_replay_payload(
-        self: EagleDraftInput,
-        req_to_token_pool: ReqToTokenPool,
-        batch: ModelWorkerBatch,
-        topk: int,
-        num_steps: int,
-        clear_future_buffers: bool = True,
-    ) -> bool:
-        replay_state = self._build_v2_draft_replay_prepare_state(
-            req_to_token_pool=req_to_token_pool,
-            batch=batch,
-            topk=topk,
-            num_steps=num_steps,
-        )
-        if replay_state is None:
-            return False
-
-        batch.out_cache_loc = replay_state["out_cache_loc"]
-        self.positions = replay_state["positions"]
-        self.topk_p = replay_state["topk_p"]
-        self.topk_index = replay_state["topk_index"]
-        self.verified_id = replay_state["verified_id"]
-        self.new_seq_lens = replay_state["new_seq_lens"]
-        self.hidden_states = replay_state["hidden_states"]
-        if clear_future_buffers:
-            self._clear_future_replay_buffers()
-        return True
-
-    def _compare_placeholder_prepare_against_replay_prepare(
-        self: EagleDraftInput,
-        batch: ModelWorkerBatch,
-        replay_state: dict[str, torch.Tensor],
-    ) -> None:
-        mismatch_messages = []
-
-        if self.verified_id.shape != replay_state["verified_id"].shape:
-            mismatch_messages.append(
-                f"verified_id shape {tuple(self.verified_id.shape)} != {tuple(replay_state['verified_id'].shape)}"
-            )
-        elif torch.any(self.verified_id != replay_state["verified_id"]):
-            mismatch_messages.append("verified_id")
-
-        if self.topk_index.shape != replay_state["topk_index"].shape:
-            mismatch_messages.append(
-                f"topk_index shape {tuple(self.topk_index.shape)} != {tuple(replay_state['topk_index'].shape)}"
-            )
-        elif torch.any(self.topk_index != replay_state["topk_index"]):
-            mismatch_messages.append("topk_index")
-
-        if self.positions.shape != replay_state["positions"].shape:
-            mismatch_messages.append(
-                f"positions shape {tuple(self.positions.shape)} != {tuple(replay_state['positions'].shape)}"
-            )
-        elif torch.any(self.positions != replay_state["positions"]):
-            mismatch_messages.append("positions")
-
-        if self.new_seq_lens.shape != replay_state["new_seq_lens"].shape:
-            mismatch_messages.append(
-                f"new_seq_lens shape {tuple(self.new_seq_lens.shape)} != {tuple(replay_state['new_seq_lens'].shape)}"
-            )
-        elif torch.any(self.new_seq_lens != replay_state["new_seq_lens"]):
-            mismatch_messages.append("new_seq_lens")
-
-        if batch.out_cache_loc.shape != replay_state["out_cache_loc"].shape:
-            mismatch_messages.append(
-                f"out_cache_loc shape {tuple(batch.out_cache_loc.shape)} != {tuple(replay_state['out_cache_loc'].shape)}"
-            )
-        elif batch.out_cache_loc.dtype != replay_state["out_cache_loc"].dtype:
-            mismatch_messages.append(
-                f"out_cache_loc dtype {batch.out_cache_loc.dtype} != {replay_state['out_cache_loc'].dtype}"
-            )
-
-        if self.topk_p.shape != replay_state["topk_p"].shape:
-            mismatch_messages.append(
-                f"topk_p shape {tuple(self.topk_p.shape)} != {tuple(replay_state['topk_p'].shape)}"
-            )
-        elif self.topk_p.dtype != replay_state["topk_p"].dtype:
-            mismatch_messages.append(
-                f"topk_p dtype {self.topk_p.dtype} != {replay_state['topk_p'].dtype}"
-            )
-        elif not torch.allclose(self.topk_p, replay_state["topk_p"]):
-            mismatch_messages.append("topk_p")
-
-        if self.hidden_states.shape != replay_state["hidden_states"].shape:
-            mismatch_messages.append(
-                "hidden_states shape "
-                f"{tuple(self.hidden_states.shape)} != {tuple(replay_state['hidden_states'].shape)}"
-            )
-        elif self.hidden_states.dtype != replay_state["hidden_states"].dtype:
-            mismatch_messages.append(
-                f"hidden_states dtype {self.hidden_states.dtype} != {replay_state['hidden_states'].dtype}"
-            )
-
-        if mismatch_messages:
-            logger.warning(
-                "Phase6-B consumer compare mismatch at interval=%s: %s.",
-                self.future_indices.interval if self.future_indices is not None else None,
-                "; ".join(mismatch_messages),
-            )
-        else:
-            logger.debug(
-                "Phase6-B consumer compare passed at interval=%s.",
-                self.future_indices.interval if self.future_indices is not None else None,
-            )
-
     def prepare_for_v2_draft(
         self: EagleDraftInput,
         req_to_token_pool: ReqToTokenPool,
@@ -628,84 +148,78 @@ class EagleDraftInputV2Mixin:
     ):
         bs = len(batch.seq_lens)
         positions_prepared = False
-        replay_prepare_state = None
         if not batch.forward_mode.is_idle():
-            future_ready = self._has_replay_prepare_payload()
-            should_shadow_compare = (
-                _ENABLE_SPECV2_PREPARE_COMPARE and future_ready
-            )
-            full_relay_fallback_reason = (
-                self._get_full_future_relay_prepare_fallback_reason(
-                    topk=topk,
-                    num_steps=num_steps,
-                )
-            )
-            prepared_from_full_future_relay = (
-                full_relay_fallback_reason is None
-                and self.prepare_for_v2_draft_from_full_future_relay(
-                    req_to_token_pool=req_to_token_pool,
-                    batch=batch,
-                    topk=topk,
-                    num_steps=num_steps,
-                    clear_future_buffers=not should_shadow_compare,
-                )
-            )
-            placeholder_fallback_reason = self._get_placeholder_prepare_fallback_reason(
-                draft_model_runner=draft_model_runner,
-                topk=topk,
-                num_steps=num_steps,
-            )
-            prepared_from_placeholder_payload = (
-                placeholder_fallback_reason is None
-                and self.prepare_for_v2_draft_from_placeholder_payload(
-                    req_to_token_pool=req_to_token_pool,
-                    batch=batch,
-                    draft_model_runner=draft_model_runner,
-                    topk=topk,
-                    num_steps=num_steps,
-                    clear_future_buffers=not should_shadow_compare,
-                )
+            future_ready = (
+                self.future_indices is not None
+                and self.future_topk_p_buf is not None
+                and self.future_topk_index_buf is not None
+                and self.future_verified_id_buf is not None
+                and self.future_new_seq_lens_buf is not None
+                and self.future_hidden_states_buf is not None
             )
 
-            if prepared_from_full_future_relay:
-                logger.debug(
-                    "Phase6-B full-relay prepare hit at interval=%s.",
-                    self.future_indices.interval if self.future_indices is not None else None,
+            if future_ready:
+                batch.out_cache_loc = torch.empty(
+                    (bs * topk * num_steps,),
+                    dtype=torch.int64,
+                    device=batch.input_ids.device,
                 )
-                if should_shadow_compare:
-                    replay_prepare_state = self._build_v2_draft_replay_prepare_state(
-                        req_to_token_pool=req_to_token_pool,
-                        batch=batch,
-                        topk=topk,
-                        num_steps=num_steps,
-                    )
-            elif prepared_from_placeholder_payload:
-                logger.debug(
-                    "Phase6-B placeholder+replay prepare hit at interval=%s.",
-                    self.future_indices.interval if self.future_indices is not None else None,
+                self.positions = torch.empty(
+                    (bs * topk,),
+                    dtype=torch.int64,
+                    device=batch.input_ids.device,
                 )
-                if should_shadow_compare:
-                    replay_prepare_state = self._build_v2_draft_replay_prepare_state(
-                        req_to_token_pool=req_to_token_pool,
-                        batch=batch,
-                        topk=topk,
-                        num_steps=num_steps,
-                    )
-            elif future_ready:
-                self.prepare_for_v2_draft_from_replay_payload(
-                    req_to_token_pool=req_to_token_pool,
-                    batch=batch,
+                self.topk_p = torch.empty(
+                    (bs, topk),
+                    dtype=self.future_topk_p_buf.dtype,
+                    device=self.future_topk_p_buf.device,
+                )
+                self.topk_index = torch.empty(
+                    (bs, topk),
+                    dtype=self.future_topk_index_buf.dtype,
+                    device=self.future_topk_index_buf.device,
+                )
+                self.verified_id = torch.empty(
+                    (bs,),
+                    dtype=self.future_verified_id_buf.dtype,
+                    device=self.future_verified_id_buf.device,
+                )
+                self.new_seq_lens = torch.empty(
+                    (bs,),
+                    dtype=self.future_new_seq_lens_buf.dtype,
+                    device=self.future_new_seq_lens_buf.device,
+                )
+                self.hidden_states = torch.empty(
+                    (bs, self.future_hidden_states_buf.shape[1]),
+                    dtype=self.future_hidden_states_buf.dtype,
+                    device=self.future_hidden_states_buf.device,
+                )
+                draft_future_replay_prepare_npu_triton(
+                    future_indices=self.future_indices.indices,
+                    src_topk_p=self.future_topk_p_buf,
+                    src_topk_index=self.future_topk_index_buf,
+                    src_hidden_states=self.future_hidden_states_buf,
+                    src_verified_id=self.future_verified_id_buf,
+                    src_new_seq_lens=self.future_new_seq_lens_buf,
+                    src_seq_lens=batch.seq_lens,
+                    src_req_pool_indices=batch.req_pool_indices,
+                    req_to_token=req_to_token_pool.req_to_token,
+                    dst_topk_p=self.topk_p,
+                    dst_topk_index=self.topk_index,
+                    dst_hidden_states=self.hidden_states,
+                    dst_verified_id=self.verified_id,
+                    dst_new_seq_lens=self.new_seq_lens,
+                    dst_positions=self.positions,
+                    dst_out_cache_loc=batch.out_cache_loc,
                     topk=topk,
-                    num_steps=num_steps,
+                    speculative_num_steps=num_steps,
                 )
                 positions_prepared = True
-                if placeholder_fallback_reason is not None:
-                    logger.debug(
-                        "Phase6-B replay fallback at interval=%s full_relay_reason=%s placeholder_reason=%s.",
-                        self.future_indices.interval if self.future_indices is not None else None,
-                        full_relay_fallback_reason,
-                        placeholder_fallback_reason,
-                    )
+                self.future_topk_p_buf = None
+                self.future_topk_index_buf = None
+                self.future_hidden_states_buf = None
+                self.future_verified_id_buf = None
+                self.future_new_seq_lens_buf = None
             else:
                 # Assign cache locations
                 batch.out_cache_loc = torch.empty(
@@ -723,18 +237,6 @@ class EagleDraftInputV2Mixin:
                     topk,
                     num_steps,
                 )
-                if (
-                    full_relay_fallback_reason is not None
-                    or placeholder_fallback_reason is not None
-                ) and (
-                    self.future_indices is not None or self.uses_future_placeholder
-                ):
-                    logger.debug(
-                        "Phase6-B default fallback at interval=%s full_relay_reason=%s placeholder_reason=%s.",
-                        self.future_indices.interval if self.future_indices is not None else None,
-                        full_relay_fallback_reason,
-                        placeholder_fallback_reason,
-                    )
 
         # Get a forward batch
         self.num_tokens_per_req = topk
@@ -742,12 +244,6 @@ class EagleDraftInputV2Mixin:
         batch.capture_hidden_mode = CaptureHiddenMode.LAST
         if not positions_prepared:
             self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
-        if replay_prepare_state is not None:
-            self._compare_placeholder_prepare_against_replay_prepare(
-                batch=batch,
-                replay_state=replay_prepare_state,
-            )
-            self._clear_future_replay_buffers()
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         return forward_batch, can_cuda_graph

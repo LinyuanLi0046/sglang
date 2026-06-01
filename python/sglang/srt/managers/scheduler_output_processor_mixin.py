@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import logging
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 
@@ -34,22 +33,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_FORCE_STREAM_INTERVAL = 50
-
-
-@dataclass
-class MaterializedBatchResult:
-    batch: ScheduleBatch
-    result: Union[GenerationBatchResult, EmbeddingBatchResult]
-    kind: str
-    source_pending_result: Optional[Any] = None
-    skip_stream_req: Optional[Req] = None
-    logits_output: Optional[LogitsProcessorOutput] = None
-    next_token_ids: Optional[Union[List[int], List[List[int]]]] = None
-    next_token_logprobs: Optional[Union[List[float], List[List[float]]]] = None
-    extend_input_len_per_req: Optional[List[int]] = None
-    extend_logprob_start_len_per_req: Optional[List[int]] = None
-    embeddings: Optional[Any] = None
-    can_run_cuda_graph: bool = False
 
 
 class SchedulerOutputProcessorMixin:
@@ -137,33 +120,31 @@ class SchedulerOutputProcessorMixin:
                     elem = elem.copy()
                 req.customized_info[k].append(elem)
 
-    def _ensure_generation_result_ready_for_output(
-        self: Scheduler, batch: ScheduleBatch, result: GenerationBatchResult
-    ) -> GenerationBatchResult:
-        if getattr(result, "delay_sample_func", None) is not None:
-            self.launch_batch_sample_if_needed(batch, result)
-        return result
-
     def process_batch_result_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
-        materialized = self._materialize_prefill_result_for_output(batch, result)
-        self._finalize_prefill_result_after_materialize(materialized)
+        skip_stream_req = None
 
-    def _materialize_prefill_result_for_output(
-        self: Scheduler,
-        batch: ScheduleBatch,
-        result: Union[GenerationBatchResult, EmbeddingBatchResult],
-    ) -> MaterializedBatchResult:
         if self.is_generation:
-            result = self._ensure_generation_result_ready_for_output(batch, result)
             if result.copy_done is not None:
                 result.copy_done.synchronize()
 
-            logits_output = result.logits_output
-            next_token_ids = result.next_token_ids.tolist()
+            (
+                logits_output,
+                next_token_ids,
+                extend_input_len_per_req,
+                extend_logprob_start_len_per_req,
+            ) = (
+                result.logits_output,
+                result.next_token_ids,
+                result.extend_input_len_per_req,
+                result.extend_logprob_start_len_per_req,
+            )
+
+            # Move next_token_ids and logprobs to cpu
+            next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
                 if logits_output.next_token_logprobs is not None:
                     logits_output.next_token_logprobs = (
@@ -185,71 +166,25 @@ class SchedulerOutputProcessorMixin:
                         v.tolist()
                         for v in logits_output.next_token_token_ids_logprobs_val
                     ]
-            return MaterializedBatchResult(
-                batch=batch,
-                result=result,
-                kind="prefill_generation",
-                logits_output=logits_output,
-                next_token_ids=next_token_ids,
-                extend_input_len_per_req=result.extend_input_len_per_req,
-                extend_logprob_start_len_per_req=result.extend_logprob_start_len_per_req,
-                can_run_cuda_graph=getattr(result, "can_run_cuda_graph", False),
-            )
-
-        if result.copy_done is not None:
-            result.copy_done.synchronize()
-
-        is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
-        embeddings = result.embeddings
-        if is_sparse:
-            batch_ids, token_ids = embeddings.indices()
-            values = embeddings.values()
-
-            embeddings = [{} for _ in range(embeddings.size(0))]
-            for i in range(batch_ids.shape[0]):
-                embeddings[batch_ids[i].item()][token_ids[i].item()] = values[
-                    i
-                ].item()
-        else:
-            if isinstance(embeddings, torch.Tensor):
-                embeddings = embeddings.tolist()
-            else:
-                embeddings = [tensor.tolist() for tensor in embeddings]
-
-        return MaterializedBatchResult(
-            batch=batch,
-            result=result,
-            kind="prefill_embedding",
-            embeddings=embeddings,
-            can_run_cuda_graph=getattr(result, "can_run_cuda_graph", False),
-        )
-
-    def _finalize_prefill_result_after_materialize(
-        self: Scheduler, materialized: MaterializedBatchResult
-    ) -> None:
-        batch = materialized.batch
-        result = materialized.result
-        skip_stream_req = materialized.skip_stream_req
-
-        if materialized.kind == "prefill_generation":
-            logits_output = materialized.logits_output
-            next_token_ids = materialized.next_token_ids
-            extend_input_len_per_req = materialized.extend_input_len_per_req
-            extend_logprob_start_len_per_req = (
-                materialized.extend_logprob_start_len_per_req
-            )
 
             hidden_state_offset = 0
+
+            # Check finish conditions
             logprob_pt = 0
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
                 if req.finished() or req.is_retracted:
+                    # decode req in mixed batch or retracted req
                     continue
 
                 if req.is_chunked <= 0:
                     req.time_stats.set_prefill_finished_time()
+
+                    # req output_ids are set here
                     req.output_ids.append(next_token_id)
+
                     self._maybe_update_reasoning_tokens(req, next_token_id)
+
                     req.check_finished()
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
@@ -300,21 +235,32 @@ class SchedulerOutputProcessorMixin:
                         )
 
                     if req.grammar is not None:
+                        # FIXME: this try-except block is for handling unexpected xgrammar issue.
                         try:
                             req.grammar.accept_token(next_token_id)
                         except ValueError as e:
+                            # Grammar accept_token can raise ValueError if the token is not in the grammar.
+                            # This can happen if the grammar is not set correctly or the token is invalid.
                             logger.error(
                                 f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
                             )
                             self.abort_request(AbortReq(rid=req.rid))
                         req.grammar.finished = req.finished()
+
                 else:
+                    # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
+                    # There is only at most one request being currently chunked.
+                    # Because this request does not finish prefill,
+                    # we don't want to stream the request currently being chunked.
                     skip_stream_req = req
+
+                    # Incrementally update input logprobs.
                     if batch.return_logprob:
                         extend_logprob_start_len = extend_logprob_start_len_per_req[i]
                         extend_input_len = extend_input_len_per_req[i]
                         if extend_logprob_start_len < extend_input_len:
+                            # Update input logprobs.
                             num_input_logprobs = self._calculate_num_input_logprobs(
                                 req, extend_input_len, extend_logprob_start_len
                             )
@@ -328,9 +274,33 @@ class SchedulerOutputProcessorMixin:
                                     last_prefill_chunk=False,
                                 )
                             logprob_pt += num_input_logprobs
+
                     req.time_stats.set_last_chunked_prefill_finish_time()
-        else:
-            embeddings = materialized.embeddings
+
+        else:  # embedding or reward model
+            if result.copy_done is not None:
+                result.copy_done.synchronize()
+
+            is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
+
+            embeddings = result.embeddings
+
+            if is_sparse:
+                batch_ids, token_ids = embeddings.indices()
+                values = embeddings.values()
+
+                embeddings = [{} for _ in range(embeddings.size(0))]
+                for i in range(batch_ids.shape[0]):
+                    embeddings[batch_ids[i].item()][token_ids[i].item()] = values[
+                        i
+                    ].item()
+            else:
+                if isinstance(embeddings, torch.Tensor):
+                    embeddings = embeddings.tolist()
+                else:
+                    embeddings = [tensor.tolist() for tensor in embeddings]
+
+            # Check finish conditions
             for i, req in enumerate(batch.reqs):
                 if req.is_retracted:
                     continue
@@ -338,6 +308,7 @@ class SchedulerOutputProcessorMixin:
                 req.embedding = embeddings[i]
                 if req.is_chunked <= 0:
                     req.time_stats.set_prefill_finished_time()
+                    # Dummy output token for embedding models
                     req.output_ids.append(0)
                     req.check_finished()
 
@@ -347,13 +318,16 @@ class SchedulerOutputProcessorMixin:
                     else:
                         self.tree_cache.cache_unfinished_req(req)
                 else:
+                    # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
+
+        can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
         self.report_prefill_stats(
             prefill_stats=batch.prefill_stats,
-            can_run_cuda_graph=materialized.can_run_cuda_graph,
+            can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
 
@@ -390,26 +364,11 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
-        materialized = self._materialize_idle_result_for_output(batch, result)
-        self._finalize_idle_result_after_materialize(materialized)
-
-    def _materialize_idle_result_for_output(
-        self: Scheduler,
-        batch: ScheduleBatch,
-        result: GenerationBatchResult,
-    ) -> MaterializedBatchResult:
-        result = self._ensure_generation_result_ready_for_output(batch, result)
         if result.copy_done is not None:
             result.copy_done.synchronize()
-        return MaterializedBatchResult(batch=batch, result=result, kind="idle_generation")
 
-    def _finalize_idle_result_after_materialize(
-        self: Scheduler, materialized: MaterializedBatchResult
-    ) -> None:
         self.stream_output_generation(
-            materialized.batch.reqs,
-            materialized.batch.return_logprob,
-            is_idle_batch=True,
+            batch.reqs, batch.return_logprob, is_idle_batch=True
         )
 
     def process_batch_result_decode(
@@ -417,21 +376,14 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
-        materialized = self._materialize_decode_result_for_output(batch, result)
-        self._finalize_decode_result_after_materialize(materialized)
-
-    def _materialize_decode_result_for_output(
-        self: Scheduler,
-        batch: ScheduleBatch,
-        result: GenerationBatchResult,
-    ) -> MaterializedBatchResult:
-        result = self._ensure_generation_result_ready_for_output(batch, result)
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
-        logits_output = result.logits_output
-        next_token_ids = result.next_token_ids
-        next_token_logprobs = None
+        logits_output, next_token_ids, can_run_cuda_graph = (
+            result.logits_output,
+            result.next_token_ids,
+            result.can_run_cuda_graph,
+        )
 
         if batch.spec_algorithm.is_none() or batch.is_spec_v2:
             if batch.is_spec_v2:
@@ -454,42 +406,29 @@ class SchedulerOutputProcessorMixin:
                         v.tolist()
                         for v in logits_output.next_token_token_ids_logprobs_val
                     ]
-
-        return MaterializedBatchResult(
-            batch=batch,
-            result=result,
-            kind="decode_generation",
-            logits_output=logits_output,
-            next_token_ids=next_token_ids,
-            next_token_logprobs=next_token_logprobs,
-            can_run_cuda_graph=result.can_run_cuda_graph,
-        )
-
-    def _finalize_decode_result_after_materialize(
-        self: Scheduler, materialized: MaterializedBatchResult
-    ) -> None:
-        batch = materialized.batch
-        result = materialized.result
-        logits_output = materialized.logits_output
-        next_token_ids = materialized.next_token_ids
-        next_token_logprobs = materialized.next_token_logprobs
+        # else: Spec V1 — output_ids, check_finished, grammar, and reasoning tokens
+        # are already handled in the verify phase (eagle_info.py / ngram_info.py).
 
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
         if self.enable_metrics:
             self.metrics_collector.increment_decode_cuda_graph_pass(
-                value=materialized.can_run_cuda_graph
+                value=can_run_cuda_graph
             )
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
+        # Spec V1 handles output_ids, check_finished, grammar, and reasoning tokens
+        # in the verify phase. Non-spec and V2 handle them here in post-processing.
         is_spec_v1 = not batch.spec_algorithm.is_none() and not batch.is_spec_v2
 
         for i, req in enumerate(batch.reqs):
             req: Req
 
             if self.enable_overlap and (req.finished() or req.is_retracted):
+                # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
+                # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
 
             if is_spec_v1:
@@ -504,6 +443,7 @@ class SchedulerOutputProcessorMixin:
                     req.grammar.finished = req.finished()
                 continue
 
+            # Non-spec and V2: full post-processing
             next_token_id = next_token_ids[i]
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
@@ -513,12 +453,17 @@ class SchedulerOutputProcessorMixin:
                 new_accepted_len = len(next_token_id)
 
             self._maybe_update_reasoning_tokens(req, next_token_id)
+
+            # Update Mamba last track seqlen
             self._mamba_prefix_cache_update(req, batch, result, i)
             req.time_stats.set_last_decode_finish_time()
             req.check_finished(new_accepted_len)
+
             self._handle_finished_req(req, i, logits_output)
 
             if req.return_logprob:
+                # Spec v1 handles logprobs inside its own worker.
+                # Normalize: non-spec has 1 token, spec v2 has multiple.
                 if batch.is_spec_v2:
                     accepted_logprobs = next_token_logprobs[i]
                     accepted_ids = next_token_id
@@ -554,13 +499,18 @@ class SchedulerOutputProcessorMixin:
                 )
 
             if req.grammar is not None:
+                # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:
                     if batch.spec_algorithm.is_none():
+                        # Normal decode: single token
                         req.grammar.accept_token(next_token_id)
                     elif batch.is_spec_v2:
+                        # Speculative decode: next_token_id is a list of accepted tokens
                         for token_id in next_token_id:
                             req.grammar.accept_token(token_id)
                 except ValueError as e:
+                    # Grammar accept_token can raise ValueError if the token is not in the grammar.
+                    # This can happen if the grammar is not set correctly or the token is invalid.
                     logger.error(
                         f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
                     )
@@ -572,88 +522,10 @@ class SchedulerOutputProcessorMixin:
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
         self.report_decode_stats(
-            materialized.can_run_cuda_graph,
+            can_run_cuda_graph,
             running_batch=batch,
             num_accepted_tokens=result.num_accepted_tokens,
         )
-
-    def materialize_batch_result_for_output(
-        self: Scheduler,
-        batch: ScheduleBatch,
-        result: Union[GenerationBatchResult, EmbeddingBatchResult],
-    ) -> MaterializedBatchResult:
-        if batch.forward_mode.is_decode():
-            return self._materialize_decode_result_for_output(batch, result)
-        if batch.forward_mode.is_extend():
-            if batch.is_dllm():
-                return MaterializedBatchResult(
-                    batch=batch, result=result, kind="direct_dllm"
-                )
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                return MaterializedBatchResult(
-                    batch=batch, result=result, kind="direct_disagg_prefill"
-                )
-            return self._materialize_prefill_result_for_output(batch, result)
-        if batch.forward_mode.is_idle():
-            return self._materialize_idle_result_for_output(batch, result)
-        if batch.forward_mode.is_prebuilt():
-            return MaterializedBatchResult(batch=batch, result=result, kind="prebuilt")
-        return MaterializedBatchResult(batch=batch, result=result, kind="direct_process")
-
-    def finalize_materialized_batch_result(
-        self: Scheduler, materialized: MaterializedBatchResult
-    ) -> None:
-        if materialized.kind in ("prefill_generation", "prefill_embedding"):
-            self._finalize_prefill_result_after_materialize(materialized)
-            return
-        if materialized.kind == "decode_generation":
-            self._finalize_decode_result_after_materialize(materialized)
-            return
-        if materialized.kind == "idle_generation":
-            self._finalize_idle_result_after_materialize(materialized)
-            return
-        if materialized.kind == "direct_dllm":
-            self.process_batch_result_dllm(materialized.batch, materialized.result)
-            return
-        if materialized.kind == "direct_disagg_prefill":
-            self.process_batch_result_disagg_prefill(
-                materialized.batch, materialized.result
-            )
-            return
-        if materialized.kind == "prebuilt":
-            self.process_batch_result_prebuilt(materialized.batch)
-            return
-        if materialized.batch.forward_mode.is_extend():
-            self._finalize_prefill_result_after_materialize(
-                self._materialize_prefill_result_for_output(
-                    materialized.batch, materialized.result
-                )
-            )
-            return
-        raise RuntimeError(
-            f"Unsupported materialized batch result kind: {materialized.kind}"
-        )
-
-    def should_finalize_materialized_result_before_sampling(
-        self: Scheduler,
-        materialized: Optional[MaterializedBatchResult],
-        current_batch: Optional[ScheduleBatch],
-        current_batch_result: Optional[
-            Union[GenerationBatchResult, EmbeddingBatchResult, object]
-        ],
-    ) -> bool:
-        if materialized is None:
-            return False
-        if materialized.batch.has_grammar:
-            return True
-        if current_batch is not None and current_batch.has_grammar:
-            return True
-        if (
-            current_batch_result is not None
-            and getattr(current_batch_result, "delay_sample_func", None) is not None
-        ):
-            return True
-        return False
 
     def _handle_finished_req(
         self: Scheduler, req: Req, i: int, logits_output: LogitsProcessorOutput

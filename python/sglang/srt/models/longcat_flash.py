@@ -482,7 +482,7 @@ class LongcatFlashDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         if get_global_server_args().enable_longcat_double_stream and MultiStreamUtils().main_stream is None and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             MultiStreamUtils().main_stream = torch.npu.current_stream()
-        if _is_npu and not get_global_server_args().disable_piecewise_cuda_graph and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+        if _is_npu  and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             cache=self._get_attn_weights_decode(0)
             _ = prepare_weight_cache(hidden_states, cache)
         # first_attn
@@ -643,15 +643,9 @@ class LongcatFlashDecoderLayer(nn.Module):
         #     MultiStreamUtils().main_stream.wait_stream(MultiStreamUtils().stream_moe)
         #     MultiStreamUtils().main_stream.wait_stream(MultiStreamUtils().stream_attn)
         else:
-            # moe
-            if _is_npu and not get_global_server_args().disable_piecewise_cuda_graph:
-                cache = self.mlp.get_router_weights()
-                _ = prepare_weight_cache(hidden_states, cache)
             hidden_states, moe_residual = self.moe_layer_communicator.prepare_mlp(
                 hidden_states, residual, forward_batch
             )
-            if _is_npu and get_cmo_stream():
-                wait_cmo_stream()
             moe_hidden_states = self.mlp(hidden_states)
             moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
                 moe_hidden_states, moe_residual, forward_batch
@@ -685,8 +679,7 @@ class LongcatFlashDecoderLayer(nn.Module):
             forward_batch,
             cache=(
                 self._get_dense_mlp_weights(0)
-                if _is_npu and not get_global_server_args().disable_piecewise_cuda_graph
-                else None
+                if _is_npu else None
             ),
         )
         # ============= 3条流 ===============
@@ -697,7 +690,7 @@ class LongcatFlashDecoderLayer(nn.Module):
             wait_cmo_stream()
         hidden_states = self.mlps[0](hidden_states)
 
-        if _is_npu and not get_global_server_args().disable_piecewise_cuda_graph and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+        if _is_npu and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             cache=self._get_attn_weights_decode(1)
             _ = prepare_weight_cache(hidden_states, cache)
 
@@ -732,8 +725,7 @@ class LongcatFlashDecoderLayer(nn.Module):
             forward_batch,
             cache=(
                 self._get_dense_mlp_weights(1)
-                if _is_npu and not get_global_server_args().disable_piecewise_cuda_graph
-                else None
+                if _is_npu else None
             ),
         )
 

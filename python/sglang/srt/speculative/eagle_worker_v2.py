@@ -184,6 +184,7 @@ class EagleDraftWorker(BaseDraftWorker):
             self.init_cuda_graphs()
 
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
+        self.decode_behavior_log_budget = 8
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
@@ -387,7 +388,7 @@ class EagleDraftWorker(BaseDraftWorker):
             position_buf,
         )
 
-        return EagleVerifyInput(
+        verify_input = EagleVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,
             positions=position,
@@ -402,6 +403,8 @@ class EagleDraftWorker(BaseDraftWorker):
             seq_lens_sum=None,
             seq_lens_cpu=None,
         )
+        self._compare_decode_behavior(model_worker_batch, draft_input, verify_input)
+        return verify_input
 
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
@@ -662,6 +665,271 @@ class EagleDraftWorker(BaseDraftWorker):
                 device=self.device,
             )
         return self._build_real_token_list_via_propose(batch, next_draft_input)
+
+    def _build_shadow_verify_input_from_real_decode_payload(
+        self,
+        batch: ModelWorkerBatch,
+        draft_input: EagleDraftInput,
+    ) -> Optional[EagleVerifyInput]:
+        if batch.forward_mode.is_idle():
+            return EagleVerifyInput.create_idle_input(
+                self.topk,
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
+            )
+
+        real_new_verified_id = getattr(draft_input, "real_new_verified_id", None)
+        real_token_list = getattr(draft_input, "real_token_list", None)
+        if real_new_verified_id is None or real_token_list is None:
+            return None
+
+        if self.topk != 1:
+            raise ValueError(
+                "Stage D.2 decode behavior compare currently requires "
+                "speculative_eagle_topk == 1"
+            )
+
+        expected_width = self.speculative_num_draft_tokens - 1
+        if real_token_list.ndim != 2:
+            raise ValueError(
+                "Stage D.2 decode behavior compare expects a 2D real_token_list, "
+                f"got ndim={real_token_list.ndim}"
+            )
+        if real_token_list.shape[0] != len(batch.seq_lens):
+            raise ValueError(
+                "Stage D.2 decode behavior compare batch mismatch: "
+                f"expected {len(batch.seq_lens)}, got {real_token_list.shape[0]}"
+            )
+        if real_token_list.shape[1] != expected_width:
+            raise ValueError(
+                "Stage D.2 decode behavior compare width mismatch: "
+                f"expected {expected_width}, got {real_token_list.shape[1]}"
+            )
+
+        batch_size = real_token_list.shape[0]
+        top_scores_index = torch.arange(
+            expected_width, dtype=torch.int64, device=self.device
+        ).unsqueeze(0).expand(batch_size, -1)
+        if expected_width > 1:
+            parent_list = torch.arange(
+                expected_width - 1, dtype=torch.int64, device=self.device
+            ).unsqueeze(0).expand(batch_size, -1)
+        else:
+            parent_list = torch.empty((batch_size, 0), dtype=torch.int64, device=self.device)
+
+        (
+            tree_mask,
+            position,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            draft_tokens,
+        ) = build_tree_kernel_efficient(
+            real_new_verified_id,
+            parent_list,
+            top_scores_index,
+            real_token_list,
+            batch.seq_lens,
+            batch.seq_lens_sum,
+            self.topk,
+            self.speculative_num_steps,
+            self.speculative_num_draft_tokens,
+            self.tree_mask_mode,
+        )
+
+        return EagleVerifyInput(
+            draft_token=draft_tokens,
+            custom_mask=tree_mask,
+            positions=position,
+            retrive_index=retrive_index,
+            retrive_next_token=retrive_next_token,
+            retrive_next_sibling=retrive_next_sibling,
+            retrive_cum_len=None,
+            spec_steps=self.speculative_num_steps,
+            topk=self.topk,
+            draft_token_num=self.speculative_num_draft_tokens,
+            capture_hidden_mode=None,
+            seq_lens_sum=None,
+            seq_lens_cpu=None,
+        )
+
+    def _get_first_mismatch_index(
+        self,
+        actual: torch.Tensor,
+        expected: torch.Tensor,
+    ) -> Optional[Tuple[int, ...]]:
+        mismatch = actual != expected
+        mismatch_index = torch.nonzero(mismatch, as_tuple=False)
+        if mismatch_index.numel() == 0:
+            return None
+        return tuple(int(x) for x in mismatch_index[0].tolist())
+
+    def _get_debug_value_at_index(
+        self,
+        tensor: Optional[torch.Tensor],
+        index: Optional[Tuple[int, ...]],
+    ):
+        if tensor is None or index is None:
+            return None
+        value = tensor[index]
+        if value.numel() == 1:
+            return value.item()
+        return value.detach().cpu().tolist()
+
+    def _get_behavior_row_index(
+        self, field: str, first_index: Optional[Tuple[int, ...]]
+    ) -> Optional[int]:
+        if first_index is None:
+            return None
+        if field in ("draft_token", "positions"):
+            return first_index[0] // self.speculative_num_draft_tokens
+        return first_index[0]
+
+    def _get_debug_row_value(
+        self,
+        tensor: Optional[torch.Tensor],
+        row_index: Optional[int],
+        row_width: Optional[int] = None,
+    ):
+        if tensor is None or row_index is None or row_index < 0:
+            return None
+        if tensor.ndim == 1:
+            if row_width is None:
+                if row_index >= tensor.shape[0]:
+                    return None
+                value = tensor[row_index]
+                return value.item() if value.numel() == 1 else value.detach().cpu().tolist()
+            start = row_index * row_width
+            end = start + row_width
+            if end > tensor.shape[0]:
+                return None
+            value = tensor[start:end]
+            return value.detach().cpu().tolist()
+        if row_index >= tensor.shape[0]:
+            return None
+        value = tensor[row_index]
+        if value.numel() == 1:
+            return value.item()
+        return value.detach().cpu().tolist()
+
+    def _compare_decode_behavior(
+        self,
+        batch: ModelWorkerBatch,
+        draft_input: EagleDraftInput,
+        verify_input: EagleVerifyInput,
+    ) -> None:
+        if batch.forward_mode.is_idle() or self.decode_behavior_log_budget <= 0:
+            return
+
+        try:
+            shadow_verify_input = self._build_shadow_verify_input_from_real_decode_payload(
+                batch, draft_input
+            )
+        except Exception as exc:
+            logger.error(
+                "Stage D.2 decode behavior build failed: bs=%s steps=%s error=%s",
+                len(batch.seq_lens),
+                self.speculative_num_steps,
+                exc,
+            )
+            self.decode_behavior_log_budget -= 1
+            return
+
+        if shadow_verify_input is None:
+            return
+
+        mismatch_fields = []
+        compare_fields = [
+            ("draft_token", verify_input.draft_token, shadow_verify_input.draft_token),
+            ("positions", verify_input.positions, shadow_verify_input.positions),
+            ("retrive_index", verify_input.retrive_index, shadow_verify_input.retrive_index),
+            (
+                "retrive_next_token",
+                verify_input.retrive_next_token,
+                shadow_verify_input.retrive_next_token,
+            ),
+            (
+                "retrive_next_sibling",
+                verify_input.retrive_next_sibling,
+                shadow_verify_input.retrive_next_sibling,
+            ),
+        ]
+        for field, actual, expected in compare_fields:
+            if actual.shape != expected.shape or not torch.equal(actual, expected):
+                first_index = (
+                    None
+                    if actual.shape != expected.shape
+                    else self._get_first_mismatch_index(actual, expected)
+                )
+                mismatch_fields.append(
+                    (
+                        field,
+                        tuple(actual.shape),
+                        tuple(expected.shape),
+                        first_index,
+                        self._get_debug_value_at_index(actual, first_index),
+                        self._get_debug_value_at_index(expected, first_index),
+                    )
+                )
+
+        if not mismatch_fields:
+            return
+
+        for (
+            field,
+            actual_shape,
+            expected_shape,
+            first_index,
+            actual_value,
+            expected_value,
+        ) in mismatch_fields:
+            logger.error(
+                "Stage D.2 decode behavior mismatch: field=%s bs=%s steps=%s actual_shape=%s expected_shape=%s first_mismatch_index=%s actual_value=%s expected_value=%s",
+                field,
+                len(batch.seq_lens),
+                self.speculative_num_steps,
+                actual_shape,
+                expected_shape,
+                first_index,
+                actual_value,
+                expected_value,
+            )
+            row_index = self._get_behavior_row_index(field, first_index)
+            logger.error(
+                "Stage D.2 decode behavior row snapshot: field=%s row=%s req_pool_index=%s verified_id=%s real_new_verified_id=%s actual_draft_token=%s expected_draft_token=%s actual_positions=%s expected_positions=%s actual_retrive_index=%s expected_retrive_index=%s actual_retrive_next_token=%s expected_retrive_next_token=%s actual_retrive_next_sibling=%s expected_retrive_next_sibling=%s",
+                field,
+                row_index,
+                self._get_debug_row_value(batch.req_pool_indices, row_index),
+                self._get_debug_row_value(draft_input.verified_id, row_index),
+                self._get_debug_row_value(draft_input.real_new_verified_id, row_index),
+                self._get_debug_row_value(
+                    verify_input.draft_token, row_index, self.speculative_num_draft_tokens
+                ),
+                self._get_debug_row_value(
+                    shadow_verify_input.draft_token,
+                    row_index,
+                    self.speculative_num_draft_tokens,
+                ),
+                self._get_debug_row_value(
+                    verify_input.positions, row_index, self.speculative_num_draft_tokens
+                ),
+                self._get_debug_row_value(
+                    shadow_verify_input.positions,
+                    row_index,
+                    self.speculative_num_draft_tokens,
+                ),
+                self._get_debug_row_value(verify_input.retrive_index, row_index),
+                self._get_debug_row_value(shadow_verify_input.retrive_index, row_index),
+                self._get_debug_row_value(verify_input.retrive_next_token, row_index),
+                self._get_debug_row_value(
+                    shadow_verify_input.retrive_next_token, row_index
+                ),
+                self._get_debug_row_value(verify_input.retrive_next_sibling, row_index),
+                self._get_debug_row_value(
+                    shadow_verify_input.retrive_next_sibling, row_index
+                ),
+            )
+        self.decode_behavior_log_budget -= 1
 
     def _alloc_real_propose_out_cache(
         self,

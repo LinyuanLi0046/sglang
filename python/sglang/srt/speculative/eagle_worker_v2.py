@@ -707,39 +707,40 @@ class EagleDraftWorker(BaseDraftWorker):
             )
 
         batch_size = real_token_list.shape[0]
-        top_scores_index = torch.arange(
-            expected_width, dtype=torch.int64, device=self.device
-        ).unsqueeze(0).expand(batch_size, -1)
-        if expected_width > 1:
-            parent_list = torch.arange(
-                expected_width - 1, dtype=torch.int64, device=self.device
-            ).unsqueeze(0).expand(batch_size, -1)
-        else:
-            parent_list = torch.empty((batch_size, 0), dtype=torch.int64, device=self.device)
-
-        (
-            tree_mask,
-            position,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
-            draft_tokens,
-        ) = build_tree_kernel_efficient(
-            real_new_verified_id,
-            parent_list,
-            top_scores_index,
-            real_token_list,
-            batch.seq_lens,
-            batch.seq_lens_sum,
-            self.topk,
-            self.speculative_num_steps,
+        draft_tokens = torch.cat(
+            (real_new_verified_id.unsqueeze(1), real_token_list), dim=1
+        ).reshape(-1)
+        relative_positions = torch.arange(
             self.speculative_num_draft_tokens,
-            self.tree_mask_mode,
+            dtype=torch.long,
+            device=self.device,
         )
+        position = (
+            batch.seq_lens.to(torch.long).unsqueeze(1) + relative_positions.unsqueeze(0)
+        ).reshape(-1)
+        retrive_base = (
+            torch.arange(batch_size, dtype=torch.long, device=self.device).unsqueeze(1)
+            * self.speculative_num_draft_tokens
+        )
+        retrive_offset = torch.arange(
+            self.speculative_num_draft_tokens,
+            dtype=torch.long,
+            device=self.device,
+        ).unsqueeze(0)
+        retrive_index = retrive_base + retrive_offset
+        retrive_next_token = torch.full(
+            (batch_size, self.speculative_num_draft_tokens),
+            -1,
+            dtype=torch.long,
+            device=self.device,
+        )
+        if self.speculative_num_draft_tokens > 1:
+            retrive_next_token[:, :-1] = retrive_index[:, 1:]
+        retrive_next_sibling = torch.full_like(retrive_next_token, -1)
 
         return EagleVerifyInput(
             draft_token=draft_tokens,
-            custom_mask=tree_mask,
+            custom_mask=torch.empty((0,), dtype=torch.bool, device=self.device),
             positions=position,
             retrive_index=retrive_index,
             retrive_next_token=retrive_next_token,
@@ -855,20 +856,24 @@ class EagleDraftWorker(BaseDraftWorker):
             ),
         ]
         for field, actual, expected in compare_fields:
-            if actual.shape != expected.shape or not torch.equal(actual, expected):
+            actual_cpu = actual.detach().cpu()
+            expected_cpu = expected.detach().cpu()
+            if actual_cpu.shape != expected_cpu.shape or not torch.equal(
+                actual_cpu, expected_cpu
+            ):
                 first_index = (
                     None
-                    if actual.shape != expected.shape
-                    else self._get_first_mismatch_index(actual, expected)
+                    if actual_cpu.shape != expected_cpu.shape
+                    else self._get_first_mismatch_index(actual_cpu, expected_cpu)
                 )
                 mismatch_fields.append(
                     (
                         field,
-                        tuple(actual.shape),
-                        tuple(expected.shape),
+                        tuple(actual_cpu.shape),
+                        tuple(expected_cpu.shape),
                         first_index,
-                        self._get_debug_value_at_index(actual, first_index),
-                        self._get_debug_value_at_index(expected, first_index),
+                        self._get_debug_value_at_index(actual_cpu, first_index),
+                        self._get_debug_value_at_index(expected_cpu, first_index),
                     )
                 )
 
@@ -903,30 +908,42 @@ class EagleDraftWorker(BaseDraftWorker):
                 self._get_debug_row_value(draft_input.verified_id, row_index),
                 self._get_debug_row_value(draft_input.real_new_verified_id, row_index),
                 self._get_debug_row_value(
-                    verify_input.draft_token, row_index, self.speculative_num_draft_tokens
-                ),
-                self._get_debug_row_value(
-                    shadow_verify_input.draft_token,
+                    verify_input.draft_token.detach().cpu(),
                     row_index,
                     self.speculative_num_draft_tokens,
                 ),
                 self._get_debug_row_value(
-                    verify_input.positions, row_index, self.speculative_num_draft_tokens
-                ),
-                self._get_debug_row_value(
-                    shadow_verify_input.positions,
+                    shadow_verify_input.draft_token.detach().cpu(),
                     row_index,
                     self.speculative_num_draft_tokens,
                 ),
-                self._get_debug_row_value(verify_input.retrive_index, row_index),
-                self._get_debug_row_value(shadow_verify_input.retrive_index, row_index),
-                self._get_debug_row_value(verify_input.retrive_next_token, row_index),
                 self._get_debug_row_value(
-                    shadow_verify_input.retrive_next_token, row_index
+                    verify_input.positions.detach().cpu(),
+                    row_index,
+                    self.speculative_num_draft_tokens,
                 ),
-                self._get_debug_row_value(verify_input.retrive_next_sibling, row_index),
                 self._get_debug_row_value(
-                    shadow_verify_input.retrive_next_sibling, row_index
+                    shadow_verify_input.positions.detach().cpu(),
+                    row_index,
+                    self.speculative_num_draft_tokens,
+                ),
+                self._get_debug_row_value(
+                    verify_input.retrive_index.detach().cpu(), row_index
+                ),
+                self._get_debug_row_value(
+                    shadow_verify_input.retrive_index.detach().cpu(), row_index
+                ),
+                self._get_debug_row_value(
+                    verify_input.retrive_next_token.detach().cpu(), row_index
+                ),
+                self._get_debug_row_value(
+                    shadow_verify_input.retrive_next_token.detach().cpu(), row_index
+                ),
+                self._get_debug_row_value(
+                    verify_input.retrive_next_sibling.detach().cpu(), row_index
+                ),
+                self._get_debug_row_value(
+                    shadow_verify_input.retrive_next_sibling.detach().cpu(), row_index
                 ),
             )
         self.decode_behavior_log_budget -= 1

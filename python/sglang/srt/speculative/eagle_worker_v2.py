@@ -186,8 +186,15 @@ class EagleDraftWorker(BaseDraftWorker):
 
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
         self.decode_behavior_log_budget = 8
+        self.decode_hang_debug_log_budget = 24
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+
+    def _log_decode_hang_debug(self, message: str, *args) -> None:
+        if self.decode_hang_debug_log_budget <= 0:
+            return
+        self.decode_hang_debug_log_budget -= 1
+        logger.error(message, *args)
 
     def init_token_map(self):
         # Load hot token ids
@@ -337,7 +344,48 @@ class EagleDraftWorker(BaseDraftWorker):
             )
         )
         if canonical_verify_input is not None:
+#region debug-point draft-canonical-hit
+            verify_done = getattr(draft_input, "verify_done", None)
+            verify_done_ready = None
+            if verify_done is not None and hasattr(verify_done, "query"):
+                try:
+                    verify_done_ready = verify_done.query()
+                except Exception:
+                    verify_done_ready = "query-error"
+            self._log_decode_hang_debug(
+                "Stage E-lite debug draft canonical_hit bs=%s verify_done_present=%s "
+                "verify_done_ready=%s token_list_shape=%s new_seq_lens=%s",
+                len(model_worker_batch.seq_lens),
+                verify_done is not None,
+                verify_done_ready,
+                None
+                if getattr(draft_input, "token_list", None) is None
+                else tuple(draft_input.token_list.shape),
+                None
+                if getattr(draft_input, "new_seq_lens", None) is None
+                else (
+                    tuple(draft_input.new_seq_lens.tolist())
+                    if len(draft_input.new_seq_lens) <= 8
+                    else tuple(draft_input.new_seq_lens[:8].tolist())
+                ),
+            )
+#endregion debug-point draft-canonical-hit
             return canonical_verify_input
+
+#region debug-point draft-fallback
+        self._log_decode_hang_debug(
+            "Stage E-lite debug draft fallback idle=%s topk=%s has_canonical_payload=%s "
+            "bs=%s seq_lens=%s",
+            model_worker_batch.forward_mode.is_idle(),
+            self.topk,
+            getattr(draft_input, "last_verified_ids", None) is not None
+            and getattr(draft_input, "token_list", None) is not None,
+            len(model_worker_batch.seq_lens),
+            tuple(model_worker_batch.seq_lens.tolist())
+            if len(model_worker_batch.seq_lens) <= 8
+            else tuple(model_worker_batch.seq_lens[:8].tolist()),
+        )
+#endregion debug-point draft-fallback
 
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
             self.req_to_token_pool,
@@ -672,6 +720,31 @@ class EagleDraftWorker(BaseDraftWorker):
         batch: ModelWorkerBatch,
         next_draft_input: EagleDraftInput,
     ) -> Optional[torch.Tensor]:
+#region debug-point canonical-producer-entry
+        verify_done = getattr(next_draft_input, "verify_done", None)
+        verify_done_ready = None
+        if verify_done is not None and hasattr(verify_done, "query"):
+            try:
+                verify_done_ready = verify_done.query()
+            except Exception:
+                verify_done_ready = "query-error"
+        self._log_decode_hang_debug(
+            "Stage E-lite debug canonical_producer entry topk=%s bs=%s verify_done_present=%s "
+            "verify_done_ready=%s batch_seq_lens=%s new_seq_lens=%s",
+            self.topk,
+            len(batch.seq_lens),
+            verify_done is not None,
+            verify_done_ready,
+            tuple(batch.seq_lens.tolist()) if len(batch.seq_lens) <= 8 else tuple(batch.seq_lens[:8].tolist()),
+            tuple(next_draft_input.new_seq_lens.tolist())
+            if next_draft_input.new_seq_lens is not None and len(next_draft_input.new_seq_lens) <= 8
+            else (
+                None
+                if next_draft_input.new_seq_lens is None
+                else tuple(next_draft_input.new_seq_lens[:8].tolist())
+            ),
+        )
+#endregion debug-point canonical-producer-entry
         if self.topk != 1 or next_draft_input.verified_id.numel() == 0:
             return None
 
@@ -708,6 +781,17 @@ class EagleDraftWorker(BaseDraftWorker):
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
             _, _, draft_tokens = self.draft_forward(forward_batch)
 
+#region debug-point canonical-producer-exit
+        self._log_decode_hang_debug(
+            "Stage E-lite debug canonical_producer exit can_cuda_graph=%s draft_tokens_shape=%s "
+            "shadow_seq_lens=%s",
+            can_cuda_graph,
+            tuple(draft_tokens.shape),
+            tuple(shadow_batch.seq_lens.tolist())
+            if len(shadow_batch.seq_lens) <= 8
+            else tuple(shadow_batch.seq_lens[:8].tolist()),
+        )
+#endregion debug-point canonical-producer-exit
         return draft_tokens
 
     def _build_real_decode_token_list(

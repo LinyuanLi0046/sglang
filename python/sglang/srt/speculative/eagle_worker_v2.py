@@ -649,9 +649,10 @@ class EagleDraftWorker(BaseDraftWorker):
             ret_topk_index,
             ret_hidden_states,
         )
-        next_draft_input.real_token_list = self._build_real_decode_token_list(
-            batch, next_draft_input
-        )
+        # Temporary decode-only ablation: disable the decode real_token_list
+        # producer so we can isolate whether the dedicated propose continuation
+        # is the source of the idle-time allocator imbalance.
+        next_draft_input.real_token_list = None
 
     def _build_real_decode_token_list(
         self,

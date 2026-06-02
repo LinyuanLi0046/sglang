@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import logging
 import time
 from typing import List, Optional, Tuple
@@ -556,6 +557,7 @@ class EagleDraftWorker(BaseDraftWorker):
         next_draft_input.real_token_list = self._build_real_prefill_token_list(
             batch, next_draft_input
         )
+        self._compare_real_payload("prefill_first_step", batch, next_draft_input)
         return next_draft_input
 
     def _build_real_prefill_token_list(
@@ -649,6 +651,7 @@ class EagleDraftWorker(BaseDraftWorker):
         next_draft_input.real_token_list = self._build_real_decode_token_list(
             batch, next_draft_input
         )
+        self._compare_real_payload("decode", batch, next_draft_input)
 
     def _build_real_decode_token_list(
         self,
@@ -662,6 +665,91 @@ class EagleDraftWorker(BaseDraftWorker):
                 device=self.device,
             )
         return self._build_real_token_list_via_propose(batch, next_draft_input)
+
+    def _build_legacy_compare_token_list(
+        self,
+        batch: ModelWorkerBatch,
+        proposal_input: EagleDraftInput,
+    ) -> torch.Tensor:
+        if batch.forward_mode.is_idle():
+            return torch.empty(
+                (0, self.speculative_num_steps),
+                dtype=proposal_input.verified_id.dtype,
+                device=self.device,
+            )
+
+        shadow_batch = copy.copy(batch)
+        shadow_input = copy.copy(proposal_input)
+        shadow_batch.input_ids = shadow_input.verified_id
+        shadow_batch.seq_lens = shadow_input.new_seq_lens
+        shadow_batch.seq_lens_cpu = shadow_input.new_seq_lens.cpu()
+        shadow_batch.seq_lens_sum = int(shadow_input.new_seq_lens.sum().item())
+        shadow_batch.forward_mode = ForwardMode.DECODE
+        shadow_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+        shadow_batch.spec_info = shadow_input
+        shadow_forward_batch, _ = shadow_input.prepare_for_v2_draft(
+            self.req_to_token_pool,
+            shadow_batch,
+            self.cuda_graph_runner,
+            self.draft_runner,
+            self.topk,
+            self.speculative_num_steps,
+        )
+        if (
+            not shadow_forward_batch.forward_mode.is_idle()
+            and self.speculative_num_steps > 1
+        ):
+            self.draft_attn_backend.init_forward_metadata(shadow_forward_batch)
+        return self._run_real_propose_forward(shadow_forward_batch)
+
+    def _raise_real_payload_mismatch(
+        self,
+        path: str,
+        field: str,
+        actual: torch.Tensor,
+        expected: torch.Tensor,
+    ) -> None:
+        mismatch = actual != expected
+        mismatch_index = torch.nonzero(mismatch, as_tuple=False)
+        first_index = (
+            tuple(int(x) for x in mismatch_index[0].tolist())
+            if mismatch_index.numel() > 0
+            else None
+        )
+        raise RuntimeError(
+            f"Stage D payload mismatch at {path}.{field}: "
+            f"actual_shape={tuple(actual.shape)}, "
+            f"expected_shape={tuple(expected.shape)}, "
+            f"first_mismatch_index={first_index}"
+        )
+
+    def _compare_real_payload(
+        self,
+        path: str,
+        batch: ModelWorkerBatch,
+        proposal_input: EagleDraftInput,
+    ) -> None:
+        real_new_verified_id = getattr(proposal_input, "real_new_verified_id", None)
+        real_token_list = getattr(proposal_input, "real_token_list", None)
+        if real_new_verified_id is None:
+            raise RuntimeError(f"Stage D payload mismatch at {path}.real_new_verified_id: missing")
+        if real_token_list is None:
+            raise RuntimeError(f"Stage D payload mismatch at {path}.real_token_list: missing")
+
+        if real_new_verified_id.shape != proposal_input.verified_id.shape or not torch.equal(
+            real_new_verified_id, proposal_input.verified_id
+        ):
+            self._raise_real_payload_mismatch(
+                path, "real_new_verified_id", real_new_verified_id, proposal_input.verified_id
+            )
+
+        legacy_token_list = self._build_legacy_compare_token_list(batch, proposal_input)
+        if real_token_list.shape != legacy_token_list.shape or not torch.equal(
+            real_token_list, legacy_token_list
+        ):
+            self._raise_real_payload_mismatch(
+                path, "real_token_list", real_token_list, legacy_token_list
+            )
 
     def _alloc_real_propose_out_cache(
         self,

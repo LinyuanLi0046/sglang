@@ -1,5 +1,4 @@
 import contextlib
-import copy
 import logging
 import time
 from typing import List, Optional, Tuple
@@ -185,7 +184,6 @@ class EagleDraftWorker(BaseDraftWorker):
             self.init_cuda_graphs()
 
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
-        self.decode_compare_log_budget = 8
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
@@ -651,9 +649,6 @@ class EagleDraftWorker(BaseDraftWorker):
         next_draft_input.real_token_list = self._build_real_decode_token_list(
             batch, next_draft_input
         )
-        self._compare_decode_real_payload(
-            batch, next_draft_input, accept_length=batch_result.accept_lens
-        )
 
     def _build_real_decode_token_list(
         self,
@@ -667,198 +662,6 @@ class EagleDraftWorker(BaseDraftWorker):
                 device=self.device,
             )
         return self._build_real_token_list_via_propose(batch, next_draft_input)
-
-    def _build_legacy_compare_payload_for_decode(
-        self,
-        batch: ModelWorkerBatch,
-        proposal_input: EagleDraftInput,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if batch.forward_mode.is_idle():
-            empty_verified = torch.empty(
-                (0,),
-                dtype=proposal_input.verified_id.dtype,
-                device=self.device,
-            )
-            empty_token_list = torch.empty(
-                (0, self.speculative_num_steps),
-                dtype=proposal_input.verified_id.dtype,
-                device=self.device,
-            )
-            return empty_verified, empty_token_list
-
-        shadow_batch = copy.copy(batch)
-        shadow_input = copy.copy(proposal_input)
-        saved_req_to_token_rows = self.req_to_token_pool.req_to_token[
-            batch.req_pool_indices
-        ].clone()
-        try:
-            shadow_batch.input_ids = shadow_input.verified_id
-            shadow_batch.seq_lens = shadow_input.new_seq_lens
-            shadow_batch.seq_lens_cpu = shadow_input.new_seq_lens.cpu()
-            shadow_batch.seq_lens_sum = int(shadow_input.new_seq_lens.sum().item())
-            shadow_batch.forward_mode = ForwardMode.DECODE
-            shadow_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-            shadow_batch.spec_info = shadow_input
-            shadow_forward_batch, _ = shadow_input.prepare_for_v2_draft(
-                self.req_to_token_pool,
-                shadow_batch,
-                self.cuda_graph_runner,
-                self.draft_runner,
-                self.topk,
-                self.speculative_num_steps,
-            )
-            if (
-                not shadow_forward_batch.forward_mode.is_idle()
-                and self.speculative_num_steps > 1
-            ):
-                self.draft_attn_backend.init_forward_metadata(shadow_forward_batch)
-            legacy_token_list = self._run_real_propose_forward(shadow_forward_batch)
-            return shadow_input.verified_id, legacy_token_list
-        finally:
-            self.req_to_token_pool.req_to_token[batch.req_pool_indices] = (
-                saved_req_to_token_rows
-            )
-
-    def _get_first_mismatch_index(
-        self,
-        actual: torch.Tensor,
-        expected: torch.Tensor,
-    ) -> Optional[Tuple[int, ...]]:
-        mismatch = actual != expected
-        mismatch_index = torch.nonzero(mismatch, as_tuple=False)
-        if mismatch_index.numel() == 0:
-            return None
-        return tuple(int(x) for x in mismatch_index[0].tolist())
-
-    def _get_debug_value_at_index(
-        self,
-        tensor: torch.Tensor,
-        index: Optional[Tuple[int, ...]],
-    ):
-        if index is None:
-            return None
-        value = tensor[index]
-        if value.numel() == 1:
-            return value.item()
-        return value.detach().cpu().tolist()
-
-    def _get_debug_row_value(self, tensor: Optional[torch.Tensor], row_index: int):
-        if tensor is None or row_index < 0 or row_index >= tensor.shape[0]:
-            return None
-        value = tensor[row_index]
-        if value.numel() == 1:
-            return value.item()
-        return value.detach().cpu().tolist()
-
-    def _compare_decode_real_payload(
-        self,
-        batch: ModelWorkerBatch,
-        proposal_input: EagleDraftInput,
-        accept_length: Optional[torch.Tensor] = None,
-    ) -> None:
-        if batch.forward_mode.is_idle() or self.decode_compare_log_budget <= 0:
-            return
-
-        real_new_verified_id = getattr(proposal_input, "real_new_verified_id", None)
-        real_token_list = getattr(proposal_input, "real_token_list", None)
-        if real_new_verified_id is None or real_token_list is None:
-            return
-
-        try:
-            legacy_verified_id, legacy_token_list = (
-                self._build_legacy_compare_payload_for_decode(batch, proposal_input)
-            )
-        except Exception as exc:
-            logger.error(
-                "Stage D.1B decode payload compare build failed: bs=%s steps=%s error=%s",
-                len(batch.seq_lens),
-                self.speculative_num_steps,
-                exc,
-            )
-            self.decode_compare_log_budget -= 1
-            return
-
-        mismatch_fields = []
-        if (
-            real_new_verified_id.shape != legacy_verified_id.shape
-            or not torch.equal(real_new_verified_id, legacy_verified_id)
-        ):
-            first_index = (
-                None
-                if real_new_verified_id.shape != legacy_verified_id.shape
-                else self._get_first_mismatch_index(
-                    real_new_verified_id, legacy_verified_id
-                )
-            )
-            mismatch_fields.append(
-                (
-                    "real_new_verified_id",
-                    tuple(real_new_verified_id.shape),
-                    tuple(legacy_verified_id.shape),
-                    first_index,
-                    self._get_debug_value_at_index(real_new_verified_id, first_index),
-                    self._get_debug_value_at_index(legacy_verified_id, first_index),
-                )
-            )
-
-        if (
-            real_token_list.shape != legacy_token_list.shape
-            or not torch.equal(real_token_list, legacy_token_list)
-        ):
-            first_index = (
-                None
-                if real_token_list.shape != legacy_token_list.shape
-                else self._get_first_mismatch_index(real_token_list, legacy_token_list)
-            )
-            mismatch_fields.append(
-                (
-                    "real_token_list",
-                    tuple(real_token_list.shape),
-                    tuple(legacy_token_list.shape),
-                    first_index,
-                    self._get_debug_value_at_index(real_token_list, first_index),
-                    self._get_debug_value_at_index(legacy_token_list, first_index),
-                )
-            )
-
-        if not mismatch_fields:
-            return
-
-        for (
-            field,
-            actual_shape,
-            expected_shape,
-            first_index,
-            actual_value,
-            expected_value,
-        ) in mismatch_fields:
-            logger.error(
-                "Stage D.1B decode payload mismatch: field=%s bs=%s steps=%s actual_shape=%s expected_shape=%s first_mismatch_index=%s actual_value=%s expected_value=%s",
-                field,
-                len(batch.seq_lens),
-                self.speculative_num_steps,
-                actual_shape,
-                expected_shape,
-                first_index,
-                actual_value,
-                expected_value,
-            )
-            if first_index is not None:
-                row_index = first_index[0]
-                logger.error(
-                    "Stage D.1B decode payload mismatch row snapshot: field=%s row=%s req_pool_index=%s verified_id=%s real_new_verified_id=%s legacy_verified_id=%s new_seq_len=%s accept_len=%s actual_row=%s expected_row=%s",
-                    field,
-                    row_index,
-                    self._get_debug_row_value(batch.req_pool_indices, row_index),
-                    self._get_debug_row_value(proposal_input.verified_id, row_index),
-                    self._get_debug_row_value(real_new_verified_id, row_index),
-                    self._get_debug_row_value(legacy_verified_id, row_index),
-                    self._get_debug_row_value(proposal_input.new_seq_lens, row_index),
-                    self._get_debug_row_value(accept_length, row_index),
-                    self._get_debug_row_value(real_token_list, row_index),
-                    self._get_debug_row_value(legacy_token_list, row_index),
-                )
-        self.decode_compare_log_budget -= 1
 
     def _alloc_real_propose_out_cache(
         self,

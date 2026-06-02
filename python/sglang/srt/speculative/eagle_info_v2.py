@@ -1,6 +1,4 @@
 from __future__ import annotations
-
-import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -38,16 +36,6 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_npu_before_atlas_a5 = is_npu_before_atlas_a5()
-logger = logging.getLogger(__name__)
-_canonical_decode_log_budget = 16
-
-
-def _log_canonical_decode_debug(message: str, *args) -> None:
-    global _canonical_decode_log_budget
-    if _canonical_decode_log_budget <= 0:
-        return
-    _canonical_decode_log_budget -= 1
-    logger.error(message, *args)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
@@ -141,21 +129,6 @@ class EagleDraftInputV2Mixin:
         spec_steps: int,
         num_verify_tokens: int,
     ):
-        #region debug-point canonical-consumer-entry
-        _log_canonical_decode_debug(
-            "Stage E-lite canonical consumer entry: idle=%s topk=%s has_payload=%s bs=%s last_verified_ids_shape=%s token_list_shape=%s",
-            batch.forward_mode.is_idle(),
-            topk,
-            self._has_canonical_decode_payload(),
-            len(batch.seq_lens),
-            None
-            if getattr(self, "last_verified_ids", None) is None
-            else tuple(self.last_verified_ids.shape),
-            None
-            if getattr(self, "token_list", None) is None
-            else tuple(self.token_list.shape),
-        )
-        #endregion debug-point canonical-consumer-entry
         if (
             batch.forward_mode.is_idle()
             or topk != 1
@@ -204,15 +177,6 @@ class EagleDraftInputV2Mixin:
                 device=batch.seq_lens.device,
             ).unsqueeze(0)
         retrive_next_sibling = torch.full_like(retrive_next_token, -1)
-        #region debug-point canonical-consumer-built
-        _log_canonical_decode_debug(
-            "Stage E-lite canonical consumer built: bs=%s draft_token_shape=%s positions_shape=%s retrieve_index_shape=%s",
-            batch_size,
-            tuple(draft_tokens.shape),
-            tuple(positions.shape),
-            tuple(retrive_index.shape),
-        )
-        #endregion debug-point canonical-consumer-built
         return EagleVerifyInput(
             draft_token=draft_tokens,
             custom_mask=torch.full(

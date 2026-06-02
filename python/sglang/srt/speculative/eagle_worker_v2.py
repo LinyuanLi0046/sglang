@@ -187,7 +187,9 @@ class EagleDraftWorker(BaseDraftWorker):
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
-        self.patch40_debug_log_budget = 24
+        # Instrumentation-only ablation: keep hooks in place but disable emission
+        # to verify whether previous logger overhead/timing changes masked the bug.
+        self.patch40_debug_log_budget = 0
 
     def _log_patch40_debug(self, message: str, *args) -> None:
         if self.patch40_debug_log_budget <= 0:

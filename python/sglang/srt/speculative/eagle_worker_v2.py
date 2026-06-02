@@ -557,7 +557,6 @@ class EagleDraftWorker(BaseDraftWorker):
         next_draft_input.real_token_list = self._build_real_prefill_token_list(
             batch, next_draft_input
         )
-        self._compare_real_payload("prefill_first_step", batch, next_draft_input)
         return next_draft_input
 
     def _build_real_prefill_token_list(
@@ -651,7 +650,6 @@ class EagleDraftWorker(BaseDraftWorker):
         next_draft_input.real_token_list = self._build_real_decode_token_list(
             batch, next_draft_input
         )
-        self._compare_real_payload("decode", batch, next_draft_input)
 
     def _build_real_decode_token_list(
         self,
@@ -916,14 +914,30 @@ class EagleDraftWorker(BaseDraftWorker):
 
             forward_batch.input_ids = input_ids.to(torch.int32)
             forward_batch.out_cache_loc = out_cache_loc[i]
-            forward_batch.positions.add_(1)
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             proposal_input.hidden_states = hidden_states
+            if _is_npu and hasattr(forward_batch, "attn_metadata"):
+                attn_metadata = forward_batch.attn_metadata
+                if hasattr(attn_metadata, "slot_mapping"):
+                    attn_metadata.slot_mapping = forward_batch.out_cache_loc.to(torch.int64)
+                if hasattr(attn_metadata, "seq_lens_tensor"):
+                    attn_metadata.seq_lens_tensor = (forward_batch.positions + 1).to(
+                        torch.int64
+                    )
+                if hasattr(attn_metadata, "query_len_tensor"):
+                    attn_metadata.query_len_tensor = torch.arange(
+                        1,
+                        forward_batch.batch_size + 1,
+                        1,
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
 
             logits_output = self.draft_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"real_propose step {i}")
+            forward_batch.positions.add_(1)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             _, topk_index = fast_topk(probs, self.topk, dim=-1)
             maybe_detect_oob(

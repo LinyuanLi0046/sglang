@@ -541,12 +541,13 @@ class EagleDraftWorker(BaseDraftWorker):
         next_draft_input = EagleDraftInput(
             hidden_states=target_hidden_states,
             verified_id=next_token_ids,
+            last_verified_ids=next_token_ids,
             new_seq_lens=batch.seq_lens,
             # draft mode is same with decode mode, only 1 token per req
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
-            # Stage C records the worker-produced first decode verified token while
-            # keeping the legacy replay fields unchanged.
+            # Keep the legacy observation field in sync for the short-term
+            # validation window while canonical payload becomes the primary path.
             real_new_verified_id=next_token_ids,
         )
 
@@ -566,22 +567,25 @@ class EagleDraftWorker(BaseDraftWorker):
             probs, self.topk, dim=-1
         )
         next_draft_input.hidden_states = logits_output.hidden_states
-        next_draft_input.real_token_list = self._build_real_prefill_token_list(
+        next_draft_input.token_list = self._build_canonical_prefill_token_list(
             batch, next_draft_input
         )
+        next_draft_input.real_token_list = next_draft_input.token_list
         return next_draft_input
 
-    def _build_real_prefill_token_list(
+    def _build_canonical_prefill_token_list(
         self,
         batch: ModelWorkerBatch,
         next_draft_input: EagleDraftInput,
-    ) -> torch.Tensor:
+    ) -> Optional[torch.Tensor]:
         if batch.forward_mode.is_idle():
             return torch.empty(
                 (0, self.speculative_num_steps),
                 dtype=next_draft_input.verified_id.dtype,
                 device=self.device,
             )
+        if self.topk != 1:
+            return None
         return self._build_real_token_list_via_propose(batch, next_draft_input)
 
     def _draft_extend_for_decode(

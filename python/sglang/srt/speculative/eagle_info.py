@@ -652,14 +652,14 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     future_indices: Optional[FutureIndices] = None
     new_seq_lens: Optional[torch.Tensor] = None
     verify_done: Optional[torch.cuda.Event] = None
-    # Canonical decode payload aligned with special_sglang. These fields are the
-    # long-term consumer-facing contract for the next verify step and are kept
-    # separate from the legacy replay buffers below.
+    # Canonical next-step payload aligned with special_sglang. These fields are the
+    # long-term consumer-facing contract for the next verify step, covering both
+    # decode-only continuation and prefill -> decode first-step continuation.
     last_verified_ids: Optional[torch.Tensor] = None
     token_list: Optional[torch.Tensor] = None
-    # Worker-produced real payload aligned with special_sglang's decode contract.
-    # Stage B only records these values for future verification/diffing and does not
-    # change the current FutureMap + replay consumption path.
+    # Legacy worker-produced observation fields kept only for verification/diffing.
+    # They are no longer the primary consumer-facing contract once canonical payload
+    # is available.
     real_new_verified_id: Optional[torch.Tensor] = None
     real_token_list: Optional[torch.Tensor] = None
     future_topk_p_buf: Optional[torch.Tensor] = None

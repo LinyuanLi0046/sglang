@@ -130,7 +130,11 @@ class EagleDraftInputV2Mixin:
         spec_steps: int,
         num_verify_tokens: int,
     ):
-        if batch.forward_mode.is_idle() or not self._has_canonical_decode_payload():
+        if (
+            batch.forward_mode.is_idle()
+            or topk != 1
+            or not self._has_canonical_decode_payload()
+        ):
             return None
 
         self._validate_canonical_decode_payload(len(batch.seq_lens), num_verify_tokens)

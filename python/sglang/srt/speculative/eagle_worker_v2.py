@@ -735,7 +735,12 @@ class EagleDraftWorker(BaseDraftWorker):
             device=self.device,
         )
         if self.speculative_num_draft_tokens > 1:
-            retrive_next_token[:, :-1] = retrive_index[:, 1:]
+            retrive_next_token[:, :-1] = torch.arange(
+                1,
+                self.speculative_num_draft_tokens,
+                dtype=torch.long,
+                device=self.device,
+            ).unsqueeze(0)
         retrive_next_sibling = torch.full_like(retrive_next_token, -1)
 
         return EagleVerifyInput(

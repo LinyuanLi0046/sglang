@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import threading
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -44,6 +45,10 @@ class SamplingBatchInfo:
     grammars: Optional[List] = None
     vocab_mask: Optional[torch.Tensor] = None
     apply_mask_func: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None
+    # Signals that the previous post-process already prepared grammar/regex state
+    # required by the current batch's _preprocess_logits(). When unset, the
+    # current path falls back to local update_regex_vocab_mask().
+    sampling_info_done: Optional[threading.Event] = None
 
     # Penalizer
     penalizer_orchestrator: Optional[penaltylib.BatchedPenalizerOrchestrator] = None

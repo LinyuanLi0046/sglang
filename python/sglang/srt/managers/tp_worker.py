@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional
 
@@ -448,6 +449,7 @@ class TpModelWorker(BaseTpWorker):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,
         skip_attn_backend_init=False,
+        launch_done: Optional[threading.Event] = None,
     ) -> GenerationBatchResult:
         # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
         #               which requires preparing replay to always be in this function
@@ -461,6 +463,8 @@ class TpModelWorker(BaseTpWorker):
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
+
+        launch_done = launch_done or getattr(model_worker_batch, "launch_done", None)
 
         if self.is_dllm():
             return self._forward_batch_generation_dllm(forward_batch)
@@ -482,10 +486,14 @@ class TpModelWorker(BaseTpWorker):
                 # Skip sampling and return logits for target forward
                 return batch_result
 
+            if launch_done is not None:
+                launch_done.set()
+
             if (
                 self.enable_overlap
                 and not self.enable_spec
                 and model_worker_batch.sampling_info.grammars is not None
+                and launch_done is None
             ):
 
                 def sample_batch_func():

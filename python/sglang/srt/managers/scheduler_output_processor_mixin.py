@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
@@ -120,12 +121,43 @@ class SchedulerOutputProcessorMixin:
                     elem = elem.copy()
                 req.customized_info[k].append(elem)
 
+    def _prepare_next_batch_sampling_info(self: Scheduler, batch: ScheduleBatch) -> None:
+        """Prepare next-batch grammar state once Phase A wires the baton end-to-end.
+
+        Phase A step 1 only adds the helper and keeps the current path unchanged.
+        Later stages can call this helper after post-process owns the next batch's
+        sampling preparation boundary.
+        """
+        sampling_info = batch.next_batch_sampling_info
+        if sampling_info is None:
+            return
+        if sampling_info.grammars is not None:
+            sampling_info.update_regex_vocab_mask()
+            if hasattr(self, "schedule_stream"):
+                self.schedule_stream.synchronize()
+        if sampling_info.sampling_info_done is not None:
+            sampling_info.sampling_info_done.set()
+
+    def _use_non_spec_overlap_worker(self: Scheduler, batch: ScheduleBatch) -> bool:
+        return (
+            self.is_generation
+            and self.enable_overlap
+            and getattr(self, "non_spec_overlap_worker", None) is not None
+            and batch.spec_algorithm.is_none()
+        )
+
     def process_batch_result_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
+        launch_done: Optional[threading.Event] = None,
     ):
         skip_stream_req = None
+
+        if self._use_non_spec_overlap_worker(batch):
+            result = self.non_spec_overlap_worker.resolve_last_batch_result(
+                result, launch_done
+            )
 
         if self.is_generation:
             if result.copy_done is not None:
@@ -322,6 +354,7 @@ class SchedulerOutputProcessorMixin:
                     req.is_chunked -= 1
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
+        self._prepare_next_batch_sampling_info(batch)
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
@@ -375,7 +408,13 @@ class SchedulerOutputProcessorMixin:
         self: Scheduler,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
+        launch_done: Optional[threading.Event] = None,
     ):
+        if self._use_non_spec_overlap_worker(batch):
+            result = self.non_spec_overlap_worker.resolve_last_batch_result(
+                result, launch_done
+            )
+
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
@@ -517,6 +556,7 @@ class SchedulerOutputProcessorMixin:
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
 
+        self._prepare_next_batch_sampling_info(batch)
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
 

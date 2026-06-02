@@ -2886,9 +2886,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ):
         # NOTE: In overlap mode, the function update_regex_vocab_mask (in sample)
         #       was executed after we processed last batch's results.
+        # Phase A keeps the old local path as a fallback until the scheduler
+        # post-process side starts wiring next_batch_sampling_info end-to-end.
 
         # Calculate logits bias and apply it to next_token_logits.
-        sampling_info.update_regex_vocab_mask()
+        if sampling_info.grammars is not None and sampling_info.sampling_info_done:
+            sampling_info.sampling_info_done.wait()
+        else:
+            sampling_info.update_regex_vocab_mask()
         sampling_info.apply_logits_bias(logits_output.next_token_logits)
 
         # Release the vocab_mask GPU tensor immediately after it has been applied

@@ -39,6 +39,7 @@ import copy
 import dataclasses
 import logging
 import re
+import threading
 from concurrent.futures import Future
 from enum import Enum, auto
 from functools import lru_cache
@@ -1328,6 +1329,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Sampling info
     sampling_info: SamplingBatchInfo = None
+    # Scheduler-owned baton for the next batch's grammar/sample preparation.
+    next_batch_sampling_info: SamplingBatchInfo = None
+    # Cross-thread launch boundary for future non-eagle overlap workerization.
+    launch_done: Optional[threading.Event] = None
 
     # Batched arguments to model runner
     input_ids: torch.Tensor = None  # shape: [b], int64
@@ -2379,6 +2384,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             encoder_out_cache_loc=self.encoder_out_cache_loc,
             lora_ids=[req.lora_id for req in self.reqs],
             sampling_info=self.sampling_info,
+            launch_done=self.launch_done,
             input_embeds=self.input_embeds,
             ne_token_table=self.ne_token_table,
             token_type_ids=self.token_type_ids,
@@ -2430,6 +2436,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
+            sampling_info=self.sampling_info,
+            next_batch_sampling_info=self.next_batch_sampling_info,
+            launch_done=self.launch_done,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
@@ -2549,6 +2558,8 @@ class ModelWorkerBatch:
 
     # Sampling info
     sampling_info: SamplingBatchInfo
+    # Cross-thread launch boundary for future non-eagle overlap workerization.
+    launch_done: Optional[threading.Event] = None
 
     # The original sequence lengths, Qwen-1M related
     orig_seq_lens: Optional[torch.Tensor] = None

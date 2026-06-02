@@ -824,6 +824,11 @@ class EagleDraftWorker(BaseDraftWorker):
         draft_input: EagleDraftInput,
         verify_input: EagleVerifyInput,
     ) -> None:
+        # Temporary D.2 ablation: keep the hook in place but skip all shadow
+        # compare work to test whether idle-time allocator failures are only
+        # being triggered by compare-induced timing/synchronization changes.
+        return
+
         if batch.forward_mode.is_idle() or self.decode_behavior_log_budget <= 0:
             return
 

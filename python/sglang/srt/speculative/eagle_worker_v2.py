@@ -739,6 +739,9 @@ class EagleDraftWorker(BaseDraftWorker):
         saved_spec_info = batch.spec_info
         saved_capture_hidden_mode = getattr(batch, "capture_hidden_mode", None)
         saved_out_cache_loc = getattr(batch, "out_cache_loc", None)
+        saved_req_to_token_rows = self.req_to_token_pool.req_to_token[
+            batch.req_pool_indices
+        ].clone()
 
         out_cache_loc, token_to_kv_pool_state_backup = self._alloc_real_propose_out_cache(
             batch, proposal_input.new_seq_lens
@@ -772,6 +775,9 @@ class EagleDraftWorker(BaseDraftWorker):
             batch.spec_info = saved_spec_info
             batch.capture_hidden_mode = saved_capture_hidden_mode
             batch.out_cache_loc = saved_out_cache_loc
+            self.req_to_token_pool.req_to_token[batch.req_pool_indices] = (
+                saved_req_to_token_rows
+            )
             if token_to_kv_pool_state_backup is not None:
                 self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
 

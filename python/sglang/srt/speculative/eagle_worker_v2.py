@@ -720,7 +720,6 @@ class EagleDraftWorker(BaseDraftWorker):
         batch: ModelWorkerBatch,
         next_draft_input: EagleDraftInput,
     ) -> Optional[torch.Tensor]:
-#region debug-point canonical-producer-entry
         verify_done = getattr(next_draft_input, "verify_done", None)
         verify_done_ready = None
         if verify_done is not None and hasattr(verify_done, "query"):
@@ -728,6 +727,8 @@ class EagleDraftWorker(BaseDraftWorker):
                 verify_done_ready = verify_done.query()
             except Exception:
                 verify_done_ready = "query-error"
+
+#region debug-point canonical-producer-entry
         self._log_decode_hang_debug(
             "Stage E-lite debug canonical_producer entry topk=%s bs=%s verify_done_present=%s "
             "verify_done_ready=%s batch_seq_lens=%s new_seq_lens=%s",
@@ -748,9 +749,16 @@ class EagleDraftWorker(BaseDraftWorker):
         if self.topk != 1 or next_draft_input.verified_id.numel() == 0:
             return None
 
+        if verify_done is not None:
+            verify_done.synchronize()
+
         shadow_batch = copy(batch)
         shadow_batch.forward_mode = ForwardMode.DECODE
         shadow_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+        if next_draft_input.new_seq_lens is not None:
+            shadow_batch.seq_lens = next_draft_input.new_seq_lens.clone()
+            shadow_batch.seq_lens_cpu = shadow_batch.seq_lens.cpu()
+            shadow_batch.seq_lens_sum = shadow_batch.seq_lens_cpu.sum().item()
         shadow_spec_info = EagleDraftInput(
             hidden_states=next_draft_input.hidden_states,
             verified_id=next_draft_input.verified_id,
@@ -784,12 +792,13 @@ class EagleDraftWorker(BaseDraftWorker):
 #region debug-point canonical-producer-exit
         self._log_decode_hang_debug(
             "Stage E-lite debug canonical_producer exit can_cuda_graph=%s draft_tokens_shape=%s "
-            "shadow_seq_lens=%s",
+            "shadow_seq_lens=%s verify_done_synchronized=%s",
             can_cuda_graph,
             tuple(draft_tokens.shape),
             tuple(shadow_batch.seq_lens.tolist())
             if len(shadow_batch.seq_lens) <= 8
             else tuple(shadow_batch.seq_lens[:8].tolist()),
+            verify_done is not None,
         )
 #endregion debug-point canonical-producer-exit
         return draft_tokens

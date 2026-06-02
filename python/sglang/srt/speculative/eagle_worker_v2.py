@@ -651,7 +651,9 @@ class EagleDraftWorker(BaseDraftWorker):
         next_draft_input.real_token_list = self._build_real_decode_token_list(
             batch, next_draft_input
         )
-        self._compare_decode_real_payload(batch, next_draft_input)
+        self._compare_decode_real_payload(
+            batch, next_draft_input, accept_length=batch_result.accept_lens
+        )
 
     def _build_real_decode_token_list(
         self,
@@ -740,10 +742,19 @@ class EagleDraftWorker(BaseDraftWorker):
             return value.item()
         return value.detach().cpu().tolist()
 
+    def _get_debug_row_value(self, tensor: Optional[torch.Tensor], row_index: int):
+        if tensor is None or row_index < 0 or row_index >= tensor.shape[0]:
+            return None
+        value = tensor[row_index]
+        if value.numel() == 1:
+            return value.item()
+        return value.detach().cpu().tolist()
+
     def _compare_decode_real_payload(
         self,
         batch: ModelWorkerBatch,
         proposal_input: EagleDraftInput,
+        accept_length: Optional[torch.Tensor] = None,
     ) -> None:
         if batch.forward_mode.is_idle() or self.decode_compare_log_budget <= 0:
             return
@@ -832,6 +843,21 @@ class EagleDraftWorker(BaseDraftWorker):
                 actual_value,
                 expected_value,
             )
+            if first_index is not None:
+                row_index = first_index[0]
+                logger.error(
+                    "Stage D.1B decode payload mismatch row snapshot: field=%s row=%s req_pool_index=%s verified_id=%s real_new_verified_id=%s legacy_verified_id=%s new_seq_len=%s accept_len=%s actual_row=%s expected_row=%s",
+                    field,
+                    row_index,
+                    self._get_debug_row_value(batch.req_pool_indices, row_index),
+                    self._get_debug_row_value(proposal_input.verified_id, row_index),
+                    self._get_debug_row_value(real_new_verified_id, row_index),
+                    self._get_debug_row_value(legacy_verified_id, row_index),
+                    self._get_debug_row_value(proposal_input.new_seq_lens, row_index),
+                    self._get_debug_row_value(accept_length, row_index),
+                    self._get_debug_row_value(real_token_list, row_index),
+                    self._get_debug_row_value(legacy_token_list, row_index),
+                )
         self.decode_compare_log_budget -= 1
 
     def _alloc_real_propose_out_cache(

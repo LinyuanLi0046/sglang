@@ -530,6 +530,9 @@ class EagleDraftWorker(BaseDraftWorker):
             # draft mode is same with decode mode, only 1 token per req
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
+            # Stage C records the worker-produced first decode verified token while
+            # keeping the legacy replay fields unchanged.
+            real_new_verified_id=next_token_ids,
         )
 
         batch.spec_info = next_draft_input
@@ -548,7 +551,63 @@ class EagleDraftWorker(BaseDraftWorker):
             probs, self.topk, dim=-1
         )
         next_draft_input.hidden_states = logits_output.hidden_states
+        next_draft_input.real_token_list = self._build_real_prefill_token_list(
+            batch, next_draft_input
+        )
         return next_draft_input
+
+    def _build_real_prefill_token_list(
+        self,
+        batch: ModelWorkerBatch,
+        next_draft_input: EagleDraftInput,
+    ) -> torch.Tensor:
+        if batch.forward_mode.is_idle():
+            return torch.empty(
+                (0, max(self.speculative_num_draft_tokens - 1, 0)),
+                dtype=next_draft_input.verified_id.dtype,
+                device=self.device,
+            )
+
+        # Use a temporary decode-shaped batch/spec snapshot so the real proposal run
+        # stays worker-owned and does not mutate the legacy replay inputs that the
+        # current v2 consumer still depends on.
+        proposal_input = EagleDraftInput(
+            topk_p=next_draft_input.topk_p,
+            topk_index=next_draft_input.topk_index,
+            hidden_states=next_draft_input.hidden_states,
+            verified_id=next_draft_input.verified_id,
+            new_seq_lens=next_draft_input.new_seq_lens,
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+        )
+        proposal_batch = copy.copy(batch)
+        proposal_batch.forward_mode = ForwardMode.DECODE
+        proposal_batch.input_ids = next_draft_input.verified_id
+        proposal_batch.seq_lens = next_draft_input.new_seq_lens
+        proposal_batch.seq_lens_cpu = batch.seq_lens_cpu
+        proposal_batch.seq_lens_sum = int(next_draft_input.new_seq_lens.sum().item())
+        proposal_batch.out_cache_loc = None
+        proposal_batch.spec_info = proposal_input
+        proposal_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+        proposal_batch.is_extend_in_batch = False
+        proposal_batch.all_extend_in_batch = False
+        proposal_batch.is_prefill_only = False
+
+        forward_batch, can_cuda_graph = proposal_input.prepare_for_v2_draft(
+            self.req_to_token_pool,
+            proposal_batch,
+            self.cuda_graph_runner,
+            self.draft_runner,
+            self.topk,
+            self.speculative_num_steps,
+        )
+
+        if can_cuda_graph:
+            _, _, draft_tokens = self.cuda_graph_runner.replay(forward_batch)
+        else:
+            if self.speculative_num_steps > 1:
+                self.draft_attn_backend.init_forward_metadata(forward_batch)
+            _, _, draft_tokens = self.draft_forward(forward_batch)
+        return draft_tokens
 
     def _draft_extend_for_decode(
         self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult

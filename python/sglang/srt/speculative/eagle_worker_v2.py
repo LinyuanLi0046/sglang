@@ -742,6 +742,17 @@ class EagleDraftWorker(BaseDraftWorker):
         saved_req_to_token_rows = self.req_to_token_pool.req_to_token[
             batch.req_pool_indices
         ].clone()
+        saved_proposal_hidden_states = proposal_input.hidden_states
+        saved_proposal_positions = getattr(proposal_input, "positions", None)
+        saved_proposal_num_tokens_per_req = getattr(
+            proposal_input, "num_tokens_per_req", None
+        )
+        saved_proposal_num_tokens_for_logprob_per_req = getattr(
+            proposal_input, "num_tokens_for_logprob_per_req", None
+        )
+        saved_proposal_capture_hidden_mode = getattr(
+            proposal_input, "capture_hidden_mode", None
+        )
 
         out_cache_loc, token_to_kv_pool_state_backup = self._alloc_real_propose_out_cache(
             batch, proposal_input.new_seq_lens
@@ -775,6 +786,13 @@ class EagleDraftWorker(BaseDraftWorker):
             batch.spec_info = saved_spec_info
             batch.capture_hidden_mode = saved_capture_hidden_mode
             batch.out_cache_loc = saved_out_cache_loc
+            proposal_input.hidden_states = saved_proposal_hidden_states
+            proposal_input.positions = saved_proposal_positions
+            proposal_input.num_tokens_per_req = saved_proposal_num_tokens_per_req
+            proposal_input.num_tokens_for_logprob_per_req = (
+                saved_proposal_num_tokens_for_logprob_per_req
+            )
+            proposal_input.capture_hidden_mode = saved_proposal_capture_hidden_mode
             self.req_to_token_pool.req_to_token[batch.req_pool_indices] = (
                 saved_req_to_token_rows
             )

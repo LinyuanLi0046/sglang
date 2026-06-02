@@ -679,27 +679,39 @@ class EagleDraftWorker(BaseDraftWorker):
 
         shadow_batch = copy.copy(batch)
         shadow_input = copy.copy(proposal_input)
-        shadow_batch.input_ids = shadow_input.verified_id
-        shadow_batch.seq_lens = shadow_input.new_seq_lens
-        shadow_batch.seq_lens_cpu = shadow_input.new_seq_lens.cpu()
-        shadow_batch.seq_lens_sum = int(shadow_input.new_seq_lens.sum().item())
-        shadow_batch.forward_mode = ForwardMode.DECODE
-        shadow_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-        shadow_batch.spec_info = shadow_input
-        shadow_forward_batch, _ = shadow_input.prepare_for_v2_draft(
-            self.req_to_token_pool,
-            shadow_batch,
-            self.cuda_graph_runner,
-            self.draft_runner,
-            self.topk,
-            self.speculative_num_steps,
-        )
-        if (
-            not shadow_forward_batch.forward_mode.is_idle()
-            and self.speculative_num_steps > 1
-        ):
-            self.draft_attn_backend.init_forward_metadata(shadow_forward_batch)
-        return self._run_real_propose_forward(shadow_forward_batch)
+        saved_req_to_token_rows = self.req_to_token_pool.req_to_token[
+            batch.req_pool_indices
+        ].clone()
+        try:
+            shadow_batch.input_ids = shadow_input.verified_id
+            shadow_batch.seq_lens = shadow_input.new_seq_lens
+            shadow_batch.seq_lens_cpu = shadow_input.new_seq_lens.cpu()
+            shadow_batch.seq_lens_sum = int(shadow_input.new_seq_lens.sum().item())
+            shadow_batch.forward_mode = ForwardMode.DECODE
+            shadow_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+            shadow_batch.spec_info = shadow_input
+            shadow_forward_batch, can_cuda_graph = shadow_input.prepare_for_v2_draft(
+                self.req_to_token_pool,
+                shadow_batch,
+                self.cuda_graph_runner,
+                self.draft_runner,
+                self.topk,
+                self.speculative_num_steps,
+            )
+            if can_cuda_graph:
+                _, _, draft_tokens = self.cuda_graph_runner.replay(shadow_forward_batch)
+            else:
+                if (
+                    not shadow_forward_batch.forward_mode.is_idle()
+                    and self.speculative_num_steps > 1
+                ):
+                    self.draft_attn_backend.init_forward_metadata(shadow_forward_batch)
+                _, _, draft_tokens = self.draft_forward(shadow_forward_batch)
+            return draft_tokens.to(proposal_input.verified_id.dtype)
+        finally:
+            self.req_to_token_pool.req_to_token[batch.req_pool_indices] = (
+                saved_req_to_token_rows
+            )
 
     def _raise_decode_real_payload_mismatch(
         self,

@@ -82,6 +82,35 @@ def assign_draft_cache_locs_page_size_1(
 
 @dataclass
 class EagleDraftInputV2Mixin:
+    def _validate_real_decode_payload(
+        self: EagleDraftInput,
+        batch_size: int,
+        speculative_num_steps: int,
+    ) -> None:
+        real_new_verified_id = getattr(self, "real_new_verified_id", None)
+        real_token_list = getattr(self, "real_token_list", None)
+        if real_new_verified_id is not None and real_new_verified_id.shape[0] != batch_size:
+            raise ValueError(
+                "real_new_verified_id batch size mismatch: "
+                f"expected {batch_size}, got {real_new_verified_id.shape[0]}"
+            )
+        if real_token_list is not None:
+            if real_token_list.ndim != 2:
+                raise ValueError(
+                    "real_token_list must be a 2D tensor for decode-only payload "
+                    f"validation, got ndim={real_token_list.ndim}"
+                )
+            if real_token_list.shape[0] != batch_size:
+                raise ValueError(
+                    "real_token_list batch size mismatch: "
+                    f"expected {batch_size}, got {real_token_list.shape[0]}"
+                )
+            if real_token_list.shape[1] != speculative_num_steps:
+                raise ValueError(
+                    "real_token_list step width mismatch: "
+                    f"expected {speculative_num_steps}, got {real_token_list.shape[1]}"
+                )
+
     def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
         batch.maybe_evict_swa()
 
@@ -149,6 +178,8 @@ class EagleDraftInputV2Mixin:
         bs = len(batch.seq_lens)
         positions_prepared = False
         if not batch.forward_mode.is_idle():
+            # Stage B only lets worker-owned real_* payload participate in validation.
+            # The actual v2 replay path below still consumes the legacy FutureMap buffers.
             future_ready = (
                 self.future_indices is not None
                 and self.future_topk_p_buf is not None
@@ -159,6 +190,7 @@ class EagleDraftInputV2Mixin:
             )
 
             if future_ready:
+                self._validate_real_decode_payload(bs, num_steps)
                 batch.out_cache_loc = torch.empty(
                     (bs * topk * num_steps,),
                     dtype=torch.int64,

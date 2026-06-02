@@ -74,6 +74,8 @@ class SpeculativeAlgorithm(Enum):
 
         elif self.is_eagle():
             if enable_overlap:
+                # Stage B only expands worker-side real payload production for EAGLE v2.
+                # Scheduler-side speculative consumption stays on the legacy relay path.
                 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 
                 return EAGLEWorkerV2

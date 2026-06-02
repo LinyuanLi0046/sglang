@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import logging
 import time
 from typing import List, Optional, Tuple
@@ -27,7 +28,11 @@ from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
@@ -620,6 +625,57 @@ class EagleDraftWorker(BaseDraftWorker):
             ret_topk_index,
             ret_hidden_states,
         )
+        next_draft_input.real_token_list = self._build_real_decode_token_list(
+            batch, next_draft_input
+        )
+
+    def _build_real_decode_token_list(
+        self,
+        batch: ModelWorkerBatch,
+        next_draft_input: EagleDraftInput,
+    ) -> torch.Tensor:
+        if batch.forward_mode.is_idle():
+            return torch.empty(
+                (0, max(self.speculative_num_draft_tokens - 1, 0)),
+                dtype=next_draft_input.verified_id.dtype,
+                device=self.device,
+            )
+
+        # Use a temporary batch/spec snapshot so the real proposal run does not mutate
+        # the replay inputs that the current v2 consumer still depends on.
+        proposal_input = EagleDraftInput(
+            topk_p=next_draft_input.topk_p,
+            topk_index=next_draft_input.topk_index,
+            hidden_states=next_draft_input.hidden_states,
+            verified_id=next_draft_input.verified_id,
+            new_seq_lens=next_draft_input.new_seq_lens,
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+        )
+        proposal_batch = copy.copy(batch)
+        proposal_batch.forward_mode = ForwardMode.DECODE
+        proposal_batch.input_ids = next_draft_input.verified_id
+        proposal_batch.seq_lens = next_draft_input.new_seq_lens
+        proposal_batch.seq_lens_sum = int(next_draft_input.new_seq_lens.sum().item())
+        proposal_batch.out_cache_loc = None
+        proposal_batch.spec_info = proposal_input
+        proposal_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+
+        forward_batch, can_cuda_graph = proposal_input.prepare_for_v2_draft(
+            self.req_to_token_pool,
+            proposal_batch,
+            self.cuda_graph_runner,
+            self.draft_runner,
+            self.topk,
+            self.speculative_num_steps,
+        )
+
+        if can_cuda_graph:
+            _, _, draft_tokens = self.cuda_graph_runner.replay(forward_batch)
+        else:
+            if self.speculative_num_steps > 1:
+                self.draft_attn_backend.init_forward_metadata(forward_batch)
+            _, _, draft_tokens = self.draft_forward(forward_batch)
+        return draft_tokens
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
@@ -859,6 +915,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             verified_id=verified_id,
             new_seq_lens=new_seq_lens,
             verify_done=verify_done,
+            real_new_verified_id=verified_id,
         )
 
         return GenerationBatchResult(

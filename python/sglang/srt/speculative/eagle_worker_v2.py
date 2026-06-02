@@ -187,15 +187,6 @@ class EagleDraftWorker(BaseDraftWorker):
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
-        # Instrumentation-only ablation: keep hooks in place but disable emission
-        # to verify whether previous logger overhead/timing changes masked the bug.
-        self.patch40_debug_log_budget = 0
-
-    def _log_patch40_debug(self, message: str, *args) -> None:
-        if self.patch40_debug_log_budget <= 0:
-            return
-        self.patch40_debug_log_budget -= 1
-        logger.error(message, *args)
 
     def init_token_map(self):
         # Load hot token ids
@@ -336,10 +327,6 @@ class EagleDraftWorker(BaseDraftWorker):
 
     def draft(self, model_worker_batch: ModelWorkerBatch):
         draft_input: EagleDraftInput = model_worker_batch.spec_info
-        has_canonical_payload = (
-            getattr(draft_input, "last_verified_ids", None) is not None
-            and getattr(draft_input, "token_list", None) is not None
-        )
         canonical_verify_input = (
             draft_input.build_verify_input_from_canonical_decode_payload(
                 model_worker_batch,
@@ -349,37 +336,7 @@ class EagleDraftWorker(BaseDraftWorker):
             )
         )
         if canonical_verify_input is not None:
-            #region debug-point patch40-canonical-hit
-            self._log_patch40_debug(
-                "Patch40 canonical consumer hit: source=%s bs=%s last_verified_ids_shape=%s token_list_shape=%s seq_lens=%s",
-                (
-                    "prefill"
-                    if getattr(draft_input, "real_token_list", None) is not None
-                    and getattr(draft_input, "num_tokens_per_req", None) == 1
-                    else "decode"
-                ),
-                len(model_worker_batch.seq_lens),
-                tuple(draft_input.last_verified_ids.shape),
-                tuple(draft_input.token_list.shape),
-                tuple(model_worker_batch.seq_lens[:8].tolist()),
-            )
-            #endregion debug-point patch40-canonical-hit
             return canonical_verify_input
-        #region debug-point patch40-canonical-miss
-        self._log_patch40_debug(
-            "Patch40 canonical consumer miss: has_payload=%s source_hint=%s bs=%s has_real_token_list=%s num_tokens_per_req=%s",
-            has_canonical_payload,
-            (
-                "prefill"
-                if getattr(draft_input, "real_token_list", None) is not None
-                and getattr(draft_input, "num_tokens_per_req", None) == 1
-                else "decode_or_legacy"
-            ),
-            len(model_worker_batch.seq_lens),
-            getattr(draft_input, "real_token_list", None) is not None,
-            getattr(draft_input, "num_tokens_per_req", None),
-        )
-        #endregion debug-point patch40-canonical-miss
 
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
             self.req_to_token_pool,
@@ -614,17 +571,6 @@ class EagleDraftWorker(BaseDraftWorker):
             batch, next_draft_input
         )
         next_draft_input.real_token_list = next_draft_input.token_list
-        #region debug-point patch40-prefill-producer
-        self._log_patch40_debug(
-            "Patch40 prefill producer write: bs=%s verified_shape=%s token_list_shape=%s seq_lens=%s",
-            len(next_token_ids),
-            tuple(next_draft_input.last_verified_ids.shape),
-            None
-            if next_draft_input.token_list is None
-            else tuple(next_draft_input.token_list.shape),
-            tuple(batch.seq_lens[:8].tolist()),
-        )
-        #endregion debug-point patch40-prefill-producer
         return next_draft_input
 
     def _build_canonical_prefill_token_list(
@@ -881,22 +827,6 @@ class EagleDraftWorker(BaseDraftWorker):
             proposal_input, "capture_hidden_mode", None
         )
 
-        allocator_before = getattr(self.token_to_kv_pool_allocator, "available_size", None)
-        #region debug-point patch40-propose-entry
-        self._log_patch40_debug(
-            "Patch40 real_propose entry: source=%s bs=%s seq_lens_sum=%s available_before=%s",
-            (
-                "prefill"
-                if getattr(proposal_input, "num_tokens_per_req", None) == 1
-                else "decode"
-            ),
-            len(batch.req_pool_indices),
-            None
-            if proposal_input.new_seq_lens is None
-            else int(proposal_input.new_seq_lens.sum().item()),
-            allocator_before,
-        )
-        #endregion debug-point patch40-propose-entry
         out_cache_loc, token_to_kv_pool_state_backup = self._alloc_real_propose_out_cache(
             batch, proposal_input.new_seq_lens
         )
@@ -941,18 +871,6 @@ class EagleDraftWorker(BaseDraftWorker):
             )
             if token_to_kv_pool_state_backup is not None:
                 self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
-            #region debug-point patch40-propose-exit
-            self._log_patch40_debug(
-                "Patch40 real_propose exit: source=%s available_before=%s available_after=%s",
-                (
-                    "prefill"
-                    if getattr(proposal_input, "num_tokens_per_req", None) == 1
-                    else "decode"
-                ),
-                allocator_before,
-                getattr(self.token_to_kv_pool_allocator, "available_size", None),
-            )
-            #endregion debug-point patch40-propose-exit
 
     def _run_real_propose_forward(self, forward_batch: ForwardBatch) -> torch.Tensor:
         proposal_input: EagleDraftInput = forward_batch.spec_info

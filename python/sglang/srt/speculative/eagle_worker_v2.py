@@ -51,6 +51,7 @@ from sglang.srt.speculative.eagle_info_v2 import (
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    assign_req_to_token_pool_func,
     draft_tp_context,
     generate_token_bitmask,
     load_token_map,
@@ -668,32 +669,56 @@ class EagleDraftWorker(BaseDraftWorker):
         seq_lens: torch.Tensor,
     ) -> Tuple[torch.Tensor, Optional[Tuple]]:
         num_reqs = len(seq_lens)
+        allocator = self.token_to_kv_pool_allocator
+        req_to_token = self.req_to_token_pool.req_to_token
         if self.page_size == 1:
-            return alloc_token_slots(
-                batch.tree_cache,
-                num_reqs * self.speculative_num_steps,
-                backup_state=True,
+            state = allocator.backup_state()
+            out_cache_loc = allocator.alloc(num_reqs * self.speculative_num_steps)
+            if out_cache_loc is None:
+                raise RuntimeError(
+                    "Dedicated real propose continuation failed to allocate decode cache slots"
+                )
+            assign_req_to_token_pool_func(
+                batch.req_pool_indices,
+                req_to_token,
+                seq_lens,
+                seq_lens + self.speculative_num_steps,
+                out_cache_loc,
+                num_reqs,
             )
+            return out_cache_loc, state
 
         prefix_lens = seq_lens
         prefix_lens_cpu = seq_lens.cpu()
         seq_lens_after_propose = prefix_lens + self.speculative_num_steps
         seq_lens_after_propose_cpu = prefix_lens_cpu + self.speculative_num_steps
         last_loc = get_last_loc(
-            batch.req_to_token_pool.req_to_token,
+            req_to_token,
             batch.req_pool_indices,
             prefix_lens,
         )
-        return alloc_paged_token_slots_extend(
-            batch.tree_cache,
+        state = allocator.backup_state()
+        out_cache_loc = allocator.alloc_extend(
             prefix_lens,
             prefix_lens_cpu,
             seq_lens_after_propose,
             seq_lens_after_propose_cpu,
             last_loc,
             num_reqs * self.speculative_num_steps,
-            backup_state=True,
         )
+        if out_cache_loc is None:
+            raise RuntimeError(
+                "Dedicated real propose continuation failed to allocate paged decode cache slots"
+            )
+        assign_req_to_token_pool_func(
+            batch.req_pool_indices,
+            req_to_token,
+            prefix_lens,
+            seq_lens_after_propose,
+            out_cache_loc,
+            num_reqs,
+        )
+        return out_cache_loc, state
 
     def _build_real_token_list_via_propose(
         self,

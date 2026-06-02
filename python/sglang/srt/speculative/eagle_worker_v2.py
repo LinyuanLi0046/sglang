@@ -1,4 +1,5 @@
 import contextlib
+from dataclasses import replace
 import logging
 import time
 from typing import List, Optional, Tuple
@@ -185,8 +186,15 @@ class EagleDraftWorker(BaseDraftWorker):
 
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
         self.decode_behavior_log_budget = 8
+        self.decode_canonical_log_budget = 16
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+
+    def _log_decode_canonical_debug(self, message: str, *args) -> None:
+        if self.decode_canonical_log_budget <= 0:
+            return
+        self.decode_canonical_log_budget -= 1
+        logger.error(message, *args)
 
     def init_token_map(self):
         # Load hot token ids
@@ -336,7 +344,36 @@ class EagleDraftWorker(BaseDraftWorker):
             )
         )
         if canonical_verify_input is not None:
+            #region debug-point decode-canonical-hit
+            self._log_decode_canonical_debug(
+                "Stage E-lite canonical consumer hit: bs=%s last_verified_ids_shape=%s token_list_shape=%s seq_lens=%s",
+                len(model_worker_batch.seq_lens),
+                None
+                if getattr(draft_input, "last_verified_ids", None) is None
+                else tuple(draft_input.last_verified_ids.shape),
+                None
+                if getattr(draft_input, "token_list", None) is None
+                else tuple(draft_input.token_list.shape),
+                tuple(model_worker_batch.seq_lens.tolist())
+                if len(model_worker_batch.seq_lens) <= 8
+                else tuple(model_worker_batch.seq_lens[:8].tolist()),
+            )
+            #endregion debug-point decode-canonical-hit
             return canonical_verify_input
+
+        #region debug-point decode-canonical-miss
+        self._log_decode_canonical_debug(
+            "Stage E-lite canonical consumer miss: idle=%s topk=%s has_last_verified_ids=%s has_token_list=%s bs=%s seq_lens=%s",
+            model_worker_batch.forward_mode.is_idle(),
+            self.topk,
+            getattr(draft_input, "last_verified_ids", None) is not None,
+            getattr(draft_input, "token_list", None) is not None,
+            len(model_worker_batch.seq_lens),
+            tuple(model_worker_batch.seq_lens.tolist())
+            if len(model_worker_batch.seq_lens) <= 8
+            else tuple(model_worker_batch.seq_lens[:8].tolist()),
+        )
+        #endregion debug-point decode-canonical-miss
 
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
             self.req_to_token_pool,
@@ -660,7 +697,84 @@ class EagleDraftWorker(BaseDraftWorker):
             ret_topk_index,
             ret_hidden_states,
         )
+        next_draft_input.last_verified_ids = next_draft_input.verified_id
+        next_draft_input.token_list = self._build_canonical_decode_token_list_from_next_state(
+            batch, next_draft_input
+        )
+        #region debug-point decode-canonical-produced
+        self._log_decode_canonical_debug(
+            "Stage E-lite canonical producer write: bs=%s last_verified_ids_shape=%s token_list_shape=%s new_seq_lens=%s",
+            len(next_draft_input.verified_id),
+            None
+            if next_draft_input.last_verified_ids is None
+            else tuple(next_draft_input.last_verified_ids.shape),
+            None
+            if next_draft_input.token_list is None
+            else tuple(next_draft_input.token_list.shape),
+            None
+            if next_draft_input.new_seq_lens is None
+            else (
+                tuple(next_draft_input.new_seq_lens.tolist())
+                if len(next_draft_input.new_seq_lens) <= 8
+                else tuple(next_draft_input.new_seq_lens[:8].tolist())
+            ),
+        )
+        #endregion debug-point decode-canonical-produced
         next_draft_input.real_token_list = None
+
+    def _build_canonical_decode_token_list_from_next_state(
+        self,
+        batch: ModelWorkerBatch,
+        next_draft_input: EagleDraftInput,
+    ) -> Optional[torch.Tensor]:
+        if self.topk != 1 or next_draft_input.verified_id.numel() == 0:
+            return None
+
+        next_seq_lens = next_draft_input.new_seq_lens
+        if next_seq_lens is None:
+            return None
+
+        relay_batch = replace(
+            batch,
+            forward_mode=ForwardMode.DECODE,
+            input_ids=next_draft_input.verified_id,
+            seq_lens=next_seq_lens,
+            seq_lens_cpu=next_seq_lens.cpu(),
+            seq_lens_sum=int(next_seq_lens.sum().item()),
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+        )
+
+        proposal_input = EagleDraftInput(
+            hidden_states=next_draft_input.hidden_states,
+            verified_id=next_draft_input.verified_id,
+            topk_p=next_draft_input.topk_p,
+            topk_index=next_draft_input.topk_index,
+            new_seq_lens=next_draft_input.new_seq_lens,
+            num_tokens_per_req=next_draft_input.num_tokens_per_req,
+            num_tokens_for_logprob_per_req=next_draft_input.num_tokens_for_logprob_per_req,
+            capture_hidden_mode=next_draft_input.capture_hidden_mode,
+        )
+        relay_batch.spec_info = proposal_input
+
+        forward_batch, can_cuda_graph = proposal_input.prepare_for_v2_draft(
+            self.req_to_token_pool,
+            relay_batch,
+            self.cuda_graph_runner,
+            self.draft_runner,
+            self.topk,
+            self.speculative_num_steps,
+        )
+        if can_cuda_graph:
+            _, _, draft_tokens = self.cuda_graph_runner.replay(forward_batch)
+        else:
+            if (
+                not forward_batch.forward_mode.is_idle()
+                and self.speculative_num_steps > 1
+            ):
+                self.draft_attn_backend.init_forward_metadata(forward_batch)
+            _, _, draft_tokens = self.draft_forward(forward_batch)
+
+        return draft_tokens
 
     def _build_real_decode_token_list(
         self,

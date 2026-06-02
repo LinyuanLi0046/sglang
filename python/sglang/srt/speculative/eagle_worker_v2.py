@@ -327,6 +327,17 @@ class EagleDraftWorker(BaseDraftWorker):
 
     def draft(self, model_worker_batch: ModelWorkerBatch):
         draft_input: EagleDraftInput = model_worker_batch.spec_info
+        canonical_verify_input = (
+            draft_input.build_verify_input_from_canonical_decode_payload(
+                model_worker_batch,
+                self.topk,
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
+            )
+        )
+        if canonical_verify_input is not None:
+            return canonical_verify_input
+
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
             self.req_to_token_pool,
             model_worker_batch,

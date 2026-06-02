@@ -82,6 +82,117 @@ def assign_draft_cache_locs_page_size_1(
 
 @dataclass
 class EagleDraftInputV2Mixin:
+    def _has_canonical_decode_payload(self: EagleDraftInput) -> bool:
+        return (
+            getattr(self, "last_verified_ids", None) is not None
+            and getattr(self, "token_list", None) is not None
+        )
+
+    def _validate_canonical_decode_payload(
+        self: EagleDraftInput,
+        batch_size: int,
+        num_verify_tokens: int,
+    ) -> None:
+        last_verified_ids = self.last_verified_ids
+        token_list = self.token_list
+        expected_width = num_verify_tokens - 1
+
+        if last_verified_ids.ndim != 1:
+            raise ValueError(
+                "last_verified_ids must be a 1D tensor for canonical decode payload "
+                f"validation, got ndim={last_verified_ids.ndim}"
+            )
+        if last_verified_ids.shape[0] != batch_size:
+            raise ValueError(
+                "last_verified_ids batch size mismatch: "
+                f"expected {batch_size}, got {last_verified_ids.shape[0]}"
+            )
+        if token_list.ndim != 2:
+            raise ValueError(
+                "token_list must be a 2D tensor for canonical decode payload "
+                f"validation, got ndim={token_list.ndim}"
+            )
+        if token_list.shape[0] != batch_size:
+            raise ValueError(
+                "token_list batch size mismatch: "
+                f"expected {batch_size}, got {token_list.shape[0]}"
+            )
+        if token_list.shape[1] != expected_width:
+            raise ValueError(
+                "token_list step width mismatch: "
+                f"expected {expected_width}, got {token_list.shape[1]}"
+            )
+
+    def build_verify_input_from_canonical_decode_payload(
+        self: EagleDraftInput,
+        batch: ModelWorkerBatch,
+        topk: int,
+        spec_steps: int,
+        num_verify_tokens: int,
+    ):
+        if batch.forward_mode.is_idle() or not self._has_canonical_decode_payload():
+            return None
+
+        self._validate_canonical_decode_payload(len(batch.seq_lens), num_verify_tokens)
+
+        from sglang.srt.speculative.eagle_info import EagleVerifyInput
+
+        batch_size = len(batch.seq_lens)
+        draft_tokens = torch.cat(
+            (self.last_verified_ids.unsqueeze(1), self.token_list), dim=1
+        ).reshape(-1)
+        positions = (
+            batch.seq_lens.unsqueeze(1)
+            + torch.arange(
+                num_verify_tokens,
+                dtype=torch.long,
+                device=batch.seq_lens.device,
+            )
+        ).reshape(-1)
+        retrive_base = (
+            torch.arange(batch_size, dtype=torch.long, device=batch.seq_lens.device)
+            .unsqueeze(1)
+            .mul(num_verify_tokens)
+        )
+        retrive_offset = torch.arange(
+            num_verify_tokens,
+            dtype=torch.long,
+            device=batch.seq_lens.device,
+        ).unsqueeze(0)
+        retrive_index = retrive_base + retrive_offset
+        retrive_next_token = torch.full(
+            (batch_size, num_verify_tokens),
+            -1,
+            dtype=torch.long,
+            device=batch.seq_lens.device,
+        )
+        if num_verify_tokens > 1:
+            retrive_next_token[:, :-1] = torch.arange(
+                1,
+                num_verify_tokens,
+                dtype=torch.long,
+                device=batch.seq_lens.device,
+            ).unsqueeze(0)
+        retrive_next_sibling = torch.full_like(retrive_next_token, -1)
+
+        return EagleVerifyInput(
+            draft_token=draft_tokens,
+            custom_mask=torch.full(
+                (0,), True, dtype=torch.bool, device=batch.seq_lens.device
+            ),
+            positions=positions,
+            retrive_index=retrive_index,
+            retrive_next_token=retrive_next_token,
+            retrive_next_sibling=retrive_next_sibling,
+            retrive_cum_len=None,
+            spec_steps=spec_steps,
+            topk=topk,
+            draft_token_num=num_verify_tokens,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            seq_lens_sum=batch.seq_lens_sum,
+            seq_lens_cpu=batch.seq_lens_cpu,
+        )
+
     def _validate_real_decode_payload(
         self: EagleDraftInput,
         batch_size: int,

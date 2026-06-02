@@ -652,6 +652,11 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     future_indices: Optional[FutureIndices] = None
     new_seq_lens: Optional[torch.Tensor] = None
     verify_done: Optional[torch.cuda.Event] = None
+    # Canonical decode payload aligned with special_sglang. These fields are the
+    # long-term consumer-facing contract for the next verify step and are kept
+    # separate from the legacy replay buffers below.
+    last_verified_ids: Optional[torch.Tensor] = None
+    token_list: Optional[torch.Tensor] = None
     # Worker-produced real payload aligned with special_sglang's decode contract.
     # Stage B only records these values for future verification/diffing and does not
     # change the current FutureMap + replay consumption path.
@@ -772,6 +777,10 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if self.future_indices is not None:
             self.future_indices.indices = self.future_indices.indices[new_indices]
+            if self.last_verified_ids is not None:
+                self.last_verified_ids = self.last_verified_ids[new_indices]
+            if self.token_list is not None:
+                self.token_list = self.token_list[new_indices]
             if self.real_new_verified_id is not None:
                 self.real_new_verified_id = self.real_new_verified_id[new_indices]
             if self.real_token_list is not None:
@@ -793,6 +802,10 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.topk_index = self.topk_index[: len(new_indices)]
             self.hidden_states = self.hidden_states[: len(new_indices)]
             self.verified_id = self.verified_id[: len(new_indices)]
+            if self.last_verified_ids is not None:
+                self.last_verified_ids = self.last_verified_ids[: len(new_indices)]
+            if self.token_list is not None:
+                self.token_list = self.token_list[: len(new_indices)]
             if self.real_new_verified_id is not None:
                 self.real_new_verified_id = self.real_new_verified_id[: len(new_indices)]
             if self.real_token_list is not None:
@@ -803,6 +816,10 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.topk_index = self.topk_index[new_indices]
             self.hidden_states = self.hidden_states[new_indices]
             self.verified_id = self.verified_id[new_indices]
+            if self.last_verified_ids is not None:
+                self.last_verified_ids = self.last_verified_ids[new_indices]
+            if self.token_list is not None:
+                self.token_list = self.token_list[new_indices]
             if self.real_new_verified_id is not None:
                 self.real_new_verified_id = self.real_new_verified_id[new_indices]
             if self.real_token_list is not None:
@@ -816,6 +833,16 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                     [self.future_indices.indices, spec_info.future_indices.indices]
                 )
             )
+            if self.last_verified_ids is not None and spec_info.last_verified_ids is not None:
+                self.last_verified_ids = torch.cat(
+                    [self.last_verified_ids, spec_info.last_verified_ids], axis=0
+                )
+            else:
+                self.last_verified_ids = None
+            if self.token_list is not None and spec_info.token_list is not None:
+                self.token_list = torch.cat([self.token_list, spec_info.token_list], axis=0)
+            else:
+                self.token_list = None
             if self.real_new_verified_id is not None and spec_info.real_new_verified_id is not None:
                 self.real_new_verified_id = torch.cat(
                     [self.real_new_verified_id, spec_info.real_new_verified_id], axis=0
@@ -835,6 +862,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.verified_id = spec_info.verified_id
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
+            self.last_verified_ids = spec_info.last_verified_ids
+            self.token_list = spec_info.token_list
             self.real_new_verified_id = spec_info.real_new_verified_id
             self.real_token_list = spec_info.real_token_list
             return
@@ -846,6 +875,16 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
+        if self.last_verified_ids is not None and spec_info.last_verified_ids is not None:
+            self.last_verified_ids = torch.cat(
+                [self.last_verified_ids, spec_info.last_verified_ids], axis=0
+            )
+        else:
+            self.last_verified_ids = None
+        if self.token_list is not None and spec_info.token_list is not None:
+            self.token_list = torch.cat([self.token_list, spec_info.token_list], axis=0)
+        else:
+            self.token_list = None
         if self.real_new_verified_id is not None and spec_info.real_new_verified_id is not None:
             self.real_new_verified_id = torch.cat(
                 [self.real_new_verified_id, spec_info.real_new_verified_id], axis=0

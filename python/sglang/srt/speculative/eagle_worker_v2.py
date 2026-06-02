@@ -650,6 +650,7 @@ class EagleDraftWorker(BaseDraftWorker):
         next_draft_input.real_token_list = self._build_real_decode_token_list(
             batch, next_draft_input
         )
+        self._compare_decode_real_payload(batch, next_draft_input)
 
     def _build_real_decode_token_list(
         self,
@@ -664,7 +665,7 @@ class EagleDraftWorker(BaseDraftWorker):
             )
         return self._build_real_token_list_via_propose(batch, next_draft_input)
 
-    def _build_legacy_compare_token_list(
+    def _build_legacy_compare_token_list_for_decode(
         self,
         batch: ModelWorkerBatch,
         proposal_input: EagleDraftInput,
@@ -700,9 +701,8 @@ class EagleDraftWorker(BaseDraftWorker):
             self.draft_attn_backend.init_forward_metadata(shadow_forward_batch)
         return self._run_real_propose_forward(shadow_forward_batch)
 
-    def _raise_real_payload_mismatch(
+    def _raise_decode_real_payload_mismatch(
         self,
-        path: str,
         field: str,
         actual: torch.Tensor,
         expected: torch.Tensor,
@@ -715,38 +715,43 @@ class EagleDraftWorker(BaseDraftWorker):
             else None
         )
         raise RuntimeError(
-            f"Stage D payload mismatch at {path}.{field}: "
+            f"Stage D decode payload mismatch at {field}: "
             f"actual_shape={tuple(actual.shape)}, "
             f"expected_shape={tuple(expected.shape)}, "
             f"first_mismatch_index={first_index}"
         )
 
-    def _compare_real_payload(
+    def _compare_decode_real_payload(
         self,
-        path: str,
         batch: ModelWorkerBatch,
         proposal_input: EagleDraftInput,
     ) -> None:
         real_new_verified_id = getattr(proposal_input, "real_new_verified_id", None)
         real_token_list = getattr(proposal_input, "real_token_list", None)
         if real_new_verified_id is None:
-            raise RuntimeError(f"Stage D payload mismatch at {path}.real_new_verified_id: missing")
+            raise RuntimeError(
+                "Stage D decode payload mismatch at real_new_verified_id: missing"
+            )
         if real_token_list is None:
-            raise RuntimeError(f"Stage D payload mismatch at {path}.real_token_list: missing")
+            raise RuntimeError(
+                "Stage D decode payload mismatch at real_token_list: missing"
+            )
 
         if real_new_verified_id.shape != proposal_input.verified_id.shape or not torch.equal(
             real_new_verified_id, proposal_input.verified_id
         ):
-            self._raise_real_payload_mismatch(
-                path, "real_new_verified_id", real_new_verified_id, proposal_input.verified_id
+            self._raise_decode_real_payload_mismatch(
+                "real_new_verified_id", real_new_verified_id, proposal_input.verified_id
             )
 
-        legacy_token_list = self._build_legacy_compare_token_list(batch, proposal_input)
+        legacy_token_list = self._build_legacy_compare_token_list_for_decode(
+            batch, proposal_input
+        )
         if real_token_list.shape != legacy_token_list.shape or not torch.equal(
             real_token_list, legacy_token_list
         ):
-            self._raise_real_payload_mismatch(
-                path, "real_token_list", real_token_list, legacy_token_list
+            self._raise_decode_real_payload_mismatch(
+                "real_token_list", real_token_list, legacy_token_list
             )
 
     def _alloc_real_propose_out_cache(

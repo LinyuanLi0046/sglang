@@ -122,19 +122,23 @@ class SchedulerOutputProcessorMixin:
                 req.customized_info[k].append(elem)
 
     def _prepare_next_batch_sampling_info(self: Scheduler, batch: ScheduleBatch) -> None:
-        """Prepare next-batch grammar state once Phase A wires the baton end-to-end.
+        """Produce the non-spec overlap grammar baton for the next batch.
 
-        Phase A step 1 only adds the helper and keeps the current path unchanged.
-        Later stages can call this helper after post-process owns the next batch's
-        sampling preparation boundary.
+        This is the real hand-off point from the previous batch post-process to the
+        next batch sample path. The helper intentionally stays narrow: update regex
+        state, synchronize the scheduler thread's current stream for visibility, then
+        set the event consumed by the next batch worker/sample path.
         """
         sampling_info = batch.next_batch_sampling_info
         if sampling_info is None:
             return
         if sampling_info.grammars is not None:
             sampling_info.update_regex_vocab_mask()
-            if hasattr(self, "schedule_stream"):
-                self.schedule_stream.synchronize()
+            current_stream = None
+            if hasattr(self, "device_module") and hasattr(self.device_module, "current_stream"):
+                current_stream = self.device_module.current_stream()
+            if current_stream is not None and hasattr(current_stream, "synchronize"):
+                current_stream.synchronize()
         if sampling_info.sampling_info_done is not None:
             sampling_info.sampling_info_done.set()
 

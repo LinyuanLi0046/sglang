@@ -1387,6 +1387,12 @@ class Scheduler(
             self.is_generation and self.non_spec_overlap_worker is not None
         )
 
+        def make_dummy_first_batch() -> ScheduleBatch:
+            return ScheduleBatch(
+                reqs=[],
+                next_batch_sampling_info=self.non_spec_overlap_worker.cur_sampling_info,
+            )
+
         def pop_and_process(
             launch_done: Optional[threading.Event] = None,
             next_batch_sampling_info=None,
@@ -1423,11 +1429,8 @@ class Scheduler(
                 if use_non_spec_overlap_worker and (
                     self.last_batch is None or disable_overlap_for_batch
                 ):
-                    self._prepare_next_batch_sampling_info(
-                        ScheduleBatch(
-                            reqs=[],
-                            next_batch_sampling_info=self.non_spec_overlap_worker.cur_sampling_info,
-                        )
+                    self.process_batch_result(
+                        make_dummy_first_batch(), None, batch.launch_done
                     )
             else:
                 batch_result = None
@@ -2898,6 +2901,11 @@ class Scheduler(
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
         launch_done: Optional[threading.Event] = None,
     ):
+        if result is None and batch.next_batch_sampling_info is not None:
+            self._prepare_next_batch_sampling_info(batch)
+            self.maybe_send_health_check_signal()
+            return
+
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result, launch_done)
         elif batch.forward_mode.is_extend():

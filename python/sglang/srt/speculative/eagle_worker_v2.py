@@ -1,5 +1,4 @@
 import contextlib
-import copy
 import logging
 import time
 from typing import List, Optional, Tuple
@@ -28,6 +27,7 @@ from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.common import alloc_paged_token_slots_extend, alloc_token_slots, get_last_loc
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -563,51 +563,11 @@ class EagleDraftWorker(BaseDraftWorker):
     ) -> torch.Tensor:
         if batch.forward_mode.is_idle():
             return torch.empty(
-                (0, max(self.speculative_num_draft_tokens - 1, 0)),
+                (0, self.speculative_num_steps),
                 dtype=next_draft_input.verified_id.dtype,
                 device=self.device,
             )
-
-        # Use a temporary decode-shaped batch/spec snapshot so the real proposal run
-        # stays worker-owned and does not mutate the legacy replay inputs that the
-        # current v2 consumer still depends on.
-        proposal_input = EagleDraftInput(
-            topk_p=next_draft_input.topk_p,
-            topk_index=next_draft_input.topk_index,
-            hidden_states=next_draft_input.hidden_states,
-            verified_id=next_draft_input.verified_id,
-            new_seq_lens=next_draft_input.new_seq_lens,
-            capture_hidden_mode=CaptureHiddenMode.LAST,
-        )
-        proposal_batch = copy.copy(batch)
-        proposal_batch.forward_mode = ForwardMode.DECODE
-        proposal_batch.input_ids = next_draft_input.verified_id
-        proposal_batch.seq_lens = next_draft_input.new_seq_lens
-        proposal_batch.seq_lens_cpu = batch.seq_lens_cpu
-        proposal_batch.seq_lens_sum = int(next_draft_input.new_seq_lens.sum().item())
-        proposal_batch.out_cache_loc = None
-        proposal_batch.spec_info = proposal_input
-        proposal_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-        proposal_batch.is_extend_in_batch = False
-        proposal_batch.all_extend_in_batch = False
-        proposal_batch.is_prefill_only = False
-
-        forward_batch, can_cuda_graph = proposal_input.prepare_for_v2_draft(
-            self.req_to_token_pool,
-            proposal_batch,
-            self.cuda_graph_runner,
-            self.draft_runner,
-            self.topk,
-            self.speculative_num_steps,
-        )
-
-        if can_cuda_graph:
-            _, _, draft_tokens = self.cuda_graph_runner.replay(forward_batch)
-        else:
-            if self.speculative_num_steps > 1:
-                self.draft_attn_backend.init_forward_metadata(forward_batch)
-            _, _, draft_tokens = self.draft_forward(forward_batch)
-        return draft_tokens
+        return self._build_real_token_list_via_propose(batch, next_draft_input)
 
     def _draft_extend_for_decode(
         self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult
@@ -695,46 +655,150 @@ class EagleDraftWorker(BaseDraftWorker):
     ) -> torch.Tensor:
         if batch.forward_mode.is_idle():
             return torch.empty(
-                (0, max(self.speculative_num_draft_tokens - 1, 0)),
+                (0, self.speculative_num_steps),
                 dtype=next_draft_input.verified_id.dtype,
                 device=self.device,
             )
+        return self._build_real_token_list_via_propose(batch, next_draft_input)
 
-        # Use a temporary batch/spec snapshot so the real proposal run does not mutate
-        # the replay inputs that the current v2 consumer still depends on.
-        proposal_input = EagleDraftInput(
-            topk_p=next_draft_input.topk_p,
-            topk_index=next_draft_input.topk_index,
-            hidden_states=next_draft_input.hidden_states,
-            verified_id=next_draft_input.verified_id,
-            new_seq_lens=next_draft_input.new_seq_lens,
-            capture_hidden_mode=CaptureHiddenMode.LAST,
+    def _alloc_real_propose_out_cache(
+        self,
+        batch: ModelWorkerBatch,
+        seq_lens: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[Tuple]]:
+        num_reqs = len(seq_lens)
+        if self.page_size == 1:
+            return alloc_token_slots(
+                batch.tree_cache,
+                num_reqs * self.speculative_num_steps,
+                backup_state=True,
+            )
+
+        prefix_lens = seq_lens
+        prefix_lens_cpu = seq_lens.cpu()
+        seq_lens_after_propose = prefix_lens + self.speculative_num_steps
+        seq_lens_after_propose_cpu = prefix_lens_cpu + self.speculative_num_steps
+        last_loc = get_last_loc(
+            batch.req_to_token_pool.req_to_token,
+            batch.req_pool_indices,
+            prefix_lens,
         )
-        proposal_batch = copy.copy(batch)
-        proposal_batch.forward_mode = ForwardMode.DECODE
-        proposal_batch.input_ids = next_draft_input.verified_id
-        proposal_batch.seq_lens = next_draft_input.new_seq_lens
-        proposal_batch.seq_lens_sum = int(next_draft_input.new_seq_lens.sum().item())
-        proposal_batch.out_cache_loc = None
-        proposal_batch.spec_info = proposal_input
-        proposal_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-
-        forward_batch, can_cuda_graph = proposal_input.prepare_for_v2_draft(
-            self.req_to_token_pool,
-            proposal_batch,
-            self.cuda_graph_runner,
-            self.draft_runner,
-            self.topk,
-            self.speculative_num_steps,
+        return alloc_paged_token_slots_extend(
+            batch.tree_cache,
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens_after_propose,
+            seq_lens_after_propose_cpu,
+            last_loc,
+            num_reqs * self.speculative_num_steps,
+            backup_state=True,
         )
 
-        if can_cuda_graph:
-            _, _, draft_tokens = self.cuda_graph_runner.replay(forward_batch)
-        else:
+    def _build_real_token_list_via_propose(
+        self,
+        batch: ModelWorkerBatch,
+        proposal_input: EagleDraftInput,
+    ) -> torch.Tensor:
+        if self.topk != 1:
+            raise ValueError(
+                "Stage C.5 / D0 real_token_list producer currently requires "
+                "speculative_eagle_topk == 1 to align with special_sglang propose() semantics"
+            )
+
+        saved_input_ids = batch.input_ids
+        saved_seq_lens = batch.seq_lens
+        saved_seq_lens_cpu = getattr(batch, "seq_lens_cpu", None)
+        saved_seq_lens_sum = getattr(batch, "seq_lens_sum", None)
+        saved_forward_mode = batch.forward_mode
+        saved_spec_info = batch.spec_info
+        saved_capture_hidden_mode = getattr(batch, "capture_hidden_mode", None)
+        saved_out_cache_loc = getattr(batch, "out_cache_loc", None)
+
+        out_cache_loc, token_to_kv_pool_state_backup = self._alloc_real_propose_out_cache(
+            batch, proposal_input.new_seq_lens
+        )
+        try:
+            batch.input_ids = proposal_input.verified_id
+            batch.seq_lens = proposal_input.new_seq_lens
+            batch.seq_lens_cpu = proposal_input.new_seq_lens.cpu()
+            batch.seq_lens_sum = int(proposal_input.new_seq_lens.sum().item())
+            batch.forward_mode = ForwardMode.DECODE
+            batch.spec_info = proposal_input
+            batch.capture_hidden_mode = CaptureHiddenMode.LAST
+            batch.out_cache_loc = out_cache_loc
+
+            proposal_input.capture_hidden_mode = CaptureHiddenMode.LAST
+            proposal_input.num_tokens_per_req = self.topk
+            proposal_input.num_tokens_for_logprob_per_req = self.topk
+            proposal_input.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
+
+            forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
+            forward_batch.positions = proposal_input.positions
             if self.speculative_num_steps > 1:
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
-            _, _, draft_tokens = self.draft_forward(forward_batch)
-        return draft_tokens
+            return self._run_real_propose_forward(forward_batch)
+        finally:
+            batch.input_ids = saved_input_ids
+            batch.seq_lens = saved_seq_lens
+            batch.seq_lens_cpu = saved_seq_lens_cpu
+            batch.seq_lens_sum = saved_seq_lens_sum
+            batch.forward_mode = saved_forward_mode
+            batch.spec_info = saved_spec_info
+            batch.capture_hidden_mode = saved_capture_hidden_mode
+            batch.out_cache_loc = saved_out_cache_loc
+            if token_to_kv_pool_state_backup is not None:
+                self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
+
+    def _run_real_propose_forward(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        proposal_input: EagleDraftInput = forward_batch.spec_info
+        topk_index = proposal_input.topk_index
+        hidden_states = proposal_input.hidden_states
+        if self.hot_token_id is not None:
+            topk_index = self.hot_token_id[topk_index]
+
+        out_cache_loc = forward_batch.out_cache_loc.reshape(
+            forward_batch.batch_size, self.topk, self.speculative_num_steps
+        )
+        out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
+            self.speculative_num_steps, -1
+        )
+
+        token_list = torch.empty(
+            (forward_batch.batch_size, self.speculative_num_steps),
+            dtype=proposal_input.verified_id.dtype,
+            device=self.device,
+        )
+
+        for i in range(self.speculative_num_steps):
+            input_ids = topk_index.flatten()
+            token_list[:, i] = input_ids.to(token_list.dtype)
+
+            if i == self.speculative_num_steps - 1:
+                break
+
+            forward_batch.input_ids = input_ids.to(torch.int32)
+            forward_batch.out_cache_loc = out_cache_loc[i]
+            forward_batch.positions.add_(1)
+            forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
+            proposal_input.hidden_states = hidden_states
+
+            logits_output = self.draft_runner.forward(
+                forward_batch, skip_attn_backend_init=True
+            ).logits_output
+            maybe_detect_nan(logits_output.next_token_logits, f"real_propose step {i}")
+            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+            _, topk_index = fast_topk(probs, self.topk, dim=-1)
+            maybe_detect_oob(
+                topk_index,
+                0,
+                logits_output.next_token_logits.shape[-1],
+                f"real_propose step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
+            )
+            if self.hot_token_id is not None:
+                topk_index = self.hot_token_id[topk_index]
+            hidden_states = logits_output.hidden_states
+
+        return token_list
 
 
 class EAGLEWorkerV2(BaseSpecWorker):

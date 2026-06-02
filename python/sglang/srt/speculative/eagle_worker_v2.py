@@ -651,7 +651,7 @@ class EagleDraftWorker(BaseDraftWorker):
         next_draft_input.real_token_list = self._build_real_decode_token_list(
             batch, next_draft_input
         )
-        self._record_decode_compare_summary(batch, next_draft_input)
+        self._compare_decode_real_payload(batch, next_draft_input)
 
     def _build_real_decode_token_list(
         self,
@@ -728,7 +728,19 @@ class EagleDraftWorker(BaseDraftWorker):
             return None
         return tuple(int(x) for x in mismatch_index[0].tolist())
 
-    def _record_decode_compare_summary(
+    def _get_debug_value_at_index(
+        self,
+        tensor: torch.Tensor,
+        index: Optional[Tuple[int, ...]],
+    ):
+        if index is None:
+            return None
+        value = tensor[index]
+        if value.numel() == 1:
+            return value.item()
+        return value.detach().cpu().tolist()
+
+    def _compare_decode_real_payload(
         self,
         batch: ModelWorkerBatch,
         proposal_input: EagleDraftInput,
@@ -746,8 +758,8 @@ class EagleDraftWorker(BaseDraftWorker):
                 self._build_legacy_compare_payload_for_decode(batch, proposal_input)
             )
         except Exception as exc:
-            logger.warning(
-                "Stage D.1A decode compare oracle build failed: bs=%s steps=%s error=%s",
+            logger.error(
+                "Stage D.1B decode payload compare build failed: bs=%s steps=%s error=%s",
                 len(batch.seq_lens),
                 self.speculative_num_steps,
                 exc,
@@ -760,16 +772,21 @@ class EagleDraftWorker(BaseDraftWorker):
             real_new_verified_id.shape != legacy_verified_id.shape
             or not torch.equal(real_new_verified_id, legacy_verified_id)
         ):
+            first_index = (
+                None
+                if real_new_verified_id.shape != legacy_verified_id.shape
+                else self._get_first_mismatch_index(
+                    real_new_verified_id, legacy_verified_id
+                )
+            )
             mismatch_fields.append(
                 (
                     "real_new_verified_id",
                     tuple(real_new_verified_id.shape),
                     tuple(legacy_verified_id.shape),
-                    None
-                    if real_new_verified_id.shape != legacy_verified_id.shape
-                    else self._get_first_mismatch_index(
-                        real_new_verified_id, legacy_verified_id
-                    ),
+                    first_index,
+                    self._get_debug_value_at_index(real_new_verified_id, first_index),
+                    self._get_debug_value_at_index(legacy_verified_id, first_index),
                 )
             )
 
@@ -777,31 +794,43 @@ class EagleDraftWorker(BaseDraftWorker):
             real_token_list.shape != legacy_token_list.shape
             or not torch.equal(real_token_list, legacy_token_list)
         ):
+            first_index = (
+                None
+                if real_token_list.shape != legacy_token_list.shape
+                else self._get_first_mismatch_index(real_token_list, legacy_token_list)
+            )
             mismatch_fields.append(
                 (
                     "real_token_list",
                     tuple(real_token_list.shape),
                     tuple(legacy_token_list.shape),
-                    None
-                    if real_token_list.shape != legacy_token_list.shape
-                    else self._get_first_mismatch_index(
-                        real_token_list, legacy_token_list
-                    ),
+                    first_index,
+                    self._get_debug_value_at_index(real_token_list, first_index),
+                    self._get_debug_value_at_index(legacy_token_list, first_index),
                 )
             )
 
         if not mismatch_fields:
             return
 
-        for field, actual_shape, expected_shape, first_index in mismatch_fields:
-            logger.warning(
-                "Stage D.1A decode compare summary: field=%s bs=%s steps=%s actual_shape=%s expected_shape=%s first_mismatch_index=%s",
+        for (
+            field,
+            actual_shape,
+            expected_shape,
+            first_index,
+            actual_value,
+            expected_value,
+        ) in mismatch_fields:
+            logger.error(
+                "Stage D.1B decode payload mismatch: field=%s bs=%s steps=%s actual_shape=%s expected_shape=%s first_mismatch_index=%s actual_value=%s expected_value=%s",
                 field,
                 len(batch.seq_lens),
                 self.speculative_num_steps,
                 actual_shape,
                 expected_shape,
                 first_index,
+                actual_value,
+                expected_value,
             )
         self.decode_compare_log_budget -= 1
 

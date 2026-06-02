@@ -131,6 +131,7 @@ class EagleDraftWorker(BaseDraftWorker):
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
+        self.page_size = self.token_to_kv_pool_allocator.page_size
 
         # Init draft worker
         if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():

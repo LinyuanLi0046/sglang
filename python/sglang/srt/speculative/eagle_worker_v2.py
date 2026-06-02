@@ -1,7 +1,6 @@
 import contextlib
 import logging
 import time
-from copy import copy
 from typing import List, Optional, Tuple
 
 import torch
@@ -186,15 +185,8 @@ class EagleDraftWorker(BaseDraftWorker):
 
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
         self.decode_behavior_log_budget = 8
-        self.decode_hang_debug_log_budget = 24
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
-
-    def _log_decode_hang_debug(self, message: str, *args) -> None:
-        if self.decode_hang_debug_log_budget <= 0:
-            return
-        self.decode_hang_debug_log_budget -= 1
-        logger.error(message, *args)
 
     def init_token_map(self):
         # Load hot token ids
@@ -344,48 +336,7 @@ class EagleDraftWorker(BaseDraftWorker):
             )
         )
         if canonical_verify_input is not None:
-#region debug-point draft-canonical-hit
-            verify_done = getattr(draft_input, "verify_done", None)
-            verify_done_ready = None
-            if verify_done is not None and hasattr(verify_done, "query"):
-                try:
-                    verify_done_ready = verify_done.query()
-                except Exception:
-                    verify_done_ready = "query-error"
-            self._log_decode_hang_debug(
-                "Stage E-lite debug draft canonical_hit bs=%s verify_done_present=%s "
-                "verify_done_ready=%s token_list_shape=%s new_seq_lens=%s",
-                len(model_worker_batch.seq_lens),
-                verify_done is not None,
-                verify_done_ready,
-                None
-                if getattr(draft_input, "token_list", None) is None
-                else tuple(draft_input.token_list.shape),
-                None
-                if getattr(draft_input, "new_seq_lens", None) is None
-                else (
-                    tuple(draft_input.new_seq_lens.tolist())
-                    if len(draft_input.new_seq_lens) <= 8
-                    else tuple(draft_input.new_seq_lens[:8].tolist())
-                ),
-            )
-#endregion debug-point draft-canonical-hit
             return canonical_verify_input
-
-#region debug-point draft-fallback
-        self._log_decode_hang_debug(
-            "Stage E-lite debug draft fallback idle=%s topk=%s has_canonical_payload=%s "
-            "bs=%s seq_lens=%s",
-            model_worker_batch.forward_mode.is_idle(),
-            self.topk,
-            getattr(draft_input, "last_verified_ids", None) is not None
-            and getattr(draft_input, "token_list", None) is not None,
-            len(model_worker_batch.seq_lens),
-            tuple(model_worker_batch.seq_lens.tolist())
-            if len(model_worker_batch.seq_lens) <= 8
-            else tuple(model_worker_batch.seq_lens[:8].tolist()),
-        )
-#endregion debug-point draft-fallback
 
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
             self.req_to_token_pool,
@@ -709,99 +660,7 @@ class EagleDraftWorker(BaseDraftWorker):
             ret_topk_index,
             ret_hidden_states,
         )
-        next_draft_input.last_verified_ids = next_draft_input.verified_id
-        next_draft_input.token_list = self._build_canonical_decode_token_list(
-            batch, next_draft_input
-        )
         next_draft_input.real_token_list = None
-
-    def _build_canonical_decode_token_list(
-        self,
-        batch: ModelWorkerBatch,
-        next_draft_input: EagleDraftInput,
-    ) -> Optional[torch.Tensor]:
-        verify_done = getattr(next_draft_input, "verify_done", None)
-        verify_done_ready = None
-        if verify_done is not None and hasattr(verify_done, "query"):
-            try:
-                verify_done_ready = verify_done.query()
-            except Exception:
-                verify_done_ready = "query-error"
-
-#region debug-point canonical-producer-entry
-        self._log_decode_hang_debug(
-            "Stage E-lite debug canonical_producer entry topk=%s bs=%s verify_done_present=%s "
-            "verify_done_ready=%s batch_seq_lens=%s new_seq_lens=%s",
-            self.topk,
-            len(batch.seq_lens),
-            verify_done is not None,
-            verify_done_ready,
-            tuple(batch.seq_lens.tolist()) if len(batch.seq_lens) <= 8 else tuple(batch.seq_lens[:8].tolist()),
-            tuple(next_draft_input.new_seq_lens.tolist())
-            if next_draft_input.new_seq_lens is not None and len(next_draft_input.new_seq_lens) <= 8
-            else (
-                None
-                if next_draft_input.new_seq_lens is None
-                else tuple(next_draft_input.new_seq_lens[:8].tolist())
-            ),
-        )
-#endregion debug-point canonical-producer-entry
-        if self.topk != 1 or next_draft_input.verified_id.numel() == 0:
-            return None
-
-        if verify_done is not None:
-            verify_done.synchronize()
-
-        shadow_batch = copy(batch)
-        shadow_batch.forward_mode = ForwardMode.DECODE
-        shadow_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-        if next_draft_input.new_seq_lens is not None:
-            shadow_batch.seq_lens = next_draft_input.new_seq_lens.clone()
-            shadow_batch.seq_lens_cpu = shadow_batch.seq_lens.cpu()
-            shadow_batch.seq_lens_sum = shadow_batch.seq_lens_cpu.sum().item()
-        shadow_spec_info = EagleDraftInput(
-            hidden_states=next_draft_input.hidden_states,
-            verified_id=next_draft_input.verified_id,
-            topk_p=next_draft_input.topk_p,
-            topk_index=next_draft_input.topk_index,
-            new_seq_lens=next_draft_input.new_seq_lens,
-            num_tokens_per_req=next_draft_input.num_tokens_per_req,
-            num_tokens_for_logprob_per_req=next_draft_input.num_tokens_for_logprob_per_req,
-            capture_hidden_mode=next_draft_input.capture_hidden_mode,
-        )
-        shadow_batch.spec_info = shadow_spec_info
-
-        forward_batch, can_cuda_graph = shadow_spec_info.prepare_for_v2_draft(
-            self.req_to_token_pool,
-            shadow_batch,
-            self.cuda_graph_runner,
-            self.draft_runner,
-            self.topk,
-            self.speculative_num_steps,
-        )
-        if can_cuda_graph:
-            _, _, draft_tokens = self.cuda_graph_runner.replay(forward_batch)
-        else:
-            if (
-                not forward_batch.forward_mode.is_idle()
-                and self.speculative_num_steps > 1
-            ):
-                self.draft_attn_backend.init_forward_metadata(forward_batch)
-            _, _, draft_tokens = self.draft_forward(forward_batch)
-
-#region debug-point canonical-producer-exit
-        self._log_decode_hang_debug(
-            "Stage E-lite debug canonical_producer exit can_cuda_graph=%s draft_tokens_shape=%s "
-            "shadow_seq_lens=%s verify_done_synchronized=%s",
-            can_cuda_graph,
-            tuple(draft_tokens.shape),
-            tuple(shadow_batch.seq_lens.tolist())
-            if len(shadow_batch.seq_lens) <= 8
-            else tuple(shadow_batch.seq_lens[:8].tolist()),
-            verify_done is not None,
-        )
-#endregion debug-point canonical-producer-exit
-        return draft_tokens
 
     def _build_real_decode_token_list(
         self,

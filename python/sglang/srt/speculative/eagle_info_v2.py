@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -38,16 +37,6 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_npu_before_atlas_a5 = is_npu_before_atlas_a5()
-logger = logging.getLogger(__name__)
-_canonical_decode_debug_log_budget = 16
-
-
-def _log_canonical_decode_debug(message: str, *args) -> None:
-    global _canonical_decode_debug_log_budget
-    if _canonical_decode_debug_log_budget <= 0:
-        return
-    _canonical_decode_debug_log_budget -= 1
-    logger.error(message, *args)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
@@ -141,33 +130,6 @@ class EagleDraftInputV2Mixin:
         spec_steps: int,
         num_verify_tokens: int,
     ):
-#region debug-point canonical-consumer-entry
-        verify_done = getattr(self, "verify_done", None)
-        verify_done_ready = None
-        if verify_done is not None and hasattr(verify_done, "query"):
-            try:
-                verify_done_ready = verify_done.query()
-            except Exception:
-                verify_done_ready = "query-error"
-        _log_canonical_decode_debug(
-            "Stage E-lite debug canonical_consumer entry idle=%s topk=%s has_payload=%s "
-            "verify_done_present=%s verify_done_ready=%s bs=%s seq_lens=%s new_seq_lens=%s",
-            batch.forward_mode.is_idle(),
-            topk,
-            self._has_canonical_decode_payload(),
-            verify_done is not None,
-            verify_done_ready,
-            len(batch.seq_lens),
-            tuple(batch.seq_lens.tolist()) if len(batch.seq_lens) <= 8 else tuple(batch.seq_lens[:8].tolist()),
-            None
-            if getattr(self, "new_seq_lens", None) is None
-            else (
-                tuple(self.new_seq_lens.tolist())
-                if len(self.new_seq_lens) <= 8
-                else tuple(self.new_seq_lens[:8].tolist())
-            ),
-        )
-#endregion debug-point canonical-consumer-entry
         if (
             batch.forward_mode.is_idle()
             or topk != 1
@@ -216,17 +178,6 @@ class EagleDraftInputV2Mixin:
                 device=batch.seq_lens.device,
             ).unsqueeze(0)
         retrive_next_sibling = torch.full_like(retrive_next_token, -1)
-
-#region debug-point canonical-consumer-exit
-        _log_canonical_decode_debug(
-            "Stage E-lite debug canonical_consumer exit bs=%s draft_token_shape=%s token_list_shape=%s "
-            "seq_lens_sum=%s",
-            batch_size,
-            tuple(draft_tokens.shape),
-            tuple(self.token_list.shape),
-            batch.seq_lens_sum,
-        )
-#endregion debug-point canonical-consumer-exit
         return EagleVerifyInput(
             draft_token=draft_tokens,
             custom_mask=torch.full(

@@ -78,6 +78,17 @@ _is_hip = is_hip()
 logger = logging.getLogger(__name__)
 
 
+def _raise_real_propose_error(location: str, **data) -> None:
+    logger.error("Stage C.5 / D0 real propose invariant failed at %s: %s", location, data)
+    raise RuntimeError(f"Stage C.5 / D0 real propose invariant failed at {location}: {data}")
+
+
+def _optional_tensor_equal(lhs: Optional[torch.Tensor], rhs: Optional[torch.Tensor]) -> bool:
+    if lhs is None or rhs is None:
+        return lhs is None and rhs is None
+    return torch.equal(lhs, rhs)
+
+
 def _get_plan_stream(
     device: str,
 ) -> Tuple[any, contextlib.AbstractContextManager]:
@@ -753,6 +764,7 @@ class EagleDraftWorker(BaseDraftWorker):
         saved_proposal_capture_hidden_mode = getattr(
             proposal_input, "capture_hidden_mode", None
         )
+        saved_available_size = self.token_to_kv_pool_allocator.available_size()
 
         out_cache_loc, token_to_kv_pool_state_backup = self._alloc_real_propose_out_cache(
             batch, proposal_input.new_seq_lens
@@ -798,6 +810,61 @@ class EagleDraftWorker(BaseDraftWorker):
             )
             if token_to_kv_pool_state_backup is not None:
                 self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
+            restored_available_size = self.token_to_kv_pool_allocator.available_size()
+            if restored_available_size != saved_available_size:
+                _raise_real_propose_error(
+                    "build_real_token_list.finally.allocator",
+                    saved_available_size=int(saved_available_size),
+                    restored_available_size=int(restored_available_size),
+                    page_size=int(self.page_size),
+                    num_steps=int(self.speculative_num_steps),
+                )
+            restored_req_to_token_rows = self.req_to_token_pool.req_to_token[
+                batch.req_pool_indices
+            ]
+            if not torch.equal(restored_req_to_token_rows, saved_req_to_token_rows):
+                _raise_real_propose_error(
+                    "build_real_token_list.finally.req_to_token",
+                    restored_checksum=int(
+                        restored_req_to_token_rows.to(torch.int64).sum().item()
+                    ),
+                    saved_checksum=int(
+                        saved_req_to_token_rows.to(torch.int64).sum().item()
+                    ),
+                )
+            if not _optional_tensor_equal(proposal_input.positions, saved_proposal_positions):
+                _raise_real_propose_error(
+                    "build_real_token_list.finally.positions",
+                    saved_is_none=saved_proposal_positions is None,
+                    restored_is_none=proposal_input.positions is None,
+                )
+            if not torch.equal(proposal_input.hidden_states, saved_proposal_hidden_states):
+                _raise_real_propose_error(
+                    "build_real_token_list.finally.hidden_states",
+                    saved_shape=tuple(saved_proposal_hidden_states.shape),
+                    restored_shape=tuple(proposal_input.hidden_states.shape),
+                )
+            if proposal_input.num_tokens_per_req != saved_proposal_num_tokens_per_req:
+                _raise_real_propose_error(
+                    "build_real_token_list.finally.num_tokens_per_req",
+                    saved=saved_proposal_num_tokens_per_req,
+                    restored=proposal_input.num_tokens_per_req,
+                )
+            if (
+                proposal_input.num_tokens_for_logprob_per_req
+                != saved_proposal_num_tokens_for_logprob_per_req
+            ):
+                _raise_real_propose_error(
+                    "build_real_token_list.finally.num_tokens_for_logprob_per_req",
+                    saved=saved_proposal_num_tokens_for_logprob_per_req,
+                    restored=proposal_input.num_tokens_for_logprob_per_req,
+                )
+            if proposal_input.capture_hidden_mode != saved_proposal_capture_hidden_mode:
+                _raise_real_propose_error(
+                    "build_real_token_list.finally.capture_hidden_mode",
+                    saved=str(saved_proposal_capture_hidden_mode),
+                    restored=str(proposal_input.capture_hidden_mode),
+                )
 
     def _run_real_propose_forward(self, forward_batch: ForwardBatch) -> torch.Tensor:
         proposal_input: EagleDraftInput = forward_batch.spec_info
@@ -828,6 +895,33 @@ class EagleDraftWorker(BaseDraftWorker):
 
             forward_batch.input_ids = input_ids.to(torch.int32)
             forward_batch.out_cache_loc = out_cache_loc[i]
+            if _is_npu and hasattr(forward_batch, "attn_metadata"):
+                slot_mapping = getattr(forward_batch.attn_metadata, "slot_mapping", None)
+                seq_lens_tensor = getattr(
+                    forward_batch.attn_metadata, "seq_lens_tensor", None
+                )
+                if slot_mapping is not None and not torch.equal(
+                    slot_mapping.to(forward_batch.out_cache_loc.dtype),
+                    forward_batch.out_cache_loc,
+                ):
+                    _raise_real_propose_error(
+                        "run_real_propose_forward.npu.slot_mapping_before_step",
+                        step=int(i),
+                        slot_mapping_sum=int(slot_mapping.to(torch.int64).sum().item()),
+                        out_cache_loc_sum=int(
+                            forward_batch.out_cache_loc.to(torch.int64).sum().item()
+                        ),
+                    )
+                expected_seq_lens_tensor = (forward_batch.positions + 1).to(torch.int64)
+                if seq_lens_tensor is not None and not torch.equal(
+                    seq_lens_tensor, expected_seq_lens_tensor
+                ):
+                    _raise_real_propose_error(
+                        "run_real_propose_forward.npu.seq_lens_tensor_before_step",
+                        step=int(i),
+                        seq_lens_tensor_sum=int(seq_lens_tensor.sum().item()),
+                        expected_sum=int(expected_seq_lens_tensor.sum().item()),
+                    )
             forward_batch.positions.add_(1)
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             proposal_input.hidden_states = hidden_states

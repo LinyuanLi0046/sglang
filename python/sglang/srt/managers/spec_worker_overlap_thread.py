@@ -47,6 +47,7 @@ class SpecModelWorkerOverlapClient:
 
         self.input_queue: Queue = Queue()
         self.apply_queue: Queue = Queue()
+        self.decode_ready_queue: Queue = Queue()
         self.output_queue: Queue = Queue()
         self.forward_stream = torch.get_device_module(self.device).Stream()
         self.forward_thread = threading.Thread(
@@ -79,6 +80,7 @@ class SpecModelWorkerOverlapClient:
             )
             logger.error("%s", self.thread_exception)
             self.apply_queue.put(self.thread_exception)
+            self.decode_ready_queue.put(self.thread_exception)
             self.output_queue.put(self.thread_exception)
 
     @torch.no_grad()
@@ -146,7 +148,7 @@ class SpecModelWorkerOverlapClient:
                     )
                 )
             else:
-                self.apply_queue.put(
+                self.decode_ready_queue.put(
                     SpecOverlapApplyState(
                         future_indices=future_indices,
                         next_verify_done=getattr(
@@ -239,14 +241,9 @@ class SpecModelWorkerOverlapClient:
     ) -> None:
         self._raise_if_thread_failed()
 
-        apply_state = self.apply_queue.get()
+        apply_state = self.decode_ready_queue.get()
         if isinstance(apply_state, RuntimeError):
             raise apply_state
-
-        if apply_state.requires_scheduler_apply:
-            raise RuntimeError(
-                "Decode future-ready sync received a full scheduler-apply state."
-            )
 
         sync_future_ready(batch, apply_state)
 

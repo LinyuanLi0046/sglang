@@ -2083,6 +2083,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.is_spec_v2:
             # TODO(spec-v2): all spec v2 should go through this path
             draft_input: EagleDraftInput = self.spec_info
+            self.maybe_wait_verify_done()
+            self.maybe_sync_spec_v2_decode_seq_lens()
             draft_input.prepare_for_decode(self)
 
         if not self.spec_algorithm.is_none():
@@ -2186,11 +2188,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if draft_input.verify_done is not None:
                 draft_input.verify_done.synchronize()
 
-    def maybe_wait_verify_done(self):
+    def maybe_sync_spec_v2_decode_seq_lens(self):
         if self.is_spec_v2:
             draft_input: EagleDraftInput = self.spec_info
-            if draft_input.verify_done is not None:
-                draft_input.verify_done.synchronize()
+            if (
+                self.forward_mode.is_decode()
+                and draft_input is not None
+                and draft_input.new_seq_lens is not None
+            ):
+                self.seq_lens = draft_input.new_seq_lens
+                self.seq_lens_cpu = draft_input.new_seq_lens.cpu()
+                self.orig_seq_lens = draft_input.new_seq_lens.to(
+                    device=self.device, dtype=torch.int32
+                )
+                self.seq_lens_sum = int(draft_input.new_seq_lens.sum().item())
+
     def maybe_wait_verify_done_event(self):
         if self.is_spec_v2:
             draft_input: EagleDraftInput = self.spec_info

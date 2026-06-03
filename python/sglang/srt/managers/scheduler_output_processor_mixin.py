@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 
@@ -405,134 +405,6 @@ class SchedulerOutputProcessorMixin:
             req.update_spec_acceptance_histogram(accepted_draft_tokens)
 
         return predict_tokens
-
-    def _iter_spec_decode_live_owner_batches(self: Scheduler):
-        seen = set()
-        for batch_name, candidate in (
-            ("running_batch", self.running_batch),
-            ("last_batch", self.last_batch),
-            ("cur_batch", self.cur_batch),
-        ):
-            if candidate is None:
-                continue
-            candidate_id = id(candidate)
-            if candidate_id in seen:
-                continue
-            seen.add(candidate_id)
-            yield batch_name, candidate
-
-    def _build_spec_decode_live_owner_index(
-        self: Scheduler,
-    ) -> Dict[str, List[dict]]:
-        owner_index: Dict[str, List[dict]] = {}
-        for batch_name, owner_batch in self._iter_spec_decode_live_owner_batches():
-            reqs = getattr(owner_batch, "reqs", None)
-            seq_lens = getattr(owner_batch, "seq_lens", None)
-            if reqs is None or seq_lens is None or len(reqs) != seq_lens.shape[0]:
-                continue
-            owner_spec_info = getattr(owner_batch, "spec_info", None)
-            owner_new_seq_lens = (
-                getattr(owner_spec_info, "new_seq_lens", None)
-                if owner_spec_info is not None
-                else None
-            )
-            for idx, req in enumerate(reqs):
-                candidate_info = {
-                    "batch_name": batch_name,
-                    "batch": owner_batch,
-                    "batch_id": id(owner_batch),
-                    "idx": idx,
-                    "req_seq_len": req.seqlen,
-                    "seq_len": int(seq_lens[idx].item()),
-                    "new_seq_len": (
-                        int(owner_new_seq_lens[idx].item())
-                        if owner_new_seq_lens is not None
-                        and idx < owner_new_seq_lens.shape[0]
-                        else None
-                    ),
-                    "forward_mode": str(getattr(owner_batch, "forward_mode", None)),
-                    "batch_size": len(reqs),
-                }
-                owner_index.setdefault(req.rid, []).append(candidate_info)
-        return owner_index
-
-    def _sync_spec_decode_result_seq_lens_shadow(
-        self: Scheduler,
-        batch: ScheduleBatch,
-    ) -> None:
-        if not batch.is_spec_v2 or not batch.forward_mode.is_decode() or batch.reqs is None:
-            return
-
-        shadow_by_rid = {req.rid: req.seqlen for req in batch.reqs}
-        owner_index = self._build_spec_decode_live_owner_index()
-        missing_rids = []
-
-        for rid, shadow_seq_len in shadow_by_rid.items():
-            owner_candidates = owner_index.get(rid, [])
-            if not owner_candidates:
-                missing_rids.append(rid)
-                continue
-
-            req_seq_len_matches = [
-                candidate
-                for candidate in owner_candidates
-                if candidate["req_seq_len"] == shadow_seq_len
-            ]
-            req_seq_len_and_new_seq_matches = [
-                candidate
-                for candidate in req_seq_len_matches
-                if candidate["new_seq_len"] in (None, shadow_seq_len)
-            ]
-            if len(req_seq_len_and_new_seq_matches) == 1:
-                owner_candidate = req_seq_len_and_new_seq_matches[0]
-            elif len(req_seq_len_matches) == 1:
-                owner_candidate = req_seq_len_matches[0]
-            else:
-                owner_candidates_desc = ", ".join(
-                    (
-                        f"{candidate['batch_name']}#id={candidate['batch_id']}"
-                        f"[idx={candidate['idx']},req_seq={candidate['req_seq_len']},"
-                        f"batch_seq={candidate['seq_len']},new_seq={candidate['new_seq_len']},"
-                        f"mode={candidate['forward_mode']},bs={candidate['batch_size']}]"
-                    )
-                    for candidate in owner_candidates
-                )
-                raise RuntimeError(
-                    "spec-v2 decode result-path req.seqlen shadow cannot find unique live owner candidate "
-                    f"for rid={rid}: shadow={shadow_seq_len}, candidates=[{owner_candidates_desc}]"
-                )
-
-            owner_batch = owner_candidate["batch"]
-            owner_shadow_by_rid = getattr(
-                owner_batch, "spec_decode_result_seq_lens_shadow_by_rid", None
-            )
-            if owner_shadow_by_rid is None:
-                owner_shadow_by_rid = {}
-                setattr(
-                    owner_batch,
-                    "spec_decode_result_seq_lens_shadow_by_rid",
-                    owner_shadow_by_rid,
-                )
-            owner_shadow_by_rid[rid] = shadow_seq_len
-
-            owner_spec_info = getattr(owner_batch, "spec_info", None)
-            if owner_spec_info is not None:
-                owner_spec_shadow_by_rid = getattr(
-                    owner_spec_info,
-                    "result_path_new_seq_lens_shadow_by_rid",
-                    None,
-                )
-                if owner_spec_shadow_by_rid is None:
-                    owner_spec_shadow_by_rid = {}
-                    setattr(
-                        owner_spec_info,
-                        "result_path_new_seq_lens_shadow_by_rid",
-                        owner_spec_shadow_by_rid,
-                    )
-                owner_spec_shadow_by_rid[rid] = shadow_seq_len
-
-        setattr(batch, "spec_decode_result_seq_lens_shadow_by_rid", shadow_by_rid)
-        setattr(batch, "spec_decode_result_seq_lens_shadow_missing_rids", missing_rids)
 
     def process_batch_result_idle(
         self: Scheduler,

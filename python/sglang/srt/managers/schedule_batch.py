@@ -2285,6 +2285,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if not self.is_spec_v2:
             return False
 
+        if self.forward_mode.is_decode():
+            return False
+
         if self.spec_decode_seq_lens_carrier is not None:
             return True
 
@@ -2329,7 +2332,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # FIXME(lsyin): deprecate this API after spec v1 is deprecated
         v1_spec_info_filtered: Optional[bool] = False,
     ):
-        if self.has_pending_spec_decode_state():
+        if self.has_pending_spec_decode_state() and not self.forward_mode.is_decode():
             self.maybe_wait_verify_done()
             self.materialize_spec_decode_seq_lens_carrier()
 
@@ -2416,10 +2419,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # In disagg decode + overlap, merge_batch can be called before
         # filter_batch, so running_batch.seq_lens may still be a forward_stream
         # future. Synchronize here to avoid a cross-stream data race.
-        if self.has_pending_spec_decode_state():
+        if self.has_pending_spec_decode_state() and not self.forward_mode.is_decode():
             self.maybe_wait_verify_done()
             self.materialize_spec_decode_seq_lens_carrier()
-        if other.has_pending_spec_decode_state():
+        if other.has_pending_spec_decode_state() and not other.forward_mode.is_decode():
             other.maybe_wait_verify_done()
             other.materialize_spec_decode_seq_lens_carrier()
 

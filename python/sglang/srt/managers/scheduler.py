@@ -1151,7 +1151,6 @@ class Scheduler(
             self.non_spec_overlap_worker = None
             self.spec_overlap_worker = None
             self.future_map = None
-            self.pending_spec_state_batch = None
             return
 
         if self.is_generation and self.spec_algorithm.is_none():
@@ -1162,7 +1161,6 @@ class Scheduler(
             self.non_spec_overlap_worker = TpModelWorkerOverlapClient(self.tp_worker)
             self.spec_overlap_worker = None
             self.future_map = None
-            self.pending_spec_state_batch = None
             self.batch_record_buf = [None] * 2
             self.batch_record_ct = 0
             return
@@ -1185,7 +1183,6 @@ class Scheduler(
             )
         else:
             self.spec_overlap_worker = None
-        self.pending_spec_state_batch = None
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
 
@@ -1427,9 +1424,6 @@ class Scheduler(
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
-
-            if use_spec_overlap_worker and self._spec_state_must_be_ready_for_selection():
-                self._ensure_pending_spec_state_ready(self.last_batch)
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
@@ -2748,24 +2742,6 @@ class Scheduler(
                 "spec-v2 overlap requires next_draft_input before applying future state"
             )
 
-        existing_spec_info = getattr(batch, "spec_info", None)
-        if (
-            getattr(self, "pending_spec_state_batch", None) is batch
-            and self.spec_overlap_worker is not None
-            and batch.forward_mode.is_decode()
-            and existing_spec_info is not None
-            and getattr(existing_spec_info, "future_indices", None) is not None
-        ):
-            existing_spec_info.future_indices = future_indices
-            existing_spec_info.verify_done = next_draft_input.verify_done
-            existing_spec_info.new_seq_lens = next_draft_input.new_seq_lens
-            existing_spec_info.real_new_verified_id = (
-                next_draft_input.real_new_verified_id
-            )
-            existing_spec_info.real_token_list = next_draft_input.real_token_list
-            batch.spec_decode_seq_lens_carrier = next_draft_input.new_seq_lens
-            return
-
         next_draft_input.future_indices = future_indices
         batch.spec_info = next_draft_input
         if batch.forward_mode.is_decode():
@@ -2787,25 +2763,6 @@ class Scheduler(
         batch.spec_info = next_draft_input
         batch.spec_decode_seq_lens_carrier = None
 
-    def _apply_spec_v2_overlap_state(
-        self,
-        batch: ScheduleBatch,
-        apply_state: "SpecOverlapApplyState",
-    ) -> None:
-        if not apply_state.requires_scheduler_apply:
-            existing_spec_info = getattr(batch, "spec_info", None)
-            if existing_spec_info is not None:
-                existing_spec_info.future_indices = apply_state.future_indices
-                existing_spec_info.verify_done = apply_state.next_verify_done
-            batch.spec_decode_seq_lens_carrier = apply_state.next_decode_seq_lens
-            return
-
-        self._apply_spec_v2_future_state(
-            batch,
-            apply_state.next_draft_input,
-            apply_state.future_indices,
-        )
-
     def _apply_spec_v2_future_result(
         self,
         batch: ScheduleBatch,
@@ -2817,39 +2774,6 @@ class Scheduler(
             batch_result.next_draft_input,
             future_indices,
         )
-
-    def _spec_state_must_be_ready_for_selection(self) -> bool:
-        pending_batch = getattr(self, "pending_spec_state_batch", None)
-        if (
-            self.spec_overlap_worker is None
-            or pending_batch is None
-            or pending_batch is not self.last_batch
-        ):
-            return False
-
-        # get_next_batch_to_run() may mutate last_batch/running_batch through
-        # filter/merge/update_running_batch before run_batch() is reached.
-        # Those paths also consume live spec_info/seq_lens, so pending spec
-        # state must be applied before batch selection starts.
-        return True
-
-    def _ensure_pending_spec_state_ready(
-        self,
-        batch: Optional[ScheduleBatch],
-    ) -> None:
-        pending_batch = getattr(self, "pending_spec_state_batch", None)
-        if (
-            self.spec_overlap_worker is None
-            or batch is None
-            or pending_batch is None
-            or pending_batch is not batch
-        ):
-            return
-
-        self.spec_overlap_worker.ensure_batch_state_ready(
-            batch, self._apply_spec_v2_overlap_state
-        )
-        self.pending_spec_state_batch = None
 
     def run_batch(
         self,
@@ -2902,7 +2826,6 @@ class Scheduler(
                             batch_result.next_draft_input,
                             batch_result.future_indices,
                         )
-                    self.pending_spec_state_batch = batch
                     future_indices_or_next_token_ids = batch_result.next_token_ids
                 else:
                     self.record_batch_in_overlap(model_worker_batch)
@@ -3313,7 +3236,6 @@ class Scheduler(
         if self.is_fully_idle():
             self.cur_batch = None
             self.last_batch = None
-            self.pending_spec_state_batch = None
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
@@ -3566,7 +3488,6 @@ class Scheduler(
                     self.running_batch.merge_batch(self.last_batch)
 
         self.last_batch = None
-        self.pending_spec_state_batch = None
         self.cur_batch = None
 
         if recv_req.mode == "retract" and not self.running_batch.is_empty():

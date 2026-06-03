@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import logging
 import threading
 import traceback
 from queue import Queue
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import Optional
 
 import torch
 
@@ -14,23 +13,10 @@ from sglang.srt.managers.overlap_utils import (
     FutureMap,
     build_decode_placeholder_canonical_draft_input,
 )
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
+from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 
-if TYPE_CHECKING:
-    from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleNextStepPayload
-
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class SpecOverlapApplyState:
-    future_indices: FutureIndices
-    next_draft_input: Optional[EagleDraftInput] = None
-    next_step_payload: Optional[EagleNextStepPayload] = None
-    next_decode_seq_lens: Optional[torch.Tensor] = None
-    next_verify_done: Optional[object] = None
-    requires_scheduler_apply: bool = True
 
 
 class SpecModelWorkerOverlapClient:
@@ -48,7 +34,6 @@ class SpecModelWorkerOverlapClient:
         self.keep_batch_reference_num = 2 * num_decode_steps
 
         self.input_queue: Queue = Queue()
-        self.apply_queue: Queue = Queue()
         self.output_queue: Queue = Queue()
         self.forward_stream = torch.get_device_module(self.device).Stream()
         self.forward_thread = threading.Thread(
@@ -80,7 +65,6 @@ class SpecModelWorkerOverlapClient:
                 f"SpecModelWorkerOverlapClient failed: {exc}\n{tb}"
             )
             logger.error("%s", self.thread_exception)
-            self.apply_queue.put(self.thread_exception)
             self.output_queue.put(self.thread_exception)
 
     @torch.no_grad()
@@ -124,36 +108,6 @@ class SpecModelWorkerOverlapClient:
                 self.future_map.replace_canonical_payload_with_future_placeholders(
                     future_indices, batch_result.next_draft_input
                 )
-
-            is_decode_placeholder_path = (
-                model_worker_batch.forward_mode.is_decode()
-                and not model_worker_batch.is_extend_in_batch
-            )
-
-            # Expose the minimal state needed by scheduler before the full
-            # D2H result becomes available.
-            if batch_result.next_draft_input is None and not is_decode_placeholder_path:
-                raise RuntimeError(
-                    "Spec overlap worker requires next_draft_input before apply-ready."
-                )
-            self.apply_queue.put(
-                SpecOverlapApplyState(
-                    future_indices=future_indices,
-                    next_draft_input=(
-                        None
-                        if is_decode_placeholder_path
-                        else batch_result.next_draft_input
-                    ),
-                    next_step_payload=batch_result.next_step_payload,
-                    next_decode_seq_lens=getattr(
-                        batch_result.next_draft_input, "new_seq_lens", None
-                    ),
-                    next_verify_done=getattr(
-                        batch_result.next_draft_input, "verify_done", None
-                    ),
-                    requires_scheduler_apply=not is_decode_placeholder_path,
-                )
-            )
 
             batch_result.copy_done = torch.get_device_module(self.device).Event()
             batch_result.copy_to_cpu_for_spec_overlap(
@@ -217,21 +171,6 @@ class SpecModelWorkerOverlapClient:
             future_indices=future_indices,
             next_draft_input=placeholder_next_draft_input,
         )
-
-    def ensure_batch_state_ready(
-        self,
-        batch: ScheduleBatch,
-        apply_future_result: Callable[
-            [ScheduleBatch, SpecOverlapApplyState], None
-        ],
-    ) -> None:
-        self._raise_if_thread_failed()
-
-        apply_state = self.apply_queue.get()
-        if isinstance(apply_state, RuntimeError):
-            raise apply_state
-
-        apply_future_result(batch, apply_state)
 
     def resolve_last_batch_result(
         self,

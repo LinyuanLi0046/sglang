@@ -2084,7 +2084,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.is_spec_v2:
             # TODO(spec-v2): all spec v2 should go through this path
             draft_input: EagleDraftInput = self.spec_info
-            self.maybe_wait_verify_done()
+            if self.has_pending_spec_decode_state():
+                self.maybe_wait_verify_done()
             if not self.materialize_spec_decode_seq_lens_carrier():
                 if (
                     draft_input is not None
@@ -2213,6 +2214,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self._set_decode_seq_lens_tensors(self.spec_decode_seq_lens_carrier)
         return True
 
+    def has_pending_spec_decode_state(self) -> bool:
+        if not self.is_spec_v2:
+            return False
+
+        if self.spec_decode_seq_lens_carrier is not None:
+            return True
+
+        draft_input: EagleDraftInput = self.spec_info
+        return bool(
+            draft_input is not None and getattr(draft_input, "verify_done", None) is not None
+        )
+
     def sync_decode_seq_lens_from_reqs(self):
         if len(self.reqs) == 0:
             self._set_decode_seq_lens_tensors(
@@ -2249,10 +2262,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # FIXME(lsyin): deprecate this API after spec v1 is deprecated
         v1_spec_info_filtered: Optional[bool] = False,
     ):
-        # FIXME(lsyin): used here to get the correct seq_lens
-        # The batch has been launched but we need it verified to get correct next batch info
-        self.maybe_wait_verify_done()
-        self.materialize_spec_decode_seq_lens_carrier()
+        if self.has_pending_spec_decode_state():
+            self.maybe_wait_verify_done()
+            self.materialize_spec_decode_seq_lens_carrier()
 
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
@@ -2337,10 +2349,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # In disagg decode + overlap, merge_batch can be called before
         # filter_batch, so running_batch.seq_lens may still be a forward_stream
         # future. Synchronize here to avoid a cross-stream data race.
-        self.maybe_wait_verify_done()
-        other.maybe_wait_verify_done()
-        self.materialize_spec_decode_seq_lens_carrier()
-        other.materialize_spec_decode_seq_lens_carrier()
+        if self.has_pending_spec_decode_state():
+            self.maybe_wait_verify_done()
+            self.materialize_spec_decode_seq_lens_carrier()
+        if other.has_pending_spec_decode_state():
+            other.maybe_wait_verify_done()
+            other.materialize_spec_decode_seq_lens_carrier()
 
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it

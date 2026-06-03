@@ -344,11 +344,24 @@ class EagleDraftWorker(BaseDraftWorker):
         )
         if canonical_verify_input is not None:
             return canonical_verify_input
+        is_decode_steady_state = (
+            model_worker_batch.forward_mode.is_decode()
+            and not getattr(model_worker_batch, "is_extend_in_batch", False)
+        )
         if not model_worker_batch.forward_mode.is_idle():
             self._log_r4_fallback(
                 model_worker_batch,
                 fallback_reason or "canonical_verify_input_unavailable",
                 fallback_details,
+            )
+        if (
+            is_decode_steady_state
+            and getattr(draft_input, "future_indices", None) is not None
+        ):
+            raise RuntimeError(
+                "decode steady-state canonical future payload is unavailable; "
+                "legacy future replay is no longer a valid primary fallback"
+                f" (reason={fallback_reason}, details={fallback_details})"
             )
 
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(

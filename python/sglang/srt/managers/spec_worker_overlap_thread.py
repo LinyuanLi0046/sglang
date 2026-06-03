@@ -125,16 +125,20 @@ class SpecModelWorkerOverlapClient:
 
             batch_result.future_indices = future_indices
             batch_result.launch_done = model_worker_batch.launch_done
-            self.future_map.store_to_map(future_indices, batch_result)
+            is_decode_placeholder_path = (
+                model_worker_batch.forward_mode.is_decode()
+                and not model_worker_batch.is_extend_in_batch
+            )
+            self.future_map.store_to_map(
+                future_indices,
+                batch_result,
+                canonical_only_decode=is_decode_placeholder_path,
+            )
             if should_placeholder_replace and batch_result.next_draft_input is not None:
                 self.future_map.replace_canonical_payload_with_future_placeholders(
                     future_indices, batch_result.next_draft_input
                 )
 
-            is_decode_placeholder_path = (
-                model_worker_batch.forward_mode.is_decode()
-                and not model_worker_batch.is_extend_in_batch
-            )
             if not is_decode_placeholder_path:
                 if batch_result.next_draft_input is None:
                     raise RuntimeError(

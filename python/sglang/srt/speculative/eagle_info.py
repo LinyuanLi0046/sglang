@@ -620,6 +620,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 @dataclass
 class EagleNextStepPayload:
     future_indices: Optional[FutureIndices] = None
+    # Worker-owned next-step live length relay for decode steady-state. This is
+    # transient truth for the next overlap step, not committed req truth.
+    next_step_seq_lens: Optional[torch.Tensor] = None
     last_verified_ids: Optional[torch.Tensor] = None
     token_list: Optional[torch.Tensor] = None
     real_new_verified_id: Optional[torch.Tensor] = None
@@ -638,6 +641,7 @@ class EagleNextStepPayload:
 
         return cls(
             future_indices=draft_input.future_indices,
+            next_step_seq_lens=draft_input.next_step_seq_lens,
             last_verified_ids=draft_input.last_verified_ids,
             token_list=draft_input.token_list,
             real_new_verified_id=draft_input.real_new_verified_id,
@@ -647,6 +651,8 @@ class EagleNextStepPayload:
     def filter_batch(self, new_indices: torch.Tensor) -> None:
         if self.future_indices is not None:
             self.future_indices.indices = self.future_indices.indices[new_indices]
+        if self.next_step_seq_lens is not None:
+            self.next_step_seq_lens = self.next_step_seq_lens[new_indices]
         if self.last_verified_ids is not None:
             self.last_verified_ids = self.last_verified_ids[new_indices]
         if self.token_list is not None:
@@ -662,6 +668,13 @@ class EagleNextStepPayload:
                 indices=torch.cat(
                     [self.future_indices.indices, other.future_indices.indices]
                 )
+            )
+        if (
+            self.next_step_seq_lens is not None
+            and other.next_step_seq_lens is not None
+        ):
+            self.next_step_seq_lens = torch.cat(
+                [self.next_step_seq_lens, other.next_step_seq_lens], dim=0
             )
         if self.last_verified_ids is not None and other.last_verified_ids is not None:
             self.last_verified_ids = torch.cat(
@@ -721,6 +734,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # Canonical next-step payload aligned with special_sglang. These fields are the
     # long-term consumer-facing contract for the next verify step, covering both
     # decode-only continuation and prefill -> decode first-step continuation.
+    # `next_step_seq_lens` is the canonical companion relay for the worker-owned
+    # live decode lengths used by scheduler-side batch transforms.
     last_verified_ids: Optional[torch.Tensor] = None
     token_list: Optional[torch.Tensor] = None
     # Legacy worker-produced observation fields kept only for verification/diffing.

@@ -292,6 +292,23 @@ class EagleDraftInputV2Mixin:
                     f"expected {speculative_num_steps}, got {real_token_list.shape[1]}"
                 )
 
+    def _legacy_future_replay_ready(
+        self: EagleDraftInput,
+        batch: ModelWorkerBatch,
+    ) -> bool:
+        if batch.forward_mode.is_decode() and not getattr(
+            batch, "is_extend_in_batch", False
+        ):
+            return False
+        return (
+            self.future_indices is not None
+            and self.future_topk_p_buf is not None
+            and self.future_topk_index_buf is not None
+            and self.future_verified_id_buf is not None
+            and self.future_new_seq_lens_buf is not None
+            and self.future_hidden_states_buf is not None
+        )
+
     def _evict_swa_batch_like(self, batch: Any) -> None:
         tree_cache = getattr(batch, "tree_cache", None)
         reqs = getattr(batch, "reqs", None)
@@ -497,14 +514,7 @@ class EagleDraftInputV2Mixin:
             # now serves as the primary path for both decode-only and
             # prefill-first-step. The legacy FutureMap replay path below is kept
             # only for batches where legacy relay buffers still exist.
-            future_ready = (
-                self.future_indices is not None
-                and self.future_topk_p_buf is not None
-                and self.future_topk_index_buf is not None
-                and self.future_verified_id_buf is not None
-                and self.future_new_seq_lens_buf is not None
-                and self.future_hidden_states_buf is not None
-            )
+            future_ready = self._legacy_future_replay_ready(batch)
 
             if future_ready:
                 self._validate_real_decode_payload(bs, num_steps)

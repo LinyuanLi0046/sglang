@@ -137,11 +137,6 @@ class FutureMap:
         topk_index0 = draft_input.topk_index[0]
         verified_id0 = draft_input.verified_id[0]
         new_seq_lens0 = draft_input.new_seq_lens[0]
-        next_step_seq_lens0 = (
-            draft_input.next_step_seq_lens[0]
-            if draft_input.next_step_seq_lens is not None
-            else new_seq_lens0
-        )
 
         self.topk_p_buf = torch.empty(
             (self.future_buffer_len, *topk_p0.shape),
@@ -163,11 +158,6 @@ class FutureMap:
             dtype=new_seq_lens0.dtype,
             device=self.device,
         )
-        self.next_step_seq_lens_buf = torch.empty(
-            (self.future_buffer_len, *next_step_seq_lens0.shape),
-            dtype=next_step_seq_lens0.dtype,
-            device=self.device,
-        )
 
         if spec_need_hidden_states():
             hidden_states0 = draft_input.hidden_states[0]
@@ -177,7 +167,23 @@ class FutureMap:
                 device=self.device,
             )
 
+        self._lazy_init_next_step_seq_lens_buf(draft_input)
         self._lazy_init_canonical_buf(draft_input)
+
+    def _lazy_init_next_step_seq_lens_buf(
+        self, draft_input: "EagleDraftInput | EagleNextStepPayload"
+    ):
+        next_step_seq_lens0 = getattr(draft_input, "next_step_seq_lens", None)
+        if next_step_seq_lens0 is None:
+            next_step_seq_lens0 = getattr(draft_input, "new_seq_lens", None)
+        if next_step_seq_lens0 is None:
+            return
+        next_step_seq_lens0 = next_step_seq_lens0[0]
+        self.next_step_seq_lens_buf = torch.empty(
+            (self.future_buffer_len, *next_step_seq_lens0.shape),
+            dtype=next_step_seq_lens0.dtype,
+            device=self.device,
+        )
 
     def _lazy_init_canonical_buf(self, draft_input: EagleDraftInput):
         if draft_input.last_verified_ids is None or draft_input.token_list is None:
@@ -225,6 +231,22 @@ class FutureMap:
             # caching allocator (torch GC) could reclaim the memory before
             # the GPU finishes reading it.
             indices.record_stream(torch.get_device_module(self.device).current_stream())
+            is_decode_placeholder_path = (
+                model_worker_batch.forward_mode.is_decode()
+                and not model_worker_batch.is_extend_in_batch
+            )
+            if is_decode_placeholder_path:
+                draft_input.future_topk_p_buf = None
+                draft_input.future_topk_index_buf = None
+                draft_input.future_verified_id_buf = None
+                draft_input.future_new_seq_lens_buf = None
+                draft_input.future_next_step_seq_lens_buf = self.next_step_seq_lens_buf
+                if spec_need_hidden_states():
+                    draft_input.future_hidden_states_buf = None
+                draft_input.future_last_verified_ids_buf = self.last_verified_ids_buf
+                draft_input.future_token_list_buf = self.token_list_buf
+                draft_input.future_canonical_ready_buf = self.canonical_ready_buf
+                return
             if self.buf_initialized:
                 draft_input.future_topk_p_buf = self.topk_p_buf
                 draft_input.future_topk_index_buf = self.topk_index_buf
@@ -253,19 +275,27 @@ class FutureMap:
             return start <= stop
 
     def store_to_map(
-        self, future_indices: FutureIndices, batch_result: GenerationBatchResult
+        self,
+        future_indices: FutureIndices,
+        batch_result: GenerationBatchResult,
+        canonical_only_decode: bool = False,
     ):
         if self.spec_algo.is_none():
             intv = future_indices.interval
             self.token_ids_buf[intv] = batch_result.next_token_ids
         else:
             payload_source = batch_result.next_step_payload or batch_result.next_draft_input
-            self.store_to_map_for_new_batch(future_indices, payload_source)
+            self.store_to_map_for_new_batch(
+                future_indices,
+                payload_source,
+                canonical_only_decode=canonical_only_decode,
+            )
 
     def store_to_map_for_new_batch(
         self,
         future_indices: FutureIndices,
         payload_source: "EagleDraftInput | EagleNextStepPayload",
+        canonical_only_decode: bool = False,
     ):
         intv = future_indices.interval
         if self.is_empty_slice(intv):
@@ -279,11 +309,27 @@ class FutureMap:
         )
         if self.canonical_ready_buf is not None:
             self.canonical_ready_buf[intv] = False
+        next_step_seq_lens = getattr(payload_source, "next_step_seq_lens", None)
+        if next_step_seq_lens is None:
+            next_step_seq_lens = getattr(payload_source, "new_seq_lens", None)
+        if canonical_only_decode:
+            if not has_canonical_payload:
+                raise RuntimeError(
+                    "decode steady-state canonical-only store requires last_verified_ids/token_list"
+                )
+            if next_step_seq_lens is None:
+                raise RuntimeError(
+                    "decode steady-state canonical-only store requires next_step_seq_lens relay"
+                )
         if has_canonical_payload:
             if self.last_verified_ids_buf is None or self.token_list_buf is None:
                 self._lazy_init_canonical_buf(payload_source)
             self.last_verified_ids_buf[intv] = payload_source.last_verified_ids
             self.token_list_buf[intv] = payload_source.token_list
+            if next_step_seq_lens is not None:
+                if self.next_step_seq_lens_buf is None:
+                    self._lazy_init_next_step_seq_lens_buf(payload_source)
+                self.next_step_seq_lens_buf[intv] = next_step_seq_lens
             self.canonical_ready_buf[intv] = True
             return
 

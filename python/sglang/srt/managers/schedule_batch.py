@@ -2207,16 +2207,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def materialize_spec_decode_seq_lens_carrier(self) -> bool:
-        draft_input: EagleDraftInput = self.spec_info
-        next_step_seq_lens = (
-            getattr(draft_input, "next_step_seq_lens", None)
-            if draft_input is not None
-            else None
-        )
-        if next_step_seq_lens is not None:
-            self._set_decode_seq_lens_tensors(next_step_seq_lens)
-            return True
-
         if self.spec_decode_seq_lens_carrier is None:
             return False
 
@@ -2227,13 +2217,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if not self.is_spec_v2:
             return False
 
-        draft_input: EagleDraftInput = self.spec_info
-        if draft_input is not None and getattr(draft_input, "next_step_seq_lens", None) is not None:
-            return True
-
         if self.spec_decode_seq_lens_carrier is not None:
             return True
 
+        draft_input: EagleDraftInput = self.spec_info
         return bool(
             draft_input is not None and getattr(draft_input, "verify_done", None) is not None
         )

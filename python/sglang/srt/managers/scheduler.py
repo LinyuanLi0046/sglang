@@ -2759,9 +2759,7 @@ class Scheduler(
         next_draft_input.future_indices = future_indices
         batch.spec_info = next_draft_input
         if batch.forward_mode.is_decode():
-            batch.spec_decode_seq_lens_carrier = (
-                next_draft_input.next_step_seq_lens or next_draft_input.new_seq_lens
-            )
+            batch.spec_decode_seq_lens_carrier = next_draft_input.new_seq_lens
         else:
             # Extend/prefill fallback still keeps the legacy relay contract for now.
             batch.seq_lens = next_draft_input.new_seq_lens
@@ -2789,8 +2787,6 @@ class Scheduler(
             if existing_spec_info is not None:
                 existing_spec_info.future_indices = apply_state.future_indices
                 existing_spec_info.verify_done = apply_state.next_verify_done
-                if apply_state.next_decode_seq_lens is not None:
-                    existing_spec_info.next_step_seq_lens = apply_state.next_decode_seq_lens
             batch.spec_decode_seq_lens_carrier = apply_state.next_decode_seq_lens
             return
 

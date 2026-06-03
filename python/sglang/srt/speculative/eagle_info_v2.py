@@ -87,6 +87,53 @@ class EagleDraftInputV2Mixin:
             and getattr(self, "token_list", None) is not None
         )
 
+    def _has_canonical_future_payload(self: EagleDraftInput) -> bool:
+        return (
+            getattr(self, "future_indices", None) is not None
+            and getattr(self, "future_last_verified_ids_buf", None) is not None
+            and getattr(self, "future_token_list_buf", None) is not None
+        )
+
+    def _resolve_canonical_future_payload(
+        self: EagleDraftInput,
+        batch_size: int,
+        num_verify_tokens: int,
+    ) -> bool:
+        if not self._has_canonical_future_payload():
+            return False
+
+        indices = self.future_indices.indices
+        if indices.shape[0] != batch_size:
+            raise ValueError(
+                "future_indices batch size mismatch for canonical future payload: "
+                f"expected {batch_size}, got {indices.shape[0]}"
+            )
+
+        ready_buf = getattr(self, "future_canonical_ready_buf", None)
+        if ready_buf is not None and not bool(torch.all(ready_buf[indices]).item()):
+            return False
+
+        expected_width = num_verify_tokens - 1
+        resolved_last_verified_ids = self.future_last_verified_ids_buf[indices]
+        resolved_token_list = self.future_token_list_buf[indices]
+        if resolved_token_list.ndim != 2:
+            raise ValueError(
+                "resolved future token_list must be 2D for canonical decode payload, "
+                f"got ndim={resolved_token_list.ndim}"
+            )
+        if resolved_token_list.shape[1] < expected_width:
+            raise ValueError(
+                "resolved future token_list step width mismatch: "
+                f"expected at least {expected_width}, got {resolved_token_list.shape[1]}"
+            )
+
+        self.last_verified_ids = resolved_last_verified_ids
+        self.token_list = resolved_token_list[:, :expected_width]
+        self.future_last_verified_ids_buf = None
+        self.future_token_list_buf = None
+        self.future_canonical_ready_buf = None
+        return True
+
     def _validate_canonical_decode_payload(
         self: EagleDraftInput,
         batch_size: int,
@@ -129,11 +176,14 @@ class EagleDraftInputV2Mixin:
         spec_steps: int,
         num_verify_tokens: int,
     ):
-        if (
-            batch.forward_mode.is_idle()
-            or topk != 1
-            or not self._has_canonical_decode_payload()
-        ):
+        if batch.forward_mode.is_idle() or topk != 1:
+            return None
+
+        if not self._has_canonical_decode_payload():
+            self._resolve_canonical_future_payload(
+                len(batch.seq_lens), num_verify_tokens
+            )
+        if not self._has_canonical_decode_payload():
             return None
 
         self._validate_canonical_decode_payload(len(batch.seq_lens), num_verify_tokens)
@@ -291,8 +341,8 @@ class EagleDraftInputV2Mixin:
         bs = len(batch.seq_lens)
         positions_prepared = False
         if not batch.forward_mode.is_idle():
-            # Stage B only lets worker-owned real_* payload participate in validation.
-            # The actual v2 replay path below still consumes the legacy FutureMap buffers.
+            # Canonical future payload is resolved before entering this method.
+            # The legacy FutureMap replay path below now serves as the fallback path.
             future_ready = (
                 self.future_indices is not None
                 and self.future_topk_p_buf is not None

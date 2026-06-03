@@ -667,6 +667,9 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     future_hidden_states_buf: Optional[torch.Tensor] = None
     future_verified_id_buf: Optional[torch.Tensor] = None
     future_new_seq_lens_buf: Optional[torch.Tensor] = None
+    future_last_verified_ids_buf: Optional[torch.Tensor] = None
+    future_token_list_buf: Optional[torch.Tensor] = None
+    future_canonical_ready_buf: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)

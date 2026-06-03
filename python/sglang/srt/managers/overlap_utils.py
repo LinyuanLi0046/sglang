@@ -79,6 +79,9 @@ class FutureMap:
             # For speculative decoding, we lazily initialize the buffers
             # This is to make the shape derivation easier.
             self.buf_initialized = False
+            self.last_verified_ids_buf = None
+            self.token_list_buf = None
+            self.canonical_ready_buf = None
 
     def _lazy_init_buf(self, draft_input: EagleDraftInput):
         self.buf_initialized = True
@@ -118,6 +121,28 @@ class FutureMap:
                 device=self.device,
             )
 
+        self._lazy_init_canonical_buf(draft_input)
+
+    def _lazy_init_canonical_buf(self, draft_input: EagleDraftInput):
+        if draft_input.last_verified_ids is None or draft_input.token_list is None:
+            return
+
+        last_verified_ids0 = draft_input.last_verified_ids[0]
+        token_list0 = draft_input.token_list[0]
+        self.last_verified_ids_buf = torch.empty(
+            (self.future_buffer_len, *last_verified_ids0.shape),
+            dtype=draft_input.last_verified_ids.dtype,
+            device=self.device,
+        )
+        self.token_list_buf = torch.empty(
+            (self.future_buffer_len, *token_list0.shape),
+            dtype=draft_input.token_list.dtype,
+            device=self.device,
+        )
+        self.canonical_ready_buf = torch.zeros(
+            (self.future_buffer_len,), dtype=torch.bool, device=self.device
+        )
+
     def alloc_future_indices(self, bs: int) -> FutureIndices:
         """Update the circular buffer pointer and allocate future indices."""
         cur_future_ct = self.future_ct
@@ -150,6 +175,9 @@ class FutureMap:
             draft_input.future_new_seq_lens_buf = self.new_seq_lens_buf
             if spec_need_hidden_states():
                 draft_input.future_hidden_states_buf = self.hidden_states_buf
+            draft_input.future_last_verified_ids_buf = self.last_verified_ids_buf
+            draft_input.future_token_list_buf = self.token_list_buf
+            draft_input.future_canonical_ready_buf = self.canonical_ready_buf
 
     def is_empty_slice(self, s: slice) -> bool:
         start, stop, step = s.indices(self.future_buffer_len)
@@ -185,3 +213,12 @@ class FutureMap:
         self.new_seq_lens_buf[intv] = draft_input.new_seq_lens
         if spec_need_hidden_states():
             self.hidden_states_buf[intv] = draft_input.hidden_states
+
+        if self.canonical_ready_buf is not None:
+            self.canonical_ready_buf[intv] = False
+        if draft_input.last_verified_ids is not None and draft_input.token_list is not None:
+            if self.last_verified_ids_buf is None or self.token_list_buf is None:
+                self._lazy_init_canonical_buf(draft_input)
+            self.last_verified_ids_buf[intv] = draft_input.last_verified_ids
+            self.token_list_buf[intv] = draft_input.token_list
+            self.canonical_ready_buf[intv] = True

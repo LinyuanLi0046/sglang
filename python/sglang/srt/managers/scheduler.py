@@ -2859,6 +2859,18 @@ class Scheduler(
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
 
+        if (
+            self.enable_overlap
+            and self.spec_overlap_worker is not None
+            and batch.is_spec_v2
+            and batch.forward_mode.is_decode()
+        ):
+            # Keep true-length owner on the worker-owned relay, but perform
+            # the real decode over-allocation and req-state updates on the
+            # scheduler thread right before submit so release/idle accounting
+            # stays in the same ownership domain.
+            batch.prepare_spec_v2_decode_allocation()
+
         # Run forward
         if self.is_generation:
             if self.spec_algorithm.is_none() or self.enable_overlap:

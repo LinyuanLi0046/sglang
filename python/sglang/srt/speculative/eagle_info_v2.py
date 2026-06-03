@@ -401,15 +401,11 @@ class EagleDraftInputV2Mixin:
         if self.verify_done is not None:
             self.verify_done.synchronize()
 
-    def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
+    def prepare_decode_live_view(self: EagleDraftInput, batch: Any) -> None:
         if hasattr(batch, "maybe_evict_swa"):
             batch.maybe_evict_swa()
         else:
             self._evict_swa_batch_like(batch)
-
-        from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
-
-        bs = batch.batch_size() if hasattr(batch, "batch_size") else len(batch.reqs)
 
         self._wait_verify_done_for_batch(batch)
         if not self._materialize_decode_seq_lens_for_batch(batch):
@@ -419,6 +415,15 @@ class EagleDraftInputV2Mixin:
                 and getattr(self, "next_step_seq_lens", None) is None
             ):
                 self._sync_decode_seq_lens_from_reqs_for_batch(batch)
+
+        # FIXME(lsyin): make this sync optional
+        batch.seq_lens_cpu = batch.seq_lens.cpu()
+        batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
+
+    def prepare_decode_allocation(self: EagleDraftInput, batch: Any) -> None:
+        from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+
+        bs = batch.batch_size() if hasattr(batch, "batch_size") else len(batch.reqs)
 
         page_size = batch.token_to_kv_pool_allocator.page_size
         cur_kv_lens_cpu = []
@@ -461,9 +466,9 @@ class EagleDraftInputV2Mixin:
                 num_needed_tokens,
             )
 
-        # FIXME(lsyin): make this sync optional
-        batch.seq_lens_cpu = batch.seq_lens.cpu()
-        batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
+    def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
+        self.prepare_decode_live_view(batch)
+        self.prepare_decode_allocation(batch)
 
     def prepare_for_v2_draft(
         self: EagleDraftInput,

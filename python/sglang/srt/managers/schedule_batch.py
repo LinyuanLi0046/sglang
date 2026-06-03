@@ -2086,6 +2086,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_for_decode_shell(self):
         self._prepare_decode_shell_common()
 
+    def prepare_spec_v2_decode_allocation(self):
+        if not self.is_spec_v2:
+            return
+        draft_input: EagleDraftInput = self.spec_info
+        if draft_input is None:
+            return
+        draft_input.prepare_decode_live_view(self)
+        draft_input.prepare_decode_allocation(self)
+
     def prepare_for_decode(self):
         bs = self._prepare_decode_shell_common()
 

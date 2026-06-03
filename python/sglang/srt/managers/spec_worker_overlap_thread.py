@@ -113,7 +113,7 @@ class SpecModelWorkerOverlapClient:
                 and model_worker_batch.spec_algorithm.supports_spec_v2()
                 and model_worker_batch.spec_info is not None
             ):
-                model_worker_batch.spec_info.prepare_for_decode(model_worker_batch)
+                model_worker_batch.spec_info.prepare_decode_live_view(model_worker_batch)
             batch_result = self.worker.forward_batch_generation(
                 model_worker_batch,
                 launch_done=model_worker_batch.launch_done,

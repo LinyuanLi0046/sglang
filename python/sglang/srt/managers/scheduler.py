@@ -2816,9 +2816,6 @@ class Scheduler(
         ):
             return False
 
-        if pending_batch.is_spec_v2 and pending_batch.forward_mode.is_decode():
-            return False
-
         return True
 
     def _ensure_pending_spec_state_ready(
@@ -2832,10 +2829,6 @@ class Scheduler(
             or pending_batch is None
             or pending_batch is not batch
         ):
-            return
-
-        if batch.is_spec_v2 and batch.forward_mode.is_decode():
-            self.pending_spec_state_batch = None
             return
 
         self.spec_overlap_worker.ensure_batch_state_ready(
@@ -2904,8 +2897,7 @@ class Scheduler(
                             batch_result.next_draft_input,
                             batch_result.future_indices,
                         )
-                    if not batch.forward_mode.is_decode():
-                        self.pending_spec_state_batch = batch
+                    self.pending_spec_state_batch = batch
                     future_indices_or_next_token_ids = batch_result.next_token_ids
                 else:
                     self.record_batch_in_overlap(model_worker_batch)

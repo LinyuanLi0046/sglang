@@ -2783,10 +2783,7 @@ class Scheduler(
         apply_state: "SpecOverlapApplyState",
     ) -> None:
         if not apply_state.requires_scheduler_apply:
-            existing_spec_info = getattr(batch, "spec_info", None)
-            if existing_spec_info is not None:
-                existing_spec_info.future_indices = apply_state.future_indices
-                existing_spec_info.verify_done = apply_state.next_verify_done
+            self._sync_spec_v2_decode_future_ready(batch, apply_state)
             return
 
         self._apply_spec_v2_future_state(
@@ -2794,6 +2791,16 @@ class Scheduler(
             apply_state.next_draft_input,
             apply_state.future_indices,
         )
+
+    def _sync_spec_v2_decode_future_ready(
+        self,
+        batch: ScheduleBatch,
+        apply_state: "SpecOverlapApplyState",
+    ) -> None:
+        existing_spec_info = getattr(batch, "spec_info", None)
+        if existing_spec_info is not None:
+            existing_spec_info.future_indices = apply_state.future_indices
+            existing_spec_info.verify_done = apply_state.next_verify_done
 
     def _apply_spec_v2_future_result(
         self,
@@ -2829,6 +2836,13 @@ class Scheduler(
             or pending_batch is None
             or pending_batch is not batch
         ):
+            return
+
+        if batch.is_spec_v2 and batch.forward_mode.is_decode():
+            self.spec_overlap_worker.ensure_decode_future_ready(
+                batch, self._sync_spec_v2_decode_future_ready
+            )
+            self.pending_spec_state_batch = None
             return
 
         self.spec_overlap_worker.ensure_batch_state_ready(

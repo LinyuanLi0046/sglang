@@ -27,7 +27,6 @@ logger = logging.getLogger(__name__)
 class SpecOverlapApplyState:
     future_indices: FutureIndices
     next_draft_input: Optional["EagleDraftInput"] = None
-    next_decode_seq_lens: Optional[torch.Tensor] = None
     next_verify_done: Optional[object] = None
     requires_scheduler_apply: bool = True
 
@@ -150,9 +149,6 @@ class SpecModelWorkerOverlapClient:
                 self.apply_queue.put(
                     SpecOverlapApplyState(
                         future_indices=future_indices,
-                        next_decode_seq_lens=getattr(
-                            batch_result.next_draft_input, "next_step_seq_lens", None
-                        ),
                         next_verify_done=getattr(
                             batch_result.next_draft_input, "verify_done", None
                         ),
@@ -235,6 +231,24 @@ class SpecModelWorkerOverlapClient:
             raise apply_state
 
         apply_future_result(batch, apply_state)
+
+    def ensure_decode_future_ready(
+        self,
+        batch: ScheduleBatch,
+        sync_future_ready: Callable[[ScheduleBatch, SpecOverlapApplyState], None],
+    ) -> None:
+        self._raise_if_thread_failed()
+
+        apply_state = self.apply_queue.get()
+        if isinstance(apply_state, RuntimeError):
+            raise apply_state
+
+        if apply_state.requires_scheduler_apply:
+            raise RuntimeError(
+                "Decode future-ready sync received a full scheduler-apply state."
+            )
+
+        sync_future_ready(batch, apply_state)
 
     def resolve_last_batch_result(
         self,

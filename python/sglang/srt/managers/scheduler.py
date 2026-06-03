@@ -1149,6 +1149,7 @@ class Scheduler(
 
         if not self.enable_overlap:
             self.non_spec_overlap_worker = None
+            self.spec_overlap_worker = None
             self.future_map = None
             return
 
@@ -1158,6 +1159,7 @@ class Scheduler(
             )
 
             self.non_spec_overlap_worker = TpModelWorkerOverlapClient(self.tp_worker)
+            self.spec_overlap_worker = None
             self.future_map = None
             self.batch_record_buf = [None] * 2
             self.batch_record_ct = 0
@@ -1171,6 +1173,16 @@ class Scheduler(
             self.device,
             self.spec_algorithm,
         )
+        if self.is_generation and self.spec_algorithm.supports_spec_v2():
+            from sglang.srt.managers.spec_worker_overlap_thread import (
+                SpecModelWorkerOverlapClient,
+            )
+
+            self.spec_overlap_worker = SpecModelWorkerOverlapClient(
+                self.draft_worker, self.future_map
+            )
+        else:
+            self.spec_overlap_worker = None
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
 
@@ -1386,6 +1398,9 @@ class Scheduler(
         use_non_spec_overlap_worker = (
             self.is_generation and self.non_spec_overlap_worker is not None
         )
+        use_spec_overlap_worker = (
+            self.is_generation and getattr(self, "spec_overlap_worker", None) is not None
+        )
 
         def make_dummy_first_batch() -> ScheduleBatch:
             return ScheduleBatch(
@@ -1409,6 +1424,11 @@ class Scheduler(
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
+
+            if use_spec_overlap_worker and self.last_batch is not None:
+                self.spec_overlap_worker.ensure_batch_state_ready(
+                    self.last_batch, self._apply_spec_v2_future_result
+                )
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
@@ -2768,6 +2788,11 @@ class Scheduler(
                 model_worker_batch = worker_batch_or_batch
                 if self.non_spec_overlap_worker is not None and batch.spec_algorithm.is_none():
                     batch_result = self.non_spec_overlap_worker.forward_batch_generation(
+                        model_worker_batch
+                    )
+                    future_indices_or_next_token_ids = batch_result.next_token_ids
+                elif self.spec_overlap_worker is not None and batch.is_spec_v2:
+                    batch_result = self.spec_overlap_worker.forward_batch_generation(
                         model_worker_batch
                     )
                     future_indices_or_next_token_ids = batch_result.next_token_ids

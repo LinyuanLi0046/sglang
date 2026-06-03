@@ -150,6 +150,14 @@ class SchedulerOutputProcessorMixin:
             and batch.spec_algorithm.is_none()
         )
 
+    def _use_spec_overlap_worker(self: Scheduler, batch: ScheduleBatch) -> bool:
+        return (
+            self.is_generation
+            and self.enable_overlap
+            and getattr(self, "spec_overlap_worker", None) is not None
+            and batch.is_spec_v2
+        )
+
     def process_batch_result_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -162,6 +170,8 @@ class SchedulerOutputProcessorMixin:
             result = self.non_spec_overlap_worker.resolve_last_batch_result(
                 result, launch_done
             )
+        elif self._use_spec_overlap_worker(batch):
+            result = self.spec_overlap_worker.resolve_last_batch_result(result)
 
         if self.is_generation:
             if result.copy_done is not None:
@@ -418,6 +428,8 @@ class SchedulerOutputProcessorMixin:
             result = self.non_spec_overlap_worker.resolve_last_batch_result(
                 result, launch_done
             )
+        elif self._use_spec_overlap_worker(batch):
+            result = self.spec_overlap_worker.resolve_last_batch_result(result)
 
         if result.copy_done is not None:
             result.copy_done.synchronize()

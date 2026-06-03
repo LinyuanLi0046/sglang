@@ -776,6 +776,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
             capture_hidden_mode=capture_hidden_mode,
             new_seq_lens=torch.empty((0,), device=device, dtype=torch.int32),
+            next_step_seq_lens=torch.empty((0,), device=device, dtype=torch.int32),
             accept_length=torch.empty((0,), device=device, dtype=torch.int32),
             accept_length_cpu=[],
         )
@@ -847,6 +848,10 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if self.future_indices is not None:
             self.future_indices.indices = self.future_indices.indices[new_indices]
+            if self.new_seq_lens is not None:
+                self.new_seq_lens = self.new_seq_lens[new_indices]
+            if self.next_step_seq_lens is not None:
+                self.next_step_seq_lens = self.next_step_seq_lens[new_indices]
             if self.last_verified_ids is not None:
                 self.last_verified_ids = self.last_verified_ids[new_indices]
             if self.token_list is not None:
@@ -872,6 +877,10 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.topk_index = self.topk_index[: len(new_indices)]
             self.hidden_states = self.hidden_states[: len(new_indices)]
             self.verified_id = self.verified_id[: len(new_indices)]
+            if self.new_seq_lens is not None:
+                self.new_seq_lens = self.new_seq_lens[: len(new_indices)]
+            if self.next_step_seq_lens is not None:
+                self.next_step_seq_lens = self.next_step_seq_lens[: len(new_indices)]
             if self.last_verified_ids is not None:
                 self.last_verified_ids = self.last_verified_ids[: len(new_indices)]
             if self.token_list is not None:
@@ -886,6 +895,10 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.topk_index = self.topk_index[new_indices]
             self.hidden_states = self.hidden_states[new_indices]
             self.verified_id = self.verified_id[new_indices]
+            if self.new_seq_lens is not None:
+                self.new_seq_lens = self.new_seq_lens[new_indices]
+            if self.next_step_seq_lens is not None:
+                self.next_step_seq_lens = self.next_step_seq_lens[new_indices]
             if self.last_verified_ids is not None:
                 self.last_verified_ids = self.last_verified_ids[new_indices]
             if self.token_list is not None:
@@ -896,13 +909,29 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                 self.real_token_list = self.real_token_list[new_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
-        if self.future_indices is not None:
+        if self.future_indices is not None or spec_info.future_indices is not None:
             assert spec_info.future_indices is not None
+            assert self.future_indices is not None
             self.future_indices = FutureIndices(
                 indices=torch.cat(
                     [self.future_indices.indices, spec_info.future_indices.indices]
                 )
             )
+            if self.new_seq_lens is not None and spec_info.new_seq_lens is not None:
+                self.new_seq_lens = torch.cat(
+                    [self.new_seq_lens, spec_info.new_seq_lens], axis=0
+                )
+            else:
+                self.new_seq_lens = None
+            if (
+                self.next_step_seq_lens is not None
+                and spec_info.next_step_seq_lens is not None
+            ):
+                self.next_step_seq_lens = torch.cat(
+                    [self.next_step_seq_lens, spec_info.next_step_seq_lens], axis=0
+                )
+            else:
+                self.next_step_seq_lens = None
             if self.last_verified_ids is not None and spec_info.last_verified_ids is not None:
                 self.last_verified_ids = torch.cat(
                     [self.last_verified_ids, spec_info.last_verified_ids], axis=0
@@ -928,14 +957,26 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             return
 
         if self.hidden_states is None:
+            self.future_indices = spec_info.future_indices
             self.hidden_states = spec_info.hidden_states
             self.verified_id = spec_info.verified_id
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
+            self.new_seq_lens = spec_info.new_seq_lens
+            self.next_step_seq_lens = spec_info.next_step_seq_lens
             self.last_verified_ids = spec_info.last_verified_ids
             self.token_list = spec_info.token_list
             self.real_new_verified_id = spec_info.real_new_verified_id
             self.real_token_list = spec_info.real_token_list
+            self.future_topk_p_buf = spec_info.future_topk_p_buf
+            self.future_topk_index_buf = spec_info.future_topk_index_buf
+            self.future_hidden_states_buf = spec_info.future_hidden_states_buf
+            self.future_verified_id_buf = spec_info.future_verified_id_buf
+            self.future_new_seq_lens_buf = spec_info.future_new_seq_lens_buf
+            self.future_next_step_seq_lens_buf = spec_info.future_next_step_seq_lens_buf
+            self.future_last_verified_ids_buf = spec_info.future_last_verified_ids_buf
+            self.future_token_list_buf = spec_info.future_token_list_buf
+            self.future_canonical_ready_buf = spec_info.future_canonical_ready_buf
             return
         if spec_info.hidden_states is None:
             return
@@ -945,6 +986,19 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
+        if self.new_seq_lens is not None and spec_info.new_seq_lens is not None:
+            self.new_seq_lens = torch.cat([self.new_seq_lens, spec_info.new_seq_lens], axis=0)
+        else:
+            self.new_seq_lens = None
+        if (
+            self.next_step_seq_lens is not None
+            and spec_info.next_step_seq_lens is not None
+        ):
+            self.next_step_seq_lens = torch.cat(
+                [self.next_step_seq_lens, spec_info.next_step_seq_lens], axis=0
+            )
+        else:
+            self.next_step_seq_lens = None
         if self.last_verified_ids is not None and spec_info.last_verified_ids is not None:
             self.last_verified_ids = torch.cat(
                 [self.last_verified_ids, spec_info.last_verified_ids], axis=0

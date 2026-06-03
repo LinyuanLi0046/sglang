@@ -406,6 +406,69 @@ class SchedulerOutputProcessorMixin:
 
         return predict_tokens
 
+    def _sync_spec_decode_result_seq_lens_shadow(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        live_batch: Optional[ScheduleBatch],
+    ) -> None:
+        if (
+            live_batch is None
+            or not batch.is_spec_v2
+            or not batch.forward_mode.is_decode()
+            or batch.reqs is None
+        ):
+            return
+
+        live_seq_lens = getattr(live_batch, "seq_lens", None)
+        if live_seq_lens is None:
+            return
+
+        shadow_seq_lens_list = [req.seqlen for req in batch.reqs]
+        shadow_seq_lens = live_seq_lens.new_tensor(shadow_seq_lens_list)
+        setattr(live_batch, "spec_decode_result_seq_lens_shadow", shadow_seq_lens)
+
+        live_seq_lens_cpu = getattr(live_batch, "seq_lens_cpu", None)
+        if live_seq_lens_cpu is not None:
+            shadow_seq_lens_cpu = live_seq_lens_cpu.new_tensor(shadow_seq_lens_list)
+            setattr(
+                live_batch,
+                "spec_decode_result_seq_lens_shadow_cpu",
+                shadow_seq_lens_cpu,
+            )
+            setattr(
+                live_batch,
+                "spec_decode_result_seq_lens_shadow_sum",
+                int(shadow_seq_lens_cpu.sum().item()),
+            )
+        else:
+            setattr(
+                live_batch,
+                "spec_decode_result_seq_lens_shadow_sum",
+                int(sum(shadow_seq_lens_list)),
+            )
+
+        live_spec_info = getattr(live_batch, "spec_info", None)
+        expected_new_seq_lens = None
+        if live_spec_info is not None:
+            setattr(live_spec_info, "result_path_new_seq_lens_shadow", shadow_seq_lens)
+            expected_new_seq_lens = getattr(live_spec_info, "new_seq_lens", None)
+
+        if (
+            shadow_seq_lens.shape != live_seq_lens.shape
+            or not torch.equal(shadow_seq_lens, live_seq_lens)
+        ):
+            raise RuntimeError(
+                "spec-v2 decode result-path seq_lens shadow mismatch with live batch.seq_lens"
+            )
+
+        if expected_new_seq_lens is not None and (
+            shadow_seq_lens.shape != expected_new_seq_lens.shape
+            or not torch.equal(shadow_seq_lens, expected_new_seq_lens)
+        ):
+            raise RuntimeError(
+                "spec-v2 decode result-path seq_lens shadow mismatch with live spec_info.new_seq_lens"
+            )
+
     def process_batch_result_idle(
         self: Scheduler,
         batch: ScheduleBatch,

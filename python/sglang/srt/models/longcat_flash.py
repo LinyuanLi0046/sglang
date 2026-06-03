@@ -281,7 +281,11 @@ class LongcatFlashMoE(nn.Module):
         cache.append(self.router.e_score_correction_bias)
         return cache
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+    ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
@@ -291,7 +295,15 @@ class LongcatFlashMoE(nn.Module):
             hidden_states,
             router_logits,
         )
-        if self.zero_expert_type is not None:
+        use_ops_deepep = (
+            _is_npu
+            and forward_batch is not None
+            and get_moe_a2a_backend().is_deepep()
+            and get_bool_env_var("ASCEND_SGLANG_USE_OPS_DEEPEP")
+            and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+        )
+        zero_expert_result = None
+        if self.zero_expert_type is not None and not use_ops_deepep:
             if not _is_npu:
                 zero_expert_result = zero_experts_compute_triton(
                     expert_indices=topk_idx,
@@ -301,24 +313,34 @@ class LongcatFlashMoE(nn.Module):
                     hidden_states=hidden_states,
                 )
             else:
-                identity_mask_value = -1 if get_moe_a2a_backend().is_deepep() else 0
                 zero_expert_result = zero_experts_compute_identity_triton(
                     expert_indices=topk_idx,
                     expert_scales=topk_weights,
                     num_experts=self.num_experts,
                     zero_expert_type=self.zero_expert_type,
                     hidden_states=hidden_states,
-                    identity_mask_value=identity_mask_value,
+                    identity_mask_value=-1 if get_moe_a2a_backend().is_deepep() else 0,
                 )
         topk_output = StandardTopKOutput(topk_weights, topk_idx, _)
 
-        final_hidden_states = self.experts(hidden_states, topk_output)
+        if use_ops_deepep:
+            final_hidden_states = self.experts.forward_impl_ops_deepep(
+                hidden_states,
+                topk_output,
+                copy_expert_num=self.zero_expert_num,
+            )
+        else:
+            final_hidden_states = self.experts(hidden_states, topk_output)
         final_hidden_states *= self.routed_scaling_factor
 
-        if self.tp_size > 1 and get_moe_a2a_backend().is_deepep():
+        if (
+            zero_expert_result is not None
+            and self.tp_size > 1
+            and get_moe_a2a_backend().is_deepep()
+        ):
             zero_expert_result *= self.tp_size
 
-        if self.zero_expert_type is not None and hidden_states.shape[0] > 0:
+        if zero_expert_result is not None and hidden_states.shape[0] > 0:
             final_hidden_states += zero_expert_result.to(final_hidden_states.device)
 
         if self.tp_size > 1 and not get_moe_a2a_backend().is_deepep():
@@ -557,7 +579,9 @@ class LongcatFlashDecoderLayer(nn.Module):
                         self.aclgraph_moe_aic_num, self.aclgraph_moe_aiv_num
                     ):
                         MultiStreamUtils().first_attn_finished.wait()
-                        moe_hidden_states = self.mlp(hidden_states)
+                        moe_hidden_states = self.mlp(
+                            hidden_states, forward_batch=forward_batch
+                        )
 
                         #torch.npu.current_stream().wait_event(MultiStreamUtils().fia_ffn_finished_event)
 
@@ -649,7 +673,7 @@ class LongcatFlashDecoderLayer(nn.Module):
             hidden_states, moe_residual = self.moe_layer_communicator.prepare_mlp(
                 hidden_states, residual, forward_batch
             )
-            moe_hidden_states = self.mlp(hidden_states)
+            moe_hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
             moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
                 moe_hidden_states, moe_residual, forward_batch
             )

@@ -2083,12 +2083,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.is_spec_v2:
             # TODO(spec-v2): all spec v2 should go through this path
             draft_input: EagleDraftInput = self.spec_info
-            if (
-                draft_input is not None
-                and getattr(draft_input, "future_indices", None) is not None
-                and getattr(draft_input, "new_seq_lens", None) is None
-            ):
-                self.sync_decode_seq_lens_from_reqs()
+            self.maybe_sync_spec_v2_decode_seq_lens_from_reqs()
             self.maybe_wait_verify_done()
             draft_input.prepare_for_decode(self)
 
@@ -2202,6 +2197,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 .to(device=self.device, non_blocking=True)
             )
 
+    def maybe_sync_spec_v2_decode_seq_lens_from_reqs(self):
+        if (
+            self.is_spec_v2
+            and self.forward_mode.is_decode()
+            and getattr(self, "spec_info", None) is not None
+        ):
+            self.sync_decode_seq_lens_from_reqs()
+
     def maybe_wait_verify_done(self):
         if self.is_spec_v2:
             draft_input: EagleDraftInput = self.spec_info
@@ -2226,6 +2229,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # FIXME(lsyin): used here to get the correct seq_lens
         # The batch has been launched but we need it verified to get correct next batch info
         self.maybe_wait_verify_done()
+        self.maybe_sync_spec_v2_decode_seq_lens_from_reqs()
 
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
@@ -2306,6 +2310,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # filter_batch, so running_batch.seq_lens may still be a forward_stream
         # future. Synchronize here to avoid a cross-stream data race.
         self.maybe_wait_verify_done()
+        self.maybe_sync_spec_v2_decode_seq_lens_from_reqs()
+        other.maybe_sync_spec_v2_decode_seq_lens_from_reqs()
 
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it

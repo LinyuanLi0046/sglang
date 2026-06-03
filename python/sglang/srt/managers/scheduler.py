@@ -2763,14 +2763,16 @@ class Scheduler(
                 next_draft_input.real_new_verified_id
             )
             existing_spec_info.real_token_list = next_draft_input.real_token_list
-            batch.seq_lens = next_draft_input.new_seq_lens
+            batch.sync_decode_seq_lens_from_reqs()
             return
 
         next_draft_input.future_indices = future_indices
         batch.spec_info = next_draft_input
-        # The future value, usually for next batch preparation.
-        # Current implementation strictly synchronizes the seq_lens.
-        batch.seq_lens = next_draft_input.new_seq_lens
+        if batch.forward_mode.is_decode():
+            batch.sync_decode_seq_lens_from_reqs()
+        else:
+            # Extend/prefill fallback still keeps the legacy relay contract for now.
+            batch.seq_lens = next_draft_input.new_seq_lens
 
     def _apply_spec_v2_submit_placeholder_carrier(
         self,

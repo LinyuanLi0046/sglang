@@ -1416,12 +1416,10 @@ class Scheduler(
             next_batch_sampling_info=None,
         ):
             # Process the results of the last batch
-            tmp_batch, live_batch, tmp_result = self.result_queue.popleft()
+            tmp_batch, tmp_result = self.result_queue.popleft()
             if use_non_spec_overlap_worker:
                 tmp_batch.next_batch_sampling_info = next_batch_sampling_info
-            self.process_batch_result(
-                tmp_batch, tmp_result, launch_done, live_batch=live_batch
-            )
+            self.process_batch_result(tmp_batch, tmp_result, launch_done)
 
         while True:
             # Receive requests
@@ -1450,7 +1448,7 @@ class Scheduler(
                 ):
                     batch.launch_done = threading.Event()
                 batch_result = self.run_batch(batch)
-                self.result_queue.append((batch.copy(), batch, batch_result))
+                self.result_queue.append((batch.copy(), batch_result))
                 if use_non_spec_overlap_worker and (
                     self.last_batch is None or disable_overlap_for_batch
                 ):
@@ -3038,7 +3036,6 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
         launch_done: Optional[threading.Event] = None,
-        live_batch: Optional[ScheduleBatch] = None,
     ):
         if result is None and batch.next_batch_sampling_info is not None:
             self._prepare_next_batch_sampling_info(batch)
@@ -3047,7 +3044,7 @@ class Scheduler(
 
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result, launch_done)
-            self._sync_spec_decode_result_seq_lens_shadow(batch, live_batch)
+            self._sync_spec_decode_result_seq_lens_shadow(batch)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)
@@ -3537,10 +3534,8 @@ class Scheduler(
 
         if self.enable_overlap and self.last_batch:
             # Process the results of the last batch
-            tmp_batch, live_batch, tmp_result = self.result_queue.popleft()
-            self.process_batch_result(
-                tmp_batch, tmp_result, None, live_batch=live_batch
-            )
+            tmp_batch, tmp_result = self.result_queue.popleft()
+            self.process_batch_result(tmp_batch, tmp_result, None)
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
             chunked_req_to_exclude = set()

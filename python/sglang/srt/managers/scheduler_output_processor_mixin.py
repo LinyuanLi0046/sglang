@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -406,68 +406,103 @@ class SchedulerOutputProcessorMixin:
 
         return predict_tokens
 
+    def _iter_spec_decode_live_owner_batches(self: Scheduler):
+        seen = set()
+        for candidate in (self.running_batch, self.last_batch, self.cur_batch):
+            if candidate is None:
+                continue
+            candidate_id = id(candidate)
+            if candidate_id in seen:
+                continue
+            seen.add(candidate_id)
+            yield candidate
+
+    def _build_spec_decode_live_owner_index(
+        self: Scheduler,
+    ) -> Dict[str, Tuple[ScheduleBatch, int]]:
+        owner_index: Dict[str, Tuple[ScheduleBatch, int]] = {}
+        for owner_batch in self._iter_spec_decode_live_owner_batches():
+            reqs = getattr(owner_batch, "reqs", None)
+            seq_lens = getattr(owner_batch, "seq_lens", None)
+            if reqs is None or seq_lens is None or len(reqs) != seq_lens.shape[0]:
+                continue
+            for idx, req in enumerate(reqs):
+                owner_index.setdefault(req.rid, (owner_batch, idx))
+        return owner_index
+
     def _sync_spec_decode_result_seq_lens_shadow(
         self: Scheduler,
         batch: ScheduleBatch,
-        live_batch: Optional[ScheduleBatch],
     ) -> None:
-        if (
-            live_batch is None
-            or not batch.is_spec_v2
-            or not batch.forward_mode.is_decode()
-            or batch.reqs is None
-        ):
+        if not batch.is_spec_v2 or not batch.forward_mode.is_decode() or batch.reqs is None:
             return
 
-        live_seq_lens = getattr(live_batch, "seq_lens", None)
-        if live_seq_lens is None:
-            return
+        shadow_by_rid = {req.rid: req.seqlen for req in batch.reqs}
+        owner_index = self._build_spec_decode_live_owner_index()
+        missing_rids = []
 
-        shadow_seq_lens_list = [req.seqlen for req in batch.reqs]
-        shadow_seq_lens = live_seq_lens.new_tensor(shadow_seq_lens_list)
-        setattr(live_batch, "spec_decode_result_seq_lens_shadow", shadow_seq_lens)
+        for rid, shadow_seq_len in shadow_by_rid.items():
+            owner_entry = owner_index.get(rid)
+            if owner_entry is None:
+                missing_rids.append(rid)
+                continue
 
-        live_seq_lens_cpu = getattr(live_batch, "seq_lens_cpu", None)
-        if live_seq_lens_cpu is not None:
-            shadow_seq_lens_cpu = live_seq_lens_cpu.new_tensor(shadow_seq_lens_list)
-            setattr(
-                live_batch,
-                "spec_decode_result_seq_lens_shadow_cpu",
-                shadow_seq_lens_cpu,
-            )
-            setattr(
-                live_batch,
-                "spec_decode_result_seq_lens_shadow_sum",
-                int(shadow_seq_lens_cpu.sum().item()),
-            )
-        else:
-            setattr(
-                live_batch,
-                "spec_decode_result_seq_lens_shadow_sum",
-                int(sum(shadow_seq_lens_list)),
-            )
+            owner_batch, owner_idx = owner_entry
+            owner_seq_lens = getattr(owner_batch, "seq_lens", None)
+            if owner_seq_lens is None or owner_idx >= owner_seq_lens.shape[0]:
+                missing_rids.append(rid)
+                continue
 
-        live_spec_info = getattr(live_batch, "spec_info", None)
-        expected_new_seq_lens = None
-        if live_spec_info is not None:
-            setattr(live_spec_info, "result_path_new_seq_lens_shadow", shadow_seq_lens)
-            expected_new_seq_lens = getattr(live_spec_info, "new_seq_lens", None)
-
-        if (
-            shadow_seq_lens.shape != live_seq_lens.shape
-            or not torch.equal(shadow_seq_lens, live_seq_lens)
-        ):
-            raise RuntimeError(
-                "spec-v2 decode result-path seq_lens shadow mismatch with live batch.seq_lens"
+            owner_shadow_by_rid = getattr(
+                owner_batch, "spec_decode_result_seq_lens_shadow_by_rid", None
             )
+            if owner_shadow_by_rid is None:
+                owner_shadow_by_rid = {}
+                setattr(
+                    owner_batch,
+                    "spec_decode_result_seq_lens_shadow_by_rid",
+                    owner_shadow_by_rid,
+                )
+            owner_shadow_by_rid[rid] = shadow_seq_len
 
-        if expected_new_seq_lens is not None and (
-            shadow_seq_lens.shape != expected_new_seq_lens.shape
-            or not torch.equal(shadow_seq_lens, expected_new_seq_lens)
-        ):
-            raise RuntimeError(
-                "spec-v2 decode result-path seq_lens shadow mismatch with live spec_info.new_seq_lens"
+            owner_seq_len = int(owner_seq_lens[owner_idx].item())
+            if owner_seq_len != shadow_seq_len:
+                raise RuntimeError(
+                    "spec-v2 decode result-path seq_lens shadow mismatch with live owner batch.seq_lens "
+                    f"for rid={rid}: shadow={shadow_seq_len}, owner={owner_seq_len}"
+                )
+
+            owner_spec_info = getattr(owner_batch, "spec_info", None)
+            owner_new_seq_lens = (
+                getattr(owner_spec_info, "new_seq_lens", None)
+                if owner_spec_info is not None
+                else None
             )
+            if owner_spec_info is not None:
+                owner_spec_shadow_by_rid = getattr(
+                    owner_spec_info,
+                    "result_path_new_seq_lens_shadow_by_rid",
+                    None,
+                )
+                if owner_spec_shadow_by_rid is None:
+                    owner_spec_shadow_by_rid = {}
+                    setattr(
+                        owner_spec_info,
+                        "result_path_new_seq_lens_shadow_by_rid",
+                        owner_spec_shadow_by_rid,
+                    )
+                owner_spec_shadow_by_rid[rid] = shadow_seq_len
+
+            if owner_new_seq_lens is not None and owner_idx < owner_new_seq_lens.shape[0]:
+                owner_new_seq_len = int(owner_new_seq_lens[owner_idx].item())
+                if owner_new_seq_len != shadow_seq_len:
+                    raise RuntimeError(
+                        "spec-v2 decode result-path seq_lens shadow mismatch with live owner spec_info.new_seq_lens "
+                        f"for rid={rid}: shadow={shadow_seq_len}, owner={owner_new_seq_len}"
+                    )
+
+        setattr(batch, "spec_decode_result_seq_lens_shadow_by_rid", shadow_by_rid)
+        setattr(batch, "spec_decode_result_seq_lens_shadow_missing_rids", missing_rids)
 
     def process_batch_result_idle(
         self: Scheduler,

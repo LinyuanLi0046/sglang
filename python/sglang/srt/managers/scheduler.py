@@ -2763,14 +2763,16 @@ class Scheduler(
                 next_draft_input.real_new_verified_id
             )
             existing_spec_info.real_token_list = next_draft_input.real_token_list
-            batch.seq_lens = next_draft_input.new_seq_lens
+            batch.spec_decode_seq_lens_carrier = next_draft_input.new_seq_lens
             return
 
         next_draft_input.future_indices = future_indices
         batch.spec_info = next_draft_input
-        # The future value, usually for next batch preparation.
-        # Current implementation strictly synchronizes the seq_lens.
-        batch.seq_lens = next_draft_input.new_seq_lens
+        if batch.forward_mode.is_decode():
+            batch.spec_decode_seq_lens_carrier = next_draft_input.new_seq_lens
+        else:
+            # Extend/prefill fallback still keeps the legacy relay contract for now.
+            batch.seq_lens = next_draft_input.new_seq_lens
 
     def _apply_spec_v2_submit_placeholder_carrier(
         self,
@@ -2783,6 +2785,7 @@ class Scheduler(
 
         next_draft_input.future_indices = future_indices
         batch.spec_info = next_draft_input
+        batch.spec_decode_seq_lens_carrier = None
 
     def _apply_spec_v2_overlap_state(
         self,
@@ -2793,7 +2796,8 @@ class Scheduler(
             existing_spec_info = getattr(batch, "spec_info", None)
             if existing_spec_info is not None:
                 existing_spec_info.future_indices = apply_state.future_indices
-            batch.sync_decode_seq_lens_from_reqs()
+                existing_spec_info.verify_done = apply_state.next_verify_done
+            batch.spec_decode_seq_lens_carrier = apply_state.next_decode_seq_lens
             return
 
         self._apply_spec_v2_future_state(

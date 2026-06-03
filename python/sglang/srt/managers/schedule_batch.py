@@ -1416,6 +1416,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     spec_algorithm: SpeculativeAlgorithm = None
     # spec_info: Optional[SpecInput] = None
     spec_info: Optional[SpecInput] = None
+    spec_decode_seq_lens_carrier: Optional[torch.Tensor] = None
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -2083,13 +2084,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.is_spec_v2:
             # TODO(spec-v2): all spec v2 should go through this path
             draft_input: EagleDraftInput = self.spec_info
-            if (
-                draft_input is not None
-                and getattr(draft_input, "future_indices", None) is not None
-                and getattr(draft_input, "new_seq_lens", None) is None
-            ):
-                self.sync_decode_seq_lens_from_reqs()
             self.maybe_wait_verify_done()
+            if not self.materialize_spec_decode_seq_lens_carrier():
+                if (
+                    draft_input is not None
+                    and getattr(draft_input, "future_indices", None) is not None
+                    and getattr(draft_input, "new_seq_lens", None) is None
+                ):
+                    self.sync_decode_seq_lens_from_reqs()
             draft_input.prepare_for_decode(self)
 
         if not self.spec_algorithm.is_none():
@@ -2149,20 +2151,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.orig_seq_lens.add_(1)
         self.seq_lens_sum += bs
 
-    def sync_decode_seq_lens_from_reqs(self):
-        if len(self.reqs) == 0:
-            self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
-            self.seq_lens_cpu = torch.empty(0, dtype=torch.int64)
-            self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
-            self.seq_lens_sum = 0
-            return
+    def _set_decode_seq_lens_tensors(
+        self,
+        seq_lens_device: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor] = None,
+    ) -> None:
+        if seq_lens_cpu is None:
+            seq_lens_device = seq_lens_device.to(device=self.device, dtype=torch.int64)
+            seq_lens_cpu = seq_lens_device.cpu()
+        else:
+            seq_lens_cpu = seq_lens_cpu.to(dtype=torch.int64)
+            seq_lens_device = seq_lens_device.to(device=self.device, dtype=torch.int64)
 
-        seq_lens = [req.seqlen for req in self.reqs]
-        seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
-        self.seq_lens = seq_lens_cpu.to(device=self.device)
+        self.seq_lens = seq_lens_device
         self.seq_lens_cpu = seq_lens_cpu
         self.orig_seq_lens = self.seq_lens.to(dtype=torch.int32)
-        self.seq_lens_sum = int(sum(seq_lens))
+        self.seq_lens_sum = int(self.seq_lens_cpu.sum().item())
 
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.map_last_loc_to_buffer(
@@ -2202,6 +2206,28 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 .to(device=self.device, non_blocking=True)
             )
 
+    def materialize_spec_decode_seq_lens_carrier(self) -> bool:
+        if self.spec_decode_seq_lens_carrier is None:
+            return False
+
+        self._set_decode_seq_lens_tensors(self.spec_decode_seq_lens_carrier)
+        return True
+
+    def sync_decode_seq_lens_from_reqs(self):
+        if len(self.reqs) == 0:
+            self._set_decode_seq_lens_tensors(
+                torch.empty(0, dtype=torch.int64, device=self.device),
+                torch.empty(0, dtype=torch.int64),
+            )
+            return
+
+        seq_lens = [req.seqlen for req in self.reqs]
+        seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+        self._set_decode_seq_lens_tensors(
+            seq_lens_cpu.to(device=self.device),
+            seq_lens_cpu,
+        )
+
     def maybe_wait_verify_done(self):
         if self.is_spec_v2:
             draft_input: EagleDraftInput = self.spec_info
@@ -2226,6 +2252,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # FIXME(lsyin): used here to get the correct seq_lens
         # The batch has been launched but we need it verified to get correct next batch info
         self.maybe_wait_verify_done()
+        self.materialize_spec_decode_seq_lens_carrier()
 
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
@@ -2242,6 +2269,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests
             self.reqs = []
+            self.spec_decode_seq_lens_carrier = None
             return
 
         if len(keep_indices) == len(self.reqs):
@@ -2265,6 +2293,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens = self.seq_lens[keep_indices_device]
         self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
+        if self.spec_decode_seq_lens_carrier is not None:
+            self.spec_decode_seq_lens_carrier = self.spec_decode_seq_lens_carrier[
+                keep_indices_device
+            ]
         self.out_cache_loc = None
         self.seq_lens_sum = self.seq_lens.sum().item()
 
@@ -2306,6 +2338,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # filter_batch, so running_batch.seq_lens may still be a forward_stream
         # future. Synchronize here to avoid a cross-stream data race.
         self.maybe_wait_verify_done()
+        other.maybe_wait_verify_done()
+        self.materialize_spec_decode_seq_lens_carrier()
+        other.materialize_spec_decode_seq_lens_carrier()
 
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
@@ -2322,6 +2357,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
         self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
+        if (
+            self.spec_decode_seq_lens_carrier is not None
+            or other.spec_decode_seq_lens_carrier is not None
+        ):
+            left_seq_lens = (
+                self.spec_decode_seq_lens_carrier
+                if self.spec_decode_seq_lens_carrier is not None
+                else self.seq_lens[: len(self.reqs)]
+            )
+            right_seq_lens = (
+                other.spec_decode_seq_lens_carrier
+                if other.spec_decode_seq_lens_carrier is not None
+                else other.seq_lens
+            )
+            self.spec_decode_seq_lens_carrier = torch.cat(
+                [left_seq_lens, right_seq_lens]
+            )
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
         if self.output_ids is not None:
@@ -2452,6 +2504,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_extend_in_batch=self.is_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
+            spec_decode_seq_lens_carrier=self.spec_decode_seq_lens_carrier,
             enable_overlap=self.enable_overlap,
             sampling_info=self.sampling_info,
             next_batch_sampling_info=self.next_batch_sampling_info,

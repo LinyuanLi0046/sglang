@@ -332,11 +332,7 @@ class EagleDraftInputV2Mixin:
 
         seq_lens_carrier = getattr(batch, "spec_decode_seq_lens_carrier", None)
         if seq_lens_carrier is None:
-            future_indices = getattr(self, "future_indices", None)
-            future_new_seq_lens_buf = getattr(self, "future_new_seq_lens_buf", None)
-            if future_indices is None or future_new_seq_lens_buf is None:
-                return False
-            seq_lens_carrier = future_new_seq_lens_buf[future_indices.indices]
+            return False
 
         seq_lens_device = seq_lens_carrier.to(
             device=batch.seq_lens.device, dtype=torch.int64

@@ -2758,7 +2758,9 @@ class Scheduler(
 
         next_draft_input.future_indices = future_indices
         batch.spec_info = next_draft_input
-        if not batch.forward_mode.is_decode():
+        if batch.forward_mode.is_decode():
+            batch.spec_decode_seq_lens_carrier = next_draft_input.new_seq_lens
+        else:
             # Extend/prefill fallback still keeps the legacy relay contract for now.
             batch.seq_lens = next_draft_input.new_seq_lens
 
@@ -2784,8 +2786,8 @@ class Scheduler(
             existing_spec_info = getattr(batch, "spec_info", None)
             if existing_spec_info is not None:
                 existing_spec_info.future_indices = apply_state.future_indices
-                if apply_state.next_verify_done is not None:
-                    existing_spec_info.verify_done = apply_state.next_verify_done
+                existing_spec_info.verify_done = apply_state.next_verify_done
+            batch.spec_decode_seq_lens_carrier = apply_state.next_decode_seq_lens
             return
 
         self._apply_spec_v2_future_state(
@@ -2815,9 +2817,6 @@ class Scheduler(
         ):
             return False
 
-        if pending_batch.forward_mode.is_decode():
-            return False
-
         return True
 
     def _ensure_pending_spec_state_ready(
@@ -2831,10 +2830,6 @@ class Scheduler(
             or pending_batch is None
             or pending_batch is not batch
         ):
-            return
-
-        if batch.forward_mode.is_decode():
-            self.pending_spec_state_batch = None
             return
 
         self.spec_overlap_worker.ensure_batch_state_ready(
@@ -2891,9 +2886,7 @@ class Scheduler(
                             batch_result.next_draft_input,
                             batch_result.future_indices,
                         )
-                        self.pending_spec_state_batch = None
-                    else:
-                        self.pending_spec_state_batch = batch
+                    self.pending_spec_state_batch = batch
                     future_indices_or_next_token_ids = batch_result.next_token_ids
                 else:
                     self.record_batch_in_overlap(model_worker_batch)

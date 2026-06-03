@@ -2325,6 +2325,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     draft_input.verify_done
                 )
 
+    def materialize_spec_v2_decode_live_seq_lens(self) -> bool:
+        if not self.is_spec_v2 or not self.forward_mode.is_decode():
+            return False
+
+        draft_input: EagleDraftInput = self.spec_info
+        if draft_input is None:
+            return False
+
+        if getattr(draft_input, "verify_done", None) is not None:
+            draft_input.verify_done.synchronize()
+
+        materialize_fn = getattr(
+            draft_input, "_materialize_decode_seq_lens_for_batch", None
+        )
+        if materialize_fn is None:
+            return False
+
+        return bool(materialize_fn(self))
+
     def filter_batch(
         self,
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
@@ -2332,6 +2351,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # FIXME(lsyin): deprecate this API after spec v1 is deprecated
         v1_spec_info_filtered: Optional[bool] = False,
     ):
+        if self.forward_mode.is_decode():
+            self.materialize_spec_v2_decode_live_seq_lens()
         if self.has_pending_spec_decode_state() and not self.forward_mode.is_decode():
             self.maybe_wait_verify_done()
             self.materialize_spec_decode_seq_lens_carrier()
@@ -2419,6 +2440,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # In disagg decode + overlap, merge_batch can be called before
         # filter_batch, so running_batch.seq_lens may still be a forward_stream
         # future. Synchronize here to avoid a cross-stream data race.
+        if self.forward_mode.is_decode():
+            self.materialize_spec_v2_decode_live_seq_lens()
+        if other.forward_mode.is_decode():
+            other.materialize_spec_v2_decode_live_seq_lens()
         if self.has_pending_spec_decode_state() and not self.forward_mode.is_decode():
             self.maybe_wait_verify_done()
             self.materialize_spec_decode_seq_lens_carrier()

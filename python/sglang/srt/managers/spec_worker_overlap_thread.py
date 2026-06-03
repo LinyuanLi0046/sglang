@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 class SpecOverlapApplyState:
     future_indices: FutureIndices
     next_draft_input: Optional["EagleDraftInput"] = None
+    next_decode_seq_lens: Optional[torch.Tensor] = None
     next_verify_done: Optional[object] = None
     requires_scheduler_apply: bool = True
 
@@ -47,7 +48,6 @@ class SpecModelWorkerOverlapClient:
 
         self.input_queue: Queue = Queue()
         self.apply_queue: Queue = Queue()
-        self.decode_ready_queue: Queue = Queue()
         self.output_queue: Queue = Queue()
         self.forward_stream = torch.get_device_module(self.device).Stream()
         self.forward_thread = threading.Thread(
@@ -80,7 +80,6 @@ class SpecModelWorkerOverlapClient:
             )
             logger.error("%s", self.thread_exception)
             self.apply_queue.put(self.thread_exception)
-            self.decode_ready_queue.put(self.thread_exception)
             self.output_queue.put(self.thread_exception)
 
     @torch.no_grad()
@@ -148,9 +147,12 @@ class SpecModelWorkerOverlapClient:
                     )
                 )
             else:
-                self.decode_ready_queue.put(
+                self.apply_queue.put(
                     SpecOverlapApplyState(
                         future_indices=future_indices,
+                        next_decode_seq_lens=getattr(
+                            batch_result.next_draft_input, "next_step_seq_lens", None
+                        ),
                         next_verify_done=getattr(
                             batch_result.next_draft_input, "verify_done", None
                         ),
@@ -233,19 +235,6 @@ class SpecModelWorkerOverlapClient:
             raise apply_state
 
         apply_future_result(batch, apply_state)
-
-    def ensure_decode_future_ready(
-        self,
-        batch: ScheduleBatch,
-        sync_future_ready: Callable[[ScheduleBatch, SpecOverlapApplyState], None],
-    ) -> None:
-        self._raise_if_thread_failed()
-
-        apply_state = self.decode_ready_queue.get()
-        if isinstance(apply_state, RuntimeError):
-            raise apply_state
-
-        sync_future_ready(batch, apply_state)
 
     def resolve_last_batch_result(
         self,

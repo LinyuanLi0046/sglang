@@ -2092,7 +2092,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         draft_input: EagleDraftInput = self.spec_info
         if draft_input is None:
             return
-        draft_input.prepare_decode_live_view(self)
+        # The live decode view is prepared on the worker side. The scheduler
+        # only owns the committed allocation and req-state updates.
         draft_input.prepare_decode_allocation(self)
 
     def prepare_for_decode(self):

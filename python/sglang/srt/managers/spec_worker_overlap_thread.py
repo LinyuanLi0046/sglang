@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
 import threading
 import traceback
 from queue import Queue
-from typing import Callable, Deque, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
@@ -12,7 +13,16 @@ from sglang.srt.managers.overlap_utils import FutureIndices, FutureMap
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 
+if TYPE_CHECKING:
+    from sglang.srt.speculative.eagle_info import EagleDraftInput
+
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SpecOverlapApplyState:
+    future_indices: FutureIndices
+    next_draft_input: EagleDraftInput
 
 
 class SpecModelWorkerOverlapClient:
@@ -62,6 +72,7 @@ class SpecModelWorkerOverlapClient:
                 f"SpecModelWorkerOverlapClient failed: {exc}\n{tb}"
             )
             logger.error("%s", self.thread_exception)
+            self.apply_queue.put(self.thread_exception)
             self.output_queue.put(self.thread_exception)
 
     @torch.no_grad()
@@ -102,7 +113,16 @@ class SpecModelWorkerOverlapClient:
 
             # Expose the minimal state needed by scheduler before the full
             # D2H result becomes available.
-            self.apply_queue.put(batch_result)
+            if batch_result.next_draft_input is None:
+                raise RuntimeError(
+                    "Spec overlap worker requires next_draft_input before apply-ready."
+                )
+            self.apply_queue.put(
+                SpecOverlapApplyState(
+                    future_indices=future_indices,
+                    next_draft_input=batch_result.next_draft_input,
+                )
+            )
 
             batch_result.copy_done = torch.get_device_module(self.device).Event()
             batch_result.copy_to_cpu(return_logprob=return_logprob)
@@ -143,16 +163,16 @@ class SpecModelWorkerOverlapClient:
         self,
         batch: ScheduleBatch,
         apply_future_result: Callable[
-            [ScheduleBatch, GenerationBatchResult, FutureIndices], None
+            [ScheduleBatch, SpecOverlapApplyState], None
         ],
     ) -> None:
         self._raise_if_thread_failed()
 
-        batch_result = self.apply_queue.get()
-        if isinstance(batch_result, RuntimeError):
-            raise batch_result
+        apply_state = self.apply_queue.get()
+        if isinstance(apply_state, RuntimeError):
+            raise apply_state
 
-        apply_future_result(batch, batch_result, batch_result.future_indices)
+        apply_future_result(batch, apply_state)
 
     def resolve_last_batch_result(
         self,

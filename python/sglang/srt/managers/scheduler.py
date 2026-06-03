@@ -2784,9 +2784,11 @@ class Scheduler(
         ):
             return False
 
-        if self.require_mlp_sync:
-            return bool(pending_batch.is_extend_in_batch)
-        return pending_batch.forward_mode.is_extend()
+        # get_next_batch_to_run() may mutate last_batch/running_batch through
+        # filter/merge/update_running_batch before run_batch() is reached.
+        # Those paths also consume live spec_info/seq_lens, so pending spec
+        # state must be applied before batch selection starts.
+        return True
 
     def _ensure_pending_spec_state_ready(
         self,

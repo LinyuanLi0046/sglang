@@ -87,6 +87,19 @@ class EagleDraftInputV2Mixin:
             and getattr(self, "token_list", None) is not None
         )
 
+    def _canonical_decode_payload_needs_future_resolve(
+        self: EagleDraftInput,
+    ) -> bool:
+        if not self._has_canonical_decode_payload():
+            return True
+
+        last_verified_ids = self.last_verified_ids
+        token_list = self.token_list
+        return bool(
+            torch.any(last_verified_ids < 0).item()
+            or torch.any(token_list < 0).item()
+        )
+
     def _has_canonical_future_payload(self: EagleDraftInput) -> bool:
         return (
             getattr(self, "future_indices", None) is not None
@@ -179,11 +192,11 @@ class EagleDraftInputV2Mixin:
         if batch.forward_mode.is_idle() or topk != 1:
             return None
 
-        if not self._has_canonical_decode_payload():
+        if self._canonical_decode_payload_needs_future_resolve():
             self._resolve_canonical_future_payload(
                 len(batch.seq_lens), num_verify_tokens
             )
-        if not self._has_canonical_decode_payload():
+        if self._canonical_decode_payload_needs_future_resolve():
             return None
 
         self._validate_canonical_decode_payload(len(batch.seq_lens), num_verify_tokens)

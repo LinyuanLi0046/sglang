@@ -222,3 +222,24 @@ class FutureMap:
             self.last_verified_ids_buf[intv] = draft_input.last_verified_ids
             self.token_list_buf[intv] = draft_input.token_list
             self.canonical_ready_buf[intv] = True
+
+    def replace_canonical_payload_with_future_placeholders(
+        self,
+        future_indices: FutureIndices,
+        draft_input: EagleDraftInput,
+    ):
+        if draft_input.last_verified_ids is None or draft_input.token_list is None:
+            return
+
+        placeholder_ids = -future_indices.indices.to(draft_input.last_verified_ids.dtype)
+        if placeholder_ids.shape[0] != draft_input.last_verified_ids.shape[0]:
+            raise ValueError(
+                "canonical future placeholder batch size mismatch: "
+                f"expected {draft_input.last_verified_ids.shape[0]}, got {placeholder_ids.shape[0]}"
+            )
+
+        token_width = draft_input.token_list.shape[1]
+        draft_input.last_verified_ids = placeholder_ids
+        draft_input.token_list = (
+            placeholder_ids.unsqueeze(1).expand(-1, token_width).clone()
+        )

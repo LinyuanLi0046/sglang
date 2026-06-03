@@ -2777,6 +2777,13 @@ class Scheduler(
                         if batch_result.delay_sample_func is None:
                             self.future_map.store_to_map(future_indices, batch_result)
                             batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
+                            if batch.is_spec_v2 and (
+                                model_worker_batch.forward_mode.is_extend()
+                                or model_worker_batch.is_extend_in_batch
+                            ):
+                                self.future_map.replace_canonical_payload_with_future_placeholders(
+                                    future_indices, batch_result.next_draft_input
+                                )
                         else:
                             batch_result.future_indices = future_indices
 

@@ -482,12 +482,12 @@ class TpModelWorker(BaseTpWorker):
                 expert_distribution_metrics=out.expert_distribution_metrics,
             )
 
+            if launch_done is not None:
+                launch_done.set()
+
             if is_verify:
                 # Skip sampling and return logits for target forward
                 return batch_result
-
-            if launch_done is not None:
-                launch_done.set()
 
             if (
                 self.enable_overlap

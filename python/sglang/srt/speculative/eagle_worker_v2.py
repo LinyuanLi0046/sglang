@@ -1,6 +1,7 @@
 import contextlib
 from dataclasses import replace
 import logging
+import threading
 import time
 from typing import List, Optional, Tuple
 
@@ -1006,7 +1007,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
-    def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
+    def forward_batch_generation(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        launch_done: Optional[threading.Event] = None,
+    ):
         if (
             model_worker_batch.forward_mode.is_extend()
             or model_worker_batch.is_extend_in_batch
@@ -1014,7 +1019,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # Target prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
             batch_output = self.target_worker.forward_batch_generation(
-                model_worker_batch
+                model_worker_batch,
+                launch_done=launch_done,
             )
 
             # Draft prefill
@@ -1048,7 +1054,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
             assert verify_input.is_verify_input()
             model_worker_batch.spec_info = verify_input
-            batch_output = self.verify(model_worker_batch)
+            batch_output = self.verify(model_worker_batch, launch_done=launch_done)
             with self.draft_worker.draft_tp_context(
                 self.draft_worker.draft_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
@@ -1057,7 +1063,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
             return batch_output
 
-    def verify(self, batch: ModelWorkerBatch):
+    def verify(
+        self,
+        batch: ModelWorkerBatch,
+        launch_done: Optional[threading.Event] = None,
+    ):
         # Since batch.seq_lens is allocated in another stream, we need
         # record_stream() to prevent pytorch gc and reuse the gpu memory
         # while forward_stream is still running.
@@ -1113,6 +1123,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             forward_batch=verify_forward_batch,
             is_verify=True,
             skip_attn_backend_init=True,
+            launch_done=launch_done,
         )
         logits_output = forward_batch_output.logits_output
 

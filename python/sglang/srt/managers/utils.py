@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import threading
 from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
@@ -38,6 +39,7 @@ class GenerationBatchResult:
     copy_done: Optional[torch.cuda.Event] = None
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[FutureIndices] = None
+    launch_done: Optional[threading.Event] = None
 
     # FIXME(lsyin): maybe move to a better place?
     # sync path: forward stream -> output processor
@@ -89,6 +91,57 @@ class GenerationBatchResult:
 
         if (x := self.expert_distribution_metrics) is not None:
             x.copy_to_cpu()
+
+        self.copy_done.record()
+
+    def copy_to_cpu_for_spec_overlap(
+        self,
+        return_logprob: bool,
+        needs_hidden_states: bool,
+        copy_input_token_logprobs: bool,
+    ):
+        """Copy only the tensors consumed by spec-v2 overlap post-processing."""
+        if return_logprob and self.logits_output is not None:
+            if self.logits_output.next_token_logprobs is not None:
+                self.logits_output.next_token_logprobs = (
+                    self.logits_output.next_token_logprobs.to("cpu", non_blocking=True)
+                )
+            if (
+                copy_input_token_logprobs
+                and self.logits_output.input_token_logprobs is not None
+            ):
+                self.logits_output.input_token_logprobs = (
+                    self.logits_output.input_token_logprobs.to("cpu", non_blocking=True)
+                )
+            if self.logits_output.next_token_top_logprobs_val is not None:
+                self.logits_output.next_token_top_logprobs_val = [
+                    v.to("cpu", non_blocking=True) if torch.is_tensor(v) else v
+                    for v in self.logits_output.next_token_top_logprobs_val
+                ]
+            if self.logits_output.next_token_top_logprobs_idx is not None:
+                self.logits_output.next_token_top_logprobs_idx = [
+                    x.to("cpu", non_blocking=True) if torch.is_tensor(x) else x
+                    for x in self.logits_output.next_token_top_logprobs_idx
+                ]
+            if self.logits_output.next_token_token_ids_logprobs_val is not None:
+                self.logits_output.next_token_token_ids_logprobs_val = [
+                    v.to("cpu", non_blocking=True) if torch.is_tensor(v) else v
+                    for v in self.logits_output.next_token_token_ids_logprobs_val
+                ]
+
+        if self.logits_output is not None:
+            if needs_hidden_states and self.logits_output.hidden_states is not None:
+                self.logits_output.hidden_states = self.logits_output.hidden_states.to(
+                    "cpu", non_blocking=True
+                )
+            else:
+                self.logits_output.hidden_states = None
+
+        if self.next_token_ids is not None:
+            self.next_token_ids = self.next_token_ids.to("cpu", non_blocking=True)
+
+        if self.accept_lens is not None:
+            self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
 
         self.copy_done.record()
 

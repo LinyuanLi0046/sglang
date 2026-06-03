@@ -1443,7 +1443,9 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                if use_non_spec_overlap_worker:
+                if use_non_spec_overlap_worker or (
+                    use_spec_overlap_worker and batch.is_spec_v2
+                ):
                     batch.launch_done = threading.Event()
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))

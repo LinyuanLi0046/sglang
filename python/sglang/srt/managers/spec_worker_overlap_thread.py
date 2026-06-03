@@ -89,6 +89,8 @@ class SpecModelWorkerOverlapClient:
                 model_worker_batch,
                 future_indices,
                 return_logprob,
+                needs_hidden_states,
+                copy_input_token_logprobs,
                 should_placeholder_replace,
             ) = item
             if model_worker_batch is None:
@@ -98,13 +100,17 @@ class SpecModelWorkerOverlapClient:
             batch_pt += 1
 
             self.future_map.resolve_future(model_worker_batch)
-            batch_result = self.worker.forward_batch_generation(model_worker_batch)
+            batch_result = self.worker.forward_batch_generation(
+                model_worker_batch,
+                launch_done=model_worker_batch.launch_done,
+            )
             if batch_result.delay_sample_func is not None:
                 raise RuntimeError(
                     "Spec overlap worker does not support delayed sample in Patch 45."
                 )
 
             batch_result.future_indices = future_indices
+            batch_result.launch_done = model_worker_batch.launch_done
             self.future_map.store_to_map(future_indices, batch_result)
             if should_placeholder_replace and batch_result.next_draft_input is not None:
                 self.future_map.replace_canonical_payload_with_future_placeholders(
@@ -125,7 +131,11 @@ class SpecModelWorkerOverlapClient:
             )
 
             batch_result.copy_done = torch.get_device_module(self.device).Event()
-            batch_result.copy_to_cpu(return_logprob=return_logprob)
+            batch_result.copy_to_cpu_for_spec_overlap(
+                return_logprob=return_logprob,
+                needs_hidden_states=needs_hidden_states,
+                copy_input_token_logprobs=copy_input_token_logprobs,
+            )
             self.output_queue.put(batch_result)
 
     def forward_batch_generation(
@@ -136,11 +146,18 @@ class SpecModelWorkerOverlapClient:
         model_worker_batch.sampling_info = model_worker_batch.sampling_info.copy_for_forward()
 
         self.scheduler_stream = torch.get_device_module(self.device).current_stream()
+        if getattr(self.device, "type", self.device) == "npu" and hasattr(torch, "npu"):
+            torch.npu.set_stream_limit(self.scheduler_stream, 8, 16)
         if hasattr(self.scheduler_stream, "synchronize"):
             self.scheduler_stream.synchronize()
 
         bs = len(model_worker_batch.seq_lens)
         future_indices = self.future_map.alloc_future_indices(bs)
+        needs_hidden_states = bool(getattr(model_worker_batch, "return_hidden_states", False))
+        copy_input_token_logprobs = bool(
+            model_worker_batch.forward_mode.is_extend()
+            or model_worker_batch.is_extend_in_batch
+        )
         should_placeholder_replace = (
             model_worker_batch.forward_mode.is_extend()
             or model_worker_batch.is_extend_in_batch
@@ -150,6 +167,8 @@ class SpecModelWorkerOverlapClient:
                 model_worker_batch,
                 future_indices,
                 model_worker_batch.return_logprob,
+                needs_hidden_states,
+                copy_input_token_logprobs,
                 should_placeholder_replace,
             )
         )
@@ -183,6 +202,8 @@ class SpecModelWorkerOverlapClient:
         batch_result = self.output_queue.get()
         if isinstance(batch_result, RuntimeError):
             raise batch_result
+        if batch_result.launch_done is not None:
+            batch_result.launch_done.wait()
 
         batch_result.extend_input_len_per_req = placeholder_result.extend_input_len_per_req
         batch_result.extend_logprob_start_len_per_req = (

@@ -2891,7 +2891,9 @@ class Scheduler(
                             batch_result.next_draft_input,
                             batch_result.future_indices,
                         )
-                    self.pending_spec_state_batch = batch
+                        self.pending_spec_state_batch = None
+                    else:
+                        self.pending_spec_state_batch = batch
                     future_indices_or_next_token_ids = batch_result.next_token_ids
                 else:
                     self.record_batch_in_overlap(model_worker_batch)

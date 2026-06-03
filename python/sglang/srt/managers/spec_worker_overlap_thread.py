@@ -151,7 +151,7 @@ class SpecModelWorkerOverlapClient:
                     SpecOverlapApplyState(
                         future_indices=future_indices,
                         next_decode_seq_lens=getattr(
-                            batch_result.next_draft_input, "new_seq_lens", None
+                            batch_result.next_draft_input, "next_step_seq_lens", None
                         ),
                         next_verify_done=getattr(
                             batch_result.next_draft_input, "verify_done", None

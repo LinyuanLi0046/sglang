@@ -79,6 +79,11 @@ class FutureMap:
             # For speculative decoding, we lazily initialize the buffers
             # This is to make the shape derivation easier.
             self.buf_initialized = False
+            self.topk_p_buf = None
+            self.topk_index_buf = None
+            self.verified_id_buf = None
+            self.new_seq_lens_buf = None
+            self.hidden_states_buf = None
             self.last_verified_ids_buf = None
             self.token_list_buf = None
             self.canonical_ready_buf = None
@@ -169,12 +174,20 @@ class FutureMap:
             # caching allocator (torch GC) could reclaim the memory before
             # the GPU finishes reading it.
             indices.record_stream(torch.get_device_module(self.device).current_stream())
-            draft_input.future_topk_p_buf = self.topk_p_buf
-            draft_input.future_topk_index_buf = self.topk_index_buf
-            draft_input.future_verified_id_buf = self.verified_id_buf
-            draft_input.future_new_seq_lens_buf = self.new_seq_lens_buf
-            if spec_need_hidden_states():
-                draft_input.future_hidden_states_buf = self.hidden_states_buf
+            if self.buf_initialized:
+                draft_input.future_topk_p_buf = self.topk_p_buf
+                draft_input.future_topk_index_buf = self.topk_index_buf
+                draft_input.future_verified_id_buf = self.verified_id_buf
+                draft_input.future_new_seq_lens_buf = self.new_seq_lens_buf
+                if spec_need_hidden_states():
+                    draft_input.future_hidden_states_buf = self.hidden_states_buf
+            else:
+                draft_input.future_topk_p_buf = None
+                draft_input.future_topk_index_buf = None
+                draft_input.future_verified_id_buf = None
+                draft_input.future_new_seq_lens_buf = None
+                if spec_need_hidden_states():
+                    draft_input.future_hidden_states_buf = None
             draft_input.future_last_verified_ids_buf = self.last_verified_ids_buf
             draft_input.future_token_list_buf = self.token_list_buf
             draft_input.future_canonical_ready_buf = self.canonical_ready_buf
@@ -204,6 +217,20 @@ class FutureMap:
             # idle indices in dp attention do not need store info
             return
 
+        has_canonical_payload = (
+            draft_input.last_verified_ids is not None
+            and draft_input.token_list is not None
+        )
+        if self.canonical_ready_buf is not None:
+            self.canonical_ready_buf[intv] = False
+        if has_canonical_payload:
+            if self.last_verified_ids_buf is None or self.token_list_buf is None:
+                self._lazy_init_canonical_buf(draft_input)
+            self.last_verified_ids_buf[intv] = draft_input.last_verified_ids
+            self.token_list_buf[intv] = draft_input.token_list
+            self.canonical_ready_buf[intv] = True
+            return
+
         if not self.buf_initialized:
             self._lazy_init_buf(draft_input)
 
@@ -213,15 +240,6 @@ class FutureMap:
         self.new_seq_lens_buf[intv] = draft_input.new_seq_lens
         if spec_need_hidden_states():
             self.hidden_states_buf[intv] = draft_input.hidden_states
-
-        if self.canonical_ready_buf is not None:
-            self.canonical_ready_buf[intv] = False
-        if draft_input.last_verified_ids is not None and draft_input.token_list is not None:
-            if self.last_verified_ids_buf is None or self.token_list_buf is None:
-                self._lazy_init_canonical_buf(draft_input)
-            self.last_verified_ids_buf[intv] = draft_input.last_verified_ids
-            self.token_list_buf[intv] = draft_input.token_list
-            self.canonical_ready_buf[intv] = True
 
     def replace_canonical_payload_with_future_placeholders(
         self,

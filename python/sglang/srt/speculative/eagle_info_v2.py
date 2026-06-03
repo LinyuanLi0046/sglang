@@ -354,8 +354,10 @@ class EagleDraftInputV2Mixin:
         bs = len(batch.seq_lens)
         positions_prepared = False
         if not batch.forward_mode.is_idle():
-            # Canonical future payload is resolved before entering this method.
-            # The legacy FutureMap replay path below now serves as the fallback path.
+            # Canonical future payload is resolved before entering this method and
+            # now serves as the primary path for both decode-only and
+            # prefill-first-step. The legacy FutureMap replay path below is kept
+            # only for batches where legacy relay buffers still exist.
             future_ready = (
                 self.future_indices is not None
                 and self.future_topk_p_buf is not None

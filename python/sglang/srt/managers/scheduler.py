@@ -2789,6 +2789,13 @@ class Scheduler(
         batch: ScheduleBatch,
         apply_state: "SpecOverlapApplyState",
     ) -> None:
+        if not apply_state.requires_scheduler_apply:
+            existing_spec_info = getattr(batch, "spec_info", None)
+            if existing_spec_info is not None:
+                existing_spec_info.future_indices = apply_state.future_indices
+            batch.sync_decode_seq_lens_from_reqs()
+            return
+
         self._apply_spec_v2_future_state(
             batch,
             apply_state.next_draft_input,

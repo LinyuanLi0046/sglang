@@ -44,7 +44,11 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
-from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.eagle_info import (
+    EagleDraftInput,
+    EagleNextStepPayload,
+    EagleVerifyInput,
+)
 from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
     fill_accepted_out_cache_loc,
@@ -1036,6 +1040,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         batch_output.logits_output.mm_input_embeds,
                     )
                 )
+                batch_output.next_step_payload = EagleNextStepPayload.from_draft_input(
+                    batch_output.next_draft_input
+                )
                 return batch_output
         else:
             if model_worker_batch.spec_info is None:
@@ -1061,6 +1068,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 self.draft_worker._draft_extend_for_decode(
                     model_worker_batch, batch_output
                 )
+            batch_output.next_step_payload = EagleNextStepPayload.from_draft_input(
+                batch_output.next_draft_input
+            )
             return batch_output
 
     def verify(

@@ -16,7 +16,7 @@ from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
-    from sglang.srt.speculative.eagle_info import EagleDraftInput
+    from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleNextStepPayload
 
 
 logger = logging.getLogger(__name__)
@@ -47,6 +47,7 @@ class GenerationBatchResult:
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
+    next_step_payload: Optional[EagleNextStepPayload] = None
 
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None

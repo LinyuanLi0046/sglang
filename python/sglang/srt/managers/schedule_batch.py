@@ -2083,6 +2083,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.is_spec_v2:
             # TODO(spec-v2): all spec v2 should go through this path
             draft_input: EagleDraftInput = self.spec_info
+            if (
+                draft_input is not None
+                and getattr(draft_input, "future_indices", None) is not None
+                and getattr(draft_input, "new_seq_lens", None) is None
+            ):
+                self.sync_decode_seq_lens_from_reqs()
             self.maybe_wait_verify_done()
             draft_input.prepare_for_decode(self)
 
@@ -2142,6 +2148,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens_cpu.add_(1)
             self.orig_seq_lens.add_(1)
         self.seq_lens_sum += bs
+
+    def sync_decode_seq_lens_from_reqs(self):
+        if len(self.reqs) == 0:
+            self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
+            self.seq_lens_cpu = torch.empty(0, dtype=torch.int64)
+            self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
+            self.seq_lens_sum = 0
+            return
+
+        seq_lens = [req.seqlen for req in self.reqs]
+        seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+        self.seq_lens = seq_lens_cpu.to(device=self.device)
+        self.seq_lens_cpu = seq_lens_cpu
+        self.orig_seq_lens = self.seq_lens.to(dtype=torch.int32)
+        self.seq_lens_sum = int(sum(seq_lens))
 
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.map_last_loc_to_buffer(

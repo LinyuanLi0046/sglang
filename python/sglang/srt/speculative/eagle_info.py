@@ -618,6 +618,71 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
 
 @dataclass
+class EagleNextStepPayload:
+    future_indices: Optional[FutureIndices] = None
+    last_verified_ids: Optional[torch.Tensor] = None
+    token_list: Optional[torch.Tensor] = None
+    real_new_verified_id: Optional[torch.Tensor] = None
+    real_token_list: Optional[torch.Tensor] = None
+
+    @classmethod
+    def from_draft_input(
+        cls, draft_input: Optional["EagleDraftInput"]
+    ) -> Optional["EagleNextStepPayload"]:
+        if (
+            draft_input is None
+            or draft_input.last_verified_ids is None
+            or draft_input.token_list is None
+        ):
+            return None
+
+        return cls(
+            future_indices=draft_input.future_indices,
+            last_verified_ids=draft_input.last_verified_ids,
+            token_list=draft_input.token_list,
+            real_new_verified_id=draft_input.real_new_verified_id,
+            real_token_list=draft_input.real_token_list,
+        )
+
+    def filter_batch(self, new_indices: torch.Tensor) -> None:
+        if self.future_indices is not None:
+            self.future_indices.indices = self.future_indices.indices[new_indices]
+        if self.last_verified_ids is not None:
+            self.last_verified_ids = self.last_verified_ids[new_indices]
+        if self.token_list is not None:
+            self.token_list = self.token_list[new_indices]
+        if self.real_new_verified_id is not None:
+            self.real_new_verified_id = self.real_new_verified_id[new_indices]
+        if self.real_token_list is not None:
+            self.real_token_list = self.real_token_list[new_indices]
+
+    def merge_batch(self, other: "EagleNextStepPayload") -> None:
+        if self.future_indices is not None and other.future_indices is not None:
+            self.future_indices = FutureIndices(
+                indices=torch.cat(
+                    [self.future_indices.indices, other.future_indices.indices]
+                )
+            )
+        if self.last_verified_ids is not None and other.last_verified_ids is not None:
+            self.last_verified_ids = torch.cat(
+                [self.last_verified_ids, other.last_verified_ids], dim=0
+            )
+        if self.token_list is not None and other.token_list is not None:
+            self.token_list = torch.cat([self.token_list, other.token_list], dim=0)
+        if (
+            self.real_new_verified_id is not None
+            and other.real_new_verified_id is not None
+        ):
+            self.real_new_verified_id = torch.cat(
+                [self.real_new_verified_id, other.real_new_verified_id], dim=0
+            )
+        if self.real_token_list is not None and other.real_token_list is not None:
+            self.real_token_list = torch.cat(
+                [self.real_token_list, other.real_token_list], dim=0
+            )
+
+
+@dataclass
 class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # The inputs for decode
     # shape: (b, topk)

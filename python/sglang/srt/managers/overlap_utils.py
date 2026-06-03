@@ -11,7 +11,7 @@ from sglang.srt.utils import is_cuda, is_hip
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch
     from sglang.srt.managers.scheduler import GenerationBatchResult
-    from sglang.srt.speculative.eagle_info import EagleDraftInput
+    from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleNextStepPayload
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 _is_cuda = is_cuda()
@@ -246,11 +246,13 @@ class FutureMap:
             intv = future_indices.interval
             self.token_ids_buf[intv] = batch_result.next_token_ids
         else:
-            draft_input: EagleDraftInput = batch_result.next_draft_input
-            self.store_to_map_for_new_batch(future_indices, draft_input)
+            payload_source = batch_result.next_step_payload or batch_result.next_draft_input
+            self.store_to_map_for_new_batch(future_indices, payload_source)
 
     def store_to_map_for_new_batch(
-        self, future_indices: FutureIndices, draft_input: EagleDraftInput
+        self,
+        future_indices: FutureIndices,
+        payload_source: "EagleDraftInput | EagleNextStepPayload",
     ):
         intv = future_indices.interval
         if self.is_empty_slice(intv):
@@ -258,28 +260,29 @@ class FutureMap:
             return
 
         has_canonical_payload = (
-            draft_input.last_verified_ids is not None
-            and draft_input.token_list is not None
+            payload_source is not None
+            and getattr(payload_source, "last_verified_ids", None) is not None
+            and getattr(payload_source, "token_list", None) is not None
         )
         if self.canonical_ready_buf is not None:
             self.canonical_ready_buf[intv] = False
         if has_canonical_payload:
             if self.last_verified_ids_buf is None or self.token_list_buf is None:
-                self._lazy_init_canonical_buf(draft_input)
-            self.last_verified_ids_buf[intv] = draft_input.last_verified_ids
-            self.token_list_buf[intv] = draft_input.token_list
+                self._lazy_init_canonical_buf(payload_source)
+            self.last_verified_ids_buf[intv] = payload_source.last_verified_ids
+            self.token_list_buf[intv] = payload_source.token_list
             self.canonical_ready_buf[intv] = True
             return
 
         if not self.buf_initialized:
-            self._lazy_init_buf(draft_input)
+            self._lazy_init_buf(payload_source)
 
-        self.topk_p_buf[intv] = draft_input.topk_p
-        self.topk_index_buf[intv] = draft_input.topk_index
-        self.verified_id_buf[intv] = draft_input.verified_id
-        self.new_seq_lens_buf[intv] = draft_input.new_seq_lens
+        self.topk_p_buf[intv] = payload_source.topk_p
+        self.topk_index_buf[intv] = payload_source.topk_index
+        self.verified_id_buf[intv] = payload_source.verified_id
+        self.new_seq_lens_buf[intv] = payload_source.new_seq_lens
         if spec_need_hidden_states():
-            self.hidden_states_buf[intv] = draft_input.hidden_states
+            self.hidden_states_buf[intv] = payload_source.hidden_states
 
     def replace_canonical_payload_with_future_placeholders(
         self,

@@ -18,7 +18,7 @@ from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 
 if TYPE_CHECKING:
-    from sglang.srt.speculative.eagle_info import EagleDraftInput
+    from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleNextStepPayload
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,9 @@ logger = logging.getLogger(__name__)
 @dataclass
 class SpecOverlapApplyState:
     future_indices: FutureIndices
-    next_draft_input: EagleDraftInput
+    next_draft_input: Optional[EagleDraftInput] = None
+    next_step_payload: Optional[EagleNextStepPayload] = None
+    requires_scheduler_apply: bool = True
 
 
 class SpecModelWorkerOverlapClient:
@@ -121,16 +123,27 @@ class SpecModelWorkerOverlapClient:
                     future_indices, batch_result.next_draft_input
                 )
 
+            is_decode_placeholder_path = (
+                model_worker_batch.forward_mode.is_decode()
+                and not model_worker_batch.is_extend_in_batch
+            )
+
             # Expose the minimal state needed by scheduler before the full
             # D2H result becomes available.
-            if batch_result.next_draft_input is None:
+            if batch_result.next_draft_input is None and not is_decode_placeholder_path:
                 raise RuntimeError(
                     "Spec overlap worker requires next_draft_input before apply-ready."
                 )
             self.apply_queue.put(
                 SpecOverlapApplyState(
                     future_indices=future_indices,
-                    next_draft_input=batch_result.next_draft_input,
+                    next_draft_input=(
+                        None
+                        if is_decode_placeholder_path
+                        else batch_result.next_draft_input
+                    ),
+                    next_step_payload=batch_result.next_step_payload,
+                    requires_scheduler_apply=not is_decode_placeholder_path,
                 )
             )
 

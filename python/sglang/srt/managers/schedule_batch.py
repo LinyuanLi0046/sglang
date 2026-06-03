@@ -66,6 +66,7 @@ from sglang.srt.mem_cache.common import (
     alloc_for_decode,
     alloc_for_extend,
     evict_from_tree_cache,
+    free_req_kv_range,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -617,6 +618,7 @@ class Req(ReqDllmMixin):
         self.kv_allocated_len = 0
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
+        self.pending_spec_decode_alloc_reservations = []
 
         # for corss-endoder model
         self.token_type_ids = token_type_ids
@@ -1212,6 +1214,7 @@ class Req(ReqDllmMixin):
         self.kv_committed_len = 0
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
+        self.pending_spec_decode_alloc_reservations = []
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
@@ -1302,6 +1305,54 @@ class Req(ReqDllmMixin):
             f"{self.grammar=}, "
             f"{self.sampling_params=})"
         )
+
+    def rollback_pending_spec_decode_alloc_reservations(
+        self, tree_cache: BasePrefixCache
+    ) -> None:
+        for reservation in list(self.pending_spec_decode_alloc_reservations):
+            reservation.rollback_req(self, tree_cache)
+
+
+@dataclasses.dataclass
+class SpecDecodeAllocReservation:
+    reqs: List[Req]
+    cur_kv_lens_cpu: torch.Tensor
+    nxt_kv_lens_cpu: torch.Tensor
+
+    def __post_init__(self):
+        self._req_index = {id(req): i for i, req in enumerate(self.reqs)}
+        self._committed = [False] * len(self.reqs)
+        self._rolled_back = [False] * len(self.reqs)
+
+        for req in self.reqs:
+            req.pending_spec_decode_alloc_reservations.append(self)
+
+    def _detach_req(self, req: Req) -> None:
+        pending = req.pending_spec_decode_alloc_reservations
+        if self in pending:
+            pending.remove(self)
+
+    def commit(self) -> None:
+        for i, req in enumerate(self.reqs):
+            if self._committed[i] or self._rolled_back[i]:
+                continue
+            req.kv_allocated_len = int(self.nxt_kv_lens_cpu[i].item())
+            req.decode_batch_idx += 1
+            self._committed[i] = True
+            self._detach_req(req)
+
+    def rollback_req(self, req: Req, tree_cache: BasePrefixCache) -> None:
+        idx = self._req_index.get(id(req))
+        if idx is None or self._committed[idx] or self._rolled_back[idx]:
+            return
+
+        start_p = int(self.cur_kv_lens_cpu[idx].item())
+        end_p = int(self.nxt_kv_lens_cpu[idx].item())
+        if req.req_pool_idx is not None and start_p < end_p:
+            free_req_kv_range(req, tree_cache, start_p, end_p)
+
+        self._rolled_back[idx] = True
+        self._detach_req(req)
 
 
 @dataclasses.dataclass
@@ -1417,6 +1468,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # spec_info: Optional[SpecInput] = None
     spec_info: Optional[SpecInput] = None
     spec_decode_seq_lens_carrier: Optional[torch.Tensor] = None
+    spec_decode_alloc_reservation: Optional[SpecDecodeAllocReservation] = None
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -2030,6 +2082,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.retract_req(req)
 
+        req.rollback_pending_spec_decode_alloc_reservations(self.tree_cache)
         if server_args.disaggregation_mode == "decode":
             req.offload_kv_cache(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
@@ -2087,14 +2140,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self._prepare_decode_shell_common()
 
     def prepare_spec_v2_decode_allocation(self):
+        self.spec_decode_alloc_reservation = None
         if not self.is_spec_v2:
-            return
+            return None
         draft_input: EagleDraftInput = self.spec_info
         if draft_input is None:
-            return
+            return None
         # The live decode view is prepared on the worker side. The scheduler
-        # only owns the committed allocation and req-state updates.
-        draft_input.prepare_decode_allocation(self)
+        # only owns the reservation lifecycle and req-state commit/rollback.
+        reservation = draft_input.prepare_decode_allocation(self)
+        self.spec_decode_alloc_reservation = reservation
+        return reservation
 
     def prepare_for_decode(self):
         bs = self._prepare_decode_shell_common()
@@ -2533,6 +2589,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
             spec_decode_seq_lens_carrier=self.spec_decode_seq_lens_carrier,
+            spec_decode_alloc_reservation=self.spec_decode_alloc_reservation,
             enable_overlap=self.enable_overlap,
             sampling_info=self.sampling_info,
             next_batch_sampling_info=self.next_batch_sampling_info,

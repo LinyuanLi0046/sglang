@@ -406,6 +406,13 @@ class SchedulerOutputProcessorMixin:
 
         return predict_tokens
 
+    def _commit_spec_decode_alloc_reservation(self, batch: ScheduleBatch) -> None:
+        reservation = getattr(batch, "spec_decode_alloc_reservation", None)
+        if reservation is None:
+            return
+        reservation.commit()
+        batch.spec_decode_alloc_reservation = None
+
     def process_batch_result_idle(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -442,6 +449,7 @@ class SchedulerOutputProcessorMixin:
 
         if batch.spec_algorithm.is_none() or batch.is_spec_v2:
             if batch.is_spec_v2:
+                self._commit_spec_decode_alloc_reservation(batch)
                 next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
             else:
                 next_token_ids = next_token_ids.tolist()
@@ -597,6 +605,7 @@ class SchedulerOutputProcessorMixin:
             if req.multimodal_inputs is not None and req.session is None:
                 req.multimodal_inputs.release_features()
             self.maybe_collect_routed_experts(req)
+            req.rollback_pending_spec_decode_alloc_reservations(self.tree_cache)
 
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
                 # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes

@@ -496,14 +496,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             start_p == end_p
         ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
 
-    if page_size > 1:
-        start_p = ceil_align(start_p, page_size)
-
-    if start_p < end_p:
-        indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
-            start_p:end_p
-        ]
-        tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
+    free_req_kv_range(req, tree_cache, start_p, end_p)
     # If the prefix cache doesn't manage mamba states, we must free them here.
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
         not tree_cache.supports_mamba()
@@ -513,6 +506,23 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         ), "mamba state is freed while the tree cache does not manage mamba states"
         tree_cache.req_to_token_pool.free_mamba_cache(req)
     tree_cache.req_to_token_pool.free(req)
+
+
+def free_req_kv_range(
+    req: Req, tree_cache: BasePrefixCache, start_p: int, end_p: int
+) -> None:
+    if req.req_pool_idx is None or start_p >= end_p:
+        return
+
+    page_size = get_global_server_args().page_size
+    if page_size > 1:
+        start_p = ceil_align(start_p, page_size)
+
+    if start_p < end_p:
+        indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
+            start_p:end_p
+        ]
+        tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
 
 
 def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:

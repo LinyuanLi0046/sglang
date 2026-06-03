@@ -8,7 +8,11 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    ModelWorkerBatch,
+    ScheduleBatch,
+    SpecDecodeAllocReservation,
+)
 from sglang.srt.managers.utils import get_alloc_len_per_decode
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend_and_assign,
@@ -420,7 +424,9 @@ class EagleDraftInputV2Mixin:
         batch.seq_lens_cpu = batch.seq_lens.cpu()
         batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
 
-    def prepare_decode_allocation(self: EagleDraftInput, batch: Any) -> None:
+    def prepare_decode_allocation(
+        self: EagleDraftInput, batch: Any
+    ) -> Optional[SpecDecodeAllocReservation]:
         from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
         bs = batch.batch_size() if hasattr(batch, "batch_size") else len(batch.reqs)
@@ -431,13 +437,10 @@ class EagleDraftInputV2Mixin:
         num_needed_tokens = 0
         alloc_len_per_decode = get_alloc_len_per_decode()
         for r in batch.reqs:
-            # Over-allocation happens here
             x = r.kv_committed_len + 2 * alloc_len_per_decode - r.kv_allocated_len
             cur_kv_lens_cpu.append(r.kv_allocated_len)
             nxt_kv_lens_cpu.append(r.kv_allocated_len + x)
             num_needed_tokens += x
-            r.kv_allocated_len += x
-            r.decode_batch_idx += 1
 
         cur_kv_lens_cpu = torch.tensor(cur_kv_lens_cpu, dtype=torch.int32, device="cpu")
         nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens_cpu, dtype=torch.int32, device="cpu")
@@ -465,6 +468,12 @@ class EagleDraftInputV2Mixin:
                 batch.req_to_token_pool.req_to_token,
                 num_needed_tokens,
             )
+
+        return SpecDecodeAllocReservation(
+            reqs=list(batch.reqs),
+            cur_kv_lens_cpu=cur_kv_lens_cpu,
+            nxt_kv_lens_cpu=nxt_kv_lens_cpu,
+        )
 
     def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
         self.prepare_decode_live_view(batch)

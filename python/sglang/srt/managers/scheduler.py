@@ -2866,9 +2866,9 @@ class Scheduler(
             and batch.forward_mode.is_decode()
         ):
             # Keep true-length owner on the worker-owned relay, but perform
-            # the real decode over-allocation and req-state updates on the
-            # scheduler thread right before submit so release/idle accounting
-            # stays in the same ownership domain.
+            # the decode allocation reservation on the scheduler thread right
+            # before submit so commit/rollback stays in the scheduler-visible
+            # ownership domain.
             batch.prepare_spec_v2_decode_allocation()
 
         # Run forward

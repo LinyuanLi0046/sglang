@@ -697,21 +697,27 @@ class EagleDraftWorker(BaseDraftWorker):
             ret_hidden_states,
         )
         next_draft_input.last_verified_ids = next_draft_input.verified_id
-        next_draft_input.token_list = self._build_canonical_decode_token_list_from_next_state(
+        token_list = self._materialize_decode_token_list_from_kplus1_state(
             batch, next_draft_input
         )
-        next_draft_input.real_token_list = None
+        if (
+            token_list is None
+            and not batch.forward_mode.is_idle()
+            and self.topk == 1
+        ):
+            self._log_r4_fallback(
+                batch,
+                "decode_main_chain_token_list_unavailable",
+                "state_k_plus_1 continuation did not materialize canonical token_list",
+            )
+        next_draft_input.token_list = token_list
+        next_draft_input.real_token_list = token_list
 
-    def _build_canonical_decode_token_list_from_next_state(
+    def _materialize_decode_token_list_from_kplus1_state(
         self,
         batch: ModelWorkerBatch,
         next_draft_input: EagleDraftInput,
     ) -> Optional[torch.Tensor]:
-        self._log_r4_fallback(
-            batch,
-            "decode_side_replay_token_list_producer",
-            "using _build_canonical_decode_token_list_from_next_state",
-        )
         if self.topk != 1 or next_draft_input.verified_id.numel() == 0:
             return None
 

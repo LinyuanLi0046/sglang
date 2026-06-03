@@ -716,6 +716,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # Inputs for V2 overlap worker
     future_indices: Optional[FutureIndices] = None
     new_seq_lens: Optional[torch.Tensor] = None
+    next_step_seq_lens: Optional[torch.Tensor] = None
     verify_done: Optional[torch.cuda.Event] = None
     # Canonical next-step payload aligned with special_sglang. These fields are the
     # long-term consumer-facing contract for the next verify step, covering both
@@ -732,6 +733,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     future_hidden_states_buf: Optional[torch.Tensor] = None
     future_verified_id_buf: Optional[torch.Tensor] = None
     future_new_seq_lens_buf: Optional[torch.Tensor] = None
+    future_next_step_seq_lens_buf: Optional[torch.Tensor] = None
     future_last_verified_ids_buf: Optional[torch.Tensor] = None
     future_token_list_buf: Optional[torch.Tensor] = None
     future_canonical_ready_buf: Optional[torch.Tensor] = None

@@ -1236,6 +1236,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,
             new_seq_lens=new_seq_lens,
+            next_step_seq_lens=new_seq_lens,
             verify_done=verify_done,
             real_new_verified_id=verified_id,
         )

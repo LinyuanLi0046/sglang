@@ -123,6 +123,7 @@ class FutureMap:
             self.topk_index_buf = None
             self.verified_id_buf = None
             self.new_seq_lens_buf = None
+            self.next_step_seq_lens_buf = None
             self.hidden_states_buf = None
             self.last_verified_ids_buf = None
             self.token_list_buf = None
@@ -136,6 +137,11 @@ class FutureMap:
         topk_index0 = draft_input.topk_index[0]
         verified_id0 = draft_input.verified_id[0]
         new_seq_lens0 = draft_input.new_seq_lens[0]
+        next_step_seq_lens0 = (
+            draft_input.next_step_seq_lens[0]
+            if draft_input.next_step_seq_lens is not None
+            else new_seq_lens0
+        )
 
         self.topk_p_buf = torch.empty(
             (self.future_buffer_len, *topk_p0.shape),
@@ -155,6 +161,11 @@ class FutureMap:
         self.new_seq_lens_buf = torch.empty(
             (self.future_buffer_len, *new_seq_lens0.shape),
             dtype=new_seq_lens0.dtype,
+            device=self.device,
+        )
+        self.next_step_seq_lens_buf = torch.empty(
+            (self.future_buffer_len, *next_step_seq_lens0.shape),
+            dtype=next_step_seq_lens0.dtype,
             device=self.device,
         )
 
@@ -219,6 +230,7 @@ class FutureMap:
                 draft_input.future_topk_index_buf = self.topk_index_buf
                 draft_input.future_verified_id_buf = self.verified_id_buf
                 draft_input.future_new_seq_lens_buf = self.new_seq_lens_buf
+                draft_input.future_next_step_seq_lens_buf = self.next_step_seq_lens_buf
                 if spec_need_hidden_states():
                     draft_input.future_hidden_states_buf = self.hidden_states_buf
             else:
@@ -226,6 +238,7 @@ class FutureMap:
                 draft_input.future_topk_index_buf = None
                 draft_input.future_verified_id_buf = None
                 draft_input.future_new_seq_lens_buf = None
+                draft_input.future_next_step_seq_lens_buf = None
                 if spec_need_hidden_states():
                     draft_input.future_hidden_states_buf = None
             draft_input.future_last_verified_ids_buf = self.last_verified_ids_buf
@@ -281,6 +294,9 @@ class FutureMap:
         self.topk_index_buf[intv] = payload_source.topk_index
         self.verified_id_buf[intv] = payload_source.verified_id
         self.new_seq_lens_buf[intv] = payload_source.new_seq_lens
+        self.next_step_seq_lens_buf[intv] = getattr(
+            payload_source, "next_step_seq_lens", payload_source.new_seq_lens
+        )
         if spec_need_hidden_states():
             self.hidden_states_buf[intv] = payload_source.hidden_states
 

@@ -326,6 +326,35 @@ class EagleDraftInputV2Mixin:
             req.swa_evicted_seqlen = new_swa_evicted_seqlen
 
     def _materialize_decode_seq_lens_for_batch(self, batch: Any) -> bool:
+        next_step_seq_lens = getattr(self, "next_step_seq_lens", None)
+        if next_step_seq_lens is not None:
+            seq_lens_device = next_step_seq_lens.to(
+                device=batch.seq_lens.device, dtype=torch.int64
+            )
+            seq_lens_cpu = seq_lens_device.cpu()
+            batch.seq_lens = seq_lens_device
+            batch.seq_lens_cpu = seq_lens_cpu
+            if getattr(batch, "orig_seq_lens", None) is not None:
+                batch.orig_seq_lens = batch.seq_lens.to(dtype=torch.int32)
+            batch.seq_lens_sum = int(seq_lens_cpu.sum().item())
+            return True
+
+        future_next_step_seq_lens_buf = getattr(
+            self, "future_next_step_seq_lens_buf", None
+        )
+        if future_next_step_seq_lens_buf is not None and self.future_indices is not None:
+            seq_lens_device = future_next_step_seq_lens_buf[self.future_indices.indices].to(
+                device=batch.seq_lens.device, dtype=torch.int64
+            )
+            seq_lens_cpu = seq_lens_device.cpu()
+            batch.seq_lens = seq_lens_device
+            batch.seq_lens_cpu = seq_lens_cpu
+            if getattr(batch, "orig_seq_lens", None) is not None:
+                batch.orig_seq_lens = batch.seq_lens.to(dtype=torch.int32)
+            batch.seq_lens_sum = int(seq_lens_cpu.sum().item())
+            self.next_step_seq_lens = seq_lens_device
+            return True
+
         if hasattr(batch, "materialize_spec_decode_seq_lens_carrier"):
             if batch.materialize_spec_decode_seq_lens_carrier():
                 return True
@@ -384,7 +413,11 @@ class EagleDraftInputV2Mixin:
 
         self._wait_verify_done_for_batch(batch)
         if not self._materialize_decode_seq_lens_for_batch(batch):
-            if self.future_indices is not None and self.new_seq_lens is None:
+            if (
+                self.future_indices is not None
+                and self.new_seq_lens is None
+                and getattr(self, "next_step_seq_lens", None) is None
+            ):
                 self._sync_decode_seq_lens_from_reqs_for_batch(batch)
 
         page_size = batch.token_to_kv_pool_allocator.page_size
@@ -484,10 +517,15 @@ class EagleDraftInputV2Mixin:
                     dtype=self.future_verified_id_buf.dtype,
                     device=self.future_verified_id_buf.device,
                 )
+                future_seq_lens_buf = (
+                    self.future_next_step_seq_lens_buf
+                    if getattr(self, "future_next_step_seq_lens_buf", None) is not None
+                    else self.future_new_seq_lens_buf
+                )
                 self.new_seq_lens = torch.empty(
                     (bs,),
-                    dtype=self.future_new_seq_lens_buf.dtype,
-                    device=self.future_new_seq_lens_buf.device,
+                    dtype=future_seq_lens_buf.dtype,
+                    device=future_seq_lens_buf.device,
                 )
                 self.hidden_states = torch.empty(
                     (bs, self.future_hidden_states_buf.shape[1]),
@@ -500,7 +538,7 @@ class EagleDraftInputV2Mixin:
                     src_topk_index=self.future_topk_index_buf,
                     src_hidden_states=self.future_hidden_states_buf,
                     src_verified_id=self.future_verified_id_buf,
-                    src_new_seq_lens=self.future_new_seq_lens_buf,
+                    src_new_seq_lens=future_seq_lens_buf,
                     src_seq_lens=batch.seq_lens,
                     src_req_pool_indices=batch.req_pool_indices,
                     req_to_token=req_to_token_pool.req_to_token,
@@ -520,6 +558,7 @@ class EagleDraftInputV2Mixin:
                 self.future_hidden_states_buf = None
                 self.future_verified_id_buf = None
                 self.future_new_seq_lens_buf = None
+                self.future_next_step_seq_lens_buf = None
             else:
                 # Assign cache locations
                 batch.out_cache_loc = torch.empty(

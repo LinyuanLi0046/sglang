@@ -2714,6 +2714,24 @@ class Scheduler(
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         self.batch_record_buf[self.batch_record_ct] = model_worker_batch
 
+    def _apply_spec_v2_future_result(
+        self,
+        batch: ScheduleBatch,
+        batch_result: GenerationBatchResult,
+        future_indices,
+    ) -> None:
+        next_draft_input = batch_result.next_draft_input
+        if next_draft_input is None:
+            raise ValueError(
+                "spec-v2 overlap requires next_draft_input before applying future result"
+            )
+
+        next_draft_input.future_indices = future_indices
+        batch.spec_info = next_draft_input
+        # The future value, usually for next batch preparation.
+        # Current implementation strictly synchronizes the seq_lens.
+        batch.seq_lens = next_draft_input.new_seq_lens
+
     def run_batch(
         self,
         batch: ScheduleBatch,
@@ -2791,20 +2809,9 @@ class Scheduler(
                     future_indices_or_next_token_ids = -future_indices.indices
 
                     if batch.is_spec_v2:
-                        # FIXME(lsyin): tmp code for spec v2
-                        # We only keep future indices for next draft input
-
-                        batch.spec_info = batch_result.next_draft_input
-                        batch.spec_info.future_indices = future_indices
-
-                        # batch.spec_info = EagleDraftInput(
-                        #     future_indices=future_indices,
-                        #     verify_done=batch_result.next_draft_input.verify_done,
-                        # )
-
-                        # The future value, usually for next batch preparation
-                        # Current implementation strictly synchronizes the seq_lens
-                        batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+                        self._apply_spec_v2_future_result(
+                            batch, batch_result, future_indices
+                        )
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids

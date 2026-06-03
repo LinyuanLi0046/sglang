@@ -2800,8 +2800,6 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             if self.spec_algorithm.is_none() or self.enable_overlap:
-                if self.enable_overlap and self.spec_overlap_worker is not None and batch.is_spec_v2:
-                    self._ensure_pending_spec_state_ready(batch)
                 # In most cases, we use the model worker batch to run the forward.
                 worker_batch_or_batch = batch.get_model_worker_batch()
             else:

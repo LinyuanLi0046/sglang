@@ -117,10 +117,7 @@ class EagleDraftInputV2Mixin:
 
         indices = self.future_indices.indices
         if indices.shape[0] != batch_size:
-            raise ValueError(
-                "future_indices batch size mismatch for canonical future payload: "
-                f"expected {batch_size}, got {indices.shape[0]}"
-            )
+            return False
 
         ready_buf = getattr(self, "future_canonical_ready_buf", None)
         if ready_buf is not None and not bool(torch.all(ready_buf[indices]).item()):
@@ -129,16 +126,8 @@ class EagleDraftInputV2Mixin:
         expected_width = num_verify_tokens - 1
         resolved_last_verified_ids = self.future_last_verified_ids_buf[indices]
         resolved_token_list = self.future_token_list_buf[indices]
-        if resolved_token_list.ndim != 2:
-            raise ValueError(
-                "resolved future token_list must be 2D for canonical decode payload, "
-                f"got ndim={resolved_token_list.ndim}"
-            )
-        if resolved_token_list.shape[1] < expected_width:
-            raise ValueError(
-                "resolved future token_list step width mismatch: "
-                f"expected at least {expected_width}, got {resolved_token_list.shape[1]}"
-            )
+        if resolved_token_list.ndim != 2 or resolved_token_list.shape[1] < expected_width:
+            return False
 
         self.last_verified_ids = resolved_last_verified_ids
         self.token_list = resolved_token_list[:, :expected_width]
@@ -146,41 +135,6 @@ class EagleDraftInputV2Mixin:
         self.future_token_list_buf = None
         self.future_canonical_ready_buf = None
         return True
-
-    def _validate_canonical_decode_payload(
-        self: EagleDraftInput,
-        batch_size: int,
-        num_verify_tokens: int,
-    ) -> None:
-        last_verified_ids = self.last_verified_ids
-        token_list = self.token_list
-        expected_width = num_verify_tokens - 1
-
-        if last_verified_ids.ndim != 1:
-            raise ValueError(
-                "last_verified_ids must be a 1D tensor for canonical decode payload "
-                f"validation, got ndim={last_verified_ids.ndim}"
-            )
-        if last_verified_ids.shape[0] != batch_size:
-            raise ValueError(
-                "last_verified_ids batch size mismatch: "
-                f"expected {batch_size}, got {last_verified_ids.shape[0]}"
-            )
-        if token_list.ndim != 2:
-            raise ValueError(
-                "token_list must be a 2D tensor for canonical decode payload "
-                f"validation, got ndim={token_list.ndim}"
-            )
-        if token_list.shape[0] != batch_size:
-            raise ValueError(
-                "token_list batch size mismatch: "
-                f"expected {batch_size}, got {token_list.shape[0]}"
-            )
-        if token_list.shape[1] != expected_width:
-            raise ValueError(
-                "token_list step width mismatch: "
-                f"expected {expected_width}, got {token_list.shape[1]}"
-            )
 
     def build_verify_input_from_canonical_decode_payload(
         self: EagleDraftInput,
@@ -192,14 +146,11 @@ class EagleDraftInputV2Mixin:
         if batch.forward_mode.is_idle() or topk != 1:
             return None
 
-        if self._canonical_decode_payload_needs_future_resolve():
-            self._resolve_canonical_future_payload(
-                len(batch.seq_lens), num_verify_tokens
-            )
-        if self._canonical_decode_payload_needs_future_resolve():
+        needs_future_resolve = self._canonical_decode_payload_needs_future_resolve()
+        if needs_future_resolve and not self._resolve_canonical_future_payload(
+            len(batch.seq_lens), num_verify_tokens
+        ):
             return None
-
-        self._validate_canonical_decode_payload(len(batch.seq_lens), num_verify_tokens)
 
         from sglang.srt.speculative.eagle_info import EagleVerifyInput
 

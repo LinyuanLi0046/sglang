@@ -250,12 +250,6 @@ class FutureMap:
             return
 
         placeholder_ids = -future_indices.indices.to(draft_input.last_verified_ids.dtype)
-        if placeholder_ids.shape[0] != draft_input.last_verified_ids.shape[0]:
-            raise ValueError(
-                "canonical future placeholder batch size mismatch: "
-                f"expected {draft_input.last_verified_ids.shape[0]}, got {placeholder_ids.shape[0]}"
-            )
-
         token_width = draft_input.token_list.shape[1]
         draft_input.last_verified_ids = placeholder_ids
         draft_input.token_list = (

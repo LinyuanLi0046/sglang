@@ -2774,6 +2774,14 @@ class Scheduler(
         batch: ScheduleBatch,
         apply_state: "SpecOverlapApplyState",
     ) -> None:
+        if not apply_state.requires_scheduler_apply:
+            existing_spec_info = getattr(batch, "spec_info", None)
+            if existing_spec_info is not None:
+                existing_spec_info.future_indices = apply_state.future_indices
+                existing_spec_info.verify_done = apply_state.next_verify_done
+            batch.spec_decode_seq_lens_carrier = apply_state.next_decode_seq_lens
+            return
+
         self._apply_spec_v2_future_state(
             batch,
             apply_state.next_draft_input,
@@ -2801,8 +2809,7 @@ class Scheduler(
         ):
             return False
 
-        # Decode steady-state no longer routes through scheduler apply-ready.
-        return not pending_batch.forward_mode.is_decode()
+        return True
 
     def _ensure_pending_spec_state_ready(
         self,
@@ -2871,9 +2878,7 @@ class Scheduler(
                             batch_result.next_draft_input,
                             batch_result.future_indices,
                         )
-                        self.pending_spec_state_batch = None
-                    else:
-                        self.pending_spec_state_batch = batch
+                    self.pending_spec_state_batch = batch
                     future_indices_or_next_token_ids = batch_result.next_token_ids
                 else:
                     self.record_batch_in_overlap(model_worker_batch)

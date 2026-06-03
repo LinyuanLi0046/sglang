@@ -27,6 +27,9 @@ logger = logging.getLogger(__name__)
 class SpecOverlapApplyState:
     future_indices: FutureIndices
     next_draft_input: Optional["EagleDraftInput"] = None
+    next_decode_seq_lens: Optional[torch.Tensor] = None
+    next_verify_done: Optional[object] = None
+    requires_scheduler_apply: bool = True
 
 
 class SpecModelWorkerOverlapClient:
@@ -134,6 +137,19 @@ class SpecModelWorkerOverlapClient:
                     SpecOverlapApplyState(
                         future_indices=future_indices,
                         next_draft_input=batch_result.next_draft_input,
+                    )
+                )
+            else:
+                self.apply_queue.put(
+                    SpecOverlapApplyState(
+                        future_indices=future_indices,
+                        next_decode_seq_lens=getattr(
+                            batch_result.next_draft_input, "new_seq_lens", None
+                        ),
+                        next_verify_done=getattr(
+                            batch_result.next_draft_input, "verify_done", None
+                        ),
+                        requires_scheduler_apply=False,
                     )
                 )
 

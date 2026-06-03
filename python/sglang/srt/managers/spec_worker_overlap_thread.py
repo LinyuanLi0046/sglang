@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import threading
 import traceback
-from collections import deque
 from queue import Queue
 from typing import Callable, Deque, Optional
 
@@ -31,8 +30,8 @@ class SpecModelWorkerOverlapClient:
         self.keep_batch_reference_num = 2 * num_decode_steps
 
         self.input_queue: Queue = Queue()
+        self.apply_queue: Queue = Queue()
         self.output_queue: Queue = Queue()
-        self.ready_results: Deque[GenerationBatchResult] = deque()
         self.forward_stream = torch.get_device_module(self.device).Stream()
         self.forward_thread = threading.Thread(
             target=self.forward_thread_func,
@@ -101,6 +100,10 @@ class SpecModelWorkerOverlapClient:
                     future_indices, batch_result.next_draft_input
                 )
 
+            # Expose the minimal state needed by scheduler before the full
+            # D2H result becomes available.
+            self.apply_queue.put(batch_result)
+
             batch_result.copy_done = torch.get_device_module(self.device).Event()
             batch_result.copy_to_cpu(return_logprob=return_logprob)
             self.output_queue.put(batch_result)
@@ -145,11 +148,10 @@ class SpecModelWorkerOverlapClient:
     ) -> None:
         self._raise_if_thread_failed()
 
-        batch_result = self.output_queue.get()
+        batch_result = self.apply_queue.get()
         if isinstance(batch_result, RuntimeError):
             raise batch_result
 
-        self.ready_results.append(batch_result)
         apply_future_result(batch, batch_result, batch_result.future_indices)
 
     def resolve_last_batch_result(
@@ -158,12 +160,9 @@ class SpecModelWorkerOverlapClient:
     ) -> GenerationBatchResult:
         self._raise_if_thread_failed()
 
-        if self.ready_results:
-            batch_result = self.ready_results.popleft()
-        else:
-            batch_result = self.output_queue.get()
-            if isinstance(batch_result, RuntimeError):
-                raise batch_result
+        batch_result = self.output_queue.get()
+        if isinstance(batch_result, RuntimeError):
+            raise batch_result
 
         batch_result.extend_input_len_per_req = placeholder_result.extend_input_len_per_req
         batch_result.extend_logprob_start_len_per_req = (

@@ -2724,11 +2724,6 @@ class Scheduler(
         if batch.is_empty():
             return batch
 
-        # Stage B defers spec-v2 decode batch preparation from selection to the
-        # launch boundary once submit-time placeholder carrier exists.
-        if self._should_defer_spec_v2_decode_prepare_to_launch(batch):
-            return batch
-
         # Update batch tensors
         batch.prepare_for_decode()
         return batch
@@ -2768,6 +2763,7 @@ class Scheduler(
                 next_draft_input.real_new_verified_id
             )
             existing_spec_info.real_token_list = next_draft_input.real_token_list
+            batch.seq_lens = next_draft_input.new_seq_lens
             return
 
         next_draft_input.future_indices = future_indices
@@ -2787,33 +2783,6 @@ class Scheduler(
 
         next_draft_input.future_indices = future_indices
         batch.spec_info = next_draft_input
-
-    def _can_defer_spec_v2_decode_selection_wait(
-        self,
-        batch: Optional[ScheduleBatch],
-    ) -> bool:
-        if (
-            self.spec_overlap_worker is None
-            or batch is None
-            or not batch.is_spec_v2
-            or not batch.forward_mode.is_decode()
-        ):
-            return False
-
-        spec_info = getattr(batch, "spec_info", None)
-        return (
-            spec_info is not None
-            and getattr(spec_info, "future_indices", None) is not None
-        )
-
-    def _should_defer_spec_v2_decode_prepare_to_launch(
-        self,
-        batch: Optional[ScheduleBatch],
-    ) -> bool:
-        return (
-            getattr(self, "pending_spec_state_batch", None) is batch
-            and self._can_defer_spec_v2_decode_selection_wait(batch)
-        )
 
     def _apply_spec_v2_overlap_state(
         self,
@@ -2847,12 +2816,10 @@ class Scheduler(
         ):
             return False
 
-        # Stage B decouples selection-visible seq_lens for decode steady-state:
-        # once submit-time placeholder carrier exists, selection can proceed on
-        # placeholder spec_info and defer the real state rendezvous until launch.
-        if self._should_defer_spec_v2_decode_prepare_to_launch(pending_batch):
-            return False
-
+        # get_next_batch_to_run() may mutate last_batch/running_batch through
+        # filter/merge/update_running_batch before run_batch() is reached.
+        # Those paths also consume live spec_info/seq_lens, so pending spec
+        # state must be applied before batch selection starts.
         return True
 
     def _ensure_pending_spec_state_ready(
@@ -2898,15 +2865,8 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             if self.spec_algorithm.is_none() or self.enable_overlap:
-                deferred_spec_v2_decode_prepare = (
-                    self.enable_overlap
-                    and self.spec_overlap_worker is not None
-                    and self._should_defer_spec_v2_decode_prepare_to_launch(batch)
-                )
                 if self.enable_overlap and self.spec_overlap_worker is not None and batch.is_spec_v2:
                     self._ensure_pending_spec_state_ready(batch)
-                    if deferred_spec_v2_decode_prepare:
-                        batch.prepare_for_decode()
                 # In most cases, we use the model worker batch to run the forward.
                 worker_batch_or_batch = batch.get_model_worker_batch()
             else:

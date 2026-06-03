@@ -441,6 +441,8 @@ class EagleDraftInputV2Mixin:
             cur_kv_lens_cpu.append(r.kv_allocated_len)
             nxt_kv_lens_cpu.append(r.kv_allocated_len + x)
             num_needed_tokens += x
+            r.kv_allocated_len += x
+            r.decode_batch_idx += 1
 
         cur_kv_lens_cpu = torch.tensor(cur_kv_lens_cpu, dtype=torch.int32, device="cpu")
         nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens_cpu, dtype=torch.int32, device="cpu")

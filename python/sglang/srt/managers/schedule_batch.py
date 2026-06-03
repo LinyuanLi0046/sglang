@@ -1309,7 +1309,7 @@ class Req(ReqDllmMixin):
     def rollback_pending_spec_decode_alloc_reservations(
         self, tree_cache: BasePrefixCache
     ) -> None:
-        for reservation in list(self.pending_spec_decode_alloc_reservations):
+        for reservation in list(self.pending_spec_decode_alloc_reservations)[::-1]:
             reservation.rollback_req(self, tree_cache)
 
 
@@ -1336,8 +1336,6 @@ class SpecDecodeAllocReservation:
         for i, req in enumerate(self.reqs):
             if self._committed[i] or self._rolled_back[i]:
                 continue
-            req.kv_allocated_len = int(self.nxt_kv_lens_cpu[i].item())
-            req.decode_batch_idx += 1
             self._committed[i] = True
             self._detach_req(req)
 
@@ -1350,6 +1348,10 @@ class SpecDecodeAllocReservation:
         end_p = int(self.nxt_kv_lens_cpu[idx].item())
         if req.req_pool_idx is not None and start_p < end_p:
             free_req_kv_range(req, tree_cache, start_p, end_p)
+        if req.kv_allocated_len == end_p:
+            req.kv_allocated_len = start_p
+        if req.decode_batch_idx > 0:
+            req.decode_batch_idx -= 1
 
         self._rolled_back[idx] = True
         self._detach_req(req)

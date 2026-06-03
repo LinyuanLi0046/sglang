@@ -288,15 +288,104 @@ class EagleDraftInputV2Mixin:
                     f"expected {speculative_num_steps}, got {real_token_list.shape[1]}"
                 )
 
+    def _evict_swa_batch_like(self, batch: Any) -> None:
+        tree_cache = getattr(batch, "tree_cache", None)
+        reqs = getattr(batch, "reqs", None)
+        if tree_cache is None or reqs is None or not tree_cache.supports_swa():
+            return
+
+        sliding_window_size = tree_cache.sliding_window_size
+        for req in reqs:
+            if batch.forward_mode.is_decode():
+                if req.decode_batch_idx % sliding_window_size == 1:
+                    self._evict_swa_req(batch, req, req.seqlen - 1)
+
+    def _evict_swa_req(self, batch: Any, req: Any, pre_len: int) -> None:
+        tree_cache = batch.tree_cache
+        assert tree_cache.supports_swa(), "prefix cache must support swa"
+        sliding_window_size = tree_cache.sliding_window_size
+
+        assert (
+            req.cache_protected_len % tree_cache.page_size == 0
+        ), "cache_protected_len must be page aligned"
+        req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
+
+        new_swa_evicted_seqlen = max(
+            req.swa_evicted_seqlen, pre_len - sliding_window_size
+        )
+        if tree_cache.page_size > 1:
+            new_swa_evicted_seqlen = (
+                new_swa_evicted_seqlen // tree_cache.page_size
+            ) * tree_cache.page_size
+
+        if new_swa_evicted_seqlen > req.swa_evicted_seqlen:
+            free_slots = batch.req_to_token_pool.req_to_token[
+                req.req_pool_idx, req.swa_evicted_seqlen : new_swa_evicted_seqlen
+            ]
+            batch.token_to_kv_pool_allocator.free_swa(free_slots)
+            req.swa_evicted_seqlen = new_swa_evicted_seqlen
+
+    def _materialize_decode_seq_lens_for_batch(self, batch: Any) -> bool:
+        if hasattr(batch, "materialize_spec_decode_seq_lens_carrier"):
+            if batch.materialize_spec_decode_seq_lens_carrier():
+                return True
+
+        seq_lens_carrier = getattr(batch, "spec_decode_seq_lens_carrier", None)
+        if seq_lens_carrier is None:
+            return False
+
+        seq_lens_device = seq_lens_carrier.to(
+            device=batch.seq_lens.device, dtype=torch.int64
+        )
+        seq_lens_cpu = seq_lens_device.cpu()
+        batch.seq_lens = seq_lens_device
+        batch.seq_lens_cpu = seq_lens_cpu
+        if getattr(batch, "orig_seq_lens", None) is not None:
+            batch.orig_seq_lens = batch.seq_lens.to(dtype=torch.int32)
+        batch.seq_lens_sum = int(seq_lens_cpu.sum().item())
+        return True
+
+    def _sync_decode_seq_lens_from_reqs_for_batch(self, batch: Any) -> None:
+        if hasattr(batch, "sync_decode_seq_lens_from_reqs"):
+            batch.sync_decode_seq_lens_from_reqs()
+            return
+
+        reqs = getattr(batch, "reqs", None)
+        if reqs is None:
+            return
+
+        if len(reqs) == 0:
+            seq_lens_cpu = torch.empty(0, dtype=torch.int64)
+        else:
+            seq_lens_cpu = torch.tensor([req.seqlen for req in reqs], dtype=torch.int64)
+        batch.seq_lens = seq_lens_cpu.to(device=batch.seq_lens.device)
+        batch.seq_lens_cpu = seq_lens_cpu
+        if getattr(batch, "orig_seq_lens", None) is not None:
+            batch.orig_seq_lens = batch.seq_lens.to(dtype=torch.int32)
+        batch.seq_lens_sum = int(seq_lens_cpu.sum().item())
+
+    def _wait_verify_done_for_batch(self, batch: Any) -> None:
+        if hasattr(batch, "maybe_wait_verify_done"):
+            batch.maybe_wait_verify_done()
+            return
+
+        if self.verify_done is not None:
+            self.verify_done.synchronize()
+
     def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
-        batch.maybe_evict_swa()
+        if hasattr(batch, "maybe_evict_swa"):
+            batch.maybe_evict_swa()
+        else:
+            self._evict_swa_batch_like(batch)
 
         from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
-        bs = batch.batch_size()
+        bs = batch.batch_size() if hasattr(batch, "batch_size") else len(batch.reqs)
 
-        # Now seq_lens is correct
-        batch.maybe_wait_verify_done()
+        self._wait_verify_done_for_batch(batch)
+        if not self._materialize_decode_seq_lens_for_batch(batch):
+            if self.future_indices is not None and self.new_seq_lens is None:
+                self._sync_decode_seq_lens_from_reqs_for_batch(batch)
 
         page_size = batch.token_to_kv_pool_allocator.page_size
         cur_kv_lens_cpu = []

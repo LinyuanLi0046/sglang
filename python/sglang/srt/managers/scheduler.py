@@ -2639,7 +2639,10 @@ class Scheduler(
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if not self.running_batch.is_empty():
-                self.running_batch.prepare_for_decode()
+                if self.spec_overlap_worker is not None and self.running_batch.is_spec_v2:
+                    self.running_batch.prepare_for_decode_shell()
+                else:
+                    self.running_batch.prepare_for_decode()
                 new_batch.mix_with_running(self.running_batch)
                 new_batch.decoding_reqs = self.running_batch.reqs
             self.running_batch = ScheduleBatch(
@@ -2724,8 +2727,13 @@ class Scheduler(
         if batch.is_empty():
             return batch
 
-        # Update batch tensors
-        batch.prepare_for_decode()
+        # R5-1/R5-2 first cut: spec-v2 overlap decode only does shell prepare
+        # on the scheduler thread. The live decode prepare will be completed on
+        # the overlap worker right before launch.
+        if self.spec_overlap_worker is not None and batch.is_spec_v2:
+            batch.prepare_for_decode_shell()
+        else:
+            batch.prepare_for_decode()
         return batch
 
     def record_batch_in_overlap(self, model_worker_batch: ModelWorkerBatch):

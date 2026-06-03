@@ -2068,7 +2068,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         assert not ret or self.spec_algorithm.supports_spec_v2()
         return ret
 
-    def prepare_for_decode(self):
+    def _prepare_decode_shell_common(self) -> int:
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
         # Decode embeds the last output token via embed_tokens; clear the stale
@@ -2081,18 +2081,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if hasattr(self, "nsa_cp_metadata") and self.nsa_cp_metadata is not None:
             self.nsa_cp_metadata = None
 
+        return bs
+
+    def prepare_for_decode_shell(self):
+        self._prepare_decode_shell_common()
+
+    def prepare_for_decode(self):
+        bs = self._prepare_decode_shell_common()
+
         if self.is_spec_v2:
             # TODO(spec-v2): all spec v2 should go through this path
             draft_input: EagleDraftInput = self.spec_info
-            if self.has_pending_spec_decode_state():
-                self.maybe_wait_verify_done()
-            if not self.materialize_spec_decode_seq_lens_carrier():
-                if (
-                    draft_input is not None
-                    and getattr(draft_input, "future_indices", None) is not None
-                    and getattr(draft_input, "new_seq_lens", None) is None
-                ):
-                    self.sync_decode_seq_lens_from_reqs()
             draft_input.prepare_for_decode(self)
 
         if not self.spec_algorithm.is_none():
@@ -2492,6 +2491,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dllm_config=self.dllm_config,
             reqs=self.reqs,
             has_grammar=self.has_grammar,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            device=self.device,
+            spec_decode_seq_lens_carrier=self.spec_decode_seq_lens_carrier,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
@@ -2680,6 +2684,14 @@ class ModelWorkerBatch:
     # FIXME(lsyin): remove this after fully overlap grammar
     reqs: Optional[List[Req]] = None
     has_grammar: bool = False
+
+    # R5-1/R5-2 staging: worker-side spec decode prepare still needs access to
+    # live request/KV context and the transitional true-length carrier.
+    req_to_token_pool: ReqToTokenPool = None
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
+    tree_cache: BasePrefixCache = None
+    device: str = None
+    spec_decode_seq_lens_carrier: Optional[torch.Tensor] = None
 
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False

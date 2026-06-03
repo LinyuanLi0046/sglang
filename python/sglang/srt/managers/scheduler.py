@@ -2639,12 +2639,6 @@ class Scheduler(
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if not self.running_batch.is_empty():
-                if (
-                    self.spec_overlap_worker is not None
-                    and self.running_batch.is_spec_v2
-                    and self.running_batch.forward_mode.is_decode()
-                ):
-                    self._ensure_pending_spec_state_ready(self.running_batch)
                 self.running_batch.prepare_for_decode()
                 new_batch.mix_with_running(self.running_batch)
                 new_batch.decoding_reqs = self.running_batch.reqs
@@ -2728,11 +2722,6 @@ class Scheduler(
             batch.batch_is_full = False
 
         if batch.is_empty():
-            return batch
-
-        # Delay spec-v2 decode preparation to the launch boundary so selection
-        # no longer waits on the decode baton.
-        if batch.is_spec_v2 and batch.forward_mode.is_decode():
             return batch
 
         # Update batch tensors
@@ -2820,9 +2809,7 @@ class Scheduler(
         ):
             return False
 
-        # Decode steady-state keeps the minimal baton but no longer waits for it
-        # before batch selection. The baton is consumed at the launch boundary.
-        return not pending_batch.forward_mode.is_decode()
+        return True
 
     def _ensure_pending_spec_state_ready(
         self,
@@ -2867,14 +2854,6 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             if self.spec_algorithm.is_none() or self.enable_overlap:
-                if (
-                    self.enable_overlap
-                    and self.spec_overlap_worker is not None
-                    and batch.is_spec_v2
-                    and batch.forward_mode.is_decode()
-                ):
-                    self._ensure_pending_spec_state_ready(batch)
-                    batch.prepare_for_decode()
                 # In most cases, we use the model worker batch to run the forward.
                 worker_batch_or_batch = batch.get_model_worker_batch()
             else:

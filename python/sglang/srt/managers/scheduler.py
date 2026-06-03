@@ -2748,11 +2748,41 @@ class Scheduler(
                 "spec-v2 overlap requires next_draft_input before applying future state"
             )
 
+        existing_spec_info = getattr(batch, "spec_info", None)
+        if (
+            getattr(self, "pending_spec_state_batch", None) is batch
+            and self.spec_overlap_worker is not None
+            and batch.forward_mode.is_decode()
+            and existing_spec_info is not None
+            and getattr(existing_spec_info, "future_indices", None) is not None
+        ):
+            existing_spec_info.future_indices = future_indices
+            existing_spec_info.verify_done = next_draft_input.verify_done
+            existing_spec_info.new_seq_lens = next_draft_input.new_seq_lens
+            existing_spec_info.real_new_verified_id = (
+                next_draft_input.real_new_verified_id
+            )
+            existing_spec_info.real_token_list = next_draft_input.real_token_list
+            batch.seq_lens = next_draft_input.new_seq_lens
+            return
+
         next_draft_input.future_indices = future_indices
         batch.spec_info = next_draft_input
         # The future value, usually for next batch preparation.
         # Current implementation strictly synchronizes the seq_lens.
         batch.seq_lens = next_draft_input.new_seq_lens
+
+    def _apply_spec_v2_submit_placeholder_carrier(
+        self,
+        batch: ScheduleBatch,
+        next_draft_input,
+        future_indices,
+    ) -> None:
+        if next_draft_input is None:
+            return
+
+        next_draft_input.future_indices = future_indices
+        batch.spec_info = next_draft_input
 
     def _apply_spec_v2_overlap_state(
         self,
@@ -2786,10 +2816,10 @@ class Scheduler(
         ):
             return False
 
-        # get_next_batch_to_run() may mutate last_batch/running_batch through
-        # filter/merge/update_running_batch before run_batch() is reached.
-        # Those paths also consume live spec_info/seq_lens, so pending spec
-        # state must be applied before batch selection starts.
+        # Stage A moves decode carrier construction to submit time, but
+        # selection still consumes live seq_lens and non-decode fallback state.
+        # Keep the rendezvous before selection until seq_lens ownership is
+        # decoupled in the next stage.
         return True
 
     def _ensure_pending_spec_state_ready(
@@ -2855,6 +2885,12 @@ class Scheduler(
                     batch_result = self.spec_overlap_worker.forward_batch_generation(
                         model_worker_batch
                     )
+                    if batch.forward_mode.is_decode():
+                        self._apply_spec_v2_submit_placeholder_carrier(
+                            batch,
+                            batch_result.next_draft_input,
+                            batch_result.future_indices,
+                        )
                     self.pending_spec_state_batch = batch
                     future_indices_or_next_token_ids = batch_result.next_token_ids
                 else:

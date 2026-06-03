@@ -9,7 +9,11 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
-from sglang.srt.managers.overlap_utils import FutureIndices, FutureMap
+from sglang.srt.managers.overlap_utils import (
+    FutureIndices,
+    FutureMap,
+    build_decode_placeholder_canonical_draft_input,
+)
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 
@@ -173,9 +177,24 @@ class SpecModelWorkerOverlapClient:
             )
         )
 
+        placeholder_next_draft_input = None
+        if model_worker_batch.forward_mode.is_decode() and not model_worker_batch.is_extend_in_batch:
+            placeholder_next_draft_input = (
+                build_decode_placeholder_canonical_draft_input(
+                    future_indices=future_indices,
+                    token_list_width=getattr(
+                        self.worker,
+                        "speculative_num_steps",
+                        self.worker.server_args.speculative_num_steps,
+                    ),
+                    template_draft_input=model_worker_batch.spec_info,
+                )
+            )
+
         return GenerationBatchResult(
             next_token_ids=-future_indices.indices,
             future_indices=future_indices,
+            next_draft_input=placeholder_next_draft_input,
         )
 
     def ensure_batch_state_ready(

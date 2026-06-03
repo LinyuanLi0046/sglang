@@ -42,6 +42,46 @@ class FutureIndices:
     interval: Optional[slice] = None
 
 
+def build_decode_placeholder_canonical_draft_input(
+    future_indices: FutureIndices,
+    token_list_width: int,
+    template_draft_input: Optional["EagleDraftInput"] = None,
+):
+    from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+    dtype = torch.int32
+    for attr_name in ("last_verified_ids", "verified_id", "real_new_verified_id"):
+        template_tensor = (
+            getattr(template_draft_input, attr_name, None)
+            if template_draft_input is not None
+            else None
+        )
+        if template_tensor is not None:
+            dtype = template_tensor.dtype
+            break
+
+    placeholder_ids = -future_indices.indices.to(dtype=dtype)
+    draft_input_kwargs = {
+        "future_indices": future_indices,
+        "last_verified_ids": placeholder_ids,
+        "token_list": placeholder_ids.unsqueeze(1)
+        .expand(-1, token_list_width)
+        .clone(),
+    }
+    if template_draft_input is not None:
+        draft_input_kwargs["capture_hidden_mode"] = getattr(
+            template_draft_input, "capture_hidden_mode", None
+        )
+        draft_input_kwargs["num_tokens_per_req"] = getattr(
+            template_draft_input, "num_tokens_per_req", -1
+        )
+        draft_input_kwargs["num_tokens_for_logprob_per_req"] = getattr(
+            template_draft_input, "num_tokens_for_logprob_per_req", -1
+        )
+
+    return EagleDraftInput(**draft_input_kwargs)
+
+
 class FutureMap:
     def __init__(
         self,

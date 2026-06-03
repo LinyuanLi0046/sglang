@@ -2777,6 +2777,14 @@ class Scheduler(
         batch.spec_info = next_draft_input
         batch.spec_decode_seq_lens_carrier = None
 
+    def _is_spec_v2_decode_placeholder_path(self, batch: Optional[ScheduleBatch]) -> bool:
+        return bool(
+            batch is not None
+            and batch.is_spec_v2
+            and batch.forward_mode.is_decode()
+            and not getattr(batch, "is_extend_in_batch", False)
+        )
+
     def _apply_spec_v2_overlap_state(
         self,
         batch: ScheduleBatch,
@@ -2838,7 +2846,7 @@ class Scheduler(
         ):
             return
 
-        if batch.is_spec_v2 and batch.forward_mode.is_decode():
+        if self._is_spec_v2_decode_placeholder_path(batch):
             self.spec_overlap_worker.ensure_decode_future_ready(
                 batch, self._sync_spec_v2_decode_future_ready
             )
@@ -2905,7 +2913,7 @@ class Scheduler(
                     batch_result = self.spec_overlap_worker.forward_batch_generation(
                         model_worker_batch
                     )
-                    if batch.forward_mode.is_decode():
+                    if self._is_spec_v2_decode_placeholder_path(batch):
                         self._apply_spec_v2_submit_placeholder_carrier(
                             batch,
                             batch_result.next_draft_input,

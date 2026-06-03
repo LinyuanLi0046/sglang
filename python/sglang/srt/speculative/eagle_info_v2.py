@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -112,29 +112,49 @@ class EagleDraftInputV2Mixin:
         batch_size: int,
         num_verify_tokens: int,
     ) -> bool:
+        resolved, _ = self._resolve_canonical_future_payload_with_reason(
+            batch_size, num_verify_tokens
+        )
+        return resolved
+
+    def _resolve_canonical_future_payload_with_reason(
+        self: EagleDraftInput,
+        batch_size: int,
+        num_verify_tokens: int,
+    ) -> Tuple[bool, Optional[str]]:
         if not self._has_canonical_future_payload():
-            return False
+            return False, "future_payload_unavailable"
 
         indices = self.future_indices.indices
         if indices.shape[0] != batch_size:
-            return False
+            return False, "future_indices_batch_mismatch"
 
         ready_buf = getattr(self, "future_canonical_ready_buf", None)
         if ready_buf is not None and not bool(torch.all(ready_buf[indices]).item()):
-            return False
+            return False, "future_not_ready"
 
         expected_width = num_verify_tokens - 1
         resolved_last_verified_ids = self.future_last_verified_ids_buf[indices]
         resolved_token_list = self.future_token_list_buf[indices]
         if resolved_token_list.ndim != 2 or resolved_token_list.shape[1] < expected_width:
-            return False
+            return False, "future_token_list_shape_mismatch"
 
         self.last_verified_ids = resolved_last_verified_ids
         self.token_list = resolved_token_list[:, :expected_width]
         self.future_last_verified_ids_buf = None
         self.future_token_list_buf = None
         self.future_canonical_ready_buf = None
-        return True
+        return True, None
+
+    def _get_canonical_decode_payload_missing_fields(
+        self: EagleDraftInput,
+    ) -> list[str]:
+        missing_fields = []
+        if getattr(self, "last_verified_ids", None) is None:
+            missing_fields.append("missing_last_verified_ids")
+        if getattr(self, "token_list", None) is None:
+            missing_fields.append("missing_token_list")
+        return missing_fields
 
     def build_verify_input_from_canonical_decode_payload(
         self: EagleDraftInput,
@@ -143,14 +163,44 @@ class EagleDraftInputV2Mixin:
         spec_steps: int,
         num_verify_tokens: int,
     ):
-        if batch.forward_mode.is_idle() or topk != 1:
-            return None
+        verify_input, _, _ = self.build_verify_input_from_canonical_decode_payload_with_reason(
+            batch, topk, spec_steps, num_verify_tokens
+        )
+        return verify_input
+
+    def build_verify_input_from_canonical_decode_payload_with_reason(
+        self: EagleDraftInput,
+        batch: ModelWorkerBatch,
+        topk: int,
+        spec_steps: int,
+        num_verify_tokens: int,
+    ) -> Tuple[Optional[Any], Optional[str], Optional[str]]:
+        if batch.forward_mode.is_idle():
+            return None, "idle_forward_mode", None
+        if topk != 1:
+            return None, "topk_not_supported", f"topk={topk}"
+
+        missing_fields = self._get_canonical_decode_payload_missing_fields()
+        if missing_fields and not self._canonical_decode_payload_needs_future_resolve():
+            return None, missing_fields[0], ",".join(missing_fields)
 
         needs_future_resolve = self._canonical_decode_payload_needs_future_resolve()
-        if needs_future_resolve and not self._resolve_canonical_future_payload(
-            len(batch.seq_lens), num_verify_tokens
-        ):
-            return None
+        if needs_future_resolve:
+            resolved, resolve_reason = self._resolve_canonical_future_payload_with_reason(
+                len(batch.seq_lens), num_verify_tokens
+            )
+            if not resolved:
+                return None, resolve_reason, ",".join(missing_fields) or None
+
+        expected_width = num_verify_tokens - 1
+        if self.token_list is None or self.token_list.ndim != 2:
+            return None, "missing_token_list", "token_list_not_2d"
+        if self.token_list.shape[1] != expected_width:
+            return (
+                None,
+                "token_list_width_mismatch",
+                f"expected_width={expected_width},actual_width={self.token_list.shape[1]}",
+            )
 
         from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
@@ -207,7 +257,7 @@ class EagleDraftInputV2Mixin:
             capture_hidden_mode=CaptureHiddenMode.FULL,
             seq_lens_sum=batch.seq_lens_sum,
             seq_lens_cpu=batch.seq_lens_cpu,
-        )
+        ), None, None
 
     def _validate_real_decode_payload(
         self: EagleDraftInput,

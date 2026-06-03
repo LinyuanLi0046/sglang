@@ -1,5 +1,4 @@
 import contextlib
-from dataclasses import replace
 import logging
 import threading
 import time
@@ -332,16 +331,24 @@ class EagleDraftWorker(BaseDraftWorker):
 
     def draft(self, model_worker_batch: ModelWorkerBatch):
         draft_input: EagleDraftInput = model_worker_batch.spec_info
-        canonical_verify_input = (
-            draft_input.build_verify_input_from_canonical_decode_payload(
-                model_worker_batch,
-                self.topk,
-                self.speculative_num_steps,
-                self.speculative_num_draft_tokens,
-            )
+        (
+            canonical_verify_input,
+            fallback_reason,
+            fallback_details,
+        ) = draft_input.build_verify_input_from_canonical_decode_payload_with_reason(
+            model_worker_batch,
+            self.topk,
+            self.speculative_num_steps,
+            self.speculative_num_draft_tokens,
         )
         if canonical_verify_input is not None:
             return canonical_verify_input
+        if not model_worker_batch.forward_mode.is_idle():
+            self._log_r4_fallback(
+                model_worker_batch,
+                fallback_reason or "canonical_verify_input_unavailable",
+                fallback_details,
+            )
 
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
             self.req_to_token_pool,
@@ -420,6 +427,26 @@ class EagleDraftWorker(BaseDraftWorker):
             seq_lens_cpu=None,
         )
         return verify_input
+
+    def _log_r4_fallback(
+        self,
+        batch: ModelWorkerBatch,
+        reason: str,
+        details: Optional[str] = None,
+    ) -> None:
+        req_ids = [
+            str(getattr(req, "rid", "unknown"))
+            for req in getattr(batch, "reqs", [])[:4]
+        ]
+        logger.error(
+            "[R4 fallback] forward_mode=%s batch_size=%s topk=%s reason=%s details=%s req_ids=%s",
+            getattr(batch.forward_mode, "name", str(batch.forward_mode)),
+            len(getattr(batch, "reqs", [])),
+            self.topk,
+            reason,
+            details or "none",
+            ",".join(req_ids) if req_ids else "none",
+        )
 
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
@@ -669,64 +696,19 @@ class EagleDraftWorker(BaseDraftWorker):
             ret_hidden_states,
         )
         next_draft_input.last_verified_ids = next_draft_input.verified_id
-        next_draft_input.token_list = self._build_canonical_decode_token_list_from_next_state(
+        next_draft_input.token_list = self._build_real_decode_token_list(
             batch, next_draft_input
         )
-        next_draft_input.real_token_list = None
+        next_draft_input.real_token_list = next_draft_input.token_list
 
     def _build_canonical_decode_token_list_from_next_state(
         self,
         batch: ModelWorkerBatch,
         next_draft_input: EagleDraftInput,
     ) -> Optional[torch.Tensor]:
-        if self.topk != 1 or next_draft_input.verified_id.numel() == 0:
-            return None
-
-        next_seq_lens = next_draft_input.new_seq_lens
-        if next_seq_lens is None:
-            return None
-
-        relay_batch = replace(
-            batch,
-            forward_mode=ForwardMode.DECODE,
-            input_ids=next_draft_input.verified_id,
-            seq_lens=next_seq_lens,
-            seq_lens_cpu=next_seq_lens.cpu(),
-            seq_lens_sum=int(next_seq_lens.sum().item()),
-            capture_hidden_mode=CaptureHiddenMode.LAST,
+        raise RuntimeError(
+            "R4 decode side replay producer should not be used after canonical producer cutover"
         )
-
-        proposal_input = EagleDraftInput(
-            hidden_states=next_draft_input.hidden_states,
-            verified_id=next_draft_input.verified_id,
-            topk_p=next_draft_input.topk_p,
-            topk_index=next_draft_input.topk_index,
-            new_seq_lens=next_draft_input.new_seq_lens,
-            num_tokens_per_req=next_draft_input.num_tokens_per_req,
-            num_tokens_for_logprob_per_req=next_draft_input.num_tokens_for_logprob_per_req,
-            capture_hidden_mode=next_draft_input.capture_hidden_mode,
-        )
-        relay_batch.spec_info = proposal_input
-
-        forward_batch, can_cuda_graph = proposal_input.prepare_for_v2_draft(
-            self.req_to_token_pool,
-            relay_batch,
-            self.cuda_graph_runner,
-            self.draft_runner,
-            self.topk,
-            self.speculative_num_steps,
-        )
-        if can_cuda_graph:
-            _, _, draft_tokens = self.cuda_graph_runner.replay(forward_batch)
-        else:
-            if (
-                not forward_batch.forward_mode.is_idle()
-                and self.speculative_num_steps > 1
-            ):
-                self.draft_attn_backend.init_forward_metadata(forward_batch)
-            _, _, draft_tokens = self.draft_forward(forward_batch)
-
-        return draft_tokens
 
     def _build_real_decode_token_list(
         self,

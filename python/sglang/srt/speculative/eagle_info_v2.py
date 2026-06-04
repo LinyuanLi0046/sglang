@@ -111,12 +111,23 @@ class EagleDraftInputV2Mixin:
 
     def _canonical_decode_payload_needs_future_resolve(
         self: EagleDraftInput,
+        batch_size: Optional[int] = None,
+        num_verify_tokens: Optional[int] = None,
     ) -> bool:
         if not self._has_canonical_decode_payload():
             return True
 
         last_verified_ids = self.last_verified_ids
         token_list = self.token_list
+        if batch_size is not None:
+            if last_verified_ids.shape[0] != batch_size:
+                return True
+            if token_list.ndim != 2 or token_list.shape[0] != batch_size:
+                return True
+        if num_verify_tokens is not None:
+            expected_width = int(num_verify_tokens) - 1
+            if token_list.ndim != 2 or token_list.shape[1] != expected_width:
+                return True
         return bool(
             torch.any(last_verified_ids < 0).item()
             or torch.any(token_list < 0).item()
@@ -204,11 +215,15 @@ class EagleDraftInputV2Mixin:
         if topk != 1:
             return None, "topk_not_supported", f"topk={topk}"
 
+        batch_size = len(batch.seq_lens)
+        effective_num_verify_tokens = self.get_verify_token_num(num_verify_tokens)
         missing_fields = self._get_canonical_decode_payload_missing_fields()
-        if missing_fields and not self._canonical_decode_payload_needs_future_resolve():
+        if missing_fields and not self._canonical_decode_payload_needs_future_resolve(
+            batch_size=batch_size,
+            num_verify_tokens=effective_num_verify_tokens,
+        ):
             return None, missing_fields[0], ",".join(missing_fields)
 
-        effective_num_verify_tokens = self.get_verify_token_num(num_verify_tokens)
         if (
             getattr(self, "verify_token_num", -1) is not None
             and int(getattr(self, "verify_token_num", -1)) > 0
@@ -221,10 +236,13 @@ class EagleDraftInputV2Mixin:
                 f"payload_verify_token_num={int(self.verify_token_num)},"
                 f"consumer_verify_token_num={int(num_verify_tokens)}",
             )
-        needs_future_resolve = self._canonical_decode_payload_needs_future_resolve()
+        needs_future_resolve = self._canonical_decode_payload_needs_future_resolve(
+            batch_size=batch_size,
+            num_verify_tokens=effective_num_verify_tokens,
+        )
         if needs_future_resolve:
             resolved, resolve_reason = self._resolve_canonical_future_payload_with_reason(
-                len(batch.seq_lens), effective_num_verify_tokens
+                batch_size, effective_num_verify_tokens
             )
             if not resolved:
                 return None, resolve_reason, ",".join(missing_fields) or None
@@ -241,7 +259,6 @@ class EagleDraftInputV2Mixin:
 
         from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
-        batch_size = len(batch.seq_lens)
         shared_verified_lens = self._get_shared_verified_lens_for_batch(batch)
         if shared_verified_lens is not None:
             live_seq_lens, live_seq_lens_cpu = shared_verified_lens

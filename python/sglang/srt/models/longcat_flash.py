@@ -800,10 +800,17 @@ class LongcatFlashDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
+        use_ops_prefill = (
+            _use_longcat_ops_deepep_runtime()
+            and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+        )
+        use_sparse_layout = _use_old_deepep_runtime() or (
+            _use_longcat_ops_deepep_runtime() and not use_ops_prefill
+        )
         if get_global_server_args().enable_longcat_double_stream and MultiStreamUtils().main_stream is None and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             MultiStreamUtils().main_stream = torch.npu.current_stream()
         # first_attn
-        if _use_longcat_sparse_a2a_runtime() and not self.is_first_layer:
+        if use_sparse_layout and not self.is_first_layer:
             residual = residual.tensor_split(self.attn_tp_size)[self.attn_tp_rank]
         hidden_states, residual = self.moe_layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
@@ -816,7 +823,7 @@ class LongcatFlashDecoderLayer(nn.Module):
                 zero_allocator=zero_allocator,
             )
 
-        if _use_longcat_sparse_a2a_runtime() and not self.is_first_layer:
+        if use_sparse_layout and not self.is_first_layer:
             mlp_residual = self.attn_tp_group.all_gather(residual.contiguous(), dim=0)
         else:
             mlp_residual = residual.clone()
@@ -896,7 +903,7 @@ class LongcatFlashDecoderLayer(nn.Module):
                 )
                 # torch.npu.current_stream().record_event(MultiStreamUtils().fia_ffn_finished_event)
 
-                if not self.is_last_layer and _use_longcat_sparse_a2a_runtime():
+                if not self.is_last_layer and use_sparse_layout:
                     mlp_hidden_states = mlp_hidden_states.tensor_split(self.attn_tp_size)[
                         self.attn_tp_rank
                     ]
@@ -975,7 +982,7 @@ class LongcatFlashDecoderLayer(nn.Module):
             hidden_states, residual = self.forward_mlp(
                 mlp_hidden_states, positions, mlp_residual, forward_batch, zero_allocator
             )
-            if not self.is_last_layer and _use_longcat_sparse_a2a_runtime():
+            if not self.is_last_layer and use_sparse_layout:
                 hidden_states = hidden_states.tensor_split(self.attn_tp_size)[
                     self.attn_tp_rank
                 ]

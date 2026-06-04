@@ -296,7 +296,7 @@ class DeepEPMoE(FusedMoE):
             hidden_states_scale=dynamic_scales,
             topk_ids=topk_output.topk_ids,
             topk_weights=topk_output.topk_weights,
-            num_recv_tokens_per_expert=expert_token_nums.cpu().tolist(),
+            num_recv_tokens_per_expert=expert_token_nums,
         )
 
     def _combine_with_ops_deepep(
@@ -508,11 +508,16 @@ class DeepEPMoE(FusedMoE):
                 dispatch_output
             )
 
-            group_list = torch.tensor(
-                num_recv_tokens_per_expert,
-                dtype=torch.int64,
-                device=hidden_states.device,
-            )
+            if torch.is_tensor(num_recv_tokens_per_expert):
+                group_list = num_recv_tokens_per_expert.to(
+                    dtype=torch.int64, device=hidden_states.device
+                )
+            else:
+                group_list = torch.tensor(
+                    num_recv_tokens_per_expert,
+                    dtype=torch.int64,
+                    device=hidden_states.device,
+                )
 
             if self.w13_weight.dtype == torch.bfloat16:
                 hidden_states = npu_fused_moe_without_routing_weights_bf16(

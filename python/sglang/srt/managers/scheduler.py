@@ -2824,6 +2824,21 @@ class Scheduler(
         ):
             return False
 
+        # R6-C0-3: decode steady-state placeholder carrier already installs the
+        # stable future-handle contract on `last_batch.spec_info` at submit time.
+        # Selection/filter/merge no longer need to wait for the worker's live
+        # apply state on this path; we can defer consuming the minimal apply
+        # contract to result processing.
+        if (
+            pending_batch.is_spec_v2
+            and pending_batch.forward_mode.is_decode()
+            and not pending_batch.is_extend_in_batch
+        ):
+            spec_info = getattr(pending_batch, "spec_info", None)
+            future_indices = getattr(spec_info, "future_indices", None)
+            if future_indices is not None:
+                return False
+
         return True
 
     def _ensure_pending_spec_state_ready(

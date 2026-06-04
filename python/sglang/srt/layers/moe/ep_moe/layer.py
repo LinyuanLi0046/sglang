@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 import torch
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
-from sglang.srt.distributed import get_longcat_moe_ep_group
+from sglang.srt.distributed import get_longcat_moe_ep_group_name
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import FusedMoEMode, npu_format_cast
 from sglang.srt.layers import deep_gemm_wrapper
@@ -213,9 +213,7 @@ class DeepEPMoE(FusedMoE):
         return hidden_states
 
     def _get_ops_deepep_group_name(self) -> str:
-        group = get_longcat_moe_ep_group()
-        backend = group.device_group._get_backend(torch.device("npu"))
-        return backend.get_hccl_comm_name(group.rank)
+        return get_longcat_moe_ep_group_name()
 
     def _build_ops_deepep_dispatch_kwargs(
         self, copy_expert_num: int = 0

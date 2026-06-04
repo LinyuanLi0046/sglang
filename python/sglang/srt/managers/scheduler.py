@@ -1432,7 +1432,9 @@ class Scheduler(
                 continue
 
             if use_spec_overlap_worker and self._spec_state_must_be_ready_for_selection():
-                self._ensure_pending_spec_state_ready(self.last_batch)
+                self._ensure_pending_spec_state_ready(
+                    getattr(self, "pending_spec_state_batch", None)
+                )
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
@@ -2826,22 +2828,27 @@ class Scheduler(
 
     def _spec_state_must_be_ready_for_selection(self) -> bool:
         pending_batch = getattr(self, "pending_spec_state_batch", None)
-        if (
-            self.spec_overlap_worker is None
-            or pending_batch is None
-            or pending_batch is not self.last_batch
-        ):
+        if self.spec_overlap_worker is None or pending_batch is None:
             return False
 
-        # A-收口版: decode steady-state submit installs the minimal stable
-        # handle directly on `batch.spec_info.future_indices`.
+        # A-收口版下，batch-visible handle 回到单轨 `spec_info.future_indices`。
+        # 但当前 decode steady-state submit-time placeholder 在 minimal apply
+        # (`verify_done` / `next_step_seq_lens`) 到达前，仍不是可安全参与
+        # selection/filter/merge 的稳定视图；否则下一拍会拿旧 batch 的
+        # placeholder handle 继续推进，最终命中 future_indices_batch_mismatch。
         if (
             pending_batch.is_spec_v2
             and pending_batch.forward_mode.is_decode()
             and not pending_batch.is_extend_in_batch
         ):
+            draft_input = getattr(pending_batch, "spec_info", None)
             future_indices = pending_batch.get_spec_future_indices()
-            if future_indices is not None:
+            if (
+                future_indices is not None
+                and draft_input is not None
+                and getattr(draft_input, "verify_done", None) is not None
+                and getattr(draft_input, "next_step_seq_lens", None) is not None
+            ):
                 return False
 
         return True

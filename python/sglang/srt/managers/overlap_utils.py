@@ -244,6 +244,7 @@ def build_decode_placeholder_canonical_draft_input(
         "num_tokens_for_logprob_per_req": (
             launch_schema.num_tokens_for_logprob_per_req
         ),
+        "verify_token_num": token_list_width + 1,
     }
 
     return sanitize_decode_placeholder_handle_contract(
@@ -391,6 +392,39 @@ class FutureMap:
                 f"buf_width={current_width}, incoming_width={incoming_width}"
             )
 
+    def _validate_canonical_payload_contract(
+        self,
+        payload_source: "EagleDraftInput | EagleNextStepPayload",
+        *,
+        context: str,
+        canonical_only_decode: bool,
+    ) -> None:
+        last_verified_ids = getattr(payload_source, "last_verified_ids", None)
+        token_list = getattr(payload_source, "token_list", None)
+        if last_verified_ids is None or token_list is None:
+            return
+        if token_list.ndim != 2:
+            raise RuntimeError(
+                f"{context}: canonical token_list must be 2D, actual_ndim={token_list.ndim}"
+            )
+        if last_verified_ids.shape[0] != token_list.shape[0]:
+            raise RuntimeError(
+                f"{context}: canonical payload batch mismatch between "
+                f"last_verified_ids={last_verified_ids.shape[0]} and "
+                f"token_list={token_list.shape[0]}"
+            )
+        verify_token_num = int(getattr(payload_source, "verify_token_num", -1) or -1)
+        if verify_token_num > 0 and token_list.shape[1] != verify_token_num - 1:
+            raise RuntimeError(
+                f"{context}: canonical verify width mismatch, "
+                f"verify_token_num={verify_token_num}, "
+                f"token_list_width={token_list.shape[1]}"
+            )
+        if canonical_only_decode and verify_token_num <= 0:
+            raise RuntimeError(
+                f"{context}: decode canonical-only payload must carry verify_token_num."
+            )
+
     def alloc_future_indices(self, bs: int) -> FutureIndices:
         """Allocate stable batch-membership handles for the current batch rows."""
         cur_future_ct = self.future_ct
@@ -514,6 +548,11 @@ class FutureMap:
                     "decode steady-state canonical-only store requires next_step_seq_lens relay"
                 )
         if has_canonical_payload:
+            self._validate_canonical_payload_contract(
+                payload_source,
+                context="FutureMap.store_to_map_for_new_batch",
+                canonical_only_decode=canonical_only_decode,
+            )
             self._check_canonical_buf_width(payload_source)
             self.last_verified_ids_buf[intv] = payload_source.last_verified_ids
             self.token_list_buf[intv] = payload_source.token_list
@@ -553,6 +592,7 @@ class FutureMap:
         placeholder_ids = -future_indices.indices.to(draft_input.last_verified_ids.dtype)
         token_width = draft_input.token_list.shape[1]
         draft_input.last_verified_ids = placeholder_ids
+        draft_input.verify_token_num = token_width + 1
         draft_input.token_list = (
             placeholder_ids.unsqueeze(1).expand(-1, token_width).clone()
         )

@@ -723,7 +723,6 @@ class CudaGraphRunner:
             if self.model_runner.spec_algorithm.is_ngram()
             else True
         )
-
         return (
             is_bs_supported
             and is_encoder_lens_supported
@@ -1075,6 +1074,36 @@ class CudaGraphRunner:
 
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.num_tokens_per_bs
+        if self.capture_forward_mode.is_target_verify():
+            if forward_batch.live_seq_lens_source == "legacy_snapshot":
+                raise RuntimeError(
+                    "verify graph replay still received legacy snapshot live lengths."
+                )
+            actual_num_tokens = (
+                forward_batch.input_ids.numel() if forward_batch.input_ids is not None else 0
+            )
+            actual_positions = (
+                forward_batch.positions.numel()
+                if forward_batch.positions is not None
+                else 0
+            )
+            actual_out_cache_loc = (
+                forward_batch.out_cache_loc.numel()
+                if forward_batch.out_cache_loc is not None
+                else 0
+            )
+            if (
+                actual_num_tokens != raw_num_token
+                or actual_positions != raw_num_token
+                or actual_out_cache_loc != raw_num_token
+            ):
+                raise RuntimeError(
+                    "verify graph replay token-width contract mismatch: "
+                    f"expected_num_tokens={raw_num_token}, "
+                    f"actual_input_ids={actual_num_tokens}, "
+                    f"actual_positions={actual_positions}, "
+                    f"actual_out_cache_loc={actual_out_cache_loc}"
+                )
 
         # Pad
         if self.require_mlp_tp_gather:

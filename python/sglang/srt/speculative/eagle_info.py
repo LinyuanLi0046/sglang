@@ -683,6 +683,7 @@ class EagleNextStepPayload:
     # Worker-owned next-step live length relay for decode steady-state. This is
     # transient truth for the next overlap step, not committed req truth.
     next_step_seq_lens: Optional[torch.Tensor] = None
+    verify_token_num: int = -1
     last_verified_ids: Optional[torch.Tensor] = None
     token_list: Optional[torch.Tensor] = None
     real_new_verified_id: Optional[torch.Tensor] = None
@@ -715,6 +716,7 @@ class EagleNextStepPayload:
         return cls(
             future_indices=draft_input.future_indices,
             next_step_seq_lens=draft_input.next_step_seq_lens,
+            verify_token_num=draft_input.verify_token_num,
             last_verified_ids=draft_input.last_verified_ids,
             token_list=draft_input.token_list,
             real_new_verified_id=draft_input.real_new_verified_id,
@@ -821,6 +823,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # Shape info for padding
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = -1
+    verify_token_num: int = -1
 
     # Inputs for draft extend
     # shape: (b,)
@@ -881,6 +884,14 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
+
+    def get_verify_token_num(self, fallback_verify_token_num: int) -> int:
+        return (
+            int(self.verify_token_num)
+            if getattr(self, "verify_token_num", -1) is not None
+            and int(self.verify_token_num) > 0
+            else int(fallback_verify_token_num)
+        )
 
     def prepare_for_extend(self, batch: ScheduleBatch):
 

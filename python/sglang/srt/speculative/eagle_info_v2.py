@@ -158,11 +158,13 @@ class EagleDraftInputV2Mixin:
         expected_width = num_verify_tokens - 1
         resolved_last_verified_ids = self.future_last_verified_ids_buf[indices]
         resolved_token_list = self.future_token_list_buf[indices]
-        if resolved_token_list.ndim != 2 or resolved_token_list.shape[1] < expected_width:
+        if resolved_last_verified_ids.shape[0] != batch_size:
+            return False, "future_last_verified_ids_batch_mismatch"
+        if resolved_token_list.ndim != 2 or resolved_token_list.shape[1] != expected_width:
             return False, "future_token_list_shape_mismatch"
 
         self.last_verified_ids = resolved_last_verified_ids
-        self.token_list = resolved_token_list[:, :expected_width]
+        self.token_list = resolved_token_list
         self.future_last_verified_ids_buf = None
         self.future_token_list_buf = None
         self.future_canonical_ready_buf = None
@@ -206,15 +208,28 @@ class EagleDraftInputV2Mixin:
         if missing_fields and not self._canonical_decode_payload_needs_future_resolve():
             return None, missing_fields[0], ",".join(missing_fields)
 
+        effective_num_verify_tokens = self.get_verify_token_num(num_verify_tokens)
+        if (
+            getattr(self, "verify_token_num", -1) is not None
+            and int(getattr(self, "verify_token_num", -1)) > 0
+            and int(num_verify_tokens) > 0
+            and int(self.verify_token_num) != int(num_verify_tokens)
+        ):
+            return (
+                None,
+                "verify_token_num_mismatch",
+                f"payload_verify_token_num={int(self.verify_token_num)},"
+                f"consumer_verify_token_num={int(num_verify_tokens)}",
+            )
         needs_future_resolve = self._canonical_decode_payload_needs_future_resolve()
         if needs_future_resolve:
             resolved, resolve_reason = self._resolve_canonical_future_payload_with_reason(
-                len(batch.seq_lens), num_verify_tokens
+                len(batch.seq_lens), effective_num_verify_tokens
             )
             if not resolved:
                 return None, resolve_reason, ",".join(missing_fields) or None
 
-        expected_width = num_verify_tokens - 1
+        expected_width = effective_num_verify_tokens - 1
         if self.token_list is None or self.token_list.ndim != 2:
             return None, "missing_token_list", "token_list_not_2d"
         if self.token_list.shape[1] != expected_width:
@@ -242,7 +257,7 @@ class EagleDraftInputV2Mixin:
         positions = (
             live_seq_lens.unsqueeze(1)
             + torch.arange(
-                num_verify_tokens,
+                effective_num_verify_tokens,
                 dtype=torch.long,
                 device=live_seq_lens.device,
             )
@@ -250,24 +265,24 @@ class EagleDraftInputV2Mixin:
         retrive_base = (
             torch.arange(batch_size, dtype=torch.long, device=live_seq_lens.device)
             .unsqueeze(1)
-            .mul(num_verify_tokens)
+            .mul(effective_num_verify_tokens)
         )
         retrive_offset = torch.arange(
-            num_verify_tokens,
+            effective_num_verify_tokens,
             dtype=torch.long,
             device=live_seq_lens.device,
         ).unsqueeze(0)
         retrive_index = retrive_base + retrive_offset
         retrive_next_token = torch.full(
-            (batch_size, num_verify_tokens),
+            (batch_size, effective_num_verify_tokens),
             -1,
             dtype=torch.long,
             device=live_seq_lens.device,
         )
-        if num_verify_tokens > 1:
+        if effective_num_verify_tokens > 1:
             retrive_next_token[:, :-1] = torch.arange(
                 1,
-                num_verify_tokens,
+                effective_num_verify_tokens,
                 dtype=torch.long,
                 device=live_seq_lens.device,
             ).unsqueeze(0)
@@ -284,7 +299,7 @@ class EagleDraftInputV2Mixin:
             retrive_cum_len=None,
             spec_steps=spec_steps,
             topk=topk,
-            draft_token_num=num_verify_tokens,
+            draft_token_num=effective_num_verify_tokens,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             seq_lens_sum=live_seq_lens_sum,
             seq_lens_cpu=live_seq_lens_cpu,
@@ -704,10 +719,16 @@ class EagleVerifyInputV2Mixin:
     ):
         shared_seq_lens = _get_shared_verified_lens_for_batch_like(batch)
         if shared_seq_lens is not None:
-            batch.seq_lens, batch.seq_lens_cpu = shared_seq_lens
-            if getattr(batch, "orig_seq_lens", None) is not None:
-                batch.orig_seq_lens = batch.seq_lens.to(dtype=torch.int32)
-            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
+            live_seq_lens, live_seq_lens_cpu = shared_seq_lens
+            live_seq_lens_source = "shared_owner"
+        else:
+            live_seq_lens = batch.seq_lens
+            live_seq_lens_cpu = batch.seq_lens_cpu
+            live_seq_lens_source = "legacy_snapshot"
+        live_seq_lens_sum = int(live_seq_lens_cpu.sum().item())
+        live_orig_seq_lens = None
+        if getattr(batch, "orig_seq_lens", None) is not None:
+            live_orig_seq_lens = live_seq_lens.to(dtype=torch.int32)
 
         if not batch.forward_mode.is_idle():
             # Assign cache locations
@@ -717,8 +738,8 @@ class EagleVerifyInputV2Mixin:
             batch.out_cache_loc = assign_extend_cache_locs_func(
                 req_pool_indices=batch.req_pool_indices,
                 req_to_token=req_to_token_pool.req_to_token,
-                start_offset=batch.seq_lens,
-                end_offset=batch.seq_lens + self.draft_token_num,
+                start_offset=live_seq_lens,
+                end_offset=live_seq_lens + self.draft_token_num,
                 batch_size=bs,
                 draft_token_num=self.draft_token_num,
                 device=device,
@@ -742,7 +763,15 @@ class EagleVerifyInputV2Mixin:
             else ForwardMode.TARGET_VERIFY
         )
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
+        verify_forward_batch = ForwardBatch.init_new(
+            batch,
+            target_worker.model_runner,
+            seq_lens_override=live_seq_lens,
+            seq_lens_cpu_override=live_seq_lens_cpu,
+            seq_lens_sum_override=live_seq_lens_sum,
+            orig_seq_lens_override=live_orig_seq_lens,
+            live_seq_lens_source=live_seq_lens_source,
+        )
 
         # Run attention backend plan and cuda graph preparation
         can_run_cuda_graph = bool(

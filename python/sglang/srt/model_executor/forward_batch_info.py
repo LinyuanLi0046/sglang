@@ -310,6 +310,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
+    live_seq_lens_source: Optional[str] = None
 
     # For logprob
     return_logprob: bool = False
@@ -437,13 +438,32 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         cls,
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
+        seq_lens_override: Optional[torch.Tensor] = None,
+        seq_lens_cpu_override: Optional[torch.Tensor] = None,
+        seq_lens_sum_override: Optional[int] = None,
+        orig_seq_lens_override: Optional[torch.Tensor] = None,
+        live_seq_lens_source: Optional[str] = None,
     ):
+        seq_lens = seq_lens_override if seq_lens_override is not None else batch.seq_lens
+        seq_lens_cpu = (
+            seq_lens_cpu_override if seq_lens_cpu_override is not None else batch.seq_lens_cpu
+        )
+        seq_lens_sum = (
+            int(seq_lens_sum_override)
+            if seq_lens_sum_override is not None
+            else batch.seq_lens_sum
+        )
+        orig_seq_lens = (
+            orig_seq_lens_override
+            if orig_seq_lens_override is not None
+            else batch.orig_seq_lens
+        )
         ret = cls(
             forward_mode=batch.forward_mode,
-            batch_size=len(batch.seq_lens),
+            batch_size=len(seq_lens),
             input_ids=batch.input_ids,
             req_pool_indices=batch.req_pool_indices,
-            seq_lens=batch.seq_lens,
+            seq_lens=seq_lens,
             out_cache_loc=batch.out_cache_loc,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
@@ -453,9 +473,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens=batch.encoder_lens,
             encoder_lens_cpu=batch.encoder_lens_cpu,
             encoder_out_cache_loc=batch.encoder_out_cache_loc,
-            seq_lens_sum=batch.seq_lens_sum,
-            seq_lens_cpu=batch.seq_lens_cpu,
-            orig_seq_lens=batch.orig_seq_lens,
+            seq_lens_sum=seq_lens_sum,
+            seq_lens_cpu=seq_lens_cpu,
+            live_seq_lens_source=live_seq_lens_source,
+            orig_seq_lens=orig_seq_lens,
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,

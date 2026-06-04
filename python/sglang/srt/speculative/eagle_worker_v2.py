@@ -590,6 +590,7 @@ class EagleDraftWorker(BaseDraftWorker):
             last_verified_ids=next_token_ids,
             new_seq_lens=batch.seq_lens,
             next_step_seq_lens=batch.seq_lens,
+            verify_token_num=self.speculative_num_draft_tokens,
             # draft mode is same with decode mode, only 1 token per req
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
@@ -650,6 +651,7 @@ class EagleDraftWorker(BaseDraftWorker):
             hidden_states=batch_result.logits_output.hidden_states,
             num_tokens_per_req=self.speculative_num_steps + 1,
             num_tokens_for_logprob_per_req=self.speculative_num_steps + 1,
+            verify_token_num=self.speculative_num_draft_tokens,
         )
         select_index = (
             torch.arange(len(batch.seq_lens), device=self.device)
@@ -718,6 +720,7 @@ class EagleDraftWorker(BaseDraftWorker):
             ret_hidden_states,
         )
         next_draft_input.last_verified_ids = next_draft_input.verified_id
+        next_draft_input.verify_token_num = self.speculative_num_draft_tokens
         token_list = self._materialize_decode_token_list_from_kplus1_state(
             batch, next_draft_input
         )
@@ -733,6 +736,14 @@ class EagleDraftWorker(BaseDraftWorker):
             )
         next_draft_input.token_list = token_list
         next_draft_input.real_token_list = token_list
+        if token_list is not None and token_list.shape[1] != (
+            next_draft_input.verify_token_num - 1
+        ):
+            raise RuntimeError(
+                "decode canonical token_list width mismatch after k+1 materialize: "
+                f"expected_width={next_draft_input.verify_token_num - 1}, "
+                f"actual_width={token_list.shape[1]}"
+            )
 
     def _materialize_decode_token_list_from_kplus1_state(
         self,
@@ -764,6 +775,7 @@ class EagleDraftWorker(BaseDraftWorker):
             new_seq_lens=next_draft_input.new_seq_lens,
             num_tokens_per_req=next_draft_input.num_tokens_per_req,
             num_tokens_for_logprob_per_req=next_draft_input.num_tokens_for_logprob_per_req,
+            verify_token_num=next_draft_input.verify_token_num,
             capture_hidden_mode=next_draft_input.capture_hidden_mode,
         )
         relay_batch.spec_info = proposal_input
@@ -1272,6 +1284,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             next_step_seq_lens=next_step_seq_lens,
             verify_done=verify_done,
             real_new_verified_id=verified_id,
+            verify_token_num=self.speculative_num_draft_tokens,
         )
 
         return GenerationBatchResult(

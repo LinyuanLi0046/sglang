@@ -2492,6 +2492,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 new_indices=keep_indices_device,
                 has_been_filtered=has_been_filtered,
             )
+            from sglang.srt.managers.overlap_utils import (
+                build_spec_future_handle_carrier,
+            )
+
+            self.spec_future_handle_carrier = build_spec_future_handle_carrier(
+                getattr(self.spec_info, "future_indices", None)
+            )
 
     def merge_batch(self, other: "ScheduleBatch"):
         # In the regular scheduler path:
@@ -2578,6 +2585,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
+            from sglang.srt.managers.overlap_utils import (
+                build_spec_future_handle_carrier,
+            )
+
+            self.spec_future_handle_carrier = build_spec_future_handle_carrier(
+                getattr(self.spec_info, "future_indices", None)
+            )
 
     def get_model_worker_batch(
         self, seq_lens_cpu_cache: Optional[torch.Tensor] = None

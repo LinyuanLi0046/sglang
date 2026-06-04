@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SpecOverlapApplyState:
+    batch_uid: int
     future_indices: FutureIndices
     next_draft_input: Optional["EagleDraftInput"] = None
     next_decode_seq_lens: Optional[torch.Tensor] = None
@@ -60,6 +61,27 @@ class SpecModelWorkerOverlapClient:
     def _raise_if_thread_failed(self) -> None:
         if self.thread_exception is not None:
             raise self.thread_exception
+
+    def _validate_apply_state_contract(self, apply_state: SpecOverlapApplyState) -> None:
+        if apply_state.future_indices is None:
+            raise RuntimeError("Spec overlap apply state missing future_indices.")
+
+        if apply_state.requires_scheduler_apply:
+            if apply_state.next_draft_input is None:
+                raise RuntimeError(
+                    "Spec overlap apply state requiring scheduler apply must carry "
+                    "next_draft_input."
+                )
+            return
+
+        if apply_state.next_verify_done is None:
+            raise RuntimeError(
+                "Decode canonical-only apply state must carry next_verify_done."
+            )
+        if apply_state.next_decode_seq_lens is None:
+            raise RuntimeError(
+                "Decode canonical-only apply state must carry next_decode_seq_lens."
+            )
 
     def _bind_thread_device(self) -> None:
         if self.gpu_id is None:
@@ -146,6 +168,7 @@ class SpecModelWorkerOverlapClient:
                     )
                 self.apply_queue.put(
                     SpecOverlapApplyState(
+                        batch_uid=id(model_worker_batch),
                         future_indices=future_indices,
                         next_draft_input=batch_result.next_draft_input,
                     )
@@ -168,6 +191,7 @@ class SpecModelWorkerOverlapClient:
                     )
                 self.apply_queue.put(
                     SpecOverlapApplyState(
+                        batch_uid=id(model_worker_batch),
                         future_indices=future_indices,
                         next_decode_seq_lens=next_decode_seq_lens,
                         next_verify_done=next_verify_done,
@@ -249,6 +273,13 @@ class SpecModelWorkerOverlapClient:
         apply_state = self.apply_queue.get()
         if isinstance(apply_state, RuntimeError):
             raise apply_state
+
+        self._validate_apply_state_contract(apply_state)
+        if apply_state.batch_uid != id(batch):
+            raise RuntimeError(
+                "Spec overlap apply state batch identity mismatch: "
+                f"expected_batch_uid={id(batch)}, actual_batch_uid={apply_state.batch_uid}"
+            )
 
         apply_future_result(batch, apply_state)
 

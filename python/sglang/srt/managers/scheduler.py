@@ -2784,13 +2784,17 @@ class Scheduler(
     ) -> None:
         if not apply_state.requires_scheduler_apply:
             existing_spec_info = getattr(batch, "spec_info", None)
-            if existing_spec_info is not None:
-                existing_spec_info.future_indices = apply_state.future_indices
-                existing_spec_info.verify_done = apply_state.next_verify_done
-                if apply_state.next_decode_seq_lens is not None:
-                    existing_spec_info.next_step_seq_lens = (
-                        apply_state.next_decode_seq_lens
-                    )
+            if existing_spec_info is None:
+                raise RuntimeError(
+                    "decode canonical-only spec overlap apply requires existing "
+                    "batch.spec_info, but none was found."
+                )
+            existing_spec_info.future_indices = apply_state.future_indices
+            existing_spec_info.verify_done = apply_state.next_verify_done
+            if apply_state.next_decode_seq_lens is not None:
+                existing_spec_info.next_step_seq_lens = (
+                    apply_state.next_decode_seq_lens
+                )
             return
 
         self._apply_spec_v2_future_state(

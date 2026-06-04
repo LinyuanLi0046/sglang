@@ -153,14 +153,26 @@ class ReqToTokenPool:
     def write(self, indices, values):
         self.req_to_token[indices] = values
 
+    def _normalize_req_pool_indices(
+        self, req_pool_indices: Union[int, List[int], torch.Tensor]
+    ):
+        if isinstance(req_pool_indices, torch.Tensor):
+            return req_pool_indices.to(device=self.verified_lens.device, dtype=torch.long)
+        return req_pool_indices
+
     def get_verified_lens(
         self, req_pool_indices: Union[int, List[int], torch.Tensor]
     ) -> torch.Tensor:
-        return self.verified_lens[req_pool_indices]
+        return self.verified_lens[self._normalize_req_pool_indices(req_pool_indices)]
 
     def set_verified_lens(
         self, req_pool_indices: Union[int, List[int], torch.Tensor], values
     ) -> None:
+        req_pool_indices = self._normalize_req_pool_indices(req_pool_indices)
+        if isinstance(values, torch.Tensor):
+            values = values.to(
+                device=self.verified_lens.device, dtype=self.verified_lens.dtype
+            )
         self.verified_lens[req_pool_indices] = values
 
     def reset_verified_lens(
@@ -171,7 +183,7 @@ class ReqToTokenPool:
         if req_pool_indices is None:
             self.verified_lens.fill_(value)
         else:
-            self.verified_lens[req_pool_indices] = value
+            self.verified_lens[self._normalize_req_pool_indices(req_pool_indices)] = value
 
     def available_size(self):
         return len(self.free_slots)

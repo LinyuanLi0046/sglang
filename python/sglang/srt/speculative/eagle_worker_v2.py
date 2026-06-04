@@ -333,7 +333,7 @@ class EagleDraftWorker(BaseDraftWorker):
     def draft(self, model_worker_batch: ModelWorkerBatch):
         draft_input: EagleDraftInput = model_worker_batch.spec_info
         (
-            canonical_verkify_input,
+            canonical_verify_input,
             fallback_reason,
             fallback_details,
         ) = draft_input.build_verify_input_from_canonical_decode_payload_with_reason(

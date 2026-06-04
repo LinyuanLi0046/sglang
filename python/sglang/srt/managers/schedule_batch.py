@@ -2275,6 +2275,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def materialize_spec_decode_seq_lens_carrier(self) -> bool:
+        if self.is_spec_v2:
+            req_pool_indices = getattr(self, "req_pool_indices", None)
+            req_to_token_pool = getattr(self, "req_to_token_pool", None)
+            get_verified_lens = getattr(req_to_token_pool, "get_verified_lens", None)
+            if (
+                req_pool_indices is not None
+                and get_verified_lens is not None
+                and len(req_pool_indices) > 0
+            ):
+                shared_seq_lens = get_verified_lens(req_pool_indices).to(
+                    device=self.device, dtype=torch.int64
+                )
+                self._set_decode_seq_lens_tensors(shared_seq_lens)
+                # Keep carrier as a compat snapshot during the owner migration.
+                self.spec_decode_seq_lens_carrier = self.seq_lens
+                return True
+
         if self.spec_decode_seq_lens_carrier is None:
             return False
 

@@ -2350,7 +2350,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if draft_input is None:
             return False
 
-        if getattr(draft_input, "verify_done", None) is not None:
+        get_shared_verified_lens = getattr(
+            draft_input, "_get_shared_verified_lens_for_batch", None
+        )
+        shared_verified_lens = (
+            get_shared_verified_lens(self)
+            if get_shared_verified_lens is not None
+            else None
+        )
+        if (
+            shared_verified_lens is None
+            and getattr(draft_input, "verify_done", None) is not None
+        ):
             draft_input.verify_done.synchronize()
 
         materialize_fn = getattr(

@@ -42,6 +42,57 @@ class FutureIndices:
     interval: Optional[slice] = None
 
 
+def _get_batch_membership_size(value) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, FutureIndices):
+        return int(value.indices.shape[0])
+    if isinstance(value, torch.Tensor) and value.ndim >= 1:
+        return int(value.shape[0])
+    return None
+
+
+def _get_payload_batch_membership_size(
+    payload_source: Optional["EagleDraftInput | EagleNextStepPayload"],
+) -> Optional[int]:
+    if payload_source is None:
+        return None
+
+    for field_name in (
+        "next_step_seq_lens",
+        "last_verified_ids",
+        "token_list",
+        "real_new_verified_id",
+        "real_token_list",
+        "new_seq_lens",
+        "verified_id",
+        "topk_p",
+        "topk_index",
+        "hidden_states",
+    ):
+        batch_size = _get_batch_membership_size(getattr(payload_source, field_name, None))
+        if batch_size is not None:
+            return batch_size
+    return None
+
+
+def _assert_future_indices_batch_membership_contract(
+    future_indices: FutureIndices,
+    payload_source: Optional["EagleDraftInput | EagleNextStepPayload"],
+    context: str,
+) -> None:
+    expected_batch_size = _get_batch_membership_size(future_indices)
+    actual_batch_size = _get_payload_batch_membership_size(payload_source)
+    if expected_batch_size is None or actual_batch_size is None:
+        return
+    if expected_batch_size != actual_batch_size:
+        raise RuntimeError(
+            "future_indices batch-membership contract mismatch "
+            f"during {context}: expected_batch_size={expected_batch_size}, "
+            f"actual_batch_size={actual_batch_size}"
+        )
+
+
 def build_decode_placeholder_canonical_draft_input(
     future_indices: FutureIndices,
     token_list_width: int,
@@ -74,6 +125,12 @@ def build_decode_placeholder_canonical_draft_input(
             "decode placeholder canonical token_list width mismatch: "
             f"expected={token_list_width}, actual={template_token_list.shape[1]}"
         )
+
+    _assert_future_indices_batch_membership_contract(
+        future_indices,
+        template_draft_input,
+        "build_decode_placeholder_canonical_draft_input",
+    )
 
     placeholder_ids = -future_indices.indices.to(dtype=dtype)
     draft_input_kwargs = {
@@ -238,7 +295,7 @@ class FutureMap:
             )
 
     def alloc_future_indices(self, bs: int) -> FutureIndices:
-        """Update the circular buffer pointer and allocate future indices."""
+        """Allocate stable batch-membership handles for the current batch rows."""
         cur_future_ct = self.future_ct
         self.future_ct = (cur_future_ct + bs) % self.future_limit
         start = cur_future_ct + 1
@@ -329,6 +386,11 @@ class FutureMap:
         payload_source: "EagleDraftInput | EagleNextStepPayload",
         canonical_only_decode: bool = False,
     ):
+        _assert_future_indices_batch_membership_contract(
+            future_indices,
+            payload_source,
+            "FutureMap.store_to_map_for_new_batch",
+        )
         intv = future_indices.interval
         if self.is_empty_slice(intv):
             # idle indices in dp attention do not need store info
@@ -383,6 +445,11 @@ class FutureMap:
         future_indices: FutureIndices,
         draft_input: EagleDraftInput,
     ):
+        _assert_future_indices_batch_membership_contract(
+            future_indices,
+            draft_input,
+            "FutureMap.replace_canonical_payload_with_future_placeholders",
+        )
         if draft_input.last_verified_ids is None or draft_input.token_list is None:
             return
 

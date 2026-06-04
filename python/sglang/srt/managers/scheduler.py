@@ -1152,7 +1152,6 @@ class Scheduler(
             self.spec_overlap_worker = None
             self.future_map = None
             self.pending_spec_state_batch = None
-            self.pending_spec_state_requires_selection_wait = False
             return
 
         if self.is_generation and self.spec_algorithm.is_none():
@@ -1164,7 +1163,6 @@ class Scheduler(
             self.spec_overlap_worker = None
             self.future_map = None
             self.pending_spec_state_batch = None
-            self.pending_spec_state_requires_selection_wait = False
             self.batch_record_buf = [None] * 2
             self.batch_record_ct = 0
             return
@@ -1188,7 +1186,6 @@ class Scheduler(
         else:
             self.spec_overlap_worker = None
         self.pending_spec_state_batch = None
-        self.pending_spec_state_requires_selection_wait = False
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
 
@@ -2823,9 +2820,7 @@ class Scheduler(
         ):
             return False
 
-        return bool(
-            getattr(self, "pending_spec_state_requires_selection_wait", True)
-        )
+        return True
 
     def _ensure_pending_spec_state_ready(
         self,
@@ -2844,7 +2839,6 @@ class Scheduler(
             batch, self._apply_spec_v2_overlap_state
         )
         self.pending_spec_state_batch = None
-        self.pending_spec_state_requires_selection_wait = False
 
     def run_batch(
         self,
@@ -2908,10 +2902,6 @@ class Scheduler(
                             batch_result.future_indices,
                         )
                     self.pending_spec_state_batch = batch
-                    self.pending_spec_state_requires_selection_wait = not (
-                        batch.forward_mode.is_decode()
-                        and not batch.is_extend_in_batch
-                    )
                     future_indices_or_next_token_ids = batch_result.next_token_ids
                 else:
                     self.record_batch_in_overlap(model_worker_batch)

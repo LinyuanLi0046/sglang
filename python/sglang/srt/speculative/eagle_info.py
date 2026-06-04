@@ -1,7 +1,7 @@
 import logging
 from copy import copy
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import ClassVar, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -61,6 +61,38 @@ def _assert_same_token_table_width(
             f"{field_name} width mismatch during merge: lhs_width={lhs.shape[1]}, "
             f"rhs_width={rhs.shape[1]}"
         )
+
+
+def _get_batch_membership_size(value) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, FutureIndices):
+        return int(value.indices.shape[0])
+    if isinstance(value, torch.Tensor) and value.ndim >= 1:
+        return int(value.shape[0])
+    return None
+
+
+def _assert_future_indices_batch_membership_contract(
+    future_indices: Optional[FutureIndices],
+    peer_fields: List[Tuple[str, object]],
+    context: str,
+) -> None:
+    expected_batch_size = _get_batch_membership_size(future_indices)
+    if expected_batch_size is None:
+        return
+
+    for field_name, field_value in peer_fields:
+        actual_batch_size = _get_batch_membership_size(field_value)
+        if actual_batch_size is None:
+            continue
+        if actual_batch_size != expected_batch_size:
+            raise RuntimeError(
+                "future_indices batch-membership contract mismatch "
+                f"during {context}: field={field_name}, "
+                f"expected_batch_size={expected_batch_size}, "
+                f"actual_batch_size={actual_batch_size}"
+            )
 
 
 @dataclass
@@ -631,6 +663,22 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
 @dataclass
 class EagleNextStepPayload:
+    # R6-C0 contract note:
+    # - `future_indices` is stable batch-membership metadata.
+    # - `next_step_seq_lens` is a live relay produced by the worker.
+    # - canonical payload stays worker-owned and is only carried through batch
+    #   transforms as metadata, not as scheduler-owned live truth.
+    STABLE_BATCH_METADATA_FIELDS: ClassVar[Tuple[str, ...]] = ("future_indices",)
+    LIVE_RELAY_FIELDS: ClassVar[Tuple[str, ...]] = ("next_step_seq_lens",)
+    CANONICAL_PAYLOAD_FIELDS: ClassVar[Tuple[str, ...]] = (
+        "last_verified_ids",
+        "token_list",
+    )
+    LEGACY_WORKER_LOCAL_FIELDS: ClassVar[Tuple[str, ...]] = (
+        "real_new_verified_id",
+        "real_token_list",
+    )
+
     future_indices: Optional[FutureIndices] = None
     # Worker-owned next-step live length relay for decode steady-state. This is
     # transient truth for the next overlap step, not committed req truth.
@@ -639,6 +687,19 @@ class EagleNextStepPayload:
     token_list: Optional[torch.Tensor] = None
     real_new_verified_id: Optional[torch.Tensor] = None
     real_token_list: Optional[torch.Tensor] = None
+
+    def assert_batch_membership_contract(self, context: str) -> None:
+        _assert_future_indices_batch_membership_contract(
+            self.future_indices,
+            [
+                ("next_step_seq_lens", self.next_step_seq_lens),
+                ("last_verified_ids", self.last_verified_ids),
+                ("token_list", self.token_list),
+                ("real_new_verified_id", self.real_new_verified_id),
+                ("real_token_list", self.real_token_list),
+            ],
+            context,
+        )
 
     @classmethod
     def from_draft_input(
@@ -661,62 +722,83 @@ class EagleNextStepPayload:
         )
 
     def filter_batch(self, new_indices: torch.Tensor) -> None:
+        self.assert_batch_membership_contract("EagleNextStepPayload.filter_batch:before")
         if self.future_indices is not None:
             self.future_indices.indices = self.future_indices.indices[new_indices]
-        if self.next_step_seq_lens is not None:
-            self.next_step_seq_lens = self.next_step_seq_lens[new_indices]
         if self.last_verified_ids is not None:
             self.last_verified_ids = self.last_verified_ids[new_indices]
         if self.token_list is not None:
             self.token_list = self.token_list[new_indices]
-        if self.real_new_verified_id is not None:
-            self.real_new_verified_id = self.real_new_verified_id[new_indices]
-        if self.real_token_list is not None:
-            self.real_token_list = self.real_token_list[new_indices]
+        # R6-C0-2: batch transforms keep only stable handle-aligned metadata.
+        self.next_step_seq_lens = None
+        self.real_new_verified_id = None
+        self.real_token_list = None
+        self.assert_batch_membership_contract("EagleNextStepPayload.filter_batch:after")
 
     def merge_batch(self, other: "EagleNextStepPayload") -> None:
+        self.assert_batch_membership_contract("EagleNextStepPayload.merge_batch:self")
+        other.assert_batch_membership_contract("EagleNextStepPayload.merge_batch:other")
         if self.future_indices is not None and other.future_indices is not None:
             self.future_indices = FutureIndices(
                 indices=torch.cat(
                     [self.future_indices.indices, other.future_indices.indices]
                 )
             )
-        if (
-            self.next_step_seq_lens is not None
-            and other.next_step_seq_lens is not None
-        ):
-            self.next_step_seq_lens = torch.cat(
-                [self.next_step_seq_lens, other.next_step_seq_lens], dim=0
-            )
         if self.last_verified_ids is not None and other.last_verified_ids is not None:
             self.last_verified_ids = torch.cat(
                 [self.last_verified_ids, other.last_verified_ids], dim=0
             )
+        else:
+            self.last_verified_ids = None
         if self.token_list is not None and other.token_list is not None:
             _assert_same_token_table_width(
                 self.token_list, other.token_list, "EagleNextStepPayload.token_list"
             )
             self.token_list = torch.cat([self.token_list, other.token_list], dim=0)
-        if (
-            self.real_new_verified_id is not None
-            and other.real_new_verified_id is not None
-        ):
-            self.real_new_verified_id = torch.cat(
-                [self.real_new_verified_id, other.real_new_verified_id], dim=0
-            )
-        if self.real_token_list is not None and other.real_token_list is not None:
-            _assert_same_token_table_width(
-                self.real_token_list,
-                other.real_token_list,
-                "EagleNextStepPayload.real_token_list",
-            )
-            self.real_token_list = torch.cat(
-                [self.real_token_list, other.real_token_list], dim=0
-            )
+        else:
+            self.token_list = None
+        self.next_step_seq_lens = None
+        self.real_new_verified_id = None
+        self.real_token_list = None
+        self.assert_batch_membership_contract("EagleNextStepPayload.merge_batch:after")
 
 
 @dataclass
 class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
+    # R6-C0 field grouping:
+    # - stable batch metadata: may participate in selection/filter/merge only if
+    #   it stays strictly aligned with current batch membership.
+    # - live relay state: worker-produced next-step signals; these should not be
+    #   treated as scheduler-owned truth in later stages.
+    # - canonical payload: worker-owned next-step payload carried by future-map
+    #   handles and consumed near worker resolve/verify.
+    # - legacy worker-local fields: compatibility / diff-only state that should
+    #   keep shrinking out of the main contract.
+    STABLE_BATCH_METADATA_FIELDS: ClassVar[Tuple[str, ...]] = ("future_indices",)
+    LIVE_RELAY_FIELDS: ClassVar[Tuple[str, ...]] = (
+        "new_seq_lens",
+        "next_step_seq_lens",
+        "verify_done",
+        "future_next_step_seq_lens_buf",
+    )
+    CANONICAL_PAYLOAD_FIELDS: ClassVar[Tuple[str, ...]] = (
+        "last_verified_ids",
+        "token_list",
+    )
+    LEGACY_WORKER_LOCAL_FIELDS: ClassVar[Tuple[str, ...]] = (
+        "verified_id",
+        "real_new_verified_id",
+        "real_token_list",
+        "topk_p",
+        "topk_index",
+        "hidden_states",
+        "future_topk_p_buf",
+        "future_topk_index_buf",
+        "future_hidden_states_buf",
+        "future_verified_id_buf",
+        "future_new_seq_lens_buf",
+    )
+
     # The inputs for decode
     # shape: (b, topk)
     topk_p: torch.Tensor = None
@@ -747,6 +829,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     req_pool_indices_for_draft_extend: torch.Tensor = None
 
     # Inputs for V2 overlap worker
+    # `future_indices` is not a weak reference. It is the stable handle contract
+    # that ties canonical future payload rows to the current batch membership.
     future_indices: Optional[FutureIndices] = None
     # Producer-owned k+1 decode length after verify accepts the carried token.
     new_seq_lens: Optional[torch.Tensor] = None
@@ -780,6 +864,20 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
+
+    def assert_batch_membership_contract(self, context: str) -> None:
+        _assert_future_indices_batch_membership_contract(
+            self.future_indices,
+            [
+                ("new_seq_lens", self.new_seq_lens),
+                ("next_step_seq_lens", self.next_step_seq_lens),
+                ("last_verified_ids", self.last_verified_ids),
+                ("token_list", self.token_list),
+                ("real_new_verified_id", self.real_new_verified_id),
+                ("real_token_list", self.real_token_list),
+            ],
+            context,
+        )
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
@@ -887,19 +985,24 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if self.future_indices is not None:
+            self.assert_batch_membership_contract(
+                "EagleDraftInput.filter_batch:future_contract_before"
+            )
             self.future_indices.indices = self.future_indices.indices[new_indices]
-            if self.new_seq_lens is not None:
-                self.new_seq_lens = self.new_seq_lens[new_indices]
-            if self.next_step_seq_lens is not None:
-                self.next_step_seq_lens = self.next_step_seq_lens[new_indices]
             if self.last_verified_ids is not None:
                 self.last_verified_ids = self.last_verified_ids[new_indices]
             if self.token_list is not None:
                 self.token_list = self.token_list[new_indices]
-            if self.real_new_verified_id is not None:
-                self.real_new_verified_id = self.real_new_verified_id[new_indices]
-            if self.real_token_list is not None:
-                self.real_token_list = self.real_token_list[new_indices]
+            # R6-C0-2: filter/merge keeps stable handle contract only. Live relay
+            # and legacy worker-local fields must be reconstructed from shared
+            # owner / worker-owned future payload instead of being batch-reshaped.
+            self.new_seq_lens = None
+            self.next_step_seq_lens = None
+            self.real_new_verified_id = None
+            self.real_token_list = None
+            self.assert_batch_membership_contract(
+                "EagleDraftInput.filter_batch:future_contract_after"
+            )
             return
 
         strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
@@ -952,26 +1055,17 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         if self.future_indices is not None or spec_info.future_indices is not None:
             assert spec_info.future_indices is not None
             assert self.future_indices is not None
+            self.assert_batch_membership_contract(
+                "EagleDraftInput.merge_batch:future_contract_self"
+            )
+            spec_info.assert_batch_membership_contract(
+                "EagleDraftInput.merge_batch:future_contract_other"
+            )
             self.future_indices = FutureIndices(
                 indices=torch.cat(
                     [self.future_indices.indices, spec_info.future_indices.indices]
                 )
             )
-            if self.new_seq_lens is not None and spec_info.new_seq_lens is not None:
-                self.new_seq_lens = torch.cat(
-                    [self.new_seq_lens, spec_info.new_seq_lens], axis=0
-                )
-            else:
-                self.new_seq_lens = None
-            if (
-                self.next_step_seq_lens is not None
-                and spec_info.next_step_seq_lens is not None
-            ):
-                self.next_step_seq_lens = torch.cat(
-                    [self.next_step_seq_lens, spec_info.next_step_seq_lens], axis=0
-                )
-            else:
-                self.next_step_seq_lens = None
             if self.last_verified_ids is not None and spec_info.last_verified_ids is not None:
                 self.last_verified_ids = torch.cat(
                     [self.last_verified_ids, spec_info.last_verified_ids], axis=0
@@ -989,23 +1083,13 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                 )
             else:
                 self.token_list = None
-            if self.real_new_verified_id is not None and spec_info.real_new_verified_id is not None:
-                self.real_new_verified_id = torch.cat(
-                    [self.real_new_verified_id, spec_info.real_new_verified_id], axis=0
-                )
-            else:
-                self.real_new_verified_id = None
-            if self.real_token_list is not None and spec_info.real_token_list is not None:
-                _assert_same_token_table_width(
-                    self.real_token_list,
-                    spec_info.real_token_list,
-                    "EagleDraftInput.real_token_list",
-                )
-                self.real_token_list = torch.cat(
-                    [self.real_token_list, spec_info.real_token_list], axis=0
-                )
-            else:
-                self.real_token_list = None
+            self.new_seq_lens = None
+            self.next_step_seq_lens = None
+            self.real_new_verified_id = None
+            self.real_token_list = None
+            self.assert_batch_membership_contract(
+                "EagleDraftInput.merge_batch:future_contract_after"
+            )
             return
 
         if self.hidden_states is None:

@@ -214,9 +214,10 @@ class SpecModelWorkerOverlapClient:
                     future_indices=future_indices,
                     token_list_width=getattr(
                         self.worker,
-                        "speculative_num_steps",
-                        self.worker.server_args.speculative_num_steps,
-                    ),
+                        "speculative_num_draft_tokens",
+                        self.worker.server_args.speculative_num_draft_tokens,
+                    )
+                    - 1,
                     template_draft_input=model_worker_batch.spec_info,
                 )
             )

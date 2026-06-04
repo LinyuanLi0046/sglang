@@ -60,6 +60,14 @@ def build_decode_placeholder_canonical_draft_input(
             dtype = template_tensor.dtype
             break
 
+    template_token_list = (
+        getattr(template_draft_input, "token_list", None)
+        if template_draft_input is not None
+        else None
+    )
+    if template_token_list is not None:
+        token_list_width = max(token_list_width, template_token_list.shape[1])
+
     placeholder_ids = -future_indices.indices.to(dtype=dtype)
     draft_input_kwargs = {
         "future_indices": future_indices,

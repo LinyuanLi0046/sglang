@@ -205,6 +205,29 @@ class FutureMap:
             (self.future_buffer_len,), dtype=torch.bool, device=self.device
         )
 
+    def _ensure_canonical_buf_capacity(
+        self, draft_input: "EagleDraftInput | EagleNextStepPayload"
+    ):
+        if draft_input.last_verified_ids is None or draft_input.token_list is None:
+            return
+        if self.last_verified_ids_buf is None or self.token_list_buf is None:
+            self._lazy_init_canonical_buf(draft_input)
+            return
+
+        current_width = self.token_list_buf.shape[1]
+        incoming_width = draft_input.token_list.shape[1]
+        if incoming_width <= current_width:
+            return
+
+        new_token_list_buf = torch.full(
+            (self.future_buffer_len, incoming_width),
+            -1,
+            dtype=self.token_list_buf.dtype,
+            device=self.device,
+        )
+        new_token_list_buf[:, :current_width] = self.token_list_buf
+        self.token_list_buf = new_token_list_buf
+
     def alloc_future_indices(self, bs: int) -> FutureIndices:
         """Update the circular buffer pointer and allocate future indices."""
         cur_future_ct = self.future_ct
@@ -322,10 +345,11 @@ class FutureMap:
                     "decode steady-state canonical-only store requires next_step_seq_lens relay"
                 )
         if has_canonical_payload:
-            if self.last_verified_ids_buf is None or self.token_list_buf is None:
-                self._lazy_init_canonical_buf(payload_source)
+            self._ensure_canonical_buf_capacity(payload_source)
             self.last_verified_ids_buf[intv] = payload_source.last_verified_ids
-            self.token_list_buf[intv] = payload_source.token_list
+            token_width = payload_source.token_list.shape[1]
+            self.token_list_buf[intv].fill_(-1)
+            self.token_list_buf[intv, :token_width] = payload_source.token_list
             if next_step_seq_lens is not None:
                 if self.next_step_seq_lens_buf is None:
                     self._lazy_init_next_step_seq_lens_buf(payload_source)

@@ -56,6 +56,22 @@ if is_cuda():
     )
 
 
+def _get_shared_verified_lens_for_batch_like(
+    batch: Any,
+) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    req_pool_indices = getattr(batch, "req_pool_indices", None)
+    req_to_token_pool = getattr(batch, "req_to_token_pool", None)
+    get_verified_lens = getattr(req_to_token_pool, "get_verified_lens", None)
+    if req_pool_indices is None or get_verified_lens is None or len(req_pool_indices) == 0:
+        return None
+
+    seq_lens_device = get_verified_lens(req_pool_indices).to(
+        device=batch.seq_lens.device, dtype=torch.int64
+    )
+    seq_lens_cpu = seq_lens_device.cpu()
+    return seq_lens_device, seq_lens_cpu
+
+
 @triton.jit
 def assign_draft_cache_locs_page_size_1(
     req_pool_indices,
@@ -209,46 +225,55 @@ class EagleDraftInputV2Mixin:
         from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
         batch_size = len(batch.seq_lens)
+        shared_verified_lens = self._get_shared_verified_lens_for_batch(batch)
+        if shared_verified_lens is not None:
+            live_seq_lens, live_seq_lens_cpu = shared_verified_lens
+            live_seq_lens_sum = int(live_seq_lens_cpu.sum().item())
+        else:
+            live_seq_lens = batch.seq_lens
+            live_seq_lens_cpu = batch.seq_lens_cpu
+            live_seq_lens_sum = batch.seq_lens_sum
+
         draft_tokens = torch.cat(
             (self.last_verified_ids.unsqueeze(1), self.token_list), dim=1
         ).reshape(-1)
         positions = (
-            batch.seq_lens.unsqueeze(1)
+            live_seq_lens.unsqueeze(1)
             + torch.arange(
                 num_verify_tokens,
                 dtype=torch.long,
-                device=batch.seq_lens.device,
+                device=live_seq_lens.device,
             )
         ).reshape(-1)
         retrive_base = (
-            torch.arange(batch_size, dtype=torch.long, device=batch.seq_lens.device)
+            torch.arange(batch_size, dtype=torch.long, device=live_seq_lens.device)
             .unsqueeze(1)
             .mul(num_verify_tokens)
         )
         retrive_offset = torch.arange(
             num_verify_tokens,
             dtype=torch.long,
-            device=batch.seq_lens.device,
+            device=live_seq_lens.device,
         ).unsqueeze(0)
         retrive_index = retrive_base + retrive_offset
         retrive_next_token = torch.full(
             (batch_size, num_verify_tokens),
             -1,
             dtype=torch.long,
-            device=batch.seq_lens.device,
+            device=live_seq_lens.device,
         )
         if num_verify_tokens > 1:
             retrive_next_token[:, :-1] = torch.arange(
                 1,
                 num_verify_tokens,
                 dtype=torch.long,
-                device=batch.seq_lens.device,
+                device=live_seq_lens.device,
             ).unsqueeze(0)
         retrive_next_sibling = torch.full_like(retrive_next_token, -1)
         return EagleVerifyInput(
             draft_token=draft_tokens,
             custom_mask=torch.full(
-                (0,), True, dtype=torch.bool, device=batch.seq_lens.device
+                (0,), True, dtype=torch.bool, device=live_seq_lens.device
             ),
             positions=positions,
             retrive_index=retrive_index,
@@ -259,8 +284,8 @@ class EagleDraftInputV2Mixin:
             topk=topk,
             draft_token_num=num_verify_tokens,
             capture_hidden_mode=CaptureHiddenMode.FULL,
-            seq_lens_sum=batch.seq_lens_sum,
-            seq_lens_cpu=batch.seq_lens_cpu,
+            seq_lens_sum=live_seq_lens_sum,
+            seq_lens_cpu=live_seq_lens_cpu,
         ), None, None
 
     def _validate_real_decode_payload(
@@ -346,19 +371,15 @@ class EagleDraftInputV2Mixin:
             batch.token_to_kv_pool_allocator.free_swa(free_slots)
             req.swa_evicted_seqlen = new_swa_evicted_seqlen
 
+    def _get_shared_verified_lens_for_batch(
+        self, batch: Any
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        return _get_shared_verified_lens_for_batch_like(batch)
+
     def _materialize_decode_seq_lens_for_batch(self, batch: Any) -> bool:
-        req_pool_indices = getattr(batch, "req_pool_indices", None)
-        req_to_token_pool = getattr(batch, "req_to_token_pool", None)
-        shared_verified_lens = getattr(req_to_token_pool, "verified_lens", None)
-        if (
-            req_pool_indices is not None
-            and shared_verified_lens is not None
-            and len(req_pool_indices) > 0
-        ):
-            seq_lens_device = shared_verified_lens[req_pool_indices].to(
-                device=batch.seq_lens.device, dtype=torch.int64
-            )
-            seq_lens_cpu = seq_lens_device.cpu()
+        shared_verified_lens = self._get_shared_verified_lens_for_batch(batch)
+        if shared_verified_lens is not None:
+            seq_lens_device, seq_lens_cpu = shared_verified_lens
             batch.seq_lens = seq_lens_device
             batch.seq_lens_cpu = seq_lens_cpu
             if getattr(batch, "orig_seq_lens", None) is not None:
@@ -681,6 +702,13 @@ class EagleVerifyInputV2Mixin:
         batch: ModelWorkerBatch,
         target_worker: TpModelWorker,
     ):
+        shared_seq_lens = _get_shared_verified_lens_for_batch_like(batch)
+        if shared_seq_lens is not None:
+            batch.seq_lens, batch.seq_lens_cpu = shared_seq_lens
+            if getattr(batch, "orig_seq_lens", None) is not None:
+                batch.orig_seq_lens = batch.seq_lens.to(dtype=torch.int32)
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
+
         if not batch.forward_mode.is_idle():
             # Assign cache locations
             bs = len(batch.req_pool_indices)

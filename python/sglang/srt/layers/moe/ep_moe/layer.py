@@ -281,6 +281,8 @@ class DeepEPMoE(FusedMoE):
             tp_recv_counts,
         ) = dispatch_output[:6]
 
+        dynamic_scales = None
+
         self._ops_deepep_ctx = {
             "origin_shape": tuple(hidden_states.shape),
             "ori_x": hidden_states_2d,

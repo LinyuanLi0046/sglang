@@ -2568,7 +2568,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         worker_spec_info = self.spec_info
         if (
             self.forward_mode.is_decode()
-            and self.enable_overlap
             and self.spec_algorithm is not None
             and self.spec_algorithm.supports_spec_v2()
             and self.spec_info is not None

@@ -583,17 +583,6 @@ class SchedulerOutputProcessorMixin:
         self._prepare_next_batch_sampling_info(batch)
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
-        if (
-            self.token_to_kv_pool_allocator.available_size()
-            > self.token_to_kv_pool_allocator.size
-        ):
-            raise RuntimeError(
-                "decode free_group_end makes allocator available_size exceed allocator.size: "
-                f"available_size={self.token_to_kv_pool_allocator.available_size()}, "
-                f"allocator_size={self.token_to_kv_pool_allocator.size}, "
-                f"page_size={self.token_to_kv_pool_allocator.page_size}, "
-                f"batch_reqs={len(batch.reqs)}"
-            )
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
         self.report_decode_stats(

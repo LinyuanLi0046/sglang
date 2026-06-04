@@ -486,7 +486,6 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if req.req_pool_idx is None:
         return
 
-    available_before_overalloc_free = allocator.available_size()
     start_p, end_p = req.pop_overallocated_kv_cache()
 
     global_server_args = get_global_server_args()
@@ -498,43 +497,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             start_p == end_p
         ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
 
-    aligned_start_p = ceil_align(start_p, page_size) if page_size > 1 else start_p
-    expected_overalloc_free = max(0, end_p - aligned_start_p)
     free_req_kv_range(req, tree_cache, start_p, end_p)
-    actual_overalloc_free = allocator.available_size() - available_before_overalloc_free
-    if allocator.is_not_in_free_group and actual_overalloc_free != expected_overalloc_free:
-        raise RuntimeError(
-            "release_kv_cache overallocated free size mismatch: "
-            f"rid={req.rid}, "
-            f"req_pool_idx={req.req_pool_idx}, "
-            f"start_p={start_p}, "
-            f"end_p={end_p}, "
-            f"aligned_start_p={aligned_start_p}, "
-            f"expected_overalloc_free={expected_overalloc_free}, "
-            f"actual_overalloc_free={actual_overalloc_free}, "
-            f"available_before={available_before_overalloc_free}, "
-            f"available_after={allocator.available_size()}, "
-            f"allocator_size={allocator.size}, "
-            f"page_size={page_size}, "
-            f"kv_committed_len={req.kv_committed_len}, "
-            f"kv_allocated_len={req.kv_allocated_len}, "
-            f"kv_committed_freed={req.kv_committed_freed}, "
-            f"kv_overallocated_freed={req.kv_overallocated_freed}"
-        )
-    if allocator.available_size() > allocator.size:
-        raise RuntimeError(
-            "release_kv_cache makes allocator available_size exceed allocator.size: "
-            f"rid={req.rid}, "
-            f"req_pool_idx={req.req_pool_idx}, "
-            f"available_size={allocator.available_size()}, "
-            f"allocator_size={allocator.size}, "
-            f"page_size={page_size}, "
-            f"start_p={start_p}, "
-            f"end_p={end_p}, "
-            f"aligned_start_p={aligned_start_p}, "
-            f"kv_committed_len={req.kv_committed_len}, "
-            f"kv_allocated_len={req.kv_allocated_len}"
-        )
     # If the prefix cache doesn't manage mamba states, we must free them here.
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
         not tree_cache.supports_mamba()

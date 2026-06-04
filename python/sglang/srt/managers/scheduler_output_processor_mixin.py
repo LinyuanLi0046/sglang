@@ -437,6 +437,8 @@ class SchedulerOutputProcessorMixin:
             )
         elif self._use_spec_overlap_worker(batch):
             result = self.spec_overlap_worker.resolve_last_batch_result(result)
+            if getattr(self, "pending_spec_state_batch", None) is batch:
+                self._ensure_pending_spec_state_ready(batch)
 
         if result.copy_done is not None:
             result.copy_done.synchronize()

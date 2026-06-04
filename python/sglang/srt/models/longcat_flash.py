@@ -795,7 +795,7 @@ class LongcatFlashDecoderLayer(nn.Module):
 
                         #torch.npu.current_stream().wait_event(MultiStreamUtils().fia_ffn_finished_event)
 
-                        torch.npu.current_stream().wait_event(MultiStreamUtils().attn1_allreduce_finised)
+                        # torch.npu.current_stream().wait_event(MultiStreamUtils().attn1_allreduce_finised)
                         moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
                             moe_hidden_states, moe_residual, forward_batch
                         )

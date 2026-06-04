@@ -62,6 +62,7 @@ if _use_aiter:
     from aiter.fused_moe import fused_moe
 elif _is_npu:
     import torch_npu
+    from sglang.srt.utils.multi_stream_utils import MultiStreamUtils
 
 
 logger = logging.getLogger(__name__)
@@ -329,6 +330,7 @@ class DeepEPMoE(FusedMoE):
                 hidden_states, topk_output, copy_expert_num
             )
             combine_input = self.run_moe_core(dispatch_output)
+            torch.npu.current_stream().wait_event(MultiStreamUtils().attn1_allreduce_finised)
             return self._combine_with_ops_deepep(combine_input)
         finally:
             self._ops_deepep_ctx = None

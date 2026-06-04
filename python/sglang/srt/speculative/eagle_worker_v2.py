@@ -589,6 +589,7 @@ class EagleDraftWorker(BaseDraftWorker):
             verified_id=next_token_ids,
             last_verified_ids=next_token_ids,
             new_seq_lens=batch.seq_lens,
+            next_step_seq_lens=batch.seq_lens,
             # draft mode is same with decode mode, only 1 token per req
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
@@ -1245,11 +1246,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if batch.return_logprob and not batch.forward_mode.is_idle():
             self._compute_spec_v2_logprobs(batch, logits_output, predict, accept_index)
 
+        # `verified_id` is carried as the root token of the next canonical decode
+        # payload, so the next-step live prefix length must exclude that root token.
+        next_step_seq_lens = new_seq_lens - 1
+
         # Construct the next draft input
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,
             new_seq_lens=new_seq_lens,
-            next_step_seq_lens=new_seq_lens,
+            next_step_seq_lens=next_step_seq_lens,
             verify_done=verify_done,
             real_new_verified_id=verified_id,
         )

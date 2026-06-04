@@ -155,7 +155,6 @@ from sglang.srt.managers.mm_utils import (
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import (
     FutureMap,
-    build_spec_future_handle_carrier,
     clone_decode_placeholder_handle_contract,
 )
 from sglang.srt.managers.prefill_delayer import (
@@ -2762,9 +2761,6 @@ class Scheduler(
 
         next_draft_input.future_indices = future_indices
         batch.spec_info = next_draft_input
-        batch.spec_future_handle_carrier = build_spec_future_handle_carrier(
-            future_indices
-        )
         if batch.forward_mode.is_decode():
             batch.spec_decode_seq_lens_carrier = None
         else:
@@ -2787,9 +2783,6 @@ class Scheduler(
             future_indices=future_indices,
         )
         batch.spec_info = placeholder_carrier
-        batch.spec_future_handle_carrier = build_spec_future_handle_carrier(
-            future_indices
-        )
         batch.spec_decode_seq_lens_carrier = None
 
     def _apply_spec_v2_overlap_state(
@@ -2804,21 +2797,8 @@ class Scheduler(
                     "decode canonical-only spec overlap apply requires existing "
                     "batch.spec_info, but none was found."
                 )
-            # R6-L2: decode steady-state minimal apply must not overwrite the
-            # current batch-owned future handle after selection/filter/merge.
-            # `apply_state.future_indices` belongs to the submitted batch at
-            # launch time and may already be stale for the current reshaped
-            # scheduler batch. The stable handle owner stays on
-            # `spec_future_handle_carrier` / current `spec_info.future_indices`
-            # maintained through filter/merge.
-            current_future_indices = batch.get_spec_future_indices()
-            if current_future_indices is None:
+            if getattr(existing_spec_info, "future_indices", None) is None:
                 existing_spec_info.future_indices = apply_state.future_indices
-                batch.spec_future_handle_carrier = build_spec_future_handle_carrier(
-                    apply_state.future_indices
-                )
-            else:
-                existing_spec_info.future_indices = current_future_indices
             existing_spec_info.verify_done = apply_state.next_verify_done
             if apply_state.next_decode_seq_lens is not None:
                 existing_spec_info.next_step_seq_lens = (
@@ -2853,11 +2833,8 @@ class Scheduler(
         ):
             return False
 
-        # R6-C0-3 / R6-L1 cut 2: decode steady-state submit now installs the
-        # stable future-handle contract on a dedicated batch-owned carrier.
-        # Selection/filter/merge no longer need to wait for the worker's live
-        # apply state on this path; we can defer consuming the minimal apply
-        # contract to result processing.
+        # A-收口版: decode steady-state submit installs the minimal stable
+        # handle directly on `batch.spec_info.future_indices`.
         if (
             pending_batch.is_spec_v2
             and pending_batch.forward_mode.is_decode()

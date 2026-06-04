@@ -1474,6 +1474,7 @@ def get_attn_cp_group() -> GroupCoordinator:
 _MOE_DP: Optional[GroupCoordinator] = None
 _MOE_EP: Optional[GroupCoordinator] = None
 _MOE_TP: Optional[GroupCoordinator] = None
+_LONGCAT_MOE_EP: Optional[GroupCoordinator] = None
 
 
 def get_moe_dp_group() -> GroupCoordinator:
@@ -1489,6 +1490,13 @@ def get_moe_ep_group() -> GroupCoordinator:
 def get_moe_tp_group() -> GroupCoordinator:
     assert _MOE_TP is not None, "expert model parallel group is not initialized"
     return _MOE_TP
+
+
+def get_longcat_moe_ep_group() -> GroupCoordinator:
+    assert (
+        _LONGCAT_MOE_EP is not None
+    ), "longcat expert model parallel group is not initialized"
+    return _LONGCAT_MOE_EP
 
 
 # kept for backward compatibility
@@ -1538,7 +1546,7 @@ def graph_capture(stream: Optional[torch.cuda.Stream] = None):
     ) as context, get_pp_group().graph_capture(context):
         with contextlib.ExitStack() as stack:
             seen = {id(_TP)}
-            for group in (_MOE_EP, _MOE_TP):
+            for group in (_MOE_EP, _MOE_TP, _LONGCAT_MOE_EP):
                 if group is not None and id(group) not in seen:
                     seen.add(id(group))
                     stack.enter_context(group.graph_capture(context))
@@ -1925,11 +1933,11 @@ def initialize_model_parallel(
 
     global _MOE_EP
     assert _MOE_EP is None, "expert model parallel group is already initialized"
+    moe_ep_group_ranks = []
     if moe_ep_size == tensor_model_parallel_size:
         _MOE_EP = _TP
     else:
         # TODO(ch-wan): use split_group to save memory
-        group_ranks = []
         for tp_group_idx in range(num_tensor_model_parallel_groups):
             for moe_dp_idx in range(moe_dp_size):
                 for moe_tp_idx in range(moe_tp_size):
@@ -1940,12 +1948,33 @@ def initialize_model_parallel(
                     )
                     en = st + moe_ep_size * moe_tp_size
                     ranks = list(range(st, en, moe_tp_size))
-                    group_ranks.append(ranks)
+                    moe_ep_group_ranks.append(ranks)
         _MOE_EP = init_model_parallel_group(
-            group_ranks,
+            moe_ep_group_ranks,
             get_world_group().local_rank,
             backend,
             group_name="moe_ep",
+        )
+    if moe_ep_size == tensor_model_parallel_size:
+        for tp_group_idx in range(num_tensor_model_parallel_groups):
+            ranks = list(
+                range(
+                    tp_group_idx * tensor_model_parallel_size,
+                    (tp_group_idx + 1) * tensor_model_parallel_size,
+                )
+            )
+            moe_ep_group_ranks.append(ranks)
+
+    global _LONGCAT_MOE_EP
+    assert (
+        _LONGCAT_MOE_EP is None
+    ), "longcat expert model parallel group is already initialized"
+    if is_npu() and get_bool_env_var("ASCEND_SGLANG_USE_OPS_DEEPEP"):
+        _LONGCAT_MOE_EP = init_model_parallel_group(
+            moe_ep_group_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="longcat_moe_ep",
         )
 
     global _MOE_TP
@@ -2210,6 +2239,11 @@ def destroy_model_parallel():
     if _MOE_EP:
         _MOE_EP.destroy()
     _MOE_EP = None
+
+    global _LONGCAT_MOE_EP
+    if _LONGCAT_MOE_EP:
+        _LONGCAT_MOE_EP.destroy()
+    _LONGCAT_MOE_EP = None
 
     global _MOE_TP
     if _MOE_TP:

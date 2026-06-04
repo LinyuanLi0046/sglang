@@ -41,6 +41,7 @@ from torch import nn
 
 from sglang.srt.configs import LongcatFlashConfig
 from sglang.srt.distributed import (
+    get_longcat_moe_ep_group,
     get_moe_ep_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -319,6 +320,8 @@ class LongcatFlashMoE(nn.Module):
         )
 
     def _get_prefill_double_routing_group(self):
+        if _use_longcat_ops_deepep_runtime():
+            return get_longcat_moe_ep_group().device_group
         return get_moe_ep_group().device_group
 
     def _split_prefill_tensors(

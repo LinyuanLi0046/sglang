@@ -502,7 +502,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     expected_overalloc_free = max(0, end_p - aligned_start_p)
     free_req_kv_range(req, tree_cache, start_p, end_p)
     actual_overalloc_free = allocator.available_size() - available_before_overalloc_free
-    if actual_overalloc_free != expected_overalloc_free:
+    if allocator.is_not_in_free_group and actual_overalloc_free != expected_overalloc_free:
         raise RuntimeError(
             "release_kv_cache overallocated free size mismatch: "
             f"rid={req.rid}, "

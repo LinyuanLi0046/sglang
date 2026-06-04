@@ -1475,7 +1475,6 @@ _MOE_DP: Optional[GroupCoordinator] = None
 _MOE_EP: Optional[GroupCoordinator] = None
 _MOE_TP: Optional[GroupCoordinator] = None
 _LONGCAT_MOE_EP: Optional[GroupCoordinator] = None
-_LONGCAT_MOE_EP_GROUP_NAME: Optional[str] = None
 
 
 def get_moe_dp_group() -> GroupCoordinator:
@@ -1498,13 +1497,6 @@ def get_longcat_moe_ep_group() -> GroupCoordinator:
         _LONGCAT_MOE_EP is not None
     ), "longcat expert model parallel group is not initialized"
     return _LONGCAT_MOE_EP
-
-
-def get_longcat_moe_ep_group_name() -> str:
-    assert (
-        _LONGCAT_MOE_EP_GROUP_NAME is not None
-    ), "longcat expert model parallel group name is not initialized"
-    return _LONGCAT_MOE_EP_GROUP_NAME
 
 
 # kept for backward compatibility
@@ -1973,7 +1965,7 @@ def initialize_model_parallel(
             )
             moe_ep_group_ranks.append(ranks)
 
-    global _LONGCAT_MOE_EP, _LONGCAT_MOE_EP_GROUP_NAME
+    global _LONGCAT_MOE_EP
     assert (
         _LONGCAT_MOE_EP is None
     ), "longcat expert model parallel group is already initialized"
@@ -1983,10 +1975,6 @@ def initialize_model_parallel(
             get_world_group().local_rank,
             backend,
             group_name="longcat_moe_ep",
-        )
-        backend_impl = _LONGCAT_MOE_EP.device_group._get_backend(torch.device("npu"))
-        _LONGCAT_MOE_EP_GROUP_NAME = backend_impl.get_hccl_comm_name(
-            _LONGCAT_MOE_EP.rank
         )
 
     global _MOE_TP
@@ -2252,11 +2240,10 @@ def destroy_model_parallel():
         _MOE_EP.destroy()
     _MOE_EP = None
 
-    global _LONGCAT_MOE_EP, _LONGCAT_MOE_EP_GROUP_NAME
+    global _LONGCAT_MOE_EP
     if _LONGCAT_MOE_EP:
         _LONGCAT_MOE_EP.destroy()
     _LONGCAT_MOE_EP = None
-    _LONGCAT_MOE_EP_GROUP_NAME = None
 
     global _MOE_TP
     if _MOE_TP:

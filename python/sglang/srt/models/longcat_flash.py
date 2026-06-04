@@ -501,11 +501,11 @@ class LongcatFlashMoE(nn.Module):
             hidden_states,
             router_logits,
         )
+        topk_weights *= self.routed_scaling_factor
         use_ops_decode = self._use_ops_deepep_decode(forward_batch)
         use_ops_prefill = self._use_ops_double_routing_prefill(forward_batch)
-        fallback_old_path = not (use_ops_decode or use_ops_prefill)
         zero_expert_result = None
-        if self.zero_expert_type is not None and fallback_old_path:
+        if self.zero_expert_type is not None and not use_ops_decode:
             if not _is_npu:
                 zero_expert_result = zero_experts_compute_triton(
                     expert_indices=topk_idx,
@@ -544,20 +544,12 @@ class LongcatFlashMoE(nn.Module):
             )
         else:
             final_hidden_states = self.experts(hidden_states, topk_output)
-        final_hidden_states *= self.routed_scaling_factor
-
-        if (
-            zero_expert_result is not None
-            and self.tp_size > 1
-            and get_moe_a2a_backend().is_deepep()
-        ):
-            zero_expert_result *= self.tp_size
-
-        if zero_expert_result is not None and hidden_states.shape[0] > 0:
-            final_hidden_states += zero_expert_result.to(final_hidden_states.device)
 
         if self.tp_size > 1 and not _use_longcat_sparse_a2a_runtime():
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        if zero_expert_result is not None and not use_ops_decode and hidden_states.shape[0] > 0:
+            final_hidden_states += zero_expert_result.to(final_hidden_states.device)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 

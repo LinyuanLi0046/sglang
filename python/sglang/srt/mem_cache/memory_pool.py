@@ -144,10 +144,34 @@ class ReqToTokenPool:
             self.req_to_token = torch.zeros(
                 (size, max_context_len), dtype=torch.int32, device=device
             )
+            # Shared authoritative live-length owner for speculative paths.
+            # R6-B1 only introduces the storage and lifecycle management; the
+            # actual producers/consumers are wired in later stages.
+            self.verified_lens = torch.zeros(size, dtype=torch.int32, device=device)
         self.free_slots = list(range(size))
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
+
+    def get_verified_lens(
+        self, req_pool_indices: Union[int, List[int], torch.Tensor]
+    ) -> torch.Tensor:
+        return self.verified_lens[req_pool_indices]
+
+    def set_verified_lens(
+        self, req_pool_indices: Union[int, List[int], torch.Tensor], values
+    ) -> None:
+        self.verified_lens[req_pool_indices] = values
+
+    def reset_verified_lens(
+        self,
+        req_pool_indices: Optional[Union[int, List[int], torch.Tensor]] = None,
+        value: int = 0,
+    ) -> None:
+        if req_pool_indices is None:
+            self.verified_lens.fill_(value)
+        else:
+            self.verified_lens[req_pool_indices] = value
 
     def available_size(self):
         return len(self.free_slots)
@@ -175,16 +199,19 @@ class ReqToTokenPool:
         for r in reqs:
             if r.req_pool_idx is None:
                 r.req_pool_idx = select_index[offset]
+                self.reset_verified_lens(r.req_pool_idx)
                 offset += 1
         return [r.req_pool_idx for r in reqs]
 
     def free(self, req: Req):
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
+        self.reset_verified_lens(req.req_pool_idx)
         self.free_slots.append(req.req_pool_idx)
         req.req_pool_idx = None
 
     def clear(self):
         self.free_slots = list(range(self.size))
+        self.reset_verified_lens()
 
 
 class MambaPool:

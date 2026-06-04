@@ -598,6 +598,13 @@ class EagleDraftWorker(BaseDraftWorker):
             real_new_verified_id=next_token_ids,
         )
 
+        if batch.req_pool_indices is not None and len(batch.req_pool_indices) > 0:
+            # R6-B2: prefill-first-step starts dual-writing the shared live-length
+            # owner while the existing relay path remains intact.
+            self.req_to_token_pool.set_verified_lens(
+                batch.req_pool_indices, next_draft_input.next_step_seq_lens
+            )
+
         batch.spec_info = next_draft_input
 
         # Run forward
@@ -1250,6 +1257,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Keep worker-produced `new_seq_lens` and consumer-facing
         # `next_step_seq_lens` aligned until the contract is further narrowed.
         next_step_seq_lens = new_seq_lens
+
+        if batch.req_pool_indices is not None and len(batch.req_pool_indices) > 0:
+            # R6-B2: shared live-length owner is now produced by the worker
+            # together with the existing next-step relay.
+            self.req_to_token_pool.set_verified_lens(
+                batch.req_pool_indices, next_step_seq_lens
+            )
 
         # Construct the next draft input
         next_draft_input = EagleDraftInput(

@@ -347,6 +347,26 @@ class EagleDraftInputV2Mixin:
             req.swa_evicted_seqlen = new_swa_evicted_seqlen
 
     def _materialize_decode_seq_lens_for_batch(self, batch: Any) -> bool:
+        req_pool_indices = getattr(batch, "req_pool_indices", None)
+        req_to_token_pool = getattr(batch, "req_to_token_pool", None)
+        shared_verified_lens = getattr(req_to_token_pool, "verified_lens", None)
+        if (
+            req_pool_indices is not None
+            and shared_verified_lens is not None
+            and len(req_pool_indices) > 0
+        ):
+            seq_lens_device = shared_verified_lens[req_pool_indices].to(
+                device=batch.seq_lens.device, dtype=torch.int64
+            )
+            seq_lens_cpu = seq_lens_device.cpu()
+            batch.seq_lens = seq_lens_device
+            batch.seq_lens_cpu = seq_lens_cpu
+            if getattr(batch, "orig_seq_lens", None) is not None:
+                batch.orig_seq_lens = batch.seq_lens.to(dtype=torch.int32)
+            batch.seq_lens_sum = int(seq_lens_cpu.sum().item())
+            self.next_step_seq_lens = seq_lens_device
+            return True
+
         next_step_seq_lens = getattr(self, "next_step_seq_lens", None)
         if next_step_seq_lens is not None:
             seq_lens_device = next_step_seq_lens.to(

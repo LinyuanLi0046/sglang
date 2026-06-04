@@ -1,5 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
+import logging
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import torch
@@ -40,6 +41,7 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_npu_before_atlas_a5 = is_npu_before_atlas_a5()
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
@@ -488,6 +490,47 @@ class EagleDraftInputV2Mixin:
         from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
         bs = batch.batch_size() if hasattr(batch, "batch_size") else len(batch.reqs)
+        shared_verified_lens = self._get_shared_verified_lens_for_batch(batch)
+        _shared_lens_cpu = (
+            shared_verified_lens[1].tolist() if shared_verified_lens is not None else None
+        )
+        _req_frontier_mismatch = []
+        if _shared_lens_cpu is not None:
+            for i, req in enumerate(batch.reqs):
+                _shared_len = int(_shared_lens_cpu[i])
+                if (
+                    _shared_len != int(req.seqlen)
+                    or _shared_len != int(req.kv_committed_len)
+                ):
+                    _req_frontier_mismatch.append(
+                        {
+                            "rid": req.rid,
+                            "req_pool_idx": req.req_pool_idx,
+                            "shared_verified_len": _shared_len,
+                            "req_seqlen": int(req.seqlen),
+                            "kv_committed_len": int(req.kv_committed_len),
+                            "kv_allocated_len": int(req.kv_allocated_len),
+                            "decode_batch_idx": int(req.decode_batch_idx),
+                            "pending_count": len(
+                                req.pending_spec_decode_alloc_reservations
+                            ),
+                        }
+                    )
+        if _req_frontier_mismatch:
+            # #region debug-point H1:decode-allocation-frontier
+            try:
+                logger.error(
+                    "[DEBUG][H1][prepare_decode_allocation] "
+                    "shared verified lens diverges from req frontier before decode reservation: %s",
+                    {
+                        "batch_size": bs,
+                        "mismatch_count": len(_req_frontier_mismatch),
+                        "mismatches": _req_frontier_mismatch[:8],
+                    },
+                )
+            except Exception:
+                pass
+            # #endregion
 
         page_size = batch.token_to_kv_pool_allocator.page_size
         cur_kv_lens_cpu = []
@@ -702,12 +745,57 @@ class EagleVerifyInputV2Mixin:
         batch: ModelWorkerBatch,
         target_worker: TpModelWorker,
     ):
+        _before_seq_lens_cpu = (
+            batch.seq_lens_cpu.tolist()
+            if getattr(batch, "seq_lens_cpu", None) is not None
+            else None
+        )
         shared_seq_lens = _get_shared_verified_lens_for_batch_like(batch)
         if shared_seq_lens is not None:
             batch.seq_lens, batch.seq_lens_cpu = shared_seq_lens
             if getattr(batch, "orig_seq_lens", None) is not None:
                 batch.orig_seq_lens = batch.seq_lens.to(dtype=torch.int32)
             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
+            _after_seq_lens_cpu = batch.seq_lens_cpu.tolist()
+            _verify_mismatch = []
+            for i, req in enumerate(batch.reqs):
+                _shared_len = int(_after_seq_lens_cpu[i])
+                if (
+                    _before_seq_lens_cpu is None
+                    or int(_before_seq_lens_cpu[i]) != _shared_len
+                    or _shared_len != int(req.seqlen)
+                    or _shared_len != int(req.kv_committed_len)
+                ):
+                    _verify_mismatch.append(
+                        {
+                            "rid": req.rid,
+                            "req_pool_idx": req.req_pool_idx,
+                            "before_batch_seq_len": None
+                            if _before_seq_lens_cpu is None
+                            else int(_before_seq_lens_cpu[i]),
+                            "shared_verified_len": _shared_len,
+                            "req_seqlen": int(req.seqlen),
+                            "kv_committed_len": int(req.kv_committed_len),
+                            "kv_allocated_len": int(req.kv_allocated_len),
+                            "decode_batch_idx": int(req.decode_batch_idx),
+                        }
+                    )
+            if _verify_mismatch:
+                # #region debug-point H2:verify-shared-owner-mismatch
+                try:
+                    logger.error(
+                        "[DEBUG][H2][prepare_for_v2_verify] "
+                        "verify consumes shared lens that diverges from batch or req frontier: %s",
+                        {
+                            "draft_token_num": int(self.draft_token_num),
+                            "batch_size": len(batch.reqs),
+                            "mismatch_count": len(_verify_mismatch),
+                            "mismatches": _verify_mismatch[:8],
+                        },
+                    )
+                except Exception:
+                    pass
+                # #endregion
 
         if not batch.forward_mode.is_idle():
             # Assign cache locations

@@ -234,66 +234,7 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
-                        # #region debug-point H6:prefill-finish-release
-                        if batch.is_spec_v2:
-                            _available_before = (
-                                self.token_to_kv_pool_allocator.available_size()
-                            )
-                            _pending_count = len(
-                                req.pending_spec_decode_alloc_reservations
-                            )
-                            logger.error(
-                                "[DEBUG][H6][process_batch_result_prefill:before_release] "
-                                "spec-v2 prefill finished req is about to release kv cache: %s",
-                                {
-                                    "rid": req.rid,
-                                    "req_pool_idx": req.req_pool_idx,
-                                    "pending_count": _pending_count,
-                                    "kv_committed_len": req.kv_committed_len,
-                                    "kv_allocated_len": req.kv_allocated_len,
-                                    "decode_batch_idx": req.decode_batch_idx,
-                                    "seqlen": req.seqlen,
-                                    "available_before": _available_before,
-                                },
-                            )
-                        # #endregion
                         release_kv_cache(req, self.tree_cache)
-                        # #region debug-point H6:prefill-finish-release-after
-                        if batch.is_spec_v2:
-                            _available_after = (
-                                self.token_to_kv_pool_allocator.available_size()
-                            )
-                            logger.error(
-                                "[DEBUG][H6][process_batch_result_prefill:after_release] "
-                                "spec-v2 prefill finished req released kv cache: %s",
-                                {
-                                    "rid": req.rid,
-                                    "req_pool_idx": req.req_pool_idx,
-                                    "kv_committed_len": req.kv_committed_len,
-                                    "kv_allocated_len": req.kv_allocated_len,
-                                    "decode_batch_idx": req.decode_batch_idx,
-                                    "seqlen": req.seqlen,
-                                    "available_after": _available_after,
-                                    "available_delta": _available_after
-                                    - _available_before,
-                                    "max_total_num_tokens": self.max_total_num_tokens,
-                                },
-                            )
-                            if _available_after > self.max_total_num_tokens:
-                                raise RuntimeError(
-                                    "prefill finished release made allocator available_size exceed max_total_num_tokens: "
-                                    f"rid={req.rid}, "
-                                    f"available_before={_available_before}, "
-                                    f"available_after={_available_after}, "
-                                    f"max_total_num_tokens={self.max_total_num_tokens}, "
-                                    f"req_pool_idx={req.req_pool_idx}, "
-                                    f"kv_committed_len={req.kv_committed_len}, "
-                                    f"kv_allocated_len={req.kv_allocated_len}, "
-                                    f"decode_batch_idx={req.decode_batch_idx}, "
-                                    f"seqlen={req.seqlen}, "
-                                    f"pending_count={_pending_count}"
-                                )
-                        # #endregion
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)

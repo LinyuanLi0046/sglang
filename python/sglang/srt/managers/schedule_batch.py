@@ -1311,25 +1311,6 @@ class Req(ReqDllmMixin):
     ) -> None:
         for reservation in list(self.pending_spec_decode_alloc_reservations)[::-1]:
             reservation.rollback_req(self, tree_cache)
-        if self.pending_spec_decode_alloc_reservations:
-            # #region debug-point H1:req-rollback-still-pending
-            try:
-                logger.error(
-                    "[DEBUG][H1][rollback_pending_spec_decode_alloc_reservations] "
-                    "req still owns pending decode reservations after rollback: %s",
-                    {
-                        "rid": self.rid,
-                        "req_pool_idx": self.req_pool_idx,
-                        "pending_count": len(self.pending_spec_decode_alloc_reservations),
-                        "kv_committed_len": self.kv_committed_len,
-                        "kv_allocated_len": self.kv_allocated_len,
-                        "decode_batch_idx": self.decode_batch_idx,
-                        "seqlen": self.seqlen,
-                    },
-                )
-            except Exception:
-                pass
-            # #endregion
 
 
 @dataclasses.dataclass
@@ -1352,39 +1333,11 @@ class SpecDecodeAllocReservation:
             pending.remove(self)
 
     def commit(self) -> None:
-        _remaining_pending = []
         for i, req in enumerate(self.reqs):
             if self._committed[i] or self._rolled_back[i]:
                 continue
             self._committed[i] = True
             self._detach_req(req)
-            pending_count = len(req.pending_spec_decode_alloc_reservations)
-            if pending_count > 1:
-                _remaining_pending.append(
-                    {
-                        "rid": req.rid,
-                        "req_pool_idx": req.req_pool_idx,
-                        "pending_count": pending_count,
-                        "kv_committed_len": req.kv_committed_len,
-                        "kv_allocated_len": req.kv_allocated_len,
-                        "decode_batch_idx": req.decode_batch_idx,
-                        "seqlen": req.seqlen,
-                    }
-                )
-        if _remaining_pending:
-            # #region debug-point H1:reservation-commit-stacked
-            try:
-                logger.error(
-                    "[DEBUG][H1][SpecDecodeAllocReservation.commit] "
-                    "reservation commit leaves stacked pending reservations: %s",
-                    {
-                        "req_count": len(self.reqs),
-                        "remaining_pending": _remaining_pending[:8],
-                    },
-                )
-            except Exception:
-                pass
-            # #endregion
 
     def rollback_req(self, req: Req, tree_cache: BasePrefixCache) -> None:
         idx = self._req_index.get(id(req))

@@ -320,8 +320,6 @@ class LongcatFlashMoE(nn.Module):
         )
 
     def _get_prefill_double_routing_group(self):
-        if _use_longcat_ops_deepep_runtime():
-            return get_longcat_moe_ep_group().device_group
         return get_moe_ep_group().device_group
 
     def _split_prefill_tensors(

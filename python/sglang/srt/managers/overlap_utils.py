@@ -65,8 +65,15 @@ def build_decode_placeholder_canonical_draft_input(
         if template_draft_input is not None
         else None
     )
-    if template_token_list is not None:
-        token_list_width = max(token_list_width, template_token_list.shape[1])
+    if (
+        template_token_list is not None
+        and template_token_list.ndim == 2
+        and template_token_list.shape[1] != token_list_width
+    ):
+        raise RuntimeError(
+            "decode placeholder canonical token_list width mismatch: "
+            f"expected={token_list_width}, actual={template_token_list.shape[1]}"
+        )
 
     placeholder_ids = -future_indices.indices.to(dtype=dtype)
     draft_input_kwargs = {
@@ -213,7 +220,7 @@ class FutureMap:
             (self.future_buffer_len,), dtype=torch.bool, device=self.device
         )
 
-    def _ensure_canonical_buf_capacity(
+    def _check_canonical_buf_width(
         self, draft_input: "EagleDraftInput | EagleNextStepPayload"
     ):
         if draft_input.last_verified_ids is None or draft_input.token_list is None:
@@ -224,17 +231,11 @@ class FutureMap:
 
         current_width = self.token_list_buf.shape[1]
         incoming_width = draft_input.token_list.shape[1]
-        if incoming_width <= current_width:
-            return
-
-        new_token_list_buf = torch.full(
-            (self.future_buffer_len, incoming_width),
-            -1,
-            dtype=self.token_list_buf.dtype,
-            device=self.device,
-        )
-        new_token_list_buf[:, :current_width] = self.token_list_buf
-        self.token_list_buf = new_token_list_buf
+        if incoming_width != current_width:
+            raise RuntimeError(
+                "canonical token_list width mismatch in FutureMap.store: "
+                f"buf_width={current_width}, incoming_width={incoming_width}"
+            )
 
     def alloc_future_indices(self, bs: int) -> FutureIndices:
         """Update the circular buffer pointer and allocate future indices."""
@@ -353,11 +354,9 @@ class FutureMap:
                     "decode steady-state canonical-only store requires next_step_seq_lens relay"
                 )
         if has_canonical_payload:
-            self._ensure_canonical_buf_capacity(payload_source)
+            self._check_canonical_buf_width(payload_source)
             self.last_verified_ids_buf[intv] = payload_source.last_verified_ids
-            token_width = payload_source.token_list.shape[1]
-            self.token_list_buf[intv].fill_(-1)
-            self.token_list_buf[intv, :token_width] = payload_source.token_list
+            self.token_list_buf[intv] = payload_source.token_list
             if next_step_seq_lens is not None:
                 if self.next_step_seq_lens_buf is None:
                     self._lazy_init_next_step_seq_lens_buf(payload_source)

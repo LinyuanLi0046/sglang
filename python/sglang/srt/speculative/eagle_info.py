@@ -51,6 +51,18 @@ if is_cuda():
 logger = logging.getLogger(__name__)
 
 
+def _assert_same_token_table_width(
+    lhs: Optional[torch.Tensor], rhs: Optional[torch.Tensor], field_name: str
+) -> None:
+    if lhs is None or rhs is None or lhs.ndim != 2 or rhs.ndim != 2:
+        return
+    if lhs.shape[1] != rhs.shape[1]:
+        raise RuntimeError(
+            f"{field_name} width mismatch during merge: lhs_width={lhs.shape[1]}, "
+            f"rhs_width={rhs.shape[1]}"
+        )
+
+
 @dataclass
 class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     draft_token: torch.Tensor
@@ -681,6 +693,9 @@ class EagleNextStepPayload:
                 [self.last_verified_ids, other.last_verified_ids], dim=0
             )
         if self.token_list is not None and other.token_list is not None:
+            _assert_same_token_table_width(
+                self.token_list, other.token_list, "EagleNextStepPayload.token_list"
+            )
             self.token_list = torch.cat([self.token_list, other.token_list], dim=0)
         if (
             self.real_new_verified_id is not None
@@ -690,6 +705,11 @@ class EagleNextStepPayload:
                 [self.real_new_verified_id, other.real_new_verified_id], dim=0
             )
         if self.real_token_list is not None and other.real_token_list is not None:
+            _assert_same_token_table_width(
+                self.real_token_list,
+                other.real_token_list,
+                "EagleNextStepPayload.real_token_list",
+            )
             self.real_token_list = torch.cat(
                 [self.real_token_list, other.real_token_list], dim=0
             )
@@ -954,7 +974,14 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             else:
                 self.last_verified_ids = None
             if self.token_list is not None and spec_info.token_list is not None:
-                self.token_list = torch.cat([self.token_list, spec_info.token_list], axis=0)
+                _assert_same_token_table_width(
+                    self.token_list,
+                    spec_info.token_list,
+                    "EagleDraftInput.token_list",
+                )
+                self.token_list = torch.cat(
+                    [self.token_list, spec_info.token_list], axis=0
+                )
             else:
                 self.token_list = None
             if self.real_new_verified_id is not None and spec_info.real_new_verified_id is not None:
@@ -964,6 +991,11 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             else:
                 self.real_new_verified_id = None
             if self.real_token_list is not None and spec_info.real_token_list is not None:
+                _assert_same_token_table_width(
+                    self.real_token_list,
+                    spec_info.real_token_list,
+                    "EagleDraftInput.real_token_list",
+                )
                 self.real_token_list = torch.cat(
                     [self.real_token_list, spec_info.real_token_list], axis=0
                 )
@@ -1021,6 +1053,11 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         else:
             self.last_verified_ids = None
         if self.token_list is not None and spec_info.token_list is not None:
+            _assert_same_token_table_width(
+                self.token_list,
+                spec_info.token_list,
+                "EagleDraftInput.token_list",
+            )
             self.token_list = torch.cat([self.token_list, spec_info.token_list], axis=0)
         else:
             self.token_list = None
@@ -1031,6 +1068,11 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         else:
             self.real_new_verified_id = None
         if self.real_token_list is not None and spec_info.real_token_list is not None:
+            _assert_same_token_table_width(
+                self.real_token_list,
+                spec_info.real_token_list,
+                "EagleDraftInput.real_token_list",
+            )
             self.real_token_list = torch.cat(
                 [self.real_token_list, spec_info.real_token_list], axis=0
             )

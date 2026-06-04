@@ -543,11 +543,7 @@ class EagleDraftInputV2Mixin:
                     dtype=self.future_verified_id_buf.dtype,
                     device=self.future_verified_id_buf.device,
                 )
-                future_seq_lens_buf = (
-                    self.future_next_step_seq_lens_buf
-                    if getattr(self, "future_next_step_seq_lens_buf", None) is not None
-                    else self.future_new_seq_lens_buf
-                )
+                future_seq_lens_buf = self.future_new_seq_lens_buf
                 self.new_seq_lens = torch.empty(
                     (bs,),
                     dtype=future_seq_lens_buf.dtype,

@@ -1246,9 +1246,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if batch.return_logprob and not batch.forward_mode.is_idle():
             self._compute_spec_v2_logprobs(batch, logits_output, predict, accept_index)
 
-        # `verified_id` is carried as the root token of the next canonical decode
-        # payload, so the next-step live prefix length must exclude that root token.
-        next_step_seq_lens = new_seq_lens - 1
+        next_step_seq_lens = new_seq_lens
 
         # Construct the next draft input
         next_draft_input = EagleDraftInput(

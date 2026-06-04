@@ -12,6 +12,7 @@ This document provides a list of commonly used environment variables and aims to
 | `SGLANG_NPU_USE_MULTI_STREAM`                    | Enable dual-stream computation of shared experts <br/> and routing experts in DeepSeek models.<br/> Enable dual-stream computation in DeepSeek NSA Indexer. | `false`       |
 | `SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT`           | Disable cast model weight tensor to a specific NPU <br/> ACL format.                                                                                        | `false`       |
 | `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | The maximum number of dispatched tokens on each rank.                                                                                                       | `128`         |
+| `ASCEND_SGLANG_USE_OPS_DEEPEP`                   | Uses `torch_npu` dispatch/combine operators instead of the original DeepEP dispatcher path for `longcat_flash` decode on Ascend NPU. The first version only targets the NPU decode path and keeps zero-expert accuracy handling for follow-up work. | `false`       |
 
 ## Used in DeepEP Ascend
 

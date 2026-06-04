@@ -164,6 +164,7 @@ from sglang.srt.utils import (
     empty_context,
     enable_show_time_cost,
     get_available_gpu_memory,
+    get_bool_env_var,
     get_cpu_ids_by_node,
     init_custom_process_group,
     is_hip,
@@ -2679,6 +2680,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.piecewise_cuda_graph_runner is not None
             and self.piecewise_cuda_graph_runner.can_run(forward_batch)
         )
+
+        if (
+            can_run_graph
+            and get_bool_env_var("ASCEND_SGLANG_USE_OPS_DEEPEP")
+            and getattr(self.model_config.hf_config, "model_type", None)
+            == "longcat_flash"
+            and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+        ):
+            can_run_graph = False
 
         if can_run_graph:
             return (

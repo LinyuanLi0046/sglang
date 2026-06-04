@@ -36,10 +36,13 @@ from contextlib import nullcontext
 from typing import Iterable, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 from torch import nn
 
 from sglang.srt.configs import LongcatFlashConfig
 from sglang.srt.distributed import (
+    get_longcat_moe_ep_group,
+    get_moe_ep_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
@@ -68,6 +71,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import zero_experts_compute_triton
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
+from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPNormalDispatchOutput
 from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
 from sglang.srt.layers.n_gram_embedding import NgramEmbedding
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -128,12 +132,22 @@ elif _is_hip:
         awq_dequantize_triton as awq_dequantize,
     )
 elif _is_npu:
+    import torch_npu
+
     from sgl_kernel_npu.moe.zero_experts_compute_identity import zero_experts_compute_identity_triton
     from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 else:
     pass
 
 logger = logging.getLogger(__name__)
+
+
+def _use_longcat_ops_deepep_runtime() -> bool:
+    return _is_npu and get_bool_env_var("ASCEND_SGLANG_USE_OPS_DEEPEP")
+
+
+def _use_longcat_sparse_a2a_runtime() -> bool:
+    return _use_longcat_ops_deepep_runtime() or get_moe_a2a_backend().is_deepep()
 
 
 class LongcatFlashMLP(nn.Module):
@@ -225,6 +239,7 @@ class LongcatFlashMoE(nn.Module):
         self.top_k = config.moe_topk
         self.zero_expert_num = config.zero_expert_num
         self.zero_expert_type = config.zero_expert_type
+        self.prefill_chunk_max_len = 65536
 
         if config.rounter_params_dtype == "float32":
             self.rounter_params_dtype = torch.float32
@@ -261,7 +276,10 @@ class LongcatFlashMoE(nn.Module):
             layer_id=layer_id,
         )
 
-        self.experts = get_moe_impl_class(quant_config)(
+        moe_impl_cls = (
+            DeepEPMoE if _use_longcat_ops_deepep_runtime() else get_moe_impl_class(quant_config)
+        )
+        self.experts = moe_impl_cls(
             num_experts=self.num_experts,
             top_k=self.top_k,
             layer_id=self.layer_id,
@@ -273,7 +291,6 @@ class LongcatFlashMoE(nn.Module):
 
     def get_router_weights(self):
         if not hasattr(self.router.classifier, "weight"):
-            print("no prefetch moe router", flush=True)
             return None
         cache = [self.router.classifier.weight]
         if getattr(self.router.classifier, "bias", None) is not None:
@@ -281,7 +298,200 @@ class LongcatFlashMoE(nn.Module):
         cache.append(self.router.e_score_correction_bias)
         return cache
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _use_ops_deepep_decode(self, forward_batch: Optional[ForwardBatch]) -> bool:
+        return (
+            _use_longcat_ops_deepep_runtime()
+            and forward_batch is not None
+            and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+        )
+
+    def _use_ops_double_routing_prefill(
+        self, forward_batch: Optional[ForwardBatch]
+    ) -> bool:
+        return (
+            _use_longcat_ops_deepep_runtime()
+            and forward_batch is not None
+            and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+        )
+
+    def _get_prefill_double_routing_group(self):
+        return get_moe_ep_group().device_group
+
+    def _split_prefill_tensors(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ):
+        if hidden_states.shape[0] <= self.prefill_chunk_max_len:
+            return [(hidden_states, topk_ids, topk_weights)]
+
+        hidden_chunks = torch.split(hidden_states, self.prefill_chunk_max_len, dim=0)
+        id_chunks = torch.split(topk_ids, self.prefill_chunk_max_len, dim=0)
+        weight_chunks = torch.split(topk_weights, self.prefill_chunk_max_len, dim=0)
+        return list(zip(hidden_chunks, id_chunks, weight_chunks))
+
+    def _dispatch_double_routing(
+        self,
+        tokens_per_expert: torch.Tensor,
+        expanded_x: torch.Tensor,
+    ):
+        group = self._get_prefill_double_routing_group()
+        ep_world_size = dist.get_world_size(group)
+
+        tokens_per_expert_group = tokens_per_expert.new_empty(tokens_per_expert.shape[0])
+        dist.all_to_all_single(tokens_per_expert_group, tokens_per_expert, group=group)
+
+        combine_tokens = torch.stack([tokens_per_expert_group, tokens_per_expert], dim=0)
+        combine_tokens = combine_tokens.view(2, ep_world_size, -1).sum(2)
+
+        all_tokens = int(combine_tokens[0].sum().item())
+        input_splits = combine_tokens[1].cpu().tolist()
+        output_splits = combine_tokens[0].cpu().tolist()
+
+        gathered_tokens = expanded_x.new_empty(all_tokens, expanded_x.shape[1])
+        dist.all_to_all_single(
+            gathered_tokens,
+            expanded_x,
+            output_splits,
+            input_splits,
+            group=group,
+        )
+        return tokens_per_expert_group, gathered_tokens, input_splits, output_splits
+
+    def _run_prefill_local_experts(
+        self,
+        rerouted_hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        tokens_per_local_expert: torch.Tensor,
+    ) -> torch.Tensor:
+        dispatch_output = DeepEPNormalDispatchOutput(
+            hidden_states=rerouted_hidden_states,
+            hidden_states_scale=None,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            num_recv_tokens_per_expert=tokens_per_local_expert,
+        )
+        return self.experts.forward_npu(dispatch_output)
+
+    def _forward_prefill_double_routing(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        group = self._get_prefill_double_routing_group()
+        ep_world_size = dist.get_world_size(group)
+
+        if self.num_experts % ep_world_size != 0:
+            raise ValueError(
+                f"LongcatFlashMoE prefill requires num_experts ({self.num_experts}) "
+                f"to be divisible by ep_world_size ({ep_world_size})."
+            )
+
+        outputs = []
+        chunks = self._split_prefill_tensors(hidden_states, topk_ids, topk_weights)
+
+        for chunk_idx, (
+            hidden_states_chunk,
+            topk_ids_chunk,
+            topk_weights_chunk,
+        ) in enumerate(chunks):
+            (
+                expanded_x,
+                expanded_row_idx,
+                tokens_per_expert,
+                _,
+            ) = torch_npu.npu_moe_init_routing_v2(
+                hidden_states_chunk,
+                expert_idx=topk_ids_chunk.to(torch.int32),
+                active_num=topk_ids_chunk.numel(),
+                expert_num=self.num_experts + self.zero_expert_num,
+                expert_tokens_num_type=1,
+                expert_tokens_num_flag=True,
+                active_expert_range=[0, self.num_experts + self.zero_expert_num],
+                quant_mode=-1,
+            )
+
+            tokens_per_expert0 = tokens_per_expert[: self.num_experts]
+            routed_token_count = int(tokens_per_expert0.sum().item())
+            expanded_x0 = expanded_x[:routed_token_count]
+            expanded_x1 = expanded_x[routed_token_count:]
+
+            (
+                tokens_per_expert_group,
+                gathered_tokens,
+                input_splits,
+                output_splits,
+            ) = self._dispatch_double_routing(tokens_per_expert0, expanded_x0)
+            (
+                rerouted_hidden_states,
+                _,
+                gathered_ids_unsort,
+                tokens_per_local_expert,
+            ) = torch_npu.npu_moe_re_routing(
+                gathered_tokens,
+                tokens_per_expert_group.view(ep_world_size, -1),
+                per_token_scales=None,
+            )
+
+            expert_output = self._run_prefill_local_experts(
+                rerouted_hidden_states=rerouted_hidden_states,
+                topk_ids=topk_ids_chunk,
+                topk_weights=topk_weights_chunk,
+                tokens_per_local_expert=tokens_per_local_expert,
+            )
+
+            restored_output = torch.index_select(
+                expert_output,
+                0,
+                gathered_ids_unsort.float().argsort().int(),
+            )
+
+            gathered_output = restored_output.new_empty(*expanded_x0.shape)
+            dist.all_to_all_single(
+                gathered_output,
+                restored_output,
+                input_splits,
+                output_splits,
+                group=group,
+            )
+
+            gathered_output = torch.cat([gathered_output, expanded_x1], dim=0)
+
+            routed_weight = topk_weights_chunk.clone()
+            routed_weight[topk_ids_chunk >= self.num_experts] = 0
+
+            zero_expert_weight = topk_weights_chunk.clone()
+            zero_expert_weight[topk_ids_chunk < self.num_experts] = 0
+
+            chunk_output = torch_npu.npu_moe_finalize_routing(
+                gathered_output,
+                skip1=None,
+                skip2=None,
+                bias=None,
+                scales=routed_weight.to(gathered_output.dtype),
+                expanded_src_to_dst_row=expanded_row_idx,
+                export_for_source_row=None,
+                drop_pad_mode=2,
+            )
+
+            chunk_output = chunk_output + (
+                hidden_states_chunk
+                * zero_expert_weight.sum(dim=1, keepdim=True).to(
+                    hidden_states_chunk.dtype
+                )
+            )
+            outputs.append(chunk_output)
+
+        return torch.cat(outputs, dim=0) if len(outputs) > 1 else outputs[0]
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+    ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
@@ -291,7 +501,11 @@ class LongcatFlashMoE(nn.Module):
             hidden_states,
             router_logits,
         )
-        if self.zero_expert_type is not None:
+        use_ops_decode = self._use_ops_deepep_decode(forward_batch)
+        use_ops_prefill = self._use_ops_double_routing_prefill(forward_batch)
+        fallback_old_path = not (use_ops_decode or use_ops_prefill)
+        zero_expert_result = None
+        if self.zero_expert_type is not None and fallback_old_path:
             if not _is_npu:
                 zero_expert_result = zero_experts_compute_triton(
                     expert_indices=topk_idx,
@@ -301,28 +515,49 @@ class LongcatFlashMoE(nn.Module):
                     hidden_states=hidden_states,
                 )
             else:
-                identity_mask_value = -1 if get_moe_a2a_backend().is_deepep() else 0
                 zero_expert_result = zero_experts_compute_identity_triton(
                     expert_indices=topk_idx,
                     expert_scales=topk_weights,
                     num_experts=self.num_experts,
                     zero_expert_type=self.zero_expert_type,
                     hidden_states=hidden_states,
-                    identity_mask_value=identity_mask_value,
+                    identity_mask_value=(
+                        -1 if get_moe_a2a_backend().is_deepep() else 0
+                    ),
                 )
         topk_output = StandardTopKOutput(topk_weights, topk_idx, _)
 
-        final_hidden_states = self.experts(hidden_states, topk_output)
+        if hidden_states.shape[0] == 0:
+            return hidden_states.view(num_tokens, hidden_dim)
+
+        if use_ops_prefill:
+            final_hidden_states = self._forward_prefill_double_routing(
+                hidden_states=hidden_states,
+                topk_ids=topk_idx,
+                topk_weights=topk_weights,
+            )
+        elif use_ops_decode:
+            final_hidden_states = self.experts.forward_impl_ops_deepep(
+                hidden_states,
+                topk_output,
+                copy_expert_num=self.zero_expert_num,
+            )
+        else:
+            final_hidden_states = self.experts(hidden_states, topk_output)
         final_hidden_states *= self.routed_scaling_factor
 
-        if self.tp_size > 1 and get_moe_a2a_backend().is_deepep():
+        if (
+            zero_expert_result is not None
+            and self.tp_size > 1
+            and get_moe_a2a_backend().is_deepep()
+        ):
             zero_expert_result *= self.tp_size
 
-        if self.zero_expert_type is not None and hidden_states.shape[0] > 0:
+        if zero_expert_result is not None and hidden_states.shape[0] > 0:
             final_hidden_states += zero_expert_result.to(final_hidden_states.device)
 
-        if self.tp_size > 1 and not get_moe_a2a_backend().is_deepep():
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)   
+        if self.tp_size > 1 and not _use_longcat_sparse_a2a_runtime():
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -484,10 +719,15 @@ class LongcatFlashDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
+        use_ops_prefill = (
+            _use_longcat_ops_deepep_runtime()
+            and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+        )
+        use_sparse_layout = get_moe_a2a_backend().is_deepep()
         if get_global_server_args().enable_longcat_double_stream and MultiStreamUtils().main_stream is None and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             MultiStreamUtils().main_stream = torch.npu.current_stream()
         # first_attn
-        if get_moe_a2a_backend().is_deepep() and not self.is_first_layer:
+        if use_sparse_layout and not self.is_first_layer:
             residual = residual.tensor_split(self.attn_tp_size)[self.attn_tp_rank]
         hidden_states, residual = self.moe_layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
@@ -500,7 +740,7 @@ class LongcatFlashDecoderLayer(nn.Module):
                 zero_allocator=zero_allocator,
             )
 
-        if get_moe_a2a_backend().is_deepep() and not self.is_first_layer:
+        if use_sparse_layout and not self.is_first_layer:
             mlp_residual = self.attn_tp_group.all_gather(residual.contiguous(), dim=0)
         else:
             mlp_residual = residual.clone()
@@ -557,7 +797,9 @@ class LongcatFlashDecoderLayer(nn.Module):
                         self.aclgraph_moe_aic_num, self.aclgraph_moe_aiv_num
                     ):
                         MultiStreamUtils().first_attn_finished.wait()
-                        moe_hidden_states = self.mlp(hidden_states)
+                        moe_hidden_states = self.mlp(
+                            hidden_states, forward_batch=forward_batch
+                        )
 
                         #torch.npu.current_stream().wait_event(MultiStreamUtils().fia_ffn_finished_event)
 
@@ -578,7 +820,7 @@ class LongcatFlashDecoderLayer(nn.Module):
                 )
                 # torch.npu.current_stream().record_event(MultiStreamUtils().fia_ffn_finished_event)
 
-                if not self.is_last_layer and get_moe_a2a_backend().is_deepep():
+                if not self.is_last_layer and use_sparse_layout:
                     mlp_hidden_states = mlp_hidden_states.tensor_split(self.attn_tp_size)[
                         self.attn_tp_rank
                     ]
@@ -649,7 +891,7 @@ class LongcatFlashDecoderLayer(nn.Module):
             hidden_states, moe_residual = self.moe_layer_communicator.prepare_mlp(
                 hidden_states, residual, forward_batch
             )
-            moe_hidden_states = self.mlp(hidden_states)
+            moe_hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
             moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
                 moe_hidden_states, moe_residual, forward_batch
             )
@@ -657,7 +899,7 @@ class LongcatFlashDecoderLayer(nn.Module):
             hidden_states, residual = self.forward_mlp(
                 mlp_hidden_states, positions, mlp_residual, forward_batch, zero_allocator
             )
-            if not self.is_last_layer and get_moe_a2a_backend().is_deepep():
+            if not self.is_last_layer and use_sparse_layout:
                 hidden_states = hidden_states.tensor_split(self.attn_tp_size)[
                     self.attn_tp_rank
                 ]

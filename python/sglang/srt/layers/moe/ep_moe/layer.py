@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 import torch
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+from sglang.srt.distributed import get_longcat_moe_ep_group
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import FusedMoEMode, npu_format_cast
 from sglang.srt.layers import deep_gemm_wrapper
@@ -21,6 +22,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import (
 from sglang.srt.layers.moe.rocm_moe_utils import upscale, upscale_mxfp4
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPLLCombineInput,
+    DeepEPNormalDispatchOutput,
     DeepEPNormalCombineInput,
 )
 from sglang.srt.layers.moe.token_dispatcher.moriep import (
@@ -114,6 +116,7 @@ class DeepEPMoE(FusedMoE):
             self.deprecate_flag = True
         else:
             self.deprecate_flag = False
+        self._ops_deepep_ctx: Optional[Dict[str, Any]] = None
 
         if self.deprecate_flag:
             return
@@ -208,6 +211,127 @@ class DeepEPMoE(FusedMoE):
         )
 
         return hidden_states
+
+    def _get_ops_deepep_group_name(self) -> str:
+        group = get_longcat_moe_ep_group()
+        backend = group.device_group._get_backend(torch.device("npu"))
+        return backend.get_hccl_comm_name(group.rank)
+
+    def _build_ops_deepep_dispatch_kwargs(
+        self, copy_expert_num: int = 0
+    ) -> Dict[str, Any]:
+        group_name = self._get_ops_deepep_group_name()
+        return {
+            "group_ep": group_name,
+            "ep_world_size": self.moe_ep_size,
+            "ep_rank_id": self.moe_ep_rank,
+            "moe_expert_num": self.num_experts,
+            "group_tp": group_name,
+            "tp_world_size": self.moe_tp_size,
+            "tp_rank_id": self.moe_tp_rank,
+            "expert_shard_type": 0,
+            "shared_expert_rank_num": 0,
+            "global_bs": 0,
+            "quant_mode": 0,
+            "copy_expert_num": copy_expert_num,
+        }
+
+    def _build_ops_deepep_combine_kwargs(
+        self, copy_expert_num: int = 0
+    ) -> Dict[str, Any]:
+        group_name = self._get_ops_deepep_group_name()
+        return {
+            "group_ep": group_name,
+            "ep_world_size": self.moe_ep_size,
+            "ep_rank_id": self.moe_ep_rank,
+            "moe_expert_num": self.num_experts,
+            "group_tp": group_name,
+            "tp_world_size": self.moe_tp_size,
+            "tp_rank_id": self.moe_tp_rank,
+            "expert_shard_type": 0,
+            "shared_expert_rank_num": 0,
+            "global_bs": 0,
+            "copy_expert_num": copy_expert_num,
+        }
+
+    def _dispatch_with_ops_deepep(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        copy_expert_num: int = 0,
+    ) -> DeepEPNormalDispatchOutput:
+        hidden_states_2d = hidden_states.reshape(-1, hidden_states.shape[-1]).to(
+            torch.bfloat16
+        )
+        dispatch_output = torch_npu.npu_moe_distribute_dispatch_v2(
+            x=hidden_states_2d,
+            expert_ids=topk_output.topk_ids.to(torch.int32),
+            **self._build_ops_deepep_dispatch_kwargs(copy_expert_num),
+        )
+        (
+            expand_x,
+            dynamic_scales,
+            assist_info_for_combine,
+            expert_token_nums,
+            ep_recv_counts,
+            tp_recv_counts,
+        ) = dispatch_output[:6]
+
+        dynamic_scales = None
+
+        self._ops_deepep_ctx = {
+            "origin_shape": tuple(hidden_states.shape),
+            "ori_x": hidden_states_2d,
+            "assist_info_for_combine": assist_info_for_combine,
+            "ep_send_counts": ep_recv_counts,
+            "tp_send_counts": tp_recv_counts,
+            "combine_kwargs": self._build_ops_deepep_combine_kwargs(copy_expert_num),
+        }
+        return DeepEPNormalDispatchOutput(
+            hidden_states=expand_x,
+            hidden_states_scale=dynamic_scales,
+            topk_ids=topk_output.topk_ids,
+            topk_weights=topk_output.topk_weights,
+            num_recv_tokens_per_expert=expert_token_nums,
+        )
+
+    def _combine_with_ops_deepep(
+        self,
+        combine_input: DeepEPNormalCombineInput,
+    ) -> torch.Tensor:
+        if self._ops_deepep_ctx is None:
+            raise RuntimeError("Ops-deepep combine context is not initialized.")
+
+        ctx = self._ops_deepep_ctx
+        combine_kwargs = {
+            "expand_x": combine_input.hidden_states,
+            "expert_ids": combine_input.topk_ids.to(torch.int32),
+            "assist_info_for_combine": ctx["assist_info_for_combine"],
+            "ep_send_counts": ctx["ep_send_counts"],
+            "expert_scales": combine_input.topk_weights.to(torch.float32),
+            "ori_x": ctx["ori_x"],
+            **ctx["combine_kwargs"],
+        }
+        if self.moe_tp_size > 1 and ctx["tp_send_counts"] is not None:
+            combine_kwargs["tp_send_counts"] = ctx["tp_send_counts"]
+
+        hidden_states = torch_npu.npu_moe_distribute_combine_v2(**combine_kwargs)
+        return hidden_states.reshape(*ctx["origin_shape"])
+
+    def forward_impl_ops_deepep(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        copy_expert_num: int = 0,
+    ) -> torch.Tensor:
+        try:
+            dispatch_output = self._dispatch_with_ops_deepep(
+                hidden_states, topk_output, copy_expert_num
+            )
+            combine_input = self.run_moe_core(dispatch_output)
+            return self._combine_with_ops_deepep(combine_input)
+        finally:
+            self._ops_deepep_ctx = None
 
     def dispatch(
         self,
@@ -380,11 +504,16 @@ class DeepEPMoE(FusedMoE):
                 dispatch_output
             )
 
-            group_list = torch.tensor(
-                num_recv_tokens_per_expert,
-                dtype=torch.int64,
-                device=hidden_states.device,
-            )
+            if torch.is_tensor(num_recv_tokens_per_expert):
+                group_list = num_recv_tokens_per_expert.to(
+                    dtype=torch.int64, device=hidden_states.device
+                )
+            else:
+                group_list = torch.tensor(
+                    num_recv_tokens_per_expert,
+                    dtype=torch.int64,
+                    device=hidden_states.device,
+                )
 
             if self.w13_weight.dtype == torch.bfloat16:
                 hidden_states = npu_fused_moe_without_routing_weights_bf16(

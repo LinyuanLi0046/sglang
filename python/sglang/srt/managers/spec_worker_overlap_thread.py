@@ -275,12 +275,6 @@ class SpecModelWorkerOverlapClient:
             raise apply_state
 
         self._validate_apply_state_contract(apply_state)
-        if apply_state.batch_uid != id(batch):
-            raise RuntimeError(
-                "Spec overlap apply state batch identity mismatch: "
-                f"expected_batch_uid={id(batch)}, actual_batch_uid={apply_state.batch_uid}"
-            )
-
         apply_future_result(batch, apply_state)
 
     def resolve_last_batch_result(

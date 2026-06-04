@@ -151,15 +151,26 @@ class SpecModelWorkerOverlapClient:
                     )
                 )
             else:
+                next_draft_input = batch_result.next_draft_input
+                next_decode_seq_lens = getattr(
+                    next_draft_input, "next_step_seq_lens", None
+                )
+                next_verify_done = getattr(next_draft_input, "verify_done", None)
+                if next_decode_seq_lens is None:
+                    raise RuntimeError(
+                        "decode steady-state overlap worker must produce "
+                        "next_step_seq_lens for canonical placeholder apply"
+                    )
+                if next_verify_done is None:
+                    raise RuntimeError(
+                        "decode steady-state overlap worker must produce "
+                        "verify_done for canonical placeholder apply"
+                    )
                 self.apply_queue.put(
                     SpecOverlapApplyState(
                         future_indices=future_indices,
-                        next_decode_seq_lens=getattr(
-                            batch_result.next_draft_input, "next_step_seq_lens", None
-                        ),
-                        next_verify_done=getattr(
-                            batch_result.next_draft_input, "verify_done", None
-                        ),
+                        next_decode_seq_lens=next_decode_seq_lens,
+                        next_verify_done=next_verify_done,
                         requires_scheduler_apply=False,
                     )
                 )

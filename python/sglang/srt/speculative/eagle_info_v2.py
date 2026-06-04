@@ -507,6 +507,80 @@ class EagleDraftInputV2Mixin:
         topk: int,
         num_steps: int,
     ):
+        def _prepare_v2_draft_from_legacy_future_relay() -> None:
+            if batch.forward_mode.is_decode() and not getattr(
+                batch, "is_extend_in_batch", False
+            ):
+                raise RuntimeError(
+                    "decode steady-state must not consume legacy future replay "
+                    "as the primary draft path"
+                )
+
+            self._validate_real_decode_payload(bs, num_steps)
+            batch.out_cache_loc = torch.empty(
+                (bs * topk * num_steps,),
+                dtype=torch.int64,
+                device=batch.input_ids.device,
+            )
+            self.positions = torch.empty(
+                (bs * topk,),
+                dtype=torch.int64,
+                device=batch.input_ids.device,
+            )
+            self.topk_p = torch.empty(
+                (bs, topk),
+                dtype=self.future_topk_p_buf.dtype,
+                device=self.future_topk_p_buf.device,
+            )
+            self.topk_index = torch.empty(
+                (bs, topk),
+                dtype=self.future_topk_index_buf.dtype,
+                device=self.future_topk_index_buf.device,
+            )
+            self.verified_id = torch.empty(
+                (bs,),
+                dtype=self.future_verified_id_buf.dtype,
+                device=self.future_verified_id_buf.device,
+            )
+            future_seq_lens_buf = self.future_new_seq_lens_buf
+            self.new_seq_lens = torch.empty(
+                (bs,),
+                dtype=future_seq_lens_buf.dtype,
+                device=future_seq_lens_buf.device,
+            )
+            self.hidden_states = torch.empty(
+                (bs, self.future_hidden_states_buf.shape[1]),
+                dtype=self.future_hidden_states_buf.dtype,
+                device=self.future_hidden_states_buf.device,
+            )
+            draft_future_replay_prepare_npu_triton(
+                future_indices=self.future_indices.indices,
+                src_topk_p=self.future_topk_p_buf,
+                src_topk_index=self.future_topk_index_buf,
+                src_hidden_states=self.future_hidden_states_buf,
+                src_verified_id=self.future_verified_id_buf,
+                src_new_seq_lens=future_seq_lens_buf,
+                src_seq_lens=batch.seq_lens,
+                src_req_pool_indices=batch.req_pool_indices,
+                req_to_token=req_to_token_pool.req_to_token,
+                dst_topk_p=self.topk_p,
+                dst_topk_index=self.topk_index,
+                dst_hidden_states=self.hidden_states,
+                dst_verified_id=self.verified_id,
+                dst_new_seq_lens=self.new_seq_lens,
+                dst_positions=self.positions,
+                dst_out_cache_loc=batch.out_cache_loc,
+                topk=topk,
+                speculative_num_steps=num_steps,
+            )
+
+            self.future_topk_p_buf = None
+            self.future_topk_index_buf = None
+            self.future_hidden_states_buf = None
+            self.future_verified_id_buf = None
+            self.future_new_seq_lens_buf = None
+            self.future_next_step_seq_lens_buf = None
+
         bs = len(batch.seq_lens)
         positions_prepared = False
         if not batch.forward_mode.is_idle():
@@ -517,70 +591,8 @@ class EagleDraftInputV2Mixin:
             future_ready = self._legacy_future_replay_ready(batch)
 
             if future_ready:
-                self._validate_real_decode_payload(bs, num_steps)
-                batch.out_cache_loc = torch.empty(
-                    (bs * topk * num_steps,),
-                    dtype=torch.int64,
-                    device=batch.input_ids.device,
-                )
-                self.positions = torch.empty(
-                    (bs * topk,),
-                    dtype=torch.int64,
-                    device=batch.input_ids.device,
-                )
-                self.topk_p = torch.empty(
-                    (bs, topk),
-                    dtype=self.future_topk_p_buf.dtype,
-                    device=self.future_topk_p_buf.device,
-                )
-                self.topk_index = torch.empty(
-                    (bs, topk),
-                    dtype=self.future_topk_index_buf.dtype,
-                    device=self.future_topk_index_buf.device,
-                )
-                self.verified_id = torch.empty(
-                    (bs,),
-                    dtype=self.future_verified_id_buf.dtype,
-                    device=self.future_verified_id_buf.device,
-                )
-                future_seq_lens_buf = self.future_new_seq_lens_buf
-                self.new_seq_lens = torch.empty(
-                    (bs,),
-                    dtype=future_seq_lens_buf.dtype,
-                    device=future_seq_lens_buf.device,
-                )
-                self.hidden_states = torch.empty(
-                    (bs, self.future_hidden_states_buf.shape[1]),
-                    dtype=self.future_hidden_states_buf.dtype,
-                    device=self.future_hidden_states_buf.device,
-                )
-                draft_future_replay_prepare_npu_triton(
-                    future_indices=self.future_indices.indices,
-                    src_topk_p=self.future_topk_p_buf,
-                    src_topk_index=self.future_topk_index_buf,
-                    src_hidden_states=self.future_hidden_states_buf,
-                    src_verified_id=self.future_verified_id_buf,
-                    src_new_seq_lens=future_seq_lens_buf,
-                    src_seq_lens=batch.seq_lens,
-                    src_req_pool_indices=batch.req_pool_indices,
-                    req_to_token=req_to_token_pool.req_to_token,
-                    dst_topk_p=self.topk_p,
-                    dst_topk_index=self.topk_index,
-                    dst_hidden_states=self.hidden_states,
-                    dst_verified_id=self.verified_id,
-                    dst_new_seq_lens=self.new_seq_lens,
-                    dst_positions=self.positions,
-                    dst_out_cache_loc=batch.out_cache_loc,
-                    topk=topk,
-                    speculative_num_steps=num_steps,
-                )
+                _prepare_v2_draft_from_legacy_future_relay()
                 positions_prepared = True
-                self.future_topk_p_buf = None
-                self.future_topk_index_buf = None
-                self.future_hidden_states_buf = None
-                self.future_verified_id_buf = None
-                self.future_new_seq_lens_buf = None
-                self.future_next_step_seq_lens_buf = None
             else:
                 # Assign cache locations
                 batch.out_cache_loc = torch.empty(

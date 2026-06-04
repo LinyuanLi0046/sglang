@@ -1246,6 +1246,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if batch.return_logprob and not batch.forward_mode.is_idle():
             self._compute_spec_v2_logprobs(batch, logits_output, predict, accept_index)
 
+        # The carried root token is already part of the next-step live prefix.
+        # Keep worker-produced `new_seq_lens` and consumer-facing
+        # `next_step_seq_lens` aligned until the contract is further narrowed.
         next_step_seq_lens = new_seq_lens
 
         # Construct the next draft input

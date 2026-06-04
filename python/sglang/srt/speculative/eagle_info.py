@@ -748,7 +748,12 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
     # Inputs for V2 overlap worker
     future_indices: Optional[FutureIndices] = None
+    # Producer-owned k+1 decode length after verify accepts the carried token.
     new_seq_lens: Optional[torch.Tensor] = None
+    # Consumer-facing live prefix length for the next decode/verify step. In the
+    # current canonical contract this must stay aligned with the carried token
+    # semantics used by `verified_id/last_verified_ids`; decode steady-state must
+    # not silently substitute `new_seq_lens` when this relay is missing.
     next_step_seq_lens: Optional[torch.Tensor] = None
     verify_done: Optional[torch.cuda.Event] = None
     # Canonical next-step payload aligned with special_sglang. These fields are the

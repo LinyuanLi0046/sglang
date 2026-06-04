@@ -342,8 +342,9 @@ class FutureMap:
         if self.canonical_ready_buf is not None:
             self.canonical_ready_buf[intv] = False
         next_step_seq_lens = getattr(payload_source, "next_step_seq_lens", None)
-        if next_step_seq_lens is None:
-            next_step_seq_lens = getattr(payload_source, "new_seq_lens", None)
+        fallback_new_seq_lens = getattr(payload_source, "new_seq_lens", None)
+        if next_step_seq_lens is None and not canonical_only_decode:
+            next_step_seq_lens = fallback_new_seq_lens
         if canonical_only_decode:
             if not has_canonical_payload:
                 raise RuntimeError(

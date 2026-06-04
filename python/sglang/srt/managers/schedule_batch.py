@@ -1309,12 +1309,14 @@ class Req(ReqDllmMixin):
     def rollback_pending_spec_decode_alloc_reservations(
         self, tree_cache: BasePrefixCache
     ) -> None:
+        for reservation in list(self.pending_spec_decode_alloc_reservations)[::-1]:
+            reservation.rollback_req(self, tree_cache)
         if self.pending_spec_decode_alloc_reservations:
-            # #region debug-point H1:req-rollback-pending
+            # #region debug-point H1:req-rollback-still-pending
             try:
                 logger.error(
                     "[DEBUG][H1][rollback_pending_spec_decode_alloc_reservations] "
-                    "req still owns pending decode reservations during rollback: %s",
+                    "req still owns pending decode reservations after rollback: %s",
                     {
                         "rid": self.rid,
                         "req_pool_idx": self.req_pool_idx,
@@ -1328,8 +1330,6 @@ class Req(ReqDllmMixin):
             except Exception:
                 pass
             # #endregion
-        for reservation in list(self.pending_spec_decode_alloc_reservations)[::-1]:
-            reservation.rollback_req(self, tree_cache)
 
 
 @dataclasses.dataclass
@@ -1358,12 +1358,13 @@ class SpecDecodeAllocReservation:
                 continue
             self._committed[i] = True
             self._detach_req(req)
-            if req.pending_spec_decode_alloc_reservations:
+            pending_count = len(req.pending_spec_decode_alloc_reservations)
+            if pending_count > 1:
                 _remaining_pending.append(
                     {
                         "rid": req.rid,
                         "req_pool_idx": req.req_pool_idx,
-                        "pending_count": len(req.pending_spec_decode_alloc_reservations),
+                        "pending_count": pending_count,
                         "kv_committed_len": req.kv_committed_len,
                         "kv_allocated_len": req.kv_allocated_len,
                         "decode_batch_idx": req.decode_batch_idx,

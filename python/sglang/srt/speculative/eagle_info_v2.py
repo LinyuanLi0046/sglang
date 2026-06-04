@@ -499,18 +499,19 @@ class EagleDraftInputV2Mixin:
             for i, req in enumerate(batch.reqs):
                 _shared_len = int(_shared_lens_cpu[i])
                 if (
-                    _shared_len != int(req.seqlen)
-                    or _shared_len != int(req.kv_committed_len)
+                    _shared_len < int(req.kv_committed_len)
+                    or _shared_len > int(req.kv_allocated_len)
+                    or len(req.pending_spec_decode_alloc_reservations) > 1
                 ):
                     _req_frontier_mismatch.append(
                         {
                             "rid": req.rid,
                             "req_pool_idx": req.req_pool_idx,
                             "shared_verified_len": _shared_len,
-                            "req_seqlen": int(req.seqlen),
                             "kv_committed_len": int(req.kv_committed_len),
                             "kv_allocated_len": int(req.kv_allocated_len),
                             "decode_batch_idx": int(req.decode_batch_idx),
+                            "seqlen": int(req.seqlen),
                             "pending_count": len(
                                 req.pending_spec_decode_alloc_reservations
                             ),
@@ -761,10 +762,12 @@ class EagleVerifyInputV2Mixin:
             for i, req in enumerate(batch.reqs):
                 _shared_len = int(_after_seq_lens_cpu[i])
                 if (
-                    _before_seq_lens_cpu is None
-                    or int(_before_seq_lens_cpu[i]) != _shared_len
-                    or _shared_len != int(req.seqlen)
-                    or _shared_len != int(req.kv_committed_len)
+                    req.req_pool_idx is not None
+                    and (
+                        _before_seq_lens_cpu is None
+                        or int(_before_seq_lens_cpu[i]) != _shared_len
+                        or _shared_len != int(req.kv_committed_len)
+                    )
                 ):
                     _verify_mismatch.append(
                         {
@@ -774,10 +777,10 @@ class EagleVerifyInputV2Mixin:
                             if _before_seq_lens_cpu is None
                             else int(_before_seq_lens_cpu[i]),
                             "shared_verified_len": _shared_len,
-                            "req_seqlen": int(req.seqlen),
                             "kv_committed_len": int(req.kv_committed_len),
                             "kv_allocated_len": int(req.kv_allocated_len),
                             "decode_batch_idx": int(req.decode_batch_idx),
+                            "seqlen": int(req.seqlen),
                         }
                     )
             if _verify_mismatch:

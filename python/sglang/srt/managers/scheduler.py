@@ -2925,7 +2925,15 @@ class Scheduler(
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
-                            self.future_map.store_to_map(future_indices, batch_result)
+                            self.future_map.store_to_map(
+                                future_indices,
+                                batch_result,
+                                canonical_only_decode=(
+                                    batch.is_spec_v2
+                                    and model_worker_batch.forward_mode.is_decode()
+                                    and not model_worker_batch.is_extend_in_batch
+                                ),
+                            )
                             batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
                             if batch.is_spec_v2 and (
                                 model_worker_batch.forward_mode.is_extend()
@@ -3028,7 +3036,16 @@ class Scheduler(
             self.forward_stream.wait_stream(self.schedule_stream)
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
-            self.future_map.store_to_map(batch_result.future_indices, batch_result)
+            self.future_map.store_to_map(
+                batch_result.future_indices,
+                batch_result,
+                canonical_only_decode=(
+                    self.cur_batch is not None
+                    and self.cur_batch.is_spec_v2
+                    and self.cur_batch.forward_mode.is_decode()
+                    and not self.cur_batch.is_extend_in_batch
+                ),
+            )
             batch_result.copy_to_cpu(return_logprob=self.cur_batch.return_logprob)
 
         # Release the closure and large GPU tensors that are no longer needed.

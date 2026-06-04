@@ -215,8 +215,11 @@ class DeepEPMoE(FusedMoE):
 
     def _get_ops_deepep_group_name(self) -> str:
         if get_global_server_args().enable_longcat_double_stream:
-            return get_double_stream_ep_group().unique_name
-        return get_tp_group().unique_name
+            group = get_double_stream_ep_group()
+        else:
+            group = get_tp_group()
+        backend = group.device_group._get_backend(torch.device("npu"))
+        return backend.get_hccl_comm_name(group.rank)
 
     def _build_ops_deepep_dispatch_kwargs(
         self, copy_expert_num: int = 0

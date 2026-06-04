@@ -60,6 +60,12 @@ from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from sglang.srt.managers.overlap_utils import (
+    FutureIndices,
+    SpecFutureHandleCarrier,
+    filter_spec_future_handle_carrier,
+    merge_spec_future_handle_carrier,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchPrefixParams
 from sglang.srt.mem_cache.common import (
@@ -99,10 +105,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.session_controller import Session
     from sglang.srt.observability.scheduler_metrics_mixin import PrefillStats
-    from sglang.srt.managers.overlap_utils import (
-        FutureIndices,
-        SpecFutureHandleCarrier,
-    )
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
@@ -2438,10 +2440,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         if self.spec_future_handle_carrier is not None:
-            from sglang.srt.managers.overlap_utils import (
-                filter_spec_future_handle_carrier,
-            )
-
             self.spec_future_handle_carrier = filter_spec_future_handle_carrier(
                 self.spec_future_handle_carrier, keep_indices_device
             )
@@ -2557,8 +2555,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.has_grammar |= other.has_grammar
         self.return_hidden_states |= other.return_hidden_states
         self.is_prefill_only = self.is_prefill_only and other.is_prefill_only
-        from sglang.srt.managers.overlap_utils import merge_spec_future_handle_carrier
-
         self.spec_future_handle_carrier = merge_spec_future_handle_carrier(
             self.spec_future_handle_carrier,
             other.spec_future_handle_carrier,

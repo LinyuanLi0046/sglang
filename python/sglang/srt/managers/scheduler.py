@@ -2804,10 +2804,21 @@ class Scheduler(
                     "decode canonical-only spec overlap apply requires existing "
                     "batch.spec_info, but none was found."
                 )
-            existing_spec_info.future_indices = apply_state.future_indices
-            batch.spec_future_handle_carrier = build_spec_future_handle_carrier(
-                apply_state.future_indices
-            )
+            # R6-L2: decode steady-state minimal apply must not overwrite the
+            # current batch-owned future handle after selection/filter/merge.
+            # `apply_state.future_indices` belongs to the submitted batch at
+            # launch time and may already be stale for the current reshaped
+            # scheduler batch. The stable handle owner stays on
+            # `spec_future_handle_carrier` / current `spec_info.future_indices`
+            # maintained through filter/merge.
+            current_future_indices = batch.get_spec_future_indices()
+            if current_future_indices is None:
+                existing_spec_info.future_indices = apply_state.future_indices
+                batch.spec_future_handle_carrier = build_spec_future_handle_carrier(
+                    apply_state.future_indices
+                )
+            else:
+                existing_spec_info.future_indices = current_future_indices
             existing_spec_info.verify_done = apply_state.next_verify_done
             if apply_state.next_decode_seq_lens is not None:
                 existing_spec_info.next_step_seq_lens = (

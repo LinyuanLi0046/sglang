@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 import torch
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
-from sglang.srt.distributed import get_double_stream_ep_group, get_tp_group
+from sglang.srt.distributed import get_moe_ep_group
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import FusedMoEMode, npu_format_cast
 from sglang.srt.layers import deep_gemm_wrapper
@@ -41,7 +41,6 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.quark.schemes import QuarkW4A4MXFp4MoE
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import npu_apply_without_routing_weights_fp8
@@ -214,10 +213,7 @@ class DeepEPMoE(FusedMoE):
         return hidden_states
 
     def _get_ops_deepep_group_name(self) -> str:
-        if get_global_server_args().enable_longcat_double_stream:
-            group = get_double_stream_ep_group()
-        else:
-            group = get_tp_group()
+        group = get_moe_ep_group()
         backend = group.device_group._get_backend(torch.device("npu"))
         return backend.get_hccl_comm_name(group.rank)
 

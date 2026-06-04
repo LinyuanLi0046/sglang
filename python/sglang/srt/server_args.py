@@ -2758,23 +2758,23 @@ class ServerArgs:
     def _handle_a2a_moe(self):
         if (
             is_npu()
-            and get_bool_env_var("ASCEND_SGLANG_USE_OPS_DEEPEP")
+            and get_bool_env_var("SGLANG_ASCEND_USE_OPS_DEEPEP")
             and self.moe_a2a_backend == "deepep"
         ):
             raise ValueError(
-                "ASCEND_SGLANG_USE_OPS_DEEPEP is mutually exclusive with "
+                "SGLANG_ASCEND_USE_OPS_DEEPEP is mutually exclusive with "
                 "--moe-a2a-backend deepep."
             )
 
         if (
             is_npu()
-            and get_bool_env_var("ASCEND_SGLANG_USE_OPS_DEEPEP")
+            and get_bool_env_var("SGLANG_ASCEND_USE_OPS_DEEPEP")
             and self.moe_a2a_backend != "deepep"
             and self.ep_size != self.tp_size
         ):
             self.ep_size = self.tp_size
             logger.warning(
-                "ASCEND_SGLANG_USE_OPS_DEEPEP is enabled. "
+                "SGLANG_ASCEND_USE_OPS_DEEPEP is enabled. "
                 f"The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 

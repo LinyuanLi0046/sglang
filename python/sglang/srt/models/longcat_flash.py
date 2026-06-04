@@ -143,7 +143,7 @@ logger = logging.getLogger(__name__)
 
 
 def _use_longcat_ops_deepep_runtime() -> bool:
-    return _is_npu and get_bool_env_var("ASCEND_SGLANG_USE_OPS_DEEPEP")
+    return _is_npu and get_bool_env_var("SGLANG_ASCEND_USE_OPS_DEEPEP")
 
 
 def _use_longcat_sparse_a2a_runtime() -> bool:

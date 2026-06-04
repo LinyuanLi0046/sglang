@@ -1969,7 +1969,7 @@ def initialize_model_parallel(
     assert (
         _LONGCAT_MOE_EP is None
     ), "longcat expert model parallel group is already initialized"
-    if is_npu() and get_bool_env_var("ASCEND_SGLANG_USE_OPS_DEEPEP"):
+    if is_npu() and get_bool_env_var("SGLANG_ASCEND_USE_OPS_DEEPEP"):
         _LONGCAT_MOE_EP = init_model_parallel_group(
             moe_ep_group_ranks,
             get_world_group().local_rank,

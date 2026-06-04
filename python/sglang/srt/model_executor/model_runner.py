@@ -2683,7 +2683,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if (
             can_run_graph
-            and get_bool_env_var("ASCEND_SGLANG_USE_OPS_DEEPEP")
+            and get_bool_env_var("SGLANG_ASCEND_USE_OPS_DEEPEP")
             and getattr(self.model_config.hf_config, "model_type", None)
             == "longcat_flash"
             and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()

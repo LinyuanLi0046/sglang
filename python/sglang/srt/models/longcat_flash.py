@@ -612,6 +612,9 @@ class LongcatFlashMoE(nn.Module):
                 )
         topk_output = StandardTopKOutput(topk_weights, topk_idx, _)
 
+        if hidden_states.shape[0] == 0:
+            return hidden_states.view(num_tokens, hidden_dim)
+
         if use_ops_prefill:
             final_hidden_states = self._forward_prefill_double_routing(
                 hidden_states=hidden_states,

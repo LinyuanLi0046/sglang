@@ -2759,6 +2759,16 @@ class ServerArgs:
         if (
             is_npu()
             and get_bool_env_var("ASCEND_SGLANG_USE_OPS_DEEPEP")
+            and self.moe_a2a_backend == "deepep"
+        ):
+            raise ValueError(
+                "ASCEND_SGLANG_USE_OPS_DEEPEP is mutually exclusive with "
+                "--moe-a2a-backend deepep."
+            )
+
+        if (
+            is_npu()
+            and get_bool_env_var("ASCEND_SGLANG_USE_OPS_DEEPEP")
             and self.moe_a2a_backend != "deepep"
             and self.ep_size != self.tp_size
         ):

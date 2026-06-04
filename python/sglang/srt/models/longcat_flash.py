@@ -146,12 +146,8 @@ def _use_longcat_ops_deepep_runtime() -> bool:
     return _is_npu and get_bool_env_var("ASCEND_SGLANG_USE_OPS_DEEPEP")
 
 
-def _use_old_deepep_runtime() -> bool:
-    return get_moe_a2a_backend().is_deepep() and not _use_longcat_ops_deepep_runtime()
-
-
 def _use_longcat_sparse_a2a_runtime() -> bool:
-    return _use_longcat_ops_deepep_runtime() or _use_old_deepep_runtime()
+    return _use_longcat_ops_deepep_runtime() or get_moe_a2a_backend().is_deepep()
 
 
 class LongcatFlashMLP(nn.Module):
@@ -608,7 +604,9 @@ class LongcatFlashMoE(nn.Module):
                     num_experts=self.num_experts,
                     zero_expert_type=self.zero_expert_type,
                     hidden_states=hidden_states,
-                    identity_mask_value=-1 if _use_old_deepep_runtime() else 0,
+                    identity_mask_value=(
+                        -1 if get_moe_a2a_backend().is_deepep() else 0
+                    ),
                 )
         topk_output = StandardTopKOutput(topk_weights, topk_idx, _)
 
@@ -634,7 +632,7 @@ class LongcatFlashMoE(nn.Module):
         if (
             zero_expert_result is not None
             and self.tp_size > 1
-            and _use_old_deepep_runtime()
+            and get_moe_a2a_backend().is_deepep()
         ):
             zero_expert_result *= self.tp_size
 
@@ -808,9 +806,7 @@ class LongcatFlashDecoderLayer(nn.Module):
             _use_longcat_ops_deepep_runtime()
             and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         )
-        use_sparse_layout = _use_old_deepep_runtime() or (
-            _use_longcat_ops_deepep_runtime() and not use_ops_prefill
-        )
+        use_sparse_layout = get_moe_a2a_backend().is_deepep()
         if get_global_server_args().enable_longcat_double_stream and MultiStreamUtils().main_stream is None and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             MultiStreamUtils().main_stream = torch.npu.current_stream()
         # first_attn

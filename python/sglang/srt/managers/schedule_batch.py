@@ -60,6 +60,12 @@ from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from sglang.srt.managers.overlap_utils import (
+    FutureIndices,
+    SpecFutureHandleCarrier,
+    filter_spec_future_handle_carrier,
+    merge_spec_future_handle_carrier,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchPrefixParams
 from sglang.srt.mem_cache.common import (
@@ -1469,6 +1475,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     spec_algorithm: SpeculativeAlgorithm = None
     # spec_info: Optional[SpecInput] = None
     spec_info: Optional[SpecInput] = None
+    spec_future_handle_carrier: Optional[SpecFutureHandleCarrier] = None
     spec_decode_seq_lens_carrier: Optional[torch.Tensor] = None
     spec_decode_alloc_reservation: Optional[SpecDecodeAllocReservation] = None
 
@@ -2313,6 +2320,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             draft_input is not None and getattr(draft_input, "verify_done", None) is not None
         )
 
+    def get_spec_future_indices(self) -> Optional[FutureIndices]:
+        carrier = getattr(self, "spec_future_handle_carrier", None)
+        if carrier is not None and carrier.future_indices is not None:
+            return carrier.future_indices
+        draft_input = getattr(self, "spec_info", None)
+        return getattr(draft_input, "future_indices", None)
+
     def sync_decode_seq_lens_from_reqs(self):
         if len(self.reqs) == 0:
             self._set_decode_seq_lens_tensors(
@@ -2400,6 +2414,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests
             self.reqs = []
+            self.spec_future_handle_carrier = None
             self.spec_decode_seq_lens_carrier = None
             return
 
@@ -2424,6 +2439,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens = self.seq_lens[keep_indices_device]
         self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
+        if self.spec_future_handle_carrier is not None:
+            self.spec_future_handle_carrier = filter_spec_future_handle_carrier(
+                self.spec_future_handle_carrier, keep_indices_device
+            )
         if self.spec_decode_seq_lens_carrier is not None:
             self.spec_decode_seq_lens_carrier = self.spec_decode_seq_lens_carrier[
                 keep_indices_device
@@ -2536,6 +2555,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.has_grammar |= other.has_grammar
         self.return_hidden_states |= other.return_hidden_states
         self.is_prefill_only = self.is_prefill_only and other.is_prefill_only
+        self.spec_future_handle_carrier = merge_spec_future_handle_carrier(
+            self.spec_future_handle_carrier,
+            other.spec_future_handle_carrier,
+        )
 
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
@@ -2596,6 +2619,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             token_type_ids=self.token_type_ids,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
+            spec_future_handle_carrier=self.spec_future_handle_carrier,
             hicache_consumer_index=self.hicache_consumer_index,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
@@ -2646,6 +2670,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_extend_in_batch=self.is_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
+            spec_future_handle_carrier=self.spec_future_handle_carrier,
             spec_decode_seq_lens_carrier=self.spec_decode_seq_lens_carrier,
             spec_decode_alloc_reservation=self.spec_decode_alloc_reservation,
             enable_overlap=self.enable_overlap,
@@ -2790,6 +2815,7 @@ class ModelWorkerBatch:
     spec_algorithm: SpeculativeAlgorithm = None
 
     spec_info: Optional[SpecInput] = None
+    spec_future_handle_carrier: Optional[SpecFutureHandleCarrier] = None
 
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None

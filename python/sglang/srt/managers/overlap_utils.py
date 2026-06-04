@@ -42,6 +42,20 @@ class FutureIndices:
     interval: Optional[slice] = None
 
 
+@dataclass
+class SpecFutureHandleCarrier:
+    future_indices: Optional[FutureIndices] = None
+
+
+@dataclass(frozen=True)
+class DecodePlaceholderLaunchSchema:
+    token_list_width: int
+    placeholder_dtype: torch.dtype = torch.int32
+    capture_hidden_mode: Optional[object] = None
+    num_tokens_per_req: int = -1
+    num_tokens_for_logprob_per_req: int = -1
+
+
 def _get_batch_membership_size(value) -> Optional[int]:
     if value is None:
         return None
@@ -93,44 +107,130 @@ def _assert_future_indices_batch_membership_contract(
         )
 
 
+def clone_future_indices_handle(
+    future_indices: Optional[FutureIndices],
+) -> Optional[FutureIndices]:
+    if future_indices is None:
+        return None
+    return FutureIndices(
+        indices=future_indices.indices,
+        interval=future_indices.interval,
+    )
+
+
+def build_spec_future_handle_carrier(
+    future_indices: Optional[FutureIndices],
+) -> Optional[SpecFutureHandleCarrier]:
+    if future_indices is None:
+        return None
+    return SpecFutureHandleCarrier(
+        future_indices=clone_future_indices_handle(future_indices)
+    )
+
+
+def filter_spec_future_handle_carrier(
+    carrier: Optional[SpecFutureHandleCarrier],
+    new_indices: torch.Tensor,
+) -> Optional[SpecFutureHandleCarrier]:
+    if carrier is None or carrier.future_indices is None:
+        return carrier
+    return SpecFutureHandleCarrier(
+        future_indices=FutureIndices(
+            indices=carrier.future_indices.indices[new_indices],
+            interval=None,
+        )
+    )
+
+
+def merge_spec_future_handle_carrier(
+    left: Optional[SpecFutureHandleCarrier],
+    right: Optional[SpecFutureHandleCarrier],
+) -> Optional[SpecFutureHandleCarrier]:
+    left_future_indices = None if left is None else left.future_indices
+    right_future_indices = None if right is None else right.future_indices
+    if left_future_indices is None and right_future_indices is None:
+        return None
+    if left_future_indices is None or right_future_indices is None:
+        # Mixed batches still fall back to spec_info-owned merge semantics until
+        # R6-L3 removes the remaining asymmetric carrier paths.
+        return None
+    return SpecFutureHandleCarrier(
+        future_indices=FutureIndices(
+            indices=torch.cat(
+                [left_future_indices.indices, right_future_indices.indices]
+            ),
+            interval=None,
+        )
+    )
+
+
+def sanitize_decode_placeholder_handle_contract(
+    draft_input: Optional["EagleDraftInput"],
+) -> Optional["EagleDraftInput"]:
+    if draft_input is None:
+        return None
+
+    # R6-L1: submit-time placeholder must stay a minimal future-handle carrier.
+    draft_input.new_seq_lens = None
+    draft_input.next_step_seq_lens = None
+    draft_input.verify_done = None
+    draft_input.verified_id = None
+    draft_input.real_new_verified_id = None
+    draft_input.real_token_list = None
+    draft_input.topk_p = None
+    draft_input.topk_index = None
+    draft_input.hidden_states = None
+    draft_input.future_topk_p_buf = None
+    draft_input.future_topk_index_buf = None
+    draft_input.future_hidden_states_buf = None
+    draft_input.future_verified_id_buf = None
+    draft_input.future_new_seq_lens_buf = None
+    draft_input.future_next_step_seq_lens_buf = None
+    draft_input.future_last_verified_ids_buf = None
+    draft_input.future_token_list_buf = None
+    draft_input.future_canonical_ready_buf = None
+    return draft_input
+
+
+def clone_decode_placeholder_handle_contract(
+    draft_input: Optional["EagleDraftInput"],
+    future_indices: Optional[FutureIndices] = None,
+) -> Optional["EagleDraftInput"]:
+    if draft_input is None:
+        return None
+
+    from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+    placeholder_carrier = EagleDraftInput(
+        future_indices=clone_future_indices_handle(
+            future_indices
+            if future_indices is not None
+            else getattr(draft_input, "future_indices", None)
+        ),
+        last_verified_ids=getattr(draft_input, "last_verified_ids", None),
+        token_list=getattr(draft_input, "token_list", None),
+        capture_hidden_mode=getattr(draft_input, "capture_hidden_mode", None),
+        num_tokens_per_req=getattr(draft_input, "num_tokens_per_req", -1),
+        num_tokens_for_logprob_per_req=getattr(
+            draft_input, "num_tokens_for_logprob_per_req", -1
+        ),
+    )
+    return sanitize_decode_placeholder_handle_contract(placeholder_carrier)
+
+
 def build_decode_placeholder_canonical_draft_input(
     future_indices: FutureIndices,
-    token_list_width: int,
-    template_draft_input: Optional["EagleDraftInput"] = None,
+    launch_schema: DecodePlaceholderLaunchSchema,
 ):
     from sglang.srt.speculative.eagle_info import EagleDraftInput
 
-    dtype = torch.int32
-    for attr_name in ("last_verified_ids", "verified_id", "real_new_verified_id"):
-        template_tensor = (
-            getattr(template_draft_input, attr_name, None)
-            if template_draft_input is not None
-            else None
-        )
-        if template_tensor is not None:
-            dtype = template_tensor.dtype
-            break
-
-    template_token_list = (
-        getattr(template_draft_input, "token_list", None)
-        if template_draft_input is not None
-        else None
-    )
-    if (
-        template_token_list is not None
-        and template_token_list.ndim == 2
-        and template_token_list.shape[1] != token_list_width
-    ):
+    token_list_width = int(launch_schema.token_list_width)
+    if token_list_width < 0:
         raise RuntimeError(
-            "decode placeholder canonical token_list width mismatch: "
-            f"expected={token_list_width}, actual={template_token_list.shape[1]}"
+            "decode placeholder canonical token_list width must be non-negative: "
+            f"actual={token_list_width}"
         )
-
-    _assert_future_indices_batch_membership_contract(
-        future_indices,
-        template_draft_input,
-        "build_decode_placeholder_canonical_draft_input",
-    )
+    dtype = launch_schema.placeholder_dtype or torch.int32
 
     placeholder_ids = -future_indices.indices.to(dtype=dtype)
     draft_input_kwargs = {
@@ -139,19 +239,16 @@ def build_decode_placeholder_canonical_draft_input(
         "token_list": placeholder_ids.unsqueeze(1)
         .expand(-1, token_list_width)
         .clone(),
+        "capture_hidden_mode": launch_schema.capture_hidden_mode,
+        "num_tokens_per_req": launch_schema.num_tokens_per_req,
+        "num_tokens_for_logprob_per_req": (
+            launch_schema.num_tokens_for_logprob_per_req
+        ),
     }
-    if template_draft_input is not None:
-        draft_input_kwargs["capture_hidden_mode"] = getattr(
-            template_draft_input, "capture_hidden_mode", None
-        )
-        draft_input_kwargs["num_tokens_per_req"] = getattr(
-            template_draft_input, "num_tokens_per_req", -1
-        )
-        draft_input_kwargs["num_tokens_for_logprob_per_req"] = getattr(
-            template_draft_input, "num_tokens_for_logprob_per_req", -1
-        )
 
-    return EagleDraftInput(**draft_input_kwargs)
+    return sanitize_decode_placeholder_handle_contract(
+        EagleDraftInput(**draft_input_kwargs)
+    )
 
 
 class FutureMap:

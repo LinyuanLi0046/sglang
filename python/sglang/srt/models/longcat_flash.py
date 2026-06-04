@@ -332,9 +332,27 @@ class LongcatFlashMoE(nn.Module):
     ):
         group = self._get_prefill_double_routing_group()
         ep_world_size = dist.get_world_size(group)
+        ep_rank = dist.get_rank(group)
+
+        print(
+            "[longcat_prefill_double_routing] before all_to_all_single#1 "
+            f"ep_rank={ep_rank} ep_world_size={ep_world_size} "
+            f"tokens_per_expert_shape={tuple(tokens_per_expert.shape)} "
+            f"tokens_per_expert={tokens_per_expert.detach().cpu().tolist()} "
+            f"expanded_x_shape={tuple(expanded_x.shape)}",
+            flush=True,
+        )
 
         tokens_per_expert_group = tokens_per_expert.new_empty(tokens_per_expert.shape[0])
         dist.all_to_all_single(tokens_per_expert_group, tokens_per_expert, group=group)
+
+        print(
+            "[longcat_prefill_double_routing] after all_to_all_single#1 "
+            f"ep_rank={ep_rank} "
+            f"tokens_per_expert_group_shape={tuple(tokens_per_expert_group.shape)} "
+            f"tokens_per_expert_group={tokens_per_expert_group.detach().cpu().tolist()}",
+            flush=True,
+        )
 
         combine_tokens = torch.stack([tokens_per_expert_group, tokens_per_expert], dim=0)
         combine_tokens = combine_tokens.view(2, ep_world_size, -1).sum(2)
@@ -344,12 +362,26 @@ class LongcatFlashMoE(nn.Module):
         output_splits = combine_tokens[0].cpu().tolist()
 
         gathered_tokens = expanded_x.new_empty(all_tokens, expanded_x.shape[1])
+        print(
+            "[longcat_prefill_double_routing] before all_to_all_single#2 "
+            f"ep_rank={ep_rank} "
+            f"input_splits={input_splits} output_splits={output_splits} "
+            f"all_tokens={all_tokens} "
+            f"expanded_x_shape={tuple(expanded_x.shape)} "
+            f"gathered_tokens_shape={tuple(gathered_tokens.shape)}",
+            flush=True,
+        )
         dist.all_to_all_single(
             gathered_tokens,
             expanded_x,
             output_splits,
             input_splits,
             group=group,
+        )
+        print(
+            "[longcat_prefill_double_routing] after all_to_all_single#2 "
+            f"ep_rank={ep_rank} gathered_tokens_shape={tuple(gathered_tokens.shape)}",
+            flush=True,
         )
         return tokens_per_expert_group, gathered_tokens, input_splits, output_splits
 
@@ -387,7 +419,18 @@ class LongcatFlashMoE(nn.Module):
         outputs = []
         chunks = self._split_prefill_tensors(hidden_states, topk_ids, topk_weights)
 
-        for hidden_states_chunk, topk_ids_chunk, topk_weights_chunk in chunks:
+        for chunk_idx, (hidden_states_chunk, topk_ids_chunk, topk_weights_chunk) in enumerate(chunks):
+            ep_rank = dist.get_rank(group)
+            print(
+                "[longcat_prefill_double_routing] chunk_begin "
+                f"ep_rank={ep_rank} chunk_idx={chunk_idx} "
+                f"hidden_states_chunk_shape={tuple(hidden_states_chunk.shape)} "
+                f"topk_ids_shape={tuple(topk_ids_chunk.shape)} "
+                f"topk_weights_shape={tuple(topk_weights_chunk.shape)} "
+                f"topk_ids_min={int(topk_ids_chunk.min().item()) if topk_ids_chunk.numel() > 0 else 'NA'} "
+                f"topk_ids_max={int(topk_ids_chunk.max().item()) if topk_ids_chunk.numel() > 0 else 'NA'}",
+                flush=True,
+            )
             (
                 expanded_x,
                 expanded_row_idx,
@@ -408,6 +451,18 @@ class LongcatFlashMoE(nn.Module):
             routed_token_count = int(tokens_per_expert0.sum().item())
             expanded_x0 = expanded_x[:routed_token_count]
             expanded_x1 = expanded_x[routed_token_count:]
+            print(
+                "[longcat_prefill_double_routing] after init_routing "
+                f"ep_rank={ep_rank} chunk_idx={chunk_idx} "
+                f"tokens_per_expert_shape={tuple(tokens_per_expert.shape)} "
+                f"tokens_per_expert0_shape={tuple(tokens_per_expert0.shape)} "
+                f"tokens_per_expert0={tokens_per_expert0.detach().cpu().tolist()} "
+                f"routed_token_count={routed_token_count} "
+                f"expanded_x_shape={tuple(expanded_x.shape)} "
+                f"expanded_x0_shape={tuple(expanded_x0.shape)} "
+                f"expanded_x1_shape={tuple(expanded_x1.shape)}",
+                flush=True,
+            )
 
             (
                 tokens_per_expert_group,
@@ -416,6 +471,14 @@ class LongcatFlashMoE(nn.Module):
                 output_splits,
             ) = self._dispatch_double_routing(tokens_per_expert0, expanded_x0)
 
+            print(
+                "[longcat_prefill_double_routing] before npu_moe_re_routing "
+                f"ep_rank={ep_rank} chunk_idx={chunk_idx} "
+                f"tokens_per_expert_group={tokens_per_expert_group.detach().cpu().tolist()} "
+                f"gathered_tokens_shape={tuple(gathered_tokens.shape)} "
+                f"input_splits={input_splits} output_splits={output_splits}",
+                flush=True,
+            )
             (
                 rerouted_hidden_states,
                 _,
@@ -425,6 +488,14 @@ class LongcatFlashMoE(nn.Module):
                 gathered_tokens,
                 tokens_per_expert_group.view(ep_world_size, -1),
                 per_token_scales=None,
+            )
+            print(
+                "[longcat_prefill_double_routing] after npu_moe_re_routing "
+                f"ep_rank={ep_rank} chunk_idx={chunk_idx} "
+                f"rerouted_hidden_states_shape={tuple(rerouted_hidden_states.shape)} "
+                f"gathered_ids_unsort_shape={tuple(gathered_ids_unsort.shape)} "
+                f"tokens_per_local_expert={tokens_per_local_expert.detach().cpu().tolist()}",
+                flush=True,
             )
 
             expert_output = self._run_prefill_local_experts(
@@ -441,12 +512,26 @@ class LongcatFlashMoE(nn.Module):
             )
 
             gathered_output = restored_output.new_empty(*expanded_x0.shape)
+            print(
+                "[longcat_prefill_double_routing] before all_to_all_single#3 "
+                f"ep_rank={ep_rank} chunk_idx={chunk_idx} "
+                f"restored_output_shape={tuple(restored_output.shape)} "
+                f"gathered_output_shape={tuple(gathered_output.shape)} "
+                f"input_splits={input_splits} output_splits={output_splits}",
+                flush=True,
+            )
             dist.all_to_all_single(
                 gathered_output,
                 restored_output,
                 input_splits,
                 output_splits,
                 group=group,
+            )
+            print(
+                "[longcat_prefill_double_routing] after all_to_all_single#3 "
+                f"ep_rank={ep_rank} chunk_idx={chunk_idx} "
+                f"gathered_output_shape={tuple(gathered_output.shape)}",
+                flush=True,
             )
 
             gathered_output = torch.cat([gathered_output, expanded_x1], dim=0)

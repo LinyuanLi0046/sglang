@@ -141,6 +141,22 @@ else:
 logger = logging.getLogger(__name__)
 
 
+def _use_longcat_ops_deepep_runtime() -> bool:
+    return (
+        _is_npu
+        and get_bool_env_var("ASCEND_SGLANG_USE_OPS_DEEPEP")
+        and get_global_server_args().enable_longcat_double_stream
+    )
+
+
+def _use_old_deepep_runtime() -> bool:
+    return get_moe_a2a_backend().is_deepep() and not _use_longcat_ops_deepep_runtime()
+
+
+def _use_longcat_sparse_a2a_runtime() -> bool:
+    return _use_longcat_ops_deepep_runtime() or _use_old_deepep_runtime()
+
+
 class LongcatFlashMLP(nn.Module):
     def __init__(
         self,
@@ -267,7 +283,10 @@ class LongcatFlashMoE(nn.Module):
             layer_id=layer_id,
         )
 
-        self.experts = get_moe_impl_class(quant_config)(
+        moe_impl_cls = (
+            DeepEPMoE if _use_longcat_ops_deepep_runtime() else get_moe_impl_class(quant_config)
+        )
+        self.experts = moe_impl_cls(
             num_experts=self.num_experts,
             top_k=self.top_k,
             layer_id=self.layer_id,
@@ -289,10 +308,8 @@ class LongcatFlashMoE(nn.Module):
 
     def _use_ops_deepep_decode(self, forward_batch: Optional[ForwardBatch]) -> bool:
         return (
-            _is_npu
+            _use_longcat_ops_deepep_runtime()
             and forward_batch is not None
-            and get_moe_a2a_backend().is_deepep()
-            and get_bool_env_var("ASCEND_SGLANG_USE_OPS_DEEPEP")
             and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         )
 
@@ -300,12 +317,9 @@ class LongcatFlashMoE(nn.Module):
         self, forward_batch: Optional[ForwardBatch]
     ) -> bool:
         return (
-            _is_npu
+            _use_longcat_ops_deepep_runtime()
             and forward_batch is not None
-            and get_moe_a2a_backend().is_deepep()
-            and get_bool_env_var("ASCEND_SGLANG_USE_OPS_DEEPEP")
             and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-            and get_global_server_args().enable_longcat_double_stream
         )
 
     def _get_prefill_double_routing_group(self):
@@ -597,7 +611,7 @@ class LongcatFlashMoE(nn.Module):
                     num_experts=self.num_experts,
                     zero_expert_type=self.zero_expert_type,
                     hidden_states=hidden_states,
-                    identity_mask_value=-1 if get_moe_a2a_backend().is_deepep() else 0,
+                    identity_mask_value=-1 if _use_old_deepep_runtime() else 0,
                 )
         topk_output = StandardTopKOutput(topk_weights, topk_idx, _)
 
@@ -620,15 +634,15 @@ class LongcatFlashMoE(nn.Module):
         if (
             zero_expert_result is not None
             and self.tp_size > 1
-            and get_moe_a2a_backend().is_deepep()
+            and _use_old_deepep_runtime()
         ):
             zero_expert_result *= self.tp_size
 
         if zero_expert_result is not None and hidden_states.shape[0] > 0:
             final_hidden_states += zero_expert_result.to(final_hidden_states.device)
 
-        if self.tp_size > 1 and not get_moe_a2a_backend().is_deepep():
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)   
+        if self.tp_size > 1 and not _use_longcat_sparse_a2a_runtime():
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -793,7 +807,7 @@ class LongcatFlashDecoderLayer(nn.Module):
         if get_global_server_args().enable_longcat_double_stream and MultiStreamUtils().main_stream is None and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             MultiStreamUtils().main_stream = torch.npu.current_stream()
         # first_attn
-        if get_moe_a2a_backend().is_deepep() and not self.is_first_layer:
+        if _use_longcat_sparse_a2a_runtime() and not self.is_first_layer:
             residual = residual.tensor_split(self.attn_tp_size)[self.attn_tp_rank]
         hidden_states, residual = self.moe_layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
@@ -806,7 +820,7 @@ class LongcatFlashDecoderLayer(nn.Module):
                 zero_allocator=zero_allocator,
             )
 
-        if get_moe_a2a_backend().is_deepep() and not self.is_first_layer:
+        if _use_longcat_sparse_a2a_runtime() and not self.is_first_layer:
             mlp_residual = self.attn_tp_group.all_gather(residual.contiguous(), dim=0)
         else:
             mlp_residual = residual.clone()
@@ -886,7 +900,7 @@ class LongcatFlashDecoderLayer(nn.Module):
                 )
                 # torch.npu.current_stream().record_event(MultiStreamUtils().fia_ffn_finished_event)
 
-                if not self.is_last_layer and get_moe_a2a_backend().is_deepep():
+                if not self.is_last_layer and _use_longcat_sparse_a2a_runtime():
                     mlp_hidden_states = mlp_hidden_states.tensor_split(self.attn_tp_size)[
                         self.attn_tp_rank
                     ]
@@ -965,7 +979,7 @@ class LongcatFlashDecoderLayer(nn.Module):
             hidden_states, residual = self.forward_mlp(
                 mlp_hidden_states, positions, mlp_residual, forward_batch, zero_allocator
             )
-            if not self.is_last_layer and get_moe_a2a_backend().is_deepep():
+            if not self.is_last_layer and _use_longcat_sparse_a2a_runtime():
                 hidden_states = hidden_states.tensor_split(self.attn_tp_size)[
                     self.attn_tp_rank
                 ]

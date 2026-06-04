@@ -126,12 +126,6 @@ def build_decode_placeholder_canonical_draft_input(
             f"expected={token_list_width}, actual={template_token_list.shape[1]}"
         )
 
-    _assert_future_indices_batch_membership_contract(
-        future_indices,
-        template_draft_input,
-        "build_decode_placeholder_canonical_draft_input",
-    )
-
     placeholder_ids = -future_indices.indices.to(dtype=dtype)
     draft_input_kwargs = {
         "future_indices": future_indices,
@@ -141,6 +135,9 @@ def build_decode_placeholder_canonical_draft_input(
         .clone(),
     }
     if template_draft_input is not None:
+        # `template_draft_input` is only used as a metadata template here.
+        # Its batch membership may still reflect the previous stable snapshot,
+        # so the placeholder builder must not require batch-size equality.
         draft_input_kwargs["capture_hidden_mode"] = getattr(
             template_draft_input, "capture_hidden_mode", None
         )

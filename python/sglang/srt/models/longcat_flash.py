@@ -732,11 +732,13 @@ class LongcatFlashDecoderLayer(nn.Module):
                 zero_allocator=zero_allocator,
             )
 
-        if use_sparse_layout and not self.is_first_layer:
-            mlp_residual = self.attn_tp_group.all_gather(residual.contiguous(), dim=0)
-        else:
-            mlp_residual = residual.clone()
+        hidden_states, residual = self.mlp_layer_communicator[0].prepare_mlp(
+            hidden_states,
+            residual,
+            forward_batch,
+        )
         mlp_hidden_states = hidden_states.clone()
+        mlp_residual = residual.clone()
 
         # ============= MOE放alt流 v1 ===============
         # if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
@@ -774,9 +776,7 @@ class LongcatFlashDecoderLayer(nn.Module):
 
         # ============= MOE放alt流 v2 ===============
         if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
-            hidden_states, moe_residual = self.moe_layer_communicator.prepare_mlp(
-                hidden_states, residual, forward_batch
-            )
+            moe_residual = residual
             msu = MultiStreamUtils()
             #msu.fia_ffn_finished_event = torch.npu.Event()
             msu.main_stream.record_event(msu.first_attn_finished)
@@ -785,37 +785,35 @@ class LongcatFlashDecoderLayer(nn.Module):
             def forward_moe_func():
                 nonlocal moe_hidden_states, hidden_states, moe_residual
                 with torch.npu.stream(MultiStreamUtils().stream_moe):
-                    with self._aclgraph_limit_core_scope(
-                        self.aclgraph_moe_aic_num, self.aclgraph_moe_aiv_num
-                    ):
-                        MultiStreamUtils().first_attn_finished.wait()
-                        moe_hidden_states = self.mlp(
-                            hidden_states, forward_batch=forward_batch
-                        )
+                    MultiStreamUtils().first_attn_finished.wait()
+                    moe_hidden_states = self.mlp(
+                        hidden_states, forward_batch=forward_batch
+                    )
 
-                        #torch.npu.current_stream().wait_event(MultiStreamUtils().fia_ffn_finished_event)
+                    #torch.npu.current_stream().wait_event(MultiStreamUtils().fia_ffn_finished_event)
 
-                        # torch.npu.current_stream().wait_event(MultiStreamUtils().attn1_allreduce_finised)
-                        moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
-                            moe_hidden_states, moe_residual, forward_batch
-                        )
-                        moe_hidden_states.record_stream(msu.main_stream)
+                    # torch.npu.current_stream().wait_event(MultiStreamUtils().attn1_allreduce_finised)
+                    moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
+                        moe_hidden_states, moe_residual, forward_batch
+                    )
+                    moe_hidden_states.record_stream(msu.main_stream)
                 MultiStreamUtils().forward_moe_func = None
             MultiStreamUtils().forward_moe_func = forward_moe_func
 
             # mlp + mla + mlp
-            with self._aclgraph_limit_core_scope(
-                self.aclgraph_main_aic_num, self.aclgraph_main_aiv_num
-            ):
-                mlp_hidden_states, residual = self.forward_mlp(
-                    mlp_hidden_states, positions, mlp_residual, forward_batch, zero_allocator,
-                )
-                # torch.npu.current_stream().record_event(MultiStreamUtils().fia_ffn_finished_event)
+            mlp_hidden_states, residual = self.forward_mlp(
+                mlp_hidden_states,
+                positions,
+                mlp_residual,
+                forward_batch,
+                zero_allocator,
+            )
+            # torch.npu.current_stream().record_event(MultiStreamUtils().fia_ffn_finished_event)
 
-                if not self.is_last_layer and use_sparse_layout:
-                    mlp_hidden_states = mlp_hidden_states.tensor_split(self.attn_tp_size)[
-                        self.attn_tp_rank
-                    ]
+            if not self.is_last_layer and use_sparse_layout:
+                mlp_hidden_states = mlp_hidden_states.tensor_split(self.attn_tp_size)[
+                    self.attn_tp_rank
+                ]
 
             msu.main_stream.wait_stream(msu.stream_moe)
             
@@ -880,16 +878,18 @@ class LongcatFlashDecoderLayer(nn.Module):
         #     MultiStreamUtils().main_stream.wait_stream(MultiStreamUtils().stream_moe)
         #     MultiStreamUtils().main_stream.wait_stream(MultiStreamUtils().stream_attn)
         else:
-            hidden_states, moe_residual = self.moe_layer_communicator.prepare_mlp(
-                hidden_states, residual, forward_batch
-            )
+            moe_residual = residual
             moe_hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
             moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
                 moe_hidden_states, moe_residual, forward_batch
             )
 
             hidden_states, residual = self.forward_mlp(
-                mlp_hidden_states, positions, mlp_residual, forward_batch, zero_allocator
+                mlp_hidden_states,
+                positions,
+                mlp_residual,
+                forward_batch,
+                zero_allocator,
             )
             if not self.is_last_layer and use_sparse_layout:
                 hidden_states = hidden_states.tensor_split(self.attn_tp_size)[
@@ -910,9 +910,6 @@ class LongcatFlashDecoderLayer(nn.Module):
         forward_batch,
         zero_allocator,
     ):
-        hidden_states, residual = self.mlp_layer_communicator[0].prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
         # ============= 3条流 ===============
         # if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
         #     MultiStreamUtils().forward_moe_func()

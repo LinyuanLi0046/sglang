@@ -2325,18 +2325,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         draft_input = getattr(self, "spec_info", None)
         return getattr(draft_input, "future_indices", None)
 
-    def sync_spec_future_handle_into_spec_info(self) -> None:
-        carrier = getattr(self, "spec_future_handle_carrier", None)
-        spec_info = getattr(self, "spec_info", None)
-        if (
-            carrier is None
-            or carrier.future_indices is None
-            or spec_info is None
-            or not hasattr(spec_info, "future_indices")
-        ):
-            return
-        spec_info.future_indices = carrier.future_indices
-
     def sync_decode_seq_lens_from_reqs(self):
         if len(self.reqs) == 0:
             self._set_decode_seq_lens_tensors(
@@ -2492,13 +2480,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 new_indices=keep_indices_device,
                 has_been_filtered=has_been_filtered,
             )
-            from sglang.srt.managers.overlap_utils import (
-                build_spec_future_handle_carrier,
-            )
-
-            self.spec_future_handle_carrier = build_spec_future_handle_carrier(
-                getattr(self.spec_info, "future_indices", None)
-            )
 
     def merge_batch(self, other: "ScheduleBatch"):
         # In the regular scheduler path:
@@ -2585,13 +2566,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
-            from sglang.srt.managers.overlap_utils import (
-                build_spec_future_handle_carrier,
-            )
-
-            self.spec_future_handle_carrier = build_spec_future_handle_carrier(
-                getattr(self.spec_info, "future_indices", None)
-            )
 
     def get_model_worker_batch(
         self, seq_lens_cpu_cache: Optional[torch.Tensor] = None
@@ -2612,7 +2586,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         seq_lens_cpu = (
             seq_lens_cpu_cache if seq_lens_cpu_cache is not None else self.seq_lens_cpu
         )
-        self.sync_spec_future_handle_into_spec_info()
 
         return ModelWorkerBatch(
             forward_mode=self.forward_mode,
@@ -2847,18 +2820,6 @@ class ModelWorkerBatch:
 
     spec_info: Optional[SpecInput] = None
     spec_future_handle_carrier: Optional[SpecFutureHandleCarrier] = None
-
-    def sync_spec_future_handle_into_spec_info(self) -> None:
-        carrier = getattr(self, "spec_future_handle_carrier", None)
-        spec_info = getattr(self, "spec_info", None)
-        if (
-            carrier is None
-            or carrier.future_indices is None
-            or spec_info is None
-            or not hasattr(spec_info, "future_indices")
-        ):
-            return
-        spec_info.future_indices = carrier.future_indices
 
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None

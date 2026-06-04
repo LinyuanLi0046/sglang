@@ -438,28 +438,11 @@ class FutureMap:
         if self.spec_algo.is_none():
             _resolve_future_token_ids(model_worker_batch.input_ids, self.token_ids_buf)
         else:
-            sync_spec_future_handle = getattr(
-                model_worker_batch, "sync_spec_future_handle_into_spec_info", None
-            )
-            if callable(sync_spec_future_handle):
-                sync_spec_future_handle()
             draft_input: EagleDraftInput = model_worker_batch.spec_info
             if draft_input is None:
                 # FIXME(lsyin): No future exists, only for prefill batch, not compatible with mixed mode
                 return
-            future_handle_carrier = getattr(
-                model_worker_batch, "spec_future_handle_carrier", None
-            )
-            future_indices = getattr(future_handle_carrier, "future_indices", None)
-            if future_indices is None:
-                future_indices = getattr(draft_input, "future_indices", None)
-            if future_indices is None:
-                raise RuntimeError(
-                    "Spec-v2 future resolve requires future_indices, but none was found "
-                    "on either spec_future_handle_carrier or spec_info."
-                )
-            draft_input.future_indices = future_indices
-            indices = future_indices.indices
+            indices = draft_input.future_indices.indices
             # The indices tensor was allocated on the default stream but is
             # used here on the forward stream. Meanwhile, the old spec_info
             # holding this tensor will lose all Python references (replaced at

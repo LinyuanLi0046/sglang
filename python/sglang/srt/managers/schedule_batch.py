@@ -2396,12 +2396,37 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         from sglang.srt.managers.overlap_utils import DecodePlaceholderLaunchSchema
 
         draft_input = self.spec_info
+        is_first_decode_boundary = (
+            getattr(draft_input, "verify_done", None) is not None
+            or getattr(draft_input, "new_seq_lens", None) is not None
+            or getattr(draft_input, "next_step_seq_lens", None) is not None
+        )
         num_tokens_per_req = int(
             getattr(draft_input, "num_tokens_per_req", -1) or -1
         )
         num_tokens_for_logprob_per_req = int(
             getattr(draft_input, "num_tokens_for_logprob_per_req", -1) or -1
         )
+        get_adjust_token_coefficient = getattr(
+            draft_input, "get_spec_adjust_token_coefficient", None
+        )
+        if callable(get_adjust_token_coefficient):
+            fallback_num_tokens_per_req, fallback_num_tokens_for_logprob = (
+                get_adjust_token_coefficient()
+            )
+            if num_tokens_per_req <= 0:
+                num_tokens_per_req = int(fallback_num_tokens_per_req or -1)
+            if num_tokens_for_logprob_per_req <= 0:
+                num_tokens_for_logprob_per_req = int(
+                    fallback_num_tokens_for_logprob or -1
+                )
+        # Prefill -> first decode can still carry the real next-step payload while
+        # missing the steady-state padding metadata. Keep a single scheduler-side
+        # derive here instead of rebuilding the schema again on the worker side.
+        if is_first_decode_boundary and num_tokens_per_req <= 0:
+            num_tokens_per_req = 1
+        if is_first_decode_boundary and num_tokens_for_logprob_per_req <= 0:
+            num_tokens_for_logprob_per_req = 1
         if num_tokens_per_req <= 0:
             raise RuntimeError(
                 "decode placeholder launch schema requires current "
@@ -2415,6 +2440,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         placeholder_dtype = getattr(getattr(self, "input_ids", None), "dtype", torch.int32)
         verify_token_num = int(getattr(draft_input, "verify_token_num", -1) or -1)
+        if verify_token_num <= 0:
+            token_list = getattr(draft_input, "token_list", None)
+            if token_list is not None and getattr(token_list, "ndim", 0) == 2:
+                verify_token_num = int(token_list.shape[1]) + 1
         if verify_token_num <= 0:
             raise RuntimeError(
                 "decode placeholder launch schema requires current "
@@ -2671,6 +2700,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             worker_spec_info = clone_spec_info_for_worker_launch(
                 self.spec_info,
+                launch_schema=decode_placeholder_launch_schema,
             )
 
         return ModelWorkerBatch(

@@ -100,7 +100,6 @@ class SpecModelWorkerOverlapClient:
                 return_logprob,
                 needs_hidden_states,
                 copy_input_token_logprobs,
-                should_placeholder_replace,
             ) = item
             if model_worker_batch is None:
                 break
@@ -139,10 +138,6 @@ class SpecModelWorkerOverlapClient:
                 batch_result,
                 canonical_only_decode=is_decode_placeholder_path,
             )
-            if should_placeholder_replace and batch_result.next_draft_input is not None:
-                self.future_map.replace_canonical_payload_with_future_placeholders(
-                    future_indices, batch_result.next_draft_input
-                )
 
             batch_result.copy_done = torch.get_device_module(self.device).Event()
             batch_result.scheduler_batch_uid = model_worker_batch.scheduler_batch_uid
@@ -173,10 +168,6 @@ class SpecModelWorkerOverlapClient:
             model_worker_batch.forward_mode.is_extend()
             or model_worker_batch.is_extend_in_batch
         )
-        should_placeholder_replace = (
-            model_worker_batch.forward_mode.is_extend()
-            or model_worker_batch.is_extend_in_batch
-        )
         self.input_queue.put(
             (
                 model_worker_batch,
@@ -184,7 +175,6 @@ class SpecModelWorkerOverlapClient:
                 model_worker_batch.return_logprob,
                 needs_hidden_states,
                 copy_input_token_logprobs,
-                should_placeholder_replace,
             )
         )
 

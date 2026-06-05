@@ -165,6 +165,7 @@ class SchedulerOutputProcessorMixin:
         launch_done: Optional[threading.Event] = None,
     ):
         skip_stream_req = None
+        deferred_finished_cleanup_reqs: List[Req] = []
 
         result = self._resolve_overlap_batch_result(
             batch, result, launch_done=launch_done
@@ -239,9 +240,7 @@ class SchedulerOutputProcessorMixin:
 
                     req.check_finished()
                     if req.finished():
-                        self.maybe_collect_routed_experts(req)
-                        release_kv_cache(req, self.tree_cache)
-                        req.time_stats.set_completion_time()
+                        deferred_finished_cleanup_reqs.append(req)
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)
                         if self.enable_hisparse:
@@ -379,6 +378,7 @@ class SchedulerOutputProcessorMixin:
 
         self._prepare_next_batch_sampling_info(batch)
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
+        self._drain_finished_req_cleanup(deferred_finished_cleanup_reqs)
 
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
         self.report_prefill_stats(
@@ -472,6 +472,7 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
         launch_done: Optional[threading.Event] = None,
     ):
+        deferred_finished_cleanup_reqs: List[Req] = []
         result = self._resolve_overlap_batch_result(
             batch, result, launch_done=launch_done
         )
@@ -541,7 +542,12 @@ class SchedulerOutputProcessorMixin:
             if is_spec_v1:
                 self._mamba_prefix_cache_update(req, batch, result, i)
                 req.time_stats.set_last_decode_finish_time()
-                self._handle_finished_req(req, i, logits_output)
+                self._handle_finished_req(
+                    req,
+                    i,
+                    logits_output,
+                    deferred_finished_cleanup_reqs,
+                )
                 if req.return_hidden_states and logits_output.hidden_states is not None:
                     req.hidden_states.append(
                         logits_output.hidden_states[i].cpu().clone().tolist()
@@ -566,7 +572,12 @@ class SchedulerOutputProcessorMixin:
             req.time_stats.set_last_decode_finish_time()
             req.check_finished(new_accepted_len)
 
-            self._handle_finished_req(req, i, logits_output)
+            self._handle_finished_req(
+                req,
+                i,
+                logits_output,
+                deferred_finished_cleanup_reqs,
+            )
 
             if req.return_logprob:
                 # Spec v1 handles logprobs inside its own worker.
@@ -626,6 +637,7 @@ class SchedulerOutputProcessorMixin:
 
         self._prepare_next_batch_sampling_info(batch)
         self.stream_output(batch.reqs, batch.return_logprob)
+        self._drain_finished_req_cleanup(deferred_finished_cleanup_reqs)
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
@@ -636,7 +648,11 @@ class SchedulerOutputProcessorMixin:
         )
 
     def _handle_finished_req(
-        self: Scheduler, req: Req, i: int, logits_output: LogitsProcessorOutput
+        self: Scheduler,
+        req: Req,
+        i: int,
+        logits_output: LogitsProcessorOutput,
+        deferred_finished_cleanup_reqs: List[Req],
     ):
         if (
             self.server_args.disaggregation_decode_enable_offload_kvcache
@@ -645,14 +661,23 @@ class SchedulerOutputProcessorMixin:
             self.decode_offload_manager.offload_kv_cache(req)
 
         if req.finished():
-            # delete feature to save memory
+            deferred_finished_cleanup_reqs.append(req)
+
+        self.maybe_collect_customized_info(i, req, logits_output)
+
+    def _drain_finished_req_cleanup(
+        self: Scheduler, deferred_finished_cleanup_reqs: List[Req]
+    ) -> None:
+        for req in deferred_finished_cleanup_reqs:
+            if not req.finished():
+                continue
+
             if req.multimodal_inputs is not None and req.session is None:
                 req.multimodal_inputs.release_features()
             self.maybe_collect_routed_experts(req)
             req.rollback_pending_spec_decode_alloc_reservations(self.tree_cache)
 
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
-                # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                 if not self.decode_offload_manager.offload_kv_cache(req):
                     self.decode_offload_manager.finalize_release_on_finish(req)
             else:
@@ -661,8 +686,6 @@ class SchedulerOutputProcessorMixin:
                 release_kv_cache(req, self.tree_cache)
 
             req.time_stats.set_completion_time()
-
-        self.maybe_collect_customized_info(i, req, logits_output)
 
     def _maybe_update_reasoning_tokens(
         self: Scheduler, req: Req, next_token_id: Union[int, List[int]]

@@ -2443,7 +2443,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         is_first_decode_boundary = (
             getattr(draft_input, "verify_done", None) is not None
             or getattr(draft_input, "new_seq_lens", None) is not None
-            or getattr(draft_input, "next_step_seq_lens", None) is not None
         )
         num_tokens_per_req = int(
             getattr(draft_input, "num_tokens_per_req", -1) or -1

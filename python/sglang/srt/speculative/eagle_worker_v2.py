@@ -589,21 +589,15 @@ class EagleDraftWorker(BaseDraftWorker):
             verified_id=next_token_ids,
             last_verified_ids=next_token_ids,
             new_seq_lens=batch.seq_lens,
-            next_step_seq_lens=batch.seq_lens,
             verify_token_num=self.speculative_num_draft_tokens,
             # draft mode is same with decode mode, only 1 token per req
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
-            # Keep the legacy observation field in sync for the short-term
-            # validation window while canonical payload becomes the primary path.
-            real_new_verified_id=next_token_ids,
         )
 
         if batch.req_pool_indices is not None and len(batch.req_pool_indices) > 0:
-            # R6-B2: prefill-first-step starts dual-writing the shared live-length
-            # owner while the existing relay path remains intact.
             self.req_to_token_pool.set_verified_lens(
-                batch.req_pool_indices, next_draft_input.next_step_seq_lens
+                batch.req_pool_indices, next_draft_input.new_seq_lens
             )
 
         batch.spec_info = next_draft_input
@@ -625,7 +619,6 @@ class EagleDraftWorker(BaseDraftWorker):
         next_draft_input.token_list = self._build_canonical_prefill_token_list(
             batch, next_draft_input
         )
-        next_draft_input.real_token_list = next_draft_input.token_list
         return next_draft_input
 
     def _build_canonical_prefill_token_list(
@@ -641,7 +634,7 @@ class EagleDraftWorker(BaseDraftWorker):
             )
         if self.topk != 1:
             return None
-        return self._build_real_token_list_via_propose(batch, next_draft_input)
+        return self._build_canonical_token_list_via_propose(batch, next_draft_input)
 
     def _draft_extend_for_decode(
         self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult
@@ -735,7 +728,6 @@ class EagleDraftWorker(BaseDraftWorker):
                 "state_k_plus_1 continuation did not materialize canonical token_list",
             )
         next_draft_input.token_list = token_list
-        next_draft_input.real_token_list = token_list
         if token_list is not None and token_list.shape[1] != (
             next_draft_input.verify_token_num - 1
         ):
@@ -811,7 +803,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 dtype=next_draft_input.verified_id.dtype,
                 device=self.device,
             )
-        return self._build_real_token_list_via_propose(batch, next_draft_input)
+        return self._build_canonical_token_list_via_propose(batch, next_draft_input)
 
     def _alloc_real_propose_out_cache(
         self,
@@ -870,14 +862,14 @@ class EagleDraftWorker(BaseDraftWorker):
         )
         return out_cache_loc, state
 
-    def _build_real_token_list_via_propose(
+    def _build_canonical_token_list_via_propose(
         self,
         batch: ModelWorkerBatch,
         proposal_input: EagleDraftInput,
     ) -> torch.Tensor:
         if self.topk != 1:
             raise ValueError(
-                "Stage C.5 / D0 real_token_list producer currently requires "
+                "Stage C.5 / D0 canonical token_list producer currently requires "
                 "speculative_eagle_topk == 1 to align with special_sglang propose() semantics"
             )
 
@@ -1265,25 +1257,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if batch.return_logprob and not batch.forward_mode.is_idle():
             self._compute_spec_v2_logprobs(batch, logits_output, predict, accept_index)
 
-        # The carried root token is already part of the next-step live prefix.
-        # Keep worker-produced `new_seq_lens` and consumer-facing
-        # `next_step_seq_lens` aligned until the contract is further narrowed.
-        next_step_seq_lens = new_seq_lens
-
         if batch.req_pool_indices is not None and len(batch.req_pool_indices) > 0:
-            # R6-B2: shared live-length owner is now produced by the worker
-            # together with the existing next-step relay.
             self.req_to_token_pool.set_verified_lens(
-                batch.req_pool_indices, next_step_seq_lens
+                batch.req_pool_indices, new_seq_lens
             )
 
         # Construct the next draft input
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,
             new_seq_lens=new_seq_lens,
-            next_step_seq_lens=next_step_seq_lens,
-            verify_done=verify_done,
-            real_new_verified_id=verified_id,
             verify_token_num=self.speculative_num_draft_tokens,
         )
 

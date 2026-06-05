@@ -68,11 +68,8 @@ def _get_payload_batch_membership_size(
         return None
 
     for field_name in (
-        "next_step_seq_lens",
         "last_verified_ids",
         "token_list",
-        "real_new_verified_id",
-        "real_token_list",
         "new_seq_lens",
         "verified_id",
         "topk_p",
@@ -246,7 +243,6 @@ def clone_spec_info_for_worker_launch(
         last_verified_ids=getattr(draft_input, "last_verified_ids", None),
         token_list=token_list,
         new_seq_lens=getattr(draft_input, "new_seq_lens", None),
-        next_step_seq_lens=getattr(draft_input, "next_step_seq_lens", None),
         verify_done=getattr(draft_input, "verify_done", None),
         capture_hidden_mode=capture_hidden_mode,
         num_tokens_per_req=num_tokens_per_req,
@@ -325,7 +321,6 @@ class FutureMap:
             self.topk_index_buf = None
             self.verified_id_buf = None
             self.new_seq_lens_buf = None
-            self.next_step_seq_lens_buf = None
             self.hidden_states_buf = None
             self.last_verified_ids_buf = None
             self.token_list_buf = None
@@ -369,23 +364,7 @@ class FutureMap:
                 device=self.device,
             )
 
-        self._lazy_init_next_step_seq_lens_buf(draft_input)
         self._lazy_init_canonical_buf(draft_input)
-
-    def _lazy_init_next_step_seq_lens_buf(
-        self, draft_input: "EagleDraftInput | EagleNextStepPayload"
-    ):
-        next_step_seq_lens0 = getattr(draft_input, "next_step_seq_lens", None)
-        if next_step_seq_lens0 is None:
-            next_step_seq_lens0 = getattr(draft_input, "new_seq_lens", None)
-        if next_step_seq_lens0 is None:
-            return
-        next_step_seq_lens0 = next_step_seq_lens0[0]
-        self.next_step_seq_lens_buf = torch.empty(
-            (self.future_buffer_len, *next_step_seq_lens0.shape),
-            dtype=next_step_seq_lens0.dtype,
-            device=self.device,
-        )
 
     def _lazy_init_canonical_buf(self, draft_input: EagleDraftInput):
         if draft_input.last_verified_ids is None or draft_input.token_list is None:
@@ -491,7 +470,7 @@ class FutureMap:
                 draft_input.future_topk_index_buf = None
                 draft_input.future_verified_id_buf = None
                 draft_input.future_new_seq_lens_buf = None
-                draft_input.future_next_step_seq_lens_buf = self.next_step_seq_lens_buf
+                draft_input.future_next_step_seq_lens_buf = None
                 if spec_need_hidden_states():
                     draft_input.future_hidden_states_buf = None
                 draft_input.future_last_verified_ids_buf = self.last_verified_ids_buf
@@ -503,7 +482,7 @@ class FutureMap:
                 draft_input.future_topk_index_buf = self.topk_index_buf
                 draft_input.future_verified_id_buf = self.verified_id_buf
                 draft_input.future_new_seq_lens_buf = self.new_seq_lens_buf
-                draft_input.future_next_step_seq_lens_buf = self.next_step_seq_lens_buf
+                draft_input.future_next_step_seq_lens_buf = None
                 if spec_need_hidden_states():
                     draft_input.future_hidden_states_buf = self.hidden_states_buf
             else:
@@ -565,18 +544,10 @@ class FutureMap:
         )
         if self.canonical_ready_buf is not None:
             self.canonical_ready_buf[intv] = False
-        next_step_seq_lens = getattr(payload_source, "next_step_seq_lens", None)
-        fallback_new_seq_lens = getattr(payload_source, "new_seq_lens", None)
-        if next_step_seq_lens is None and not canonical_only_decode:
-            next_step_seq_lens = fallback_new_seq_lens
         if canonical_only_decode:
             if not has_canonical_payload:
                 raise RuntimeError(
                     "decode steady-state canonical-only store requires last_verified_ids/token_list"
-                )
-            if next_step_seq_lens is None:
-                raise RuntimeError(
-                    "decode steady-state canonical-only store requires next_step_seq_lens relay"
                 )
         if has_canonical_payload:
             self._validate_canonical_payload_contract(
@@ -587,10 +558,6 @@ class FutureMap:
             self._check_canonical_buf_width(payload_source)
             self.last_verified_ids_buf[intv] = payload_source.last_verified_ids
             self.token_list_buf[intv] = payload_source.token_list
-            if next_step_seq_lens is not None:
-                if self.next_step_seq_lens_buf is None:
-                    self._lazy_init_next_step_seq_lens_buf(payload_source)
-                self.next_step_seq_lens_buf[intv] = next_step_seq_lens
             self.canonical_ready_buf[intv] = True
             return
 
@@ -601,9 +568,6 @@ class FutureMap:
         self.topk_index_buf[intv] = payload_source.topk_index
         self.verified_id_buf[intv] = payload_source.verified_id
         self.new_seq_lens_buf[intv] = payload_source.new_seq_lens
-        self.next_step_seq_lens_buf[intv] = getattr(
-            payload_source, "next_step_seq_lens", payload_source.new_seq_lens
-        )
         if spec_need_hidden_states():
             self.hidden_states_buf[intv] = payload_source.hidden_states
 

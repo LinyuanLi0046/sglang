@@ -322,52 +322,6 @@ class EagleDraftInputV2Mixin:
             seq_lens_cpu=live_seq_lens_cpu,
         ), None, None
 
-    def _validate_real_decode_payload(
-        self: EagleDraftInput,
-        batch_size: int,
-        speculative_num_steps: int,
-    ) -> None:
-        real_new_verified_id = getattr(self, "real_new_verified_id", None)
-        real_token_list = getattr(self, "real_token_list", None)
-        if real_new_verified_id is not None and real_new_verified_id.shape[0] != batch_size:
-            raise ValueError(
-                "real_new_verified_id batch size mismatch: "
-                f"expected {batch_size}, got {real_new_verified_id.shape[0]}"
-            )
-        if real_token_list is not None:
-            if real_token_list.ndim != 2:
-                raise ValueError(
-                    "real_token_list must be a 2D tensor for decode-only payload "
-                    f"validation, got ndim={real_token_list.ndim}"
-                )
-            if real_token_list.shape[0] != batch_size:
-                raise ValueError(
-                    "real_token_list batch size mismatch: "
-                    f"expected {batch_size}, got {real_token_list.shape[0]}"
-                )
-            if real_token_list.shape[1] != speculative_num_steps:
-                raise ValueError(
-                    "real_token_list step width mismatch: "
-                    f"expected {speculative_num_steps}, got {real_token_list.shape[1]}"
-                )
-
-    def _legacy_future_replay_ready(
-        self: EagleDraftInput,
-        batch: ModelWorkerBatch,
-    ) -> bool:
-        if batch.forward_mode.is_decode() and not getattr(
-            batch, "is_extend_in_batch", False
-        ):
-            return False
-        return (
-            self.future_indices is not None
-            and self.future_topk_p_buf is not None
-            and self.future_topk_index_buf is not None
-            and self.future_verified_id_buf is not None
-            and self.future_new_seq_lens_buf is not None
-            and self.future_hidden_states_buf is not None
-        )
-
     def _evict_swa_batch_like(self, batch: Any) -> None:
         tree_cache = getattr(batch, "tree_cache", None)
         reqs = getattr(batch, "reqs", None)
@@ -421,13 +375,9 @@ class EagleDraftInputV2Mixin:
             if getattr(batch, "orig_seq_lens", None) is not None:
                 batch.orig_seq_lens = batch.seq_lens.to(dtype=torch.int32)
             batch.seq_lens_sum = int(seq_lens_cpu.sum().item())
-            self.next_step_seq_lens = seq_lens_device
             return True
 
-        if not allow_compat_fallback:
-            return False
-
-        return self._compat_materialize_decode_seq_lens_for_batch(batch)
+        return False
 
     def _sync_decode_seq_lens_from_reqs_for_batch(self, batch: Any) -> None:
         if hasattr(batch, "sync_decode_seq_lens_from_reqs"):
@@ -457,40 +407,6 @@ class EagleDraftInputV2Mixin:
             self.verify_done.synchronize()
 
     def _compat_materialize_decode_seq_lens_for_batch(self, batch: Any) -> bool:
-        self._wait_verify_done_for_batch(batch)
-
-        next_step_seq_lens = getattr(self, "next_step_seq_lens", None)
-        if next_step_seq_lens is not None:
-            seq_lens_device = next_step_seq_lens.to(
-                device=batch.seq_lens.device, dtype=torch.int64
-            )
-            seq_lens_cpu = seq_lens_device.cpu()
-            batch.seq_lens = seq_lens_device
-            batch.seq_lens_cpu = seq_lens_cpu
-            if getattr(batch, "orig_seq_lens", None) is not None:
-                batch.orig_seq_lens = batch.seq_lens.to(dtype=torch.int32)
-            batch.seq_lens_sum = int(seq_lens_cpu.sum().item())
-            return True
-
-        future_next_step_seq_lens_buf = getattr(
-            self, "future_next_step_seq_lens_buf", None
-        )
-        if future_next_step_seq_lens_buf is not None and self.future_indices is not None:
-            seq_lens_device = future_next_step_seq_lens_buf[self.future_indices.indices].to(
-                device=batch.seq_lens.device, dtype=torch.int64
-            )
-            seq_lens_cpu = seq_lens_device.cpu()
-            batch.seq_lens = seq_lens_device
-            batch.seq_lens_cpu = seq_lens_cpu
-            if getattr(batch, "orig_seq_lens", None) is not None:
-                batch.orig_seq_lens = batch.seq_lens.to(dtype=torch.int32)
-            batch.seq_lens_sum = int(seq_lens_cpu.sum().item())
-            self.next_step_seq_lens = seq_lens_device
-            return True
-
-        if hasattr(batch, "materialize_spec_decode_seq_lens_carrier"):
-            if batch.materialize_spec_decode_seq_lens_carrier():
-                return True
         return False
 
     def prepare_decode_live_view(
@@ -504,14 +420,10 @@ class EagleDraftInputV2Mixin:
         if not self._materialize_decode_seq_lens_for_batch(
             batch, allow_compat_fallback=False
         ):
-            if allow_compat_fallback:
-                self._compat_materialize_decode_seq_lens_for_batch(batch)
-            if (
-                self.future_indices is not None
-                and self.new_seq_lens is None
-                and getattr(self, "next_step_seq_lens", None) is None
-            ):
-                self._sync_decode_seq_lens_from_reqs_for_batch(batch)
+            raise RuntimeError(
+                "spec-v2 decode live view requires shared verified_lens owner; "
+                "compat seq-lens relay is no longer part of the main path"
+            )
 
         # FIXME(lsyin): make this sync optional
         batch.seq_lens_cpu = batch.seq_lens.cpu()
@@ -581,116 +493,30 @@ class EagleDraftInputV2Mixin:
         topk: int,
         num_steps: int,
     ):
-        def _prepare_v2_draft_from_legacy_future_relay() -> None:
-            if batch.forward_mode.is_decode() and not getattr(
-                batch, "is_extend_in_batch", False
-            ):
-                raise RuntimeError(
-                    "decode steady-state must not consume legacy future replay "
-                    "as the primary draft path"
-                )
-
-            self._validate_real_decode_payload(bs, num_steps)
+        bs = len(batch.seq_lens)
+        if not batch.forward_mode.is_idle():
+            # Assign cache locations from the current canonical owner only.
             batch.out_cache_loc = torch.empty(
                 (bs * topk * num_steps,),
                 dtype=torch.int64,
                 device=batch.input_ids.device,
             )
-            self.positions = torch.empty(
-                (bs * topk,),
-                dtype=torch.int64,
-                device=batch.input_ids.device,
+            # FIXME(lsyin): align with the default code path
+            assign_draft_cache_locs_page_size_1[(bs,)](
+                batch.req_pool_indices,
+                req_to_token_pool.req_to_token,
+                batch.seq_lens,
+                batch.out_cache_loc,
+                req_to_token_pool.req_to_token.shape[1],
+                topk,
+                num_steps,
             )
-            self.topk_p = torch.empty(
-                (bs, topk),
-                dtype=self.future_topk_p_buf.dtype,
-                device=self.future_topk_p_buf.device,
-            )
-            self.topk_index = torch.empty(
-                (bs, topk),
-                dtype=self.future_topk_index_buf.dtype,
-                device=self.future_topk_index_buf.device,
-            )
-            self.verified_id = torch.empty(
-                (bs,),
-                dtype=self.future_verified_id_buf.dtype,
-                device=self.future_verified_id_buf.device,
-            )
-            future_seq_lens_buf = self.future_new_seq_lens_buf
-            self.new_seq_lens = torch.empty(
-                (bs,),
-                dtype=future_seq_lens_buf.dtype,
-                device=future_seq_lens_buf.device,
-            )
-            self.hidden_states = torch.empty(
-                (bs, self.future_hidden_states_buf.shape[1]),
-                dtype=self.future_hidden_states_buf.dtype,
-                device=self.future_hidden_states_buf.device,
-            )
-            draft_future_replay_prepare_npu_triton(
-                future_indices=self.future_indices.indices,
-                src_topk_p=self.future_topk_p_buf,
-                src_topk_index=self.future_topk_index_buf,
-                src_hidden_states=self.future_hidden_states_buf,
-                src_verified_id=self.future_verified_id_buf,
-                src_new_seq_lens=future_seq_lens_buf,
-                src_seq_lens=batch.seq_lens,
-                src_req_pool_indices=batch.req_pool_indices,
-                req_to_token=req_to_token_pool.req_to_token,
-                dst_topk_p=self.topk_p,
-                dst_topk_index=self.topk_index,
-                dst_hidden_states=self.hidden_states,
-                dst_verified_id=self.verified_id,
-                dst_new_seq_lens=self.new_seq_lens,
-                dst_positions=self.positions,
-                dst_out_cache_loc=batch.out_cache_loc,
-                topk=topk,
-                speculative_num_steps=num_steps,
-            )
-
-            self.future_topk_p_buf = None
-            self.future_topk_index_buf = None
-            self.future_hidden_states_buf = None
-            self.future_verified_id_buf = None
-            self.future_new_seq_lens_buf = None
-            self.future_next_step_seq_lens_buf = None
-
-        bs = len(batch.seq_lens)
-        positions_prepared = False
-        if not batch.forward_mode.is_idle():
-            # Canonical future payload is resolved before entering this method and
-            # now serves as the primary path for both decode-only and
-            # prefill-first-step. The legacy FutureMap replay path below is kept
-            # only for batches where legacy relay buffers still exist.
-            future_ready = self._legacy_future_replay_ready(batch)
-
-            if future_ready:
-                _prepare_v2_draft_from_legacy_future_relay()
-                positions_prepared = True
-            else:
-                # Assign cache locations
-                batch.out_cache_loc = torch.empty(
-                    (bs * topk * num_steps,),
-                    dtype=torch.int64,
-                    device=batch.input_ids.device,
-                )
-                # FIXME(lsyin): align with the default code path
-                assign_draft_cache_locs_page_size_1[(bs,)](
-                    batch.req_pool_indices,
-                    req_to_token_pool.req_to_token,
-                    batch.seq_lens,
-                    batch.out_cache_loc,
-                    req_to_token_pool.req_to_token.shape[1],
-                    topk,
-                    num_steps,
-                )
 
         # Get a forward batch
         self.num_tokens_per_req = topk
         self.num_tokens_for_logprob_per_req = topk
         batch.capture_hidden_mode = CaptureHiddenMode.LAST
-        if not positions_prepared:
-            self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
+        self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         return forward_batch, can_cuda_graph

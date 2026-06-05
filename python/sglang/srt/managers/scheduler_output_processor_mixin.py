@@ -171,7 +171,7 @@ class SchedulerOutputProcessorMixin:
         )
 
         if self.is_generation:
-            if result.copy_done is not None:
+            if result.copy_done is not None and not getattr(result, "cpu_ready", False):
                 result.copy_done.synchronize()
 
             (
@@ -187,26 +187,35 @@ class SchedulerOutputProcessorMixin:
             )
 
             # Move next_token_ids and logprobs to cpu
-            next_token_ids = next_token_ids.tolist()
+            if torch.is_tensor(next_token_ids):
+                next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
-                if logits_output.next_token_logprobs is not None:
+                if (
+                    logits_output.next_token_logprobs is not None
+                    and torch.is_tensor(logits_output.next_token_logprobs)
+                ):
                     logits_output.next_token_logprobs = (
                         logits_output.next_token_logprobs.tolist()
                     )
-                if logits_output.input_token_logprobs is not None:
+                if (
+                    logits_output.input_token_logprobs is not None
+                    and torch.is_tensor(logits_output.input_token_logprobs)
+                ):
                     logits_output.input_token_logprobs = tuple(
                         logits_output.input_token_logprobs.tolist()
                     )
                 if logits_output.next_token_top_logprobs_val:
                     logits_output.next_token_top_logprobs_val = [
-                        v.tolist() for v in logits_output.next_token_top_logprobs_val
+                        v.tolist() if torch.is_tensor(v) else v
+                        for v in logits_output.next_token_top_logprobs_val
                     ]
                     logits_output.next_token_top_logprobs_idx = [
-                        x.tolist() for x in logits_output.next_token_top_logprobs_idx
+                        x.tolist() if torch.is_tensor(x) else x
+                        for x in logits_output.next_token_top_logprobs_idx
                     ]
                 if logits_output.next_token_token_ids_logprobs_val:
                     logits_output.next_token_token_ids_logprobs_val = [
-                        v.tolist()
+                        v.tolist() if torch.is_tensor(v) else v
                         for v in logits_output.next_token_token_ids_logprobs_val
                     ]
 
@@ -382,11 +391,16 @@ class SchedulerOutputProcessorMixin:
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> List[List[int]]:
         """Resolve the padding next token ids for speculative decoding with overlap."""
-        assert result.next_token_ids.is_cpu
-        assert result.accept_lens.is_cpu
-
-        next_token_ids = result.next_token_ids.tolist()
-        accept_lens = result.accept_lens.tolist()
+        if isinstance(result.next_token_ids, torch.Tensor):
+            assert result.next_token_ids.is_cpu
+            next_token_ids = result.next_token_ids.tolist()
+        else:
+            next_token_ids = result.next_token_ids
+        if isinstance(result.accept_lens, torch.Tensor):
+            assert result.accept_lens.is_cpu
+            accept_lens = result.accept_lens.tolist()
+        else:
+            accept_lens = result.accept_lens
         result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
         result.accept_length_per_req_cpu = [x - 1 for x in accept_lens]
 
@@ -442,7 +456,7 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
-        if result.copy_done is not None:
+        if result.copy_done is not None and not getattr(result, "cpu_ready", False):
             result.copy_done.synchronize()
 
         if getattr(batch, "spec_decode_postprocess_state", None) is not None:
@@ -462,7 +476,7 @@ class SchedulerOutputProcessorMixin:
             batch, result, launch_done=launch_done
         )
 
-        if result.copy_done is not None:
+        if result.copy_done is not None and not getattr(result, "cpu_ready", False):
             result.copy_done.synchronize()
 
         logits_output, next_token_ids, can_run_cuda_graph = (
@@ -476,21 +490,27 @@ class SchedulerOutputProcessorMixin:
                 self._commit_spec_decode_alloc_reservation(batch)
                 next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
             else:
-                next_token_ids = next_token_ids.tolist()
+                if torch.is_tensor(next_token_ids):
+                    next_token_ids = next_token_ids.tolist()
 
             if batch.return_logprob:
-                next_token_logprobs = logits_output.next_token_logprobs.tolist()
+                if torch.is_tensor(logits_output.next_token_logprobs):
+                    next_token_logprobs = logits_output.next_token_logprobs.tolist()
+                else:
+                    next_token_logprobs = logits_output.next_token_logprobs
                 if logits_output.next_token_top_logprobs_val:
                     logits_output.next_token_top_logprobs_val = [
-                        v.tolist() for v in logits_output.next_token_top_logprobs_val
+                        v.tolist() if torch.is_tensor(v) else v
+                        for v in logits_output.next_token_top_logprobs_val
                     ]
                     logits_output.next_token_top_logprobs_idx = [
-                        x.tolist() for x in logits_output.next_token_top_logprobs_idx
+                        x.tolist() if torch.is_tensor(x) else x
+                        for x in logits_output.next_token_top_logprobs_idx
                     ]
 
                 if logits_output.next_token_token_ids_logprobs_val:
                     logits_output.next_token_token_ids_logprobs_val = [
-                        v.tolist()
+                        v.tolist() if torch.is_tensor(v) else v
                         for v in logits_output.next_token_token_ids_logprobs_val
                     ]
         # else: Spec V1 — output_ids, check_finished, grammar, and reasoning tokens

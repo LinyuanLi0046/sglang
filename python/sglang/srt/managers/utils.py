@@ -52,6 +52,7 @@ class GenerationBatchResult:
 
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
+    cpu_ready: bool = False
 
     def copy_to_cpu(self, return_logprob: bool):
         """Copy tensors to CPU in overlap scheduling.
@@ -95,6 +96,7 @@ class GenerationBatchResult:
             x.copy_to_cpu()
 
         self.copy_done.record()
+        self.cpu_ready = False
 
     def copy_to_cpu_for_spec_overlap(
         self,
@@ -146,6 +148,7 @@ class GenerationBatchResult:
             self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
 
         self.copy_done.record()
+        self.cpu_ready = False
 
     @classmethod
     def from_pp_proxy(

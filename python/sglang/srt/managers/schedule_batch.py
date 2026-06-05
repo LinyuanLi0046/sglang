@@ -2396,46 +2396,37 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         from sglang.srt.managers.overlap_utils import DecodePlaceholderLaunchSchema
 
         draft_input = self.spec_info
-        server_args = get_global_server_args()
-        speculative_num_steps = int(getattr(server_args, "speculative_num_steps", 0) or 0)
         num_tokens_per_req = int(
             getattr(draft_input, "num_tokens_per_req", -1) or -1
         )
         num_tokens_for_logprob_per_req = int(
             getattr(draft_input, "num_tokens_for_logprob_per_req", -1) or -1
         )
-
-        get_adjust_token_coefficient = getattr(
-            draft_input, "get_spec_adjust_token_coefficient", None
-        )
-        if callable(get_adjust_token_coefficient):
-            adjusted_num_tokens_per_req, adjusted_num_tokens_for_logprob_per_req = (
-                get_adjust_token_coefficient()
-            )
-            if num_tokens_per_req <= 0 and adjusted_num_tokens_per_req is not None:
-                if adjusted_num_tokens_per_req > 0:
-                    num_tokens_per_req = int(adjusted_num_tokens_per_req)
-            if (
-                num_tokens_for_logprob_per_req <= 0
-                and adjusted_num_tokens_for_logprob_per_req is not None
-            ):
-                if adjusted_num_tokens_for_logprob_per_req > 0:
-                    num_tokens_for_logprob_per_req = int(
-                        adjusted_num_tokens_for_logprob_per_req
-                    )
-
-        default_num_tokens_per_req = max(1, speculative_num_steps + 1)
         if num_tokens_per_req <= 0:
-            num_tokens_per_req = default_num_tokens_per_req
+            raise RuntimeError(
+                "decode placeholder launch schema requires current "
+                "draft_input.num_tokens_per_req"
+            )
         if num_tokens_for_logprob_per_req <= 0:
-            num_tokens_for_logprob_per_req = num_tokens_per_req
+            raise RuntimeError(
+                "decode placeholder launch schema requires current "
+                "draft_input.num_tokens_for_logprob_per_req"
+            )
 
         placeholder_dtype = getattr(getattr(self, "input_ids", None), "dtype", torch.int32)
         verify_token_num = int(getattr(draft_input, "verify_token_num", -1) or -1)
         if verify_token_num <= 0:
-            verify_token_num = int(server_args.speculative_num_draft_tokens)
+            raise RuntimeError(
+                "decode placeholder launch schema requires current "
+                "draft_input.verify_token_num"
+            )
         token_list_width = verify_token_num - 1
         capture_hidden_mode = self._get_worker_capture_hidden_mode()
+        if capture_hidden_mode is None:
+            raise RuntimeError(
+                "decode placeholder launch schema requires current "
+                "capture_hidden_mode"
+            )
         return DecodePlaceholderLaunchSchema(
             token_list_width=token_list_width,
             placeholder_dtype=placeholder_dtype,
@@ -2680,7 +2671,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             worker_spec_info = clone_spec_info_for_worker_launch(
                 self.spec_info,
-                launch_schema=decode_placeholder_launch_schema,
             )
 
         return ModelWorkerBatch(

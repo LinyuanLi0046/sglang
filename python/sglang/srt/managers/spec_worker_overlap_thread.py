@@ -101,46 +101,9 @@ class SpecModelWorkerOverlapClient:
         )
         if explicit_launch_schema is not None:
             return explicit_launch_schema
-
-        default_num_tokens_per_req = getattr(self.worker, "speculative_num_steps", 0) + 1
-        default_num_tokens_for_logprob_per_req = default_num_tokens_per_req
-        existing_spec_info = getattr(model_worker_batch, "spec_info", None)
-        get_adjust_token_coefficient = getattr(
-            existing_spec_info, "get_spec_adjust_token_coefficient", None
-        )
-        if callable(get_adjust_token_coefficient):
-            num_tokens_per_req, num_tokens_for_logprob_per_req = (
-                get_adjust_token_coefficient()
-            )
-            if num_tokens_per_req is not None and num_tokens_per_req > 0:
-                default_num_tokens_per_req = int(num_tokens_per_req)
-            if (
-                num_tokens_for_logprob_per_req is not None
-                and num_tokens_for_logprob_per_req > 0
-            ):
-                default_num_tokens_for_logprob_per_req = int(
-                    num_tokens_for_logprob_per_req
-                )
-
-        placeholder_dtype = getattr(
-            getattr(model_worker_batch, "input_ids", None), "dtype", torch.int32
-        )
-        token_list_width = (
-            getattr(
-                self.worker,
-                "speculative_num_draft_tokens",
-                self.worker.server_args.speculative_num_draft_tokens,
-            )
-            - 1
-        )
-        return DecodePlaceholderLaunchSchema(
-            token_list_width=token_list_width,
-            placeholder_dtype=placeholder_dtype,
-            capture_hidden_mode=getattr(
-                model_worker_batch, "capture_hidden_mode", None
-            ),
-            num_tokens_per_req=default_num_tokens_per_req,
-            num_tokens_for_logprob_per_req=default_num_tokens_for_logprob_per_req,
+        raise RuntimeError(
+            "spec overlap decode placeholder launch requires explicit "
+            "decode_placeholder_launch_schema from scheduler"
         )
 
     def forward_thread_func(self) -> None:

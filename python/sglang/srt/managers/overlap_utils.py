@@ -171,7 +171,6 @@ def clone_decode_placeholder_handle_contract(
 def clone_spec_info_for_worker_launch(
     draft_input: Optional["EagleDraftInput"],
     future_indices: Optional[FutureIndices] = None,
-    launch_schema: Optional[DecodePlaceholderLaunchSchema] = None,
 ) -> Optional["EagleDraftInput"]:
     if draft_input is None:
         return None
@@ -179,24 +178,31 @@ def clone_spec_info_for_worker_launch(
     from sglang.srt.speculative.eagle_info import EagleDraftInput
 
     capture_hidden_mode = getattr(draft_input, "capture_hidden_mode", None)
-    if capture_hidden_mode is None and launch_schema is not None:
-        capture_hidden_mode = launch_schema.capture_hidden_mode
 
     num_tokens_per_req = int(getattr(draft_input, "num_tokens_per_req", -1) or -1)
-    if num_tokens_per_req <= 0 and launch_schema is not None:
-        num_tokens_per_req = int(launch_schema.num_tokens_per_req)
+    if num_tokens_per_req <= 0:
+        raise RuntimeError(
+            "worker launch spec_info clone requires current draft_input.num_tokens_per_req"
+        )
 
     num_tokens_for_logprob_per_req = int(
         getattr(draft_input, "num_tokens_for_logprob_per_req", -1) or -1
     )
-    if num_tokens_for_logprob_per_req <= 0 and launch_schema is not None:
-        num_tokens_for_logprob_per_req = int(
-            launch_schema.num_tokens_for_logprob_per_req
+    if num_tokens_for_logprob_per_req <= 0:
+        raise RuntimeError(
+            "worker launch spec_info clone requires current "
+            "draft_input.num_tokens_for_logprob_per_req"
         )
 
     verify_token_num = int(getattr(draft_input, "verify_token_num", -1) or -1)
-    if verify_token_num <= 0 and launch_schema is not None:
-        verify_token_num = int(launch_schema.token_list_width) + 1
+    if verify_token_num <= 0:
+        raise RuntimeError(
+            "worker launch spec_info clone requires current draft_input.verify_token_num"
+        )
+    if capture_hidden_mode is None:
+        raise RuntimeError(
+            "worker launch spec_info clone requires current draft_input.capture_hidden_mode"
+        )
 
     worker_private_spec_info = EagleDraftInput(
         future_indices=clone_future_indices_handle(

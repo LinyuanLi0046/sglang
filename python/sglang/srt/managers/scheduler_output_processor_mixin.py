@@ -158,6 +158,9 @@ class SchedulerOutputProcessorMixin:
             and batch.is_spec_v2
         )
 
+    def _uses_ready_spec_overlap_result(self: Scheduler, batch: ScheduleBatch) -> bool:
+        return self._use_spec_overlap_worker(batch)
+
     def process_batch_result_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -172,7 +175,7 @@ class SchedulerOutputProcessorMixin:
         )
 
         if self.is_generation:
-            if result.copy_done is not None and not getattr(result, "cpu_ready", False):
+            if result.copy_done is not None:
                 result.copy_done.synchronize()
 
             (
@@ -391,16 +394,14 @@ class SchedulerOutputProcessorMixin:
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> List[List[int]]:
         """Resolve the padding next token ids for speculative decoding with overlap."""
-        if isinstance(result.next_token_ids, torch.Tensor):
-            assert result.next_token_ids.is_cpu
-            next_token_ids = result.next_token_ids.tolist()
-        else:
-            next_token_ids = result.next_token_ids
-        if isinstance(result.accept_lens, torch.Tensor):
-            assert result.accept_lens.is_cpu
-            accept_lens = result.accept_lens.tolist()
-        else:
-            accept_lens = result.accept_lens
+        if torch.is_tensor(result.next_token_ids) or torch.is_tensor(result.accept_lens):
+            raise RuntimeError(
+                "spec overlap ready result must expose next_token_ids/accept_lens "
+                "as python lists before scheduler post-process"
+            )
+
+        next_token_ids = result.next_token_ids
+        accept_lens = result.accept_lens
         result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
         result.accept_length_per_req_cpu = [x - 1 for x in accept_lens]
 
@@ -456,7 +457,7 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
-        if result.copy_done is not None and not getattr(result, "cpu_ready", False):
+        if result.copy_done is not None:
             result.copy_done.synchronize()
 
         if getattr(batch, "spec_decode_postprocess_state", None) is not None:
@@ -477,7 +478,7 @@ class SchedulerOutputProcessorMixin:
             batch, result, launch_done=launch_done
         )
 
-        if result.copy_done is not None and not getattr(result, "cpu_ready", False):
+        if result.copy_done is not None:
             result.copy_done.synchronize()
 
         logits_output, next_token_ids, can_run_cuda_graph = (
@@ -495,10 +496,30 @@ class SchedulerOutputProcessorMixin:
                     next_token_ids = next_token_ids.tolist()
 
             if batch.return_logprob:
-                if torch.is_tensor(logits_output.next_token_logprobs):
+                if batch.is_spec_v2 and self._uses_ready_spec_overlap_result(batch):
+                    if torch.is_tensor(logits_output.next_token_logprobs):
+                        raise RuntimeError(
+                            "spec overlap ready result must expose next_token_logprobs "
+                            "as python values before scheduler post-process"
+                        )
+                    next_token_logprobs = logits_output.next_token_logprobs
+                elif torch.is_tensor(logits_output.next_token_logprobs):
                     next_token_logprobs = logits_output.next_token_logprobs.tolist()
                 else:
                     next_token_logprobs = logits_output.next_token_logprobs
+                if (
+                    batch.is_spec_v2
+                    and self._uses_ready_spec_overlap_result(batch)
+                    and logits_output.next_token_top_logprobs_val
+                    and any(
+                        torch.is_tensor(v)
+                        for v in logits_output.next_token_top_logprobs_val
+                    )
+                ):
+                    raise RuntimeError(
+                        "spec overlap ready result must expose next_token_top_logprobs "
+                        "as python values before scheduler post-process"
+                    )
                 if logits_output.next_token_top_logprobs_val:
                     logits_output.next_token_top_logprobs_val = [
                         v.tolist() if torch.is_tensor(v) else v
@@ -509,6 +530,19 @@ class SchedulerOutputProcessorMixin:
                         for x in logits_output.next_token_top_logprobs_idx
                     ]
 
+                if (
+                    batch.is_spec_v2
+                    and self._uses_ready_spec_overlap_result(batch)
+                    and logits_output.next_token_token_ids_logprobs_val
+                    and any(
+                        torch.is_tensor(v)
+                        for v in logits_output.next_token_token_ids_logprobs_val
+                    )
+                ):
+                    raise RuntimeError(
+                        "spec overlap ready result must expose next_token_token_ids_logprobs "
+                        "as python values before scheduler post-process"
+                    )
                 if logits_output.next_token_token_ids_logprobs_val:
                     logits_output.next_token_token_ids_logprobs_val = [
                         v.tolist() if torch.is_tensor(v) else v

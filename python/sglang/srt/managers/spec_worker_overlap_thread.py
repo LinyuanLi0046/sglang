@@ -71,6 +71,55 @@ class SpecModelWorkerOverlapClient:
             "decode_placeholder_launch_schema from scheduler"
         )
 
+    @staticmethod
+    def _to_python_value(value):
+        if torch.is_tensor(value):
+            return value.tolist()
+        if isinstance(value, tuple):
+            return tuple(SpecModelWorkerOverlapClient._to_python_value(v) for v in value)
+        if isinstance(value, list):
+            return [SpecModelWorkerOverlapClient._to_python_value(v) for v in value]
+        return value
+
+    def _materialize_scheduler_ready_result(
+        self, batch_result: GenerationBatchResult
+    ) -> GenerationBatchResult:
+        if batch_result.next_token_ids is not None:
+            batch_result.next_token_ids = self._to_python_value(batch_result.next_token_ids)
+        if batch_result.accept_lens is not None:
+            batch_result.accept_lens = self._to_python_value(batch_result.accept_lens)
+
+        logits_output = batch_result.logits_output
+        if logits_output is not None:
+            if logits_output.next_token_logprobs is not None:
+                logits_output.next_token_logprobs = self._to_python_value(
+                    logits_output.next_token_logprobs
+                )
+            if logits_output.input_token_logprobs is not None:
+                logits_output.input_token_logprobs = tuple(
+                    self._to_python_value(logits_output.input_token_logprobs)
+                )
+            if logits_output.next_token_top_logprobs_val is not None:
+                logits_output.next_token_top_logprobs_val = self._to_python_value(
+                    logits_output.next_token_top_logprobs_val
+                )
+            if logits_output.next_token_top_logprobs_idx is not None:
+                logits_output.next_token_top_logprobs_idx = self._to_python_value(
+                    logits_output.next_token_top_logprobs_idx
+                )
+            if logits_output.next_token_token_ids_logprobs_val is not None:
+                logits_output.next_token_token_ids_logprobs_val = self._to_python_value(
+                    logits_output.next_token_token_ids_logprobs_val
+                )
+            if logits_output.next_token_token_ids_logprobs_idx is not None:
+                logits_output.next_token_token_ids_logprobs_idx = self._to_python_value(
+                    logits_output.next_token_token_ids_logprobs_idx
+                )
+
+        batch_result.copy_done = None
+        batch_result.launch_done = None
+        return batch_result
+
     def forward_thread_func(self) -> None:
         try:
             self._bind_thread_device()
@@ -219,52 +268,7 @@ class SpecModelWorkerOverlapClient:
             batch_result.copy_done.synchronize()
         if batch_result.launch_done is not None:
             batch_result.launch_done.wait()
-
-        if batch_result.next_token_ids is not None and torch.is_tensor(
-            batch_result.next_token_ids
-        ):
-            batch_result.next_token_ids = batch_result.next_token_ids.tolist()
-        if batch_result.accept_lens is not None and torch.is_tensor(
-            batch_result.accept_lens
-        ):
-            batch_result.accept_lens = batch_result.accept_lens.tolist()
-        if (
-            batch_result.logits_output is not None
-            and batch_result.logits_output.next_token_logprobs is not None
-            and torch.is_tensor(batch_result.logits_output.next_token_logprobs)
-        ):
-            batch_result.logits_output.next_token_logprobs = (
-                batch_result.logits_output.next_token_logprobs.tolist()
-            )
-        if (
-            batch_result.logits_output is not None
-            and batch_result.logits_output.input_token_logprobs is not None
-            and torch.is_tensor(batch_result.logits_output.input_token_logprobs)
-        ):
-            batch_result.logits_output.input_token_logprobs = tuple(
-                batch_result.logits_output.input_token_logprobs.tolist()
-            )
-        if (
-            batch_result.logits_output is not None
-            and batch_result.logits_output.next_token_top_logprobs_val
-        ):
-            batch_result.logits_output.next_token_top_logprobs_val = [
-                v.tolist() if torch.is_tensor(v) else v
-                for v in batch_result.logits_output.next_token_top_logprobs_val
-            ]
-            batch_result.logits_output.next_token_top_logprobs_idx = [
-                x.tolist() if torch.is_tensor(x) else x
-                for x in batch_result.logits_output.next_token_top_logprobs_idx
-            ]
-        if (
-            batch_result.logits_output is not None
-            and batch_result.logits_output.next_token_token_ids_logprobs_val
-        ):
-            batch_result.logits_output.next_token_token_ids_logprobs_val = [
-                v.tolist() if torch.is_tensor(v) else v
-                for v in batch_result.logits_output.next_token_token_ids_logprobs_val
-            ]
-        batch_result.cpu_ready = True
+        batch_result = self._materialize_scheduler_ready_result(batch_result)
 
         batch_result.extend_input_len_per_req = placeholder_result.extend_input_len_per_req
         batch_result.extend_logprob_start_len_per_req = (

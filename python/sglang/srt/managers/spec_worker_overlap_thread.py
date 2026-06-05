@@ -115,7 +115,6 @@ class SpecModelWorkerOverlapClient:
             (
                 model_worker_batch,
                 future_indices,
-                spec_ready_event,
                 return_logprob,
                 needs_hidden_states,
                 copy_input_token_logprobs,
@@ -162,8 +161,6 @@ class SpecModelWorkerOverlapClient:
                 self.future_map.replace_canonical_payload_with_future_placeholders(
                     future_indices, batch_result.next_draft_input
                 )
-            if spec_ready_event is not None:
-                spec_ready_event.record()
 
             if not is_decode_placeholder_path:
                 if batch_result.next_draft_input is None:
@@ -202,7 +199,6 @@ class SpecModelWorkerOverlapClient:
 
         bs = len(model_worker_batch.seq_lens)
         future_indices = self.future_map.alloc_future_indices(bs)
-        spec_ready_event = None
         needs_hidden_states = bool(getattr(model_worker_batch, "return_hidden_states", False))
         copy_input_token_logprobs = bool(
             model_worker_batch.forward_mode.is_extend()
@@ -212,13 +208,10 @@ class SpecModelWorkerOverlapClient:
             model_worker_batch.forward_mode.is_extend()
             or model_worker_batch.is_extend_in_batch
         )
-        if model_worker_batch.forward_mode.is_decode() and not model_worker_batch.is_extend_in_batch:
-            spec_ready_event = torch.get_device_module(self.device).Event()
         self.input_queue.put(
             (
                 model_worker_batch,
                 future_indices,
-                spec_ready_event,
                 model_worker_batch.return_logprob,
                 needs_hidden_states,
                 copy_input_token_logprobs,
@@ -242,7 +235,6 @@ class SpecModelWorkerOverlapClient:
             next_token_ids=-future_indices.indices,
             future_indices=future_indices,
             next_draft_input=placeholder_next_draft_input,
-            spec_ready_event=spec_ready_event,
             scheduler_batch_uid=model_worker_batch.scheduler_batch_uid,
         )
 

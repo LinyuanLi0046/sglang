@@ -420,39 +420,6 @@ class SchedulerOutputProcessorMixin:
         reservation.commit()
         cleanup_state.alloc_reservation = None
 
-    def _future_indices_match(self, lhs, rhs) -> bool:
-        if lhs is None or rhs is None:
-            return False
-        if lhs is rhs:
-            return True
-        if getattr(lhs, "interval", None) != getattr(rhs, "interval", None):
-            return False
-        lhs_indices = getattr(lhs, "indices", None)
-        rhs_indices = getattr(rhs, "indices", None)
-        if lhs_indices is None or rhs_indices is None:
-            return False
-        return torch.equal(lhs_indices, rhs_indices)
-
-    def _ensure_spec_overlap_result_ready(
-        self, batch: ScheduleBatch, result: GenerationBatchResult
-    ) -> None:
-        if not self._use_spec_overlap_worker(batch):
-            return
-        if not (batch.forward_mode.is_decode() and not batch.is_extend_in_batch):
-            return
-
-        spec_ready_event = getattr(result, "spec_ready_event", None)
-        if spec_ready_event is not None:
-            spec_ready_event.synchronize()
-
-        pending_decode_state = getattr(self, "pending_spec_decode_state", None)
-        if pending_decode_state is None:
-            return
-        if self._future_indices_match(
-            pending_decode_state.future_indices, getattr(result, "future_indices", None)
-        ):
-            self._ensure_pending_spec_decode_state_ready(pending_decode_state)
-
     def _resolve_overlap_batch_result(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -464,7 +431,6 @@ class SchedulerOutputProcessorMixin:
                 result, launch_done
             )
         if self._use_spec_overlap_worker(batch):
-            self._ensure_spec_overlap_result_ready(batch, result)
             return self.spec_overlap_worker.resolve_last_batch_result(result)
         return result
 

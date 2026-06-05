@@ -153,11 +153,7 @@ from sglang.srt.managers.mm_utils import (
     unwrap_shm_features,
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
-from sglang.srt.managers.overlap_utils import (
-    FutureIndices,
-    FutureMap,
-    clone_decode_placeholder_handle_contract,
-)
+from sglang.srt.managers.overlap_utils import FutureMap, clone_decode_placeholder_handle_contract
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
@@ -254,11 +250,6 @@ else:
 
 logger = logging.getLogger(__name__)
 
-
-@dataclass
-class SpecDecodePendingState:
-    future_indices: FutureIndices
-    ready_event: Optional[torch.cuda.Event] = None
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
@@ -1162,7 +1153,6 @@ class Scheduler(
             self.spec_overlap_worker = None
             self.future_map = None
             self.pending_spec_state_batch = None
-            self.pending_spec_decode_state = None
             return
 
         if self.is_generation and self.spec_algorithm.is_none():
@@ -1174,7 +1164,6 @@ class Scheduler(
             self.spec_overlap_worker = None
             self.future_map = None
             self.pending_spec_state_batch = None
-            self.pending_spec_decode_state = None
             self.batch_record_buf = [None] * 2
             self.batch_record_ct = 0
             return
@@ -1198,7 +1187,6 @@ class Scheduler(
         else:
             self.spec_overlap_worker = None
         self.pending_spec_state_batch = None
-        self.pending_spec_decode_state = None
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
 
@@ -1442,13 +1430,9 @@ class Scheduler(
                 continue
 
             if use_spec_overlap_worker and self._spec_state_must_be_ready_for_selection():
-                pending_decode_state = getattr(self, "pending_spec_decode_state", None)
-                if pending_decode_state is not None:
-                    self._ensure_pending_spec_decode_state_ready(pending_decode_state)
-                else:
-                    self._ensure_pending_spec_state_ready(
-                        getattr(self, "pending_spec_state_batch", None)
-                    )
+                self._ensure_pending_spec_state_ready(
+                    getattr(self, "pending_spec_state_batch", None)
+                )
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
@@ -2832,24 +2816,6 @@ class Scheduler(
         if self.spec_overlap_worker is None:
             return False
 
-        pending_decode_state = getattr(self, "pending_spec_decode_state", None)
-        if pending_decode_state is not None:
-            canonical_ready_buf = (
-                getattr(self.future_map, "canonical_ready_buf", None)
-                if self.future_map is not None
-                else None
-            )
-            if (
-                canonical_ready_buf is not None
-                and bool(
-                    torch.all(
-                        canonical_ready_buf[pending_decode_state.future_indices.indices]
-                    ).item()
-                )
-            ):
-                return False
-            return True
-
         pending_batch = getattr(self, "pending_spec_state_batch", None)
         if pending_batch is None:
             return False
@@ -2876,45 +2842,6 @@ class Scheduler(
                 return False
 
         return True
-
-    def _ensure_pending_spec_decode_state_ready(
-        self,
-        pending_state: Optional[SpecDecodePendingState],
-    ) -> None:
-        current_pending_state = getattr(self, "pending_spec_decode_state", None)
-        if (
-            self.spec_overlap_worker is None
-            or pending_state is None
-            or current_pending_state is None
-            or current_pending_state is not pending_state
-        ):
-            return
-
-        canonical_ready_buf = (
-            getattr(self.future_map, "canonical_ready_buf", None)
-            if self.future_map is not None
-            else None
-        )
-        ready = False
-        if canonical_ready_buf is not None:
-            ready = bool(
-                torch.all(canonical_ready_buf[pending_state.future_indices.indices]).item()
-            )
-        if not ready and pending_state.ready_event is not None:
-            pending_state.ready_event.synchronize()
-            if canonical_ready_buf is not None:
-                ready = bool(
-                    torch.all(
-                        canonical_ready_buf[pending_state.future_indices.indices]
-                    ).item()
-                )
-        if not ready:
-            raise RuntimeError(
-                "spec-v2 decode stable-ready wait completed without FutureMap "
-                "canonical-ready becoming visible."
-            )
-        self.pending_spec_decode_state = None
-
     def _ensure_pending_spec_state_ready(
         self,
         batch: Optional[ScheduleBatch],
@@ -3001,14 +2928,8 @@ class Scheduler(
                             batch_result.next_draft_input,
                             batch_result.future_indices,
                         )
-                        self.pending_spec_decode_state = SpecDecodePendingState(
-                            future_indices=batch_result.future_indices,
-                            ready_event=batch_result.spec_ready_event,
-                        )
-                        self.pending_spec_state_batch = None
                     else:
                         self.pending_spec_state_batch = batch
-                        self.pending_spec_decode_state = None
                     future_indices_or_next_token_ids = batch_result.next_token_ids
                 else:
                     self.record_batch_in_overlap(model_worker_batch)

@@ -178,21 +178,25 @@ def clone_spec_info_for_worker_launch(
 
     from sglang.srt.speculative.eagle_info import EagleDraftInput
 
-    capture_hidden_mode = (
-        launch_schema.capture_hidden_mode
-        if launch_schema is not None
-        else getattr(draft_input, "capture_hidden_mode", None)
+    capture_hidden_mode = getattr(draft_input, "capture_hidden_mode", None)
+    if capture_hidden_mode is None and launch_schema is not None:
+        capture_hidden_mode = launch_schema.capture_hidden_mode
+
+    num_tokens_per_req = int(getattr(draft_input, "num_tokens_per_req", -1) or -1)
+    if num_tokens_per_req <= 0 and launch_schema is not None:
+        num_tokens_per_req = int(launch_schema.num_tokens_per_req)
+
+    num_tokens_for_logprob_per_req = int(
+        getattr(draft_input, "num_tokens_for_logprob_per_req", -1) or -1
     )
-    num_tokens_per_req = (
-        int(launch_schema.num_tokens_per_req)
-        if launch_schema is not None
-        else getattr(draft_input, "num_tokens_per_req", -1)
-    )
-    num_tokens_for_logprob_per_req = (
-        int(launch_schema.num_tokens_for_logprob_per_req)
-        if launch_schema is not None
-        else getattr(draft_input, "num_tokens_for_logprob_per_req", -1)
-    )
+    if num_tokens_for_logprob_per_req <= 0 and launch_schema is not None:
+        num_tokens_for_logprob_per_req = int(
+            launch_schema.num_tokens_for_logprob_per_req
+        )
+
+    verify_token_num = int(getattr(draft_input, "verify_token_num", -1) or -1)
+    if verify_token_num <= 0 and launch_schema is not None:
+        verify_token_num = int(launch_schema.token_list_width) + 1
 
     worker_private_spec_info = EagleDraftInput(
         future_indices=clone_future_indices_handle(
@@ -208,7 +212,7 @@ def clone_spec_info_for_worker_launch(
         capture_hidden_mode=capture_hidden_mode,
         num_tokens_per_req=num_tokens_per_req,
         num_tokens_for_logprob_per_req=num_tokens_for_logprob_per_req,
-        verify_token_num=getattr(draft_input, "verify_token_num", -1),
+        verify_token_num=verify_token_num,
     )
     return worker_private_spec_info
 

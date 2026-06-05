@@ -2348,6 +2348,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     draft_input.verify_done
                 )
 
+    def _get_worker_capture_hidden_mode(self) -> CaptureHiddenMode:
+        return (
+            CaptureHiddenMode.FULL
+            if self.return_hidden_states
+            else (
+                getattr(self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL)
+                if self.spec_info is not None
+                else CaptureHiddenMode.NULL
+            )
+        )
+
     def build_decode_placeholder_launch_schema(
         self,
     ) -> Optional["DecodePlaceholderLaunchSchema"]:
@@ -2360,45 +2371,53 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         from sglang.srt.managers.overlap_utils import DecodePlaceholderLaunchSchema
 
+        draft_input = self.spec_info
         server_args = get_global_server_args()
         speculative_num_steps = int(getattr(server_args, "speculative_num_steps", 0) or 0)
-        default_num_tokens_per_req = max(1, speculative_num_steps + 1)
-        default_num_tokens_for_logprob_per_req = default_num_tokens_per_req
+        num_tokens_per_req = int(
+            getattr(draft_input, "num_tokens_per_req", -1) or -1
+        )
+        num_tokens_for_logprob_per_req = int(
+            getattr(draft_input, "num_tokens_for_logprob_per_req", -1) or -1
+        )
 
         get_adjust_token_coefficient = getattr(
-            self.spec_info, "get_spec_adjust_token_coefficient", None
+            draft_input, "get_spec_adjust_token_coefficient", None
         )
         if callable(get_adjust_token_coefficient):
-            num_tokens_per_req, num_tokens_for_logprob_per_req = (
+            adjusted_num_tokens_per_req, adjusted_num_tokens_for_logprob_per_req = (
                 get_adjust_token_coefficient()
             )
-            if num_tokens_per_req is not None and num_tokens_per_req > 0:
-                default_num_tokens_per_req = int(num_tokens_per_req)
+            if num_tokens_per_req <= 0 and adjusted_num_tokens_per_req is not None:
+                if adjusted_num_tokens_per_req > 0:
+                    num_tokens_per_req = int(adjusted_num_tokens_per_req)
             if (
-                num_tokens_for_logprob_per_req is not None
-                and num_tokens_for_logprob_per_req > 0
+                num_tokens_for_logprob_per_req <= 0
+                and adjusted_num_tokens_for_logprob_per_req is not None
             ):
-                default_num_tokens_for_logprob_per_req = int(
-                    num_tokens_for_logprob_per_req
-                )
+                if adjusted_num_tokens_for_logprob_per_req > 0:
+                    num_tokens_for_logprob_per_req = int(
+                        adjusted_num_tokens_for_logprob_per_req
+                    )
+
+        default_num_tokens_per_req = max(1, speculative_num_steps + 1)
+        if num_tokens_per_req <= 0:
+            num_tokens_per_req = default_num_tokens_per_req
+        if num_tokens_for_logprob_per_req <= 0:
+            num_tokens_for_logprob_per_req = num_tokens_per_req
 
         placeholder_dtype = getattr(getattr(self, "input_ids", None), "dtype", torch.int32)
-        token_list_width = int(server_args.speculative_num_draft_tokens) - 1
-        capture_hidden_mode = (
-            CaptureHiddenMode.FULL
-            if self.return_hidden_states
-            else (
-                getattr(self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL)
-                if self.spec_info is not None
-                else CaptureHiddenMode.NULL
-            )
-        )
+        verify_token_num = int(getattr(draft_input, "verify_token_num", -1) or -1)
+        if verify_token_num <= 0:
+            verify_token_num = int(server_args.speculative_num_draft_tokens)
+        token_list_width = verify_token_num - 1
+        capture_hidden_mode = self._get_worker_capture_hidden_mode()
         return DecodePlaceholderLaunchSchema(
             token_list_width=token_list_width,
             placeholder_dtype=placeholder_dtype,
             capture_hidden_mode=capture_hidden_mode,
-            num_tokens_per_req=default_num_tokens_per_req,
-            num_tokens_for_logprob_per_req=default_num_tokens_for_logprob_per_req,
+            num_tokens_per_req=num_tokens_per_req,
+            num_tokens_for_logprob_per_req=num_tokens_for_logprob_per_req,
         )
 
     def materialize_spec_v2_decode_live_seq_lens(self) -> bool:
@@ -2674,17 +2693,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_info=worker_spec_info,
             decode_placeholder_launch_schema=decode_placeholder_launch_schema,
             hicache_consumer_index=self.hicache_consumer_index,
-            capture_hidden_mode=(
-                CaptureHiddenMode.FULL
-                if self.return_hidden_states
-                else (
-                    getattr(
-                        self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
-                    )
-                    if self.spec_info
-                    else CaptureHiddenMode.NULL
-                )
-            ),
+            capture_hidden_mode=self._get_worker_capture_hidden_mode(),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             is_prefill_only=self.is_prefill_only,
             dimensions=self.dimensions,

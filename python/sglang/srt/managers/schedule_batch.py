@@ -2420,7 +2420,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             num_tokens_for_logprob_per_req=num_tokens_for_logprob_per_req,
         )
 
-    def materialize_spec_v2_decode_live_seq_lens(self) -> bool:
+    def materialize_spec_v2_decode_live_seq_lens(
+        self, allow_compat_fallback: bool = False
+    ) -> bool:
         if not self.is_spec_v2 or not self.forward_mode.is_decode():
             return False
 
@@ -2428,27 +2430,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if draft_input is None:
             return False
 
-        get_shared_verified_lens = getattr(
-            draft_input, "_get_shared_verified_lens_for_batch", None
-        )
-        shared_verified_lens = (
-            get_shared_verified_lens(self)
-            if get_shared_verified_lens is not None
-            else None
-        )
-        if (
-            shared_verified_lens is None
-            and getattr(draft_input, "verify_done", None) is not None
-        ):
-            draft_input.verify_done.synchronize()
-
         materialize_fn = getattr(
             draft_input, "_materialize_decode_seq_lens_for_batch", None
         )
         if materialize_fn is None:
             return False
 
-        return bool(materialize_fn(self))
+        if materialize_fn(self, allow_compat_fallback=False):
+            return True
+        if not allow_compat_fallback:
+            return False
+
+        compat_materialize_fn = getattr(
+            draft_input, "_compat_materialize_decode_seq_lens_for_batch", None
+        )
+        if compat_materialize_fn is not None:
+            return bool(compat_materialize_fn(self))
+        return bool(materialize_fn(self, allow_compat_fallback=True))
 
     def filter_batch(
         self,
@@ -2458,7 +2456,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         v1_spec_info_filtered: Optional[bool] = False,
     ):
         if self.forward_mode.is_decode():
-            self.materialize_spec_v2_decode_live_seq_lens()
+            self.materialize_spec_v2_decode_live_seq_lens(
+                allow_compat_fallback=False
+            )
         if self.has_pending_spec_decode_state() and not self.forward_mode.is_decode():
             self.maybe_wait_verify_done()
             self.materialize_spec_decode_seq_lens_carrier()
@@ -2547,9 +2547,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # filter_batch, so running_batch.seq_lens may still be a forward_stream
         # future. Synchronize here to avoid a cross-stream data race.
         if self.forward_mode.is_decode():
-            self.materialize_spec_v2_decode_live_seq_lens()
+            self.materialize_spec_v2_decode_live_seq_lens(
+                allow_compat_fallback=False
+            )
         if other.forward_mode.is_decode():
-            other.materialize_spec_v2_decode_live_seq_lens()
+            other.materialize_spec_v2_decode_live_seq_lens(
+                allow_compat_fallback=False
+            )
         if self.has_pending_spec_decode_state() and not self.forward_mode.is_decode():
             self.maybe_wait_verify_done()
             self.materialize_spec_decode_seq_lens_carrier()

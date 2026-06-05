@@ -29,8 +29,8 @@ class SpecOverlapApplyState:
     batch_uid: int
     future_indices: FutureIndices
     next_draft_input: Optional["EagleDraftInput"] = None
-    next_decode_seq_lens: Optional[torch.Tensor] = None
-    next_verify_done: Optional[object] = None
+    future_next_step_seq_lens_buf: Optional[torch.Tensor] = None
+    future_canonical_ready_buf: Optional[torch.Tensor] = None
     requires_scheduler_apply: bool = True
 
 
@@ -75,13 +75,15 @@ class SpecModelWorkerOverlapClient:
                 )
             return
 
-        if apply_state.next_verify_done is None:
+        if apply_state.future_next_step_seq_lens_buf is None:
             raise RuntimeError(
-                "Decode canonical-only apply state must carry next_verify_done."
+                "Decode canonical-only apply state must carry "
+                "future_next_step_seq_lens_buf."
             )
-        if apply_state.next_decode_seq_lens is None:
+        if apply_state.future_canonical_ready_buf is None:
             raise RuntimeError(
-                "Decode canonical-only apply state must carry next_decode_seq_lens."
+                "Decode canonical-only apply state must carry "
+                "future_canonical_ready_buf."
             )
 
     def _bind_thread_device(self) -> None:
@@ -186,7 +188,10 @@ class SpecModelWorkerOverlapClient:
                 and model_worker_batch.spec_algorithm.supports_spec_v2()
                 and model_worker_batch.spec_info is not None
             ):
-                model_worker_batch.spec_info.prepare_decode_live_view(model_worker_batch)
+                model_worker_batch.spec_info.prepare_decode_live_view(
+                    model_worker_batch,
+                    allow_compat_fallback=False,
+                )
             batch_result = self.worker.forward_batch_generation(
                 model_worker_batch,
                 launch_done=model_worker_batch.launch_done,
@@ -225,27 +230,25 @@ class SpecModelWorkerOverlapClient:
                     )
                 )
             else:
-                next_draft_input = batch_result.next_draft_input
-                next_decode_seq_lens = getattr(
-                    next_draft_input, "next_step_seq_lens", None
-                )
-                next_verify_done = getattr(next_draft_input, "verify_done", None)
-                if next_decode_seq_lens is None:
+                future_next_step_seq_lens_buf = self.future_map.next_step_seq_lens_buf
+                future_canonical_ready_buf = self.future_map.canonical_ready_buf
+                if future_next_step_seq_lens_buf is None:
                     raise RuntimeError(
                         "decode steady-state overlap worker must produce "
-                        "next_step_seq_lens for canonical placeholder apply"
+                        "future next-step seq-lens companion for canonical "
+                        "placeholder apply"
                     )
-                if next_verify_done is None:
+                if future_canonical_ready_buf is None:
                     raise RuntimeError(
                         "decode steady-state overlap worker must produce "
-                        "verify_done for canonical placeholder apply"
+                        "canonical-ready companion for canonical placeholder apply"
                     )
                 self.apply_queue.put(
                     SpecOverlapApplyState(
                         batch_uid=id(model_worker_batch),
                         future_indices=future_indices,
-                        next_decode_seq_lens=next_decode_seq_lens,
-                        next_verify_done=next_verify_done,
+                        future_next_step_seq_lens_buf=future_next_step_seq_lens_buf,
+                        future_canonical_ready_buf=future_canonical_ready_buf,
                         requires_scheduler_apply=False,
                     )
                 )

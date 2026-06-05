@@ -410,7 +410,9 @@ class EagleDraftInputV2Mixin:
     ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
         return _get_shared_verified_lens_for_batch_like(batch)
 
-    def _materialize_decode_seq_lens_for_batch(self, batch: Any) -> bool:
+    def _materialize_decode_seq_lens_for_batch(
+        self, batch: Any, allow_compat_fallback: bool = True
+    ) -> bool:
         shared_verified_lens = self._get_shared_verified_lens_for_batch(batch)
         if shared_verified_lens is not None:
             seq_lens_device, seq_lens_cpu = shared_verified_lens
@@ -450,6 +452,9 @@ class EagleDraftInputV2Mixin:
             batch.seq_lens_sum = int(seq_lens_cpu.sum().item())
             self.next_step_seq_lens = seq_lens_device
             return True
+
+        if not allow_compat_fallback:
+            return False
 
         if hasattr(batch, "materialize_spec_decode_seq_lens_carrier"):
             if batch.materialize_spec_decode_seq_lens_carrier():
@@ -497,14 +502,25 @@ class EagleDraftInputV2Mixin:
         if self.verify_done is not None:
             self.verify_done.synchronize()
 
-    def prepare_decode_live_view(self: EagleDraftInput, batch: Any) -> None:
+    def _compat_materialize_decode_seq_lens_for_batch(self, batch: Any) -> bool:
+        self._wait_verify_done_for_batch(batch)
+        return self._materialize_decode_seq_lens_for_batch(
+            batch, allow_compat_fallback=True
+        )
+
+    def prepare_decode_live_view(
+        self: EagleDraftInput, batch: Any, allow_compat_fallback: bool = True
+    ) -> None:
         if hasattr(batch, "maybe_evict_swa"):
             batch.maybe_evict_swa()
         else:
             self._evict_swa_batch_like(batch)
 
-        self._wait_verify_done_for_batch(batch)
-        if not self._materialize_decode_seq_lens_for_batch(batch):
+        if not self._materialize_decode_seq_lens_for_batch(
+            batch, allow_compat_fallback=False
+        ):
+            if allow_compat_fallback:
+                self._compat_materialize_decode_seq_lens_for_batch(batch)
             if (
                 self.future_indices is not None
                 and self.new_seq_lens is None
@@ -568,7 +584,7 @@ class EagleDraftInputV2Mixin:
         )
 
     def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
-        self.prepare_decode_live_view(batch)
+        self.prepare_decode_live_view(batch, allow_compat_fallback=True)
         self.prepare_decode_allocation(batch)
 
     def prepare_for_v2_draft(

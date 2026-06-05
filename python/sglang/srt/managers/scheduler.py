@@ -2801,11 +2801,15 @@ class Scheduler(
                 )
             if getattr(existing_spec_info, "future_indices", None) is None:
                 existing_spec_info.future_indices = apply_state.future_indices
-            existing_spec_info.verify_done = apply_state.next_verify_done
-            if apply_state.next_decode_seq_lens is not None:
-                existing_spec_info.next_step_seq_lens = (
-                    apply_state.next_decode_seq_lens
-                )
+            existing_spec_info.verify_done = None
+            existing_spec_info.next_step_seq_lens = None
+            existing_spec_info.future_next_step_seq_lens_buf = (
+                apply_state.future_next_step_seq_lens_buf
+            )
+            existing_spec_info.future_canonical_ready_buf = (
+                apply_state.future_canonical_ready_buf
+            )
+            batch.spec_decode_seq_lens_carrier = None
             return
 
         self._apply_spec_v2_future_state(
@@ -2832,9 +2836,9 @@ class Scheduler(
             return False
 
         # A-收口版下，batch-visible handle 回到单轨 `spec_info.future_indices`。
-        # 但当前 decode steady-state submit-time placeholder 在 minimal apply
-        # (`verify_done` / `next_step_seq_lens`) 到达前，仍不是可安全参与
-        # selection/filter/merge 的稳定视图；否则下一拍会拿旧 batch 的
+        # 当前 decode steady-state 必须等 worker-owned stable-ready companion
+        #（future next-step seq-lens buf + canonical-ready buf）安装完成后，
+        # 才能安全参与 selection/filter/merge；否则下一拍会拿 submit-time
         # placeholder handle 继续推进，最终命中 future_indices_batch_mismatch。
         if (
             pending_batch.is_spec_v2
@@ -2846,8 +2850,10 @@ class Scheduler(
             if (
                 future_indices is not None
                 and draft_input is not None
-                and getattr(draft_input, "verify_done", None) is not None
-                and getattr(draft_input, "next_step_seq_lens", None) is not None
+                and getattr(draft_input, "future_next_step_seq_lens_buf", None)
+                is not None
+                and getattr(draft_input, "future_canonical_ready_buf", None)
+                is not None
             ):
                 return False
 

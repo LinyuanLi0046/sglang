@@ -1437,6 +1437,7 @@ class Scheduler(
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+            pending_result_batch = self.result_queue[0][0] if len(self.result_queue) > 0 else None
             must_resolve_prefill_before_first_decode = (
                 use_spec_overlap_worker
                 and batch is not None
@@ -1444,10 +1445,9 @@ class Scheduler(
                 and batch.forward_mode.is_decode()
                 and not batch.is_extend_in_batch
                 and getattr(batch, "spec_decode_launch_schema", None) is None
-                and self.last_batch is not None
-                and self.last_batch.is_spec_v2
-                and self.last_batch.forward_mode.is_extend()
-                and len(self.result_queue) > 0
+                and pending_result_batch is not None
+                and pending_result_batch.is_spec_v2
+                and pending_result_batch.forward_mode.is_extend()
             )
 
             # If we do not need to overlap the current batch with the last batch,

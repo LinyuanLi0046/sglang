@@ -169,7 +169,6 @@ class SchedulerOutputProcessorMixin:
         result = self._resolve_overlap_batch_result(
             batch, result, launch_done=launch_done
         )
-        self._apply_spec_v2_overlap_future_result_if_needed(batch, result)
 
         if self.is_generation:
             if result.copy_done is not None:
@@ -366,6 +365,9 @@ class SchedulerOutputProcessorMixin:
                     req.is_chunked -= 1
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
+        if batch.is_spec_v2:
+            batch.sync_decode_seq_lens_from_reqs()
+
         self._prepare_next_batch_sampling_info(batch)
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
@@ -435,29 +437,6 @@ class SchedulerOutputProcessorMixin:
             return self.spec_overlap_worker.resolve_last_batch_result(result)
         return result
 
-    def _apply_spec_v2_overlap_future_result_if_needed(
-        self: Scheduler,
-        batch: ScheduleBatch,
-        result: GenerationBatchResult,
-    ) -> None:
-        if (
-            not self._use_spec_overlap_worker(batch)
-            or not batch.is_spec_v2
-            or batch.forward_mode.is_decode()
-        ):
-            return
-
-        future_indices = result.future_indices
-        if future_indices is None:
-            raise RuntimeError(
-                "spec-v2 overlap non-decode result missing future_indices at "
-                "output-resolve boundary"
-            )
-        live_batch = getattr(batch, "_postprocess_live_batch_ref", None)
-        if live_batch is None:
-            live_batch = batch
-        self._apply_spec_v2_future_result(live_batch, result, future_indices)
-
     def process_batch_result_idle(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -482,7 +461,6 @@ class SchedulerOutputProcessorMixin:
         result = self._resolve_overlap_batch_result(
             batch, result, launch_done=launch_done
         )
-        self._apply_spec_v2_overlap_future_result_if_needed(batch, result)
 
         if result.copy_done is not None:
             result.copy_done.synchronize()

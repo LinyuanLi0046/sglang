@@ -569,7 +569,7 @@ class EagleDraftInputV2Mixin:
         )
 
     def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
-        self.prepare_decode_live_view(batch, allow_compat_fallback=True)
+        self.prepare_decode_live_view(batch, allow_compat_fallback=False)
         self.prepare_decode_allocation(batch)
 
     def prepare_for_v2_draft(

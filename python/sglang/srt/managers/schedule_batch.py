@@ -2330,6 +2330,30 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         draft_input = getattr(self, "spec_info", None)
         return getattr(draft_input, "future_indices", None)
 
+    def install_spec_decode_stable_owner(
+        self,
+        future_indices: Optional["FutureIndices"],
+        launch_schema: Optional["DecodePlaceholderLaunchSchema"],
+    ) -> None:
+        if future_indices is not None:
+            self.spec_future_handle_carrier = future_indices
+        if launch_schema is not None:
+            self.spec_decode_launch_schema = launch_schema
+
+        active_launch_schema = self.build_decode_placeholder_launch_schema()
+        active_future_indices = self.get_spec_future_indices()
+        if active_launch_schema is None or active_future_indices is None:
+            return
+
+        from sglang.srt.managers.overlap_utils import (
+            build_decode_placeholder_canonical_draft_input,
+        )
+
+        self.spec_info = build_decode_placeholder_canonical_draft_input(
+            future_indices=active_future_indices,
+            launch_schema=active_launch_schema,
+        )
+
     def sync_decode_seq_lens_from_reqs(self):
         if len(self.reqs) == 0:
             self._set_decode_seq_lens_tensors(
@@ -2369,6 +2393,35 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 else CaptureHiddenMode.NULL
             )
         )
+
+    def build_prefill_first_decode_launch_schema(
+        self,
+    ) -> Optional["DecodePlaceholderLaunchSchema"]:
+        existing_launch_schema = getattr(self, "spec_decode_launch_schema", None)
+        if existing_launch_schema is not None:
+            return existing_launch_schema
+
+        if not self.is_spec_v2 or self.forward_mode.is_decode():
+            return existing_launch_schema
+
+        from sglang.srt.managers.overlap_utils import DecodePlaceholderLaunchSchema
+
+        server_args = get_global_server_args()
+        verify_token_num = int(server_args.speculative_num_draft_tokens or -1)
+        if verify_token_num <= 0:
+            return None
+
+        launch_schema = DecodePlaceholderLaunchSchema(
+            token_list_width=verify_token_num - 1,
+            placeholder_dtype=getattr(
+                getattr(self, "input_ids", None), "dtype", torch.int32
+            ),
+            capture_hidden_mode=self._get_worker_capture_hidden_mode(),
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
+        )
+        self.spec_decode_launch_schema = launch_schema
+        return launch_schema
 
     def build_decode_placeholder_launch_schema(
         self,
@@ -2558,6 +2611,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.has_grammar = any(req.grammar for req in self.reqs)
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
+        if self.spec_future_handle_carrier is not None:
+            self.spec_future_handle_carrier = FutureIndices(
+                indices=self.spec_future_handle_carrier.indices[keep_indices_device]
+            )
         # NOTE: spec_info filtered before batch filtering only happens in:
         # - Spec v1's verify phase
         # - Only for decode batch (running_batch)
@@ -2598,8 +2655,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 f"rhs={other.spec_decode_launch_schema}"
             )
 
-        if self.spec_future_handle_carrier is None:
-            self.spec_future_handle_carrier = other.spec_future_handle_carrier
+        from sglang.srt.managers.overlap_utils import (
+            merge_decode_placeholder_handle_contract,
+            merge_future_indices_handle,
+        )
+
+        self.spec_future_handle_carrier = merge_future_indices_handle(
+            self.spec_future_handle_carrier, other.spec_future_handle_carrier
+        )
 
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
@@ -2642,7 +2705,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.return_hidden_states |= other.return_hidden_states
         self.is_prefill_only = self.is_prefill_only and other.is_prefill_only
 
-        if self.spec_info:
+        if self.is_spec_v2:
+            from sglang.srt.managers.overlap_utils import (
+                merge_decode_placeholder_handle_contract,
+            )
+
+            self.spec_info = merge_decode_placeholder_handle_contract(
+                self.spec_info, other.spec_info
+            )
+        elif self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
 
     def get_model_worker_batch(

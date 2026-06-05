@@ -113,6 +113,17 @@ def clone_future_indices_handle(
     )
 
 
+def merge_future_indices_handle(
+    lhs: Optional[FutureIndices],
+    rhs: Optional[FutureIndices],
+) -> Optional[FutureIndices]:
+    if lhs is None:
+        return clone_future_indices_handle(rhs)
+    if rhs is None:
+        return clone_future_indices_handle(lhs)
+    return FutureIndices(indices=torch.cat([lhs.indices, rhs.indices], dim=0))
+
+
 def sanitize_decode_placeholder_handle_contract(
     draft_input: Optional["EagleDraftInput"],
 ) -> Optional["EagleDraftInput"]:
@@ -160,6 +171,20 @@ def clone_decode_placeholder_handle_contract(
         token_list=getattr(draft_input, "token_list", None),
     )
     return sanitize_decode_placeholder_handle_contract(placeholder_carrier)
+
+
+def merge_decode_placeholder_handle_contract(
+    lhs: Optional["EagleDraftInput"],
+    rhs: Optional["EagleDraftInput"],
+) -> Optional["EagleDraftInput"]:
+    lhs_handle = clone_decode_placeholder_handle_contract(lhs)
+    rhs_handle = clone_decode_placeholder_handle_contract(rhs)
+    if lhs_handle is None:
+        return rhs_handle
+    if rhs_handle is None:
+        return lhs_handle
+    lhs_handle.merge_batch(rhs_handle)
+    return sanitize_decode_placeholder_handle_contract(lhs_handle)
 
 
 def clone_spec_info_for_worker_launch(

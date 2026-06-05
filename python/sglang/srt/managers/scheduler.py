@@ -1436,32 +1436,11 @@ class Scheduler(
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
-            pending_result_batch = self.result_queue[0][0] if len(self.result_queue) > 0 else None
-            must_resolve_prefill_before_first_decode = (
-                use_spec_overlap_worker
-                and batch is not None
-                and batch.is_spec_v2
-                and batch.forward_mode.is_decode()
-                and not batch.is_extend_in_batch
-                and getattr(batch, "spec_decode_launch_schema", None) is None
-                and pending_result_batch is not None
-                and pending_result_batch.is_spec_v2
-                and pending_result_batch.forward_mode.is_extend()
-            )
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
             if disable_overlap_for_batch:
                 pop_and_process()
-            elif must_resolve_prefill_before_first_decode:
-                pop_and_process()
-                # The candidate decode batch was derived before the previous
-                # prefill overlap result reinstalled live speculative state on
-                # the running batch. Drop it and let the next loop iteration
-                # rebuild first-decode launch state from the updated owner.
-                self.last_batch = None
-                self.cur_batch = None
-                continue
 
             # Launch the current batch
             if batch:
@@ -2783,19 +2762,28 @@ class Scheduler(
             )
 
         next_draft_input.future_indices = future_indices
-        batch.spec_future_handle_carrier = future_indices
         if batch.forward_mode.is_decode():
             batch.spec_info = next_draft_input
-            batch.build_decode_placeholder_launch_schema()
-            batch.spec_info = clone_decode_placeholder_handle_contract(
-                next_draft_input,
-                future_indices=future_indices,
-            )
-            batch.spec_decode_seq_lens_carrier = None
+            launch_schema = batch.build_decode_placeholder_launch_schema()
         else:
-            batch.spec_info = next_draft_input
-            # Extend/prefill fallback still keeps the legacy relay contract for now.
-            batch.seq_lens = next_draft_input.new_seq_lens
+            launch_schema = batch.build_prefill_first_decode_launch_schema()
+
+        batch.install_spec_decode_stable_owner(
+            future_indices=future_indices,
+            launch_schema=launch_schema,
+        )
+        batch.spec_decode_seq_lens_carrier = None
+
+    def _install_spec_v2_submit_placeholder_carrier(
+        self,
+        batch: ScheduleBatch,
+        future_indices,
+    ) -> None:
+        launch_schema = batch.build_prefill_first_decode_launch_schema()
+        batch.install_spec_decode_stable_owner(
+            future_indices=future_indices,
+            launch_schema=launch_schema,
+        )
 
     def _apply_spec_v2_submit_placeholder_carrier(
         self,
@@ -2815,6 +2803,7 @@ class Scheduler(
         batch.spec_info = placeholder_carrier
         batch.spec_future_handle_carrier = future_indices
         batch.spec_decode_seq_lens_carrier = None
+        batch.build_decode_placeholder_launch_schema()
 
     def _apply_spec_v2_overlap_state(
         self,
@@ -2899,6 +2888,11 @@ class Scheduler(
                         self._apply_spec_v2_submit_placeholder_carrier(
                             batch,
                             batch_result.next_draft_input,
+                            batch_result.future_indices,
+                        )
+                    else:
+                        self._install_spec_v2_submit_placeholder_carrier(
+                            batch,
                             batch_result.future_indices,
                         )
                     future_indices_or_next_token_ids = batch_result.next_token_ids

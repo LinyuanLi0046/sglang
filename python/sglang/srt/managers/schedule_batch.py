@@ -2612,6 +2612,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
         if self.spec_future_handle_carrier is not None:
+            from sglang.srt.managers.overlap_utils import FutureIndices
+
             self.spec_future_handle_carrier = FutureIndices(
                 indices=self.spec_future_handle_carrier.indices[keep_indices_device]
             )

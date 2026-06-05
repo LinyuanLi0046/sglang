@@ -711,10 +711,6 @@ class LongcatFlashDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-        use_ops_prefill = (
-            _use_longcat_ops_deepep_runtime()
-            and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-        )
         use_sparse_layout = get_moe_a2a_backend().is_deepep()
         if get_global_server_args().enable_longcat_double_stream and MultiStreamUtils().main_stream is None and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             MultiStreamUtils().main_stream = torch.npu.current_stream()
@@ -791,8 +787,8 @@ class LongcatFlashDecoderLayer(nn.Module):
                     )
 
                     #torch.npu.current_stream().wait_event(MultiStreamUtils().fia_ffn_finished_event)
-
-                    # torch.npu.current_stream().wait_event(MultiStreamUtils().attn1_allreduce_finised)
+                    if not _use_longcat_ops_deepep_runtime():
+                        torch.npu.current_stream().wait_event(MultiStreamUtils().attn1_allreduce_finised)
                     moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
                         moe_hidden_states, moe_residual, forward_batch
                     )

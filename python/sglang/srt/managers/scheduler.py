@@ -1415,12 +1415,11 @@ class Scheduler(
         ):
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
-            live_batch_ref = None
-            running_batch = getattr(self, "running_batch", None)
-            if running_batch is not None and not running_batch.is_empty():
-                live_batch_ref = running_batch
-            elif self.last_batch is not None:
-                live_batch_ref = self.last_batch
+            live_batch_ref = self.last_batch
+            if live_batch_ref is None:
+                running_batch = getattr(self, "running_batch", None)
+                if running_batch is not None and not running_batch.is_empty():
+                    live_batch_ref = running_batch
             setattr(tmp_batch, "_postprocess_live_batch_ref", live_batch_ref)
             if use_non_spec_overlap_worker:
                 tmp_batch.next_batch_sampling_info = next_batch_sampling_info

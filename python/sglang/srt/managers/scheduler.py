@@ -1432,20 +1432,6 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
-            pending_result_batch = self.result_queue[0][0] if len(self.result_queue) > 0 else None
-            must_resolve_prefill_before_merge = (
-                use_spec_overlap_worker
-                and self.last_batch is not None
-                and self.last_batch.is_spec_v2
-                and self.last_batch.forward_mode.is_extend()
-                and getattr(self.last_batch, "spec_info", None) is None
-                and pending_result_batch is not None
-                and pending_result_batch.is_spec_v2
-                and pending_result_batch.forward_mode.is_extend()
-            )
-            if must_resolve_prefill_before_merge:
-                pop_and_process()
-
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch

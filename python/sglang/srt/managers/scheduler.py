@@ -2784,6 +2784,7 @@ class Scheduler(
             )
 
         next_draft_input.future_indices = future_indices
+        batch.spec_future_handle_carrier = future_indices
         if batch.forward_mode.is_decode():
             batch.spec_info = next_draft_input
             batch.build_decode_placeholder_launch_schema()
@@ -2813,6 +2814,7 @@ class Scheduler(
             future_indices=future_indices,
         )
         batch.spec_info = placeholder_carrier
+        batch.spec_future_handle_carrier = future_indices
         batch.spec_decode_seq_lens_carrier = None
 
     def _apply_spec_v2_overlap_state(

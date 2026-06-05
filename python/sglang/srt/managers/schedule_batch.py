@@ -1499,6 +1499,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # spec_info: Optional[SpecInput] = None
     spec_info: Optional[SpecInput] = None
     spec_decode_launch_schema: Optional["DecodePlaceholderLaunchSchema"] = None
+    spec_future_handle_carrier: Optional["FutureIndices"] = None
     spec_decode_seq_lens_carrier: Optional[torch.Tensor] = None
     spec_decode_alloc_reservation: Optional[SpecDecodeAllocReservation] = None
     spec_decode_postprocess_state: Optional[SpecDecodePostprocessState] = None
@@ -2323,6 +2324,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return False
 
     def get_spec_future_indices(self) -> Optional[FutureIndices]:
+        handle_carrier = getattr(self, "spec_future_handle_carrier", None)
+        if handle_carrier is not None:
+            return handle_carrier
         draft_input = getattr(self, "spec_info", None)
         return getattr(draft_input, "future_indices", None)
 
@@ -2369,16 +2373,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def build_decode_placeholder_launch_schema(
         self,
     ) -> Optional["DecodePlaceholderLaunchSchema"]:
+        existing_launch_schema = getattr(self, "spec_decode_launch_schema", None)
+        if existing_launch_schema is not None:
+            return existing_launch_schema
+
         if not (
             self.forward_mode.is_decode()
             and self.is_spec_v2
             and self.spec_info is not None
         ):
             return None
-
-        existing_launch_schema = getattr(self, "spec_decode_launch_schema", None)
-        if existing_launch_schema is not None:
-            return existing_launch_schema
 
         from sglang.srt.managers.overlap_utils import DecodePlaceholderLaunchSchema
 
@@ -2509,6 +2513,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # Filter out all requests
             self.reqs = []
             self.spec_decode_launch_schema = None
+            self.spec_future_handle_carrier = None
             return
 
         if len(keep_indices) == len(self.reqs):
@@ -2593,6 +2598,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 f"rhs={other.spec_decode_launch_schema}"
             )
 
+        if self.spec_future_handle_carrier is None:
+            self.spec_future_handle_carrier = other.spec_future_handle_carrier
+
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
@@ -2663,14 +2671,32 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.forward_mode.is_decode()
             and self.spec_algorithm is not None
             and self.spec_algorithm.supports_spec_v2()
-            and self.spec_info is not None
+            and worker_spec_info is None
+            and decode_placeholder_launch_schema is not None
+        ):
+            from sglang.srt.managers.overlap_utils import (
+                build_decode_placeholder_canonical_draft_input,
+            )
+
+            future_indices = self.get_spec_future_indices()
+            if future_indices is not None:
+                worker_spec_info = build_decode_placeholder_canonical_draft_input(
+                    future_indices=future_indices,
+                    launch_schema=decode_placeholder_launch_schema,
+                )
+        if (
+            self.forward_mode.is_decode()
+            and self.spec_algorithm is not None
+            and self.spec_algorithm.supports_spec_v2()
+            and worker_spec_info is not None
         ):
             from sglang.srt.managers.overlap_utils import (
                 clone_spec_info_for_worker_launch,
             )
 
             worker_spec_info = clone_spec_info_for_worker_launch(
-                self.spec_info,
+                worker_spec_info,
+                future_indices=self.get_spec_future_indices(),
                 launch_schema=decode_placeholder_launch_schema,
             )
 

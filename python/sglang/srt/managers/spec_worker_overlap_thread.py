@@ -94,6 +94,12 @@ class SpecModelWorkerOverlapClient:
     def _build_decode_placeholder_launch_schema(
         self, model_worker_batch: ModelWorkerBatch
     ) -> DecodePlaceholderLaunchSchema:
+        explicit_launch_schema = getattr(
+            model_worker_batch, "decode_placeholder_launch_schema", None
+        )
+        if explicit_launch_schema is not None:
+            return explicit_launch_schema
+
         default_num_tokens_per_req = getattr(self.worker, "speculative_num_steps", 0) + 1
         default_num_tokens_for_logprob_per_req = default_num_tokens_per_req
         existing_spec_info = getattr(model_worker_batch, "spec_info", None)

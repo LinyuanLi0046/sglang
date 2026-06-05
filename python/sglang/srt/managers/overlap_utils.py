@@ -158,6 +158,7 @@ def clone_decode_placeholder_handle_contract(
         ),
         last_verified_ids=getattr(draft_input, "last_verified_ids", None),
         token_list=getattr(draft_input, "token_list", None),
+        verify_token_num=getattr(draft_input, "verify_token_num", -1),
         capture_hidden_mode=getattr(draft_input, "capture_hidden_mode", None),
         num_tokens_per_req=getattr(draft_input, "num_tokens_per_req", -1),
         num_tokens_for_logprob_per_req=getattr(
@@ -170,11 +171,28 @@ def clone_decode_placeholder_handle_contract(
 def clone_spec_info_for_worker_launch(
     draft_input: Optional["EagleDraftInput"],
     future_indices: Optional[FutureIndices] = None,
+    launch_schema: Optional[DecodePlaceholderLaunchSchema] = None,
 ) -> Optional["EagleDraftInput"]:
     if draft_input is None:
         return None
 
     from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+    capture_hidden_mode = (
+        launch_schema.capture_hidden_mode
+        if launch_schema is not None
+        else getattr(draft_input, "capture_hidden_mode", None)
+    )
+    num_tokens_per_req = (
+        int(launch_schema.num_tokens_per_req)
+        if launch_schema is not None
+        else getattr(draft_input, "num_tokens_per_req", -1)
+    )
+    num_tokens_for_logprob_per_req = (
+        int(launch_schema.num_tokens_for_logprob_per_req)
+        if launch_schema is not None
+        else getattr(draft_input, "num_tokens_for_logprob_per_req", -1)
+    )
 
     worker_private_spec_info = EagleDraftInput(
         future_indices=clone_future_indices_handle(
@@ -187,11 +205,9 @@ def clone_spec_info_for_worker_launch(
         new_seq_lens=getattr(draft_input, "new_seq_lens", None),
         next_step_seq_lens=getattr(draft_input, "next_step_seq_lens", None),
         verify_done=getattr(draft_input, "verify_done", None),
-        capture_hidden_mode=getattr(draft_input, "capture_hidden_mode", None),
-        num_tokens_per_req=getattr(draft_input, "num_tokens_per_req", -1),
-        num_tokens_for_logprob_per_req=getattr(
-            draft_input, "num_tokens_for_logprob_per_req", -1
-        ),
+        capture_hidden_mode=capture_hidden_mode,
+        num_tokens_per_req=num_tokens_per_req,
+        num_tokens_for_logprob_per_req=num_tokens_for_logprob_per_req,
         verify_token_num=getattr(draft_input, "verify_token_num", -1),
     )
     return worker_private_spec_info

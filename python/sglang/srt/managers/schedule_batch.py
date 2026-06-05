@@ -96,6 +96,7 @@ if TYPE_CHECKING:
     from typing import Any, Dict
 
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.overlap_utils import DecodePlaceholderLaunchSchema
     from sglang.srt.managers.overlap_utils import FutureIndices
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.session_controller import Session
@@ -2347,6 +2348,59 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     draft_input.verify_done
                 )
 
+    def build_decode_placeholder_launch_schema(
+        self,
+    ) -> Optional["DecodePlaceholderLaunchSchema"]:
+        if not (
+            self.forward_mode.is_decode()
+            and self.is_spec_v2
+            and self.spec_info is not None
+        ):
+            return None
+
+        from sglang.srt.managers.overlap_utils import DecodePlaceholderLaunchSchema
+
+        server_args = get_global_server_args()
+        speculative_num_steps = int(getattr(server_args, "speculative_num_steps", 0) or 0)
+        default_num_tokens_per_req = max(1, speculative_num_steps + 1)
+        default_num_tokens_for_logprob_per_req = default_num_tokens_per_req
+
+        get_adjust_token_coefficient = getattr(
+            self.spec_info, "get_spec_adjust_token_coefficient", None
+        )
+        if callable(get_adjust_token_coefficient):
+            num_tokens_per_req, num_tokens_for_logprob_per_req = (
+                get_adjust_token_coefficient()
+            )
+            if num_tokens_per_req is not None and num_tokens_per_req > 0:
+                default_num_tokens_per_req = int(num_tokens_per_req)
+            if (
+                num_tokens_for_logprob_per_req is not None
+                and num_tokens_for_logprob_per_req > 0
+            ):
+                default_num_tokens_for_logprob_per_req = int(
+                    num_tokens_for_logprob_per_req
+                )
+
+        placeholder_dtype = getattr(getattr(self, "input_ids", None), "dtype", torch.int32)
+        token_list_width = int(server_args.speculative_num_draft_tokens) - 1
+        capture_hidden_mode = (
+            CaptureHiddenMode.FULL
+            if self.return_hidden_states
+            else (
+                getattr(self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL)
+                if self.spec_info is not None
+                else CaptureHiddenMode.NULL
+            )
+        )
+        return DecodePlaceholderLaunchSchema(
+            token_list_width=token_list_width,
+            placeholder_dtype=placeholder_dtype,
+            capture_hidden_mode=capture_hidden_mode,
+            num_tokens_per_req=default_num_tokens_per_req,
+            num_tokens_for_logprob_per_req=default_num_tokens_for_logprob_per_req,
+        )
+
     def materialize_spec_v2_decode_live_seq_lens(self) -> bool:
         if not self.is_spec_v2 or not self.forward_mode.is_decode():
             return False
@@ -2564,6 +2618,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         seq_lens_cpu = (
             seq_lens_cpu_cache if seq_lens_cpu_cache is not None else self.seq_lens_cpu
         )
+        decode_placeholder_launch_schema = self.build_decode_placeholder_launch_schema()
 
         worker_spec_info = self.spec_info
         if (
@@ -2576,7 +2631,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 clone_spec_info_for_worker_launch,
             )
 
-            worker_spec_info = clone_spec_info_for_worker_launch(self.spec_info)
+            worker_spec_info = clone_spec_info_for_worker_launch(
+                self.spec_info,
+                launch_schema=decode_placeholder_launch_schema,
+            )
 
         return ModelWorkerBatch(
             forward_mode=self.forward_mode,
@@ -2614,6 +2672,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             token_type_ids=self.token_type_ids,
             spec_algorithm=self.spec_algorithm,
             spec_info=worker_spec_info,
+            decode_placeholder_launch_schema=decode_placeholder_launch_schema,
             hicache_consumer_index=self.hicache_consumer_index,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
@@ -2808,6 +2867,7 @@ class ModelWorkerBatch:
     spec_algorithm: SpeculativeAlgorithm = None
 
     spec_info: Optional[SpecInput] = None
+    decode_placeholder_launch_schema: Optional["DecodePlaceholderLaunchSchema"] = None
 
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None

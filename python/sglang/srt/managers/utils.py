@@ -40,6 +40,7 @@ class GenerationBatchResult:
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[FutureIndices] = None
     launch_done: Optional[threading.Event] = None
+    scheduler_batch_uid: Optional[int] = None
 
     # FIXME(lsyin): maybe move to a better place?
     # sync path: forward stream -> output processor

@@ -1420,6 +1420,8 @@ class Scheduler(
         ):
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
+            if use_spec_overlap_worker and getattr(tmp_batch, "is_spec_v2", False):
+                self._ensure_spec_overlap_postprocess_ready(tmp_batch)
             if use_non_spec_overlap_worker:
                 tmp_batch.next_batch_sampling_info = next_batch_sampling_info
             self.process_batch_result(tmp_batch, tmp_result, launch_done)
@@ -1453,7 +1455,11 @@ class Scheduler(
                 ):
                     batch.launch_done = threading.Event()
                 batch_result = self.run_batch(batch)
-                self.result_queue.append((batch.copy(), batch_result))
+                if use_spec_overlap_worker and batch.is_spec_v2:
+                    batch_snapshot = batch.make_postprocess_snapshot()
+                else:
+                    batch_snapshot = batch.copy()
+                self.result_queue.append((batch_snapshot, batch_result))
                 if use_non_spec_overlap_worker and (
                     self.last_batch is None or disable_overlap_for_batch
                 ):
@@ -2877,6 +2883,28 @@ class Scheduler(
         )
         self.pending_spec_state_batch = None
 
+    def _ensure_spec_overlap_postprocess_ready(
+        self, batch_snapshot: Optional[ScheduleBatch]
+    ) -> None:
+        if self.spec_overlap_worker is None or batch_snapshot is None:
+            return
+
+        postprocess_state = getattr(batch_snapshot, "spec_decode_postprocess_state", None)
+        pending_batch_uid = (
+            getattr(postprocess_state, "scheduler_batch_uid", None)
+            if postprocess_state is not None
+            else None
+        )
+        pending_batch = getattr(self, "pending_spec_state_batch", None)
+        if (
+            pending_batch is None
+            or pending_batch_uid is None
+            or id(pending_batch) != pending_batch_uid
+        ):
+            return
+
+        self._ensure_pending_spec_state_ready(pending_batch)
+
     def run_batch(
         self,
         batch: ScheduleBatch,
@@ -3597,6 +3625,10 @@ class Scheduler(
         if self.enable_overlap and self.last_batch:
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
+            if getattr(self, "spec_overlap_worker", None) is not None and getattr(
+                tmp_batch, "is_spec_v2", False
+            ):
+                self._ensure_spec_overlap_postprocess_ready(tmp_batch)
             self.process_batch_result(tmp_batch, tmp_result, None)
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():

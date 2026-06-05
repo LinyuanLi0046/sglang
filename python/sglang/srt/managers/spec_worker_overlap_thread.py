@@ -224,7 +224,7 @@ class SpecModelWorkerOverlapClient:
                     )
                 self.apply_queue.put(
                     SpecOverlapApplyState(
-                        batch_uid=id(model_worker_batch),
+                        batch_uid=model_worker_batch.scheduler_batch_uid,
                         future_indices=future_indices,
                         next_draft_input=batch_result.next_draft_input,
                     )
@@ -245,7 +245,7 @@ class SpecModelWorkerOverlapClient:
                     )
                 self.apply_queue.put(
                     SpecOverlapApplyState(
-                        batch_uid=id(model_worker_batch),
+                        batch_uid=model_worker_batch.scheduler_batch_uid,
                         future_indices=future_indices,
                         future_next_step_seq_lens_buf=future_next_step_seq_lens_buf,
                         future_canonical_ready_buf=future_canonical_ready_buf,
@@ -254,6 +254,7 @@ class SpecModelWorkerOverlapClient:
                 )
 
             batch_result.copy_done = torch.get_device_module(self.device).Event()
+            batch_result.scheduler_batch_uid = model_worker_batch.scheduler_batch_uid
             batch_result.copy_to_cpu_for_spec_overlap(
                 return_logprob=return_logprob,
                 needs_hidden_states=needs_hidden_states,
@@ -312,6 +313,7 @@ class SpecModelWorkerOverlapClient:
             next_token_ids=-future_indices.indices,
             future_indices=future_indices,
             next_draft_input=placeholder_next_draft_input,
+            scheduler_batch_uid=model_worker_batch.scheduler_batch_uid,
         )
 
     def ensure_batch_state_ready(
@@ -326,6 +328,11 @@ class SpecModelWorkerOverlapClient:
             raise apply_state
 
         self._validate_apply_state_contract(apply_state)
+        if apply_state.batch_uid is not None and apply_state.batch_uid != id(batch):
+            raise RuntimeError(
+                "Spec overlap apply state batch_uid mismatch: "
+                f"expected={id(batch)}, actual={apply_state.batch_uid}"
+            )
         apply_future_result(batch, apply_state)
 
     def resolve_last_batch_result(
@@ -337,6 +344,17 @@ class SpecModelWorkerOverlapClient:
         batch_result = self.output_queue.get()
         if isinstance(batch_result, RuntimeError):
             raise batch_result
+        if (
+            placeholder_result.scheduler_batch_uid is not None
+            and batch_result.scheduler_batch_uid is not None
+            and batch_result.scheduler_batch_uid
+            != placeholder_result.scheduler_batch_uid
+        ):
+            raise RuntimeError(
+                "Spec overlap output result batch_uid mismatch: "
+                f"expected={placeholder_result.scheduler_batch_uid}, "
+                f"actual={batch_result.scheduler_batch_uid}"
+            )
         if batch_result.launch_done is not None:
             batch_result.launch_done.wait()
 

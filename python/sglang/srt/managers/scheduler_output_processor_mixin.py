@@ -407,11 +407,20 @@ class SchedulerOutputProcessorMixin:
         return predict_tokens
 
     def _commit_spec_decode_alloc_reservation(self, batch: ScheduleBatch) -> None:
-        reservation = getattr(batch, "spec_decode_alloc_reservation", None)
+        postprocess_state = getattr(batch, "spec_decode_postprocess_state", None)
+        if postprocess_state is not None:
+            reservation = getattr(
+                postprocess_state, "spec_decode_alloc_reservation", None
+            )
+        else:
+            reservation = getattr(batch, "spec_decode_alloc_reservation", None)
         if reservation is None:
             return
         reservation.commit()
-        batch.spec_decode_alloc_reservation = None
+        if postprocess_state is not None:
+            postprocess_state.spec_decode_alloc_reservation = None
+        else:
+            batch.spec_decode_alloc_reservation = None
 
     def process_batch_result_idle(
         self: Scheduler,
@@ -436,13 +445,6 @@ class SchedulerOutputProcessorMixin:
                 result, launch_done
             )
         elif self._use_spec_overlap_worker(batch):
-            pending_batch = getattr(self, "pending_spec_state_batch", None)
-            if pending_batch is not None:
-                # `batch` here is the result_queue snapshot (`batch.copy()`), not the
-                # original scheduler-owned batch stored in `pending_spec_state_batch`.
-                # Drain the final apply state against the real pending batch so the
-                # last decode step does not leave overlap apply work queued at idle.
-                self._ensure_pending_spec_state_ready(pending_batch)
             result = self.spec_overlap_worker.resolve_last_batch_result(result)
 
         if result.copy_done is not None:

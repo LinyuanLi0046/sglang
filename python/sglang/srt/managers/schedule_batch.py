@@ -1334,12 +1334,28 @@ class SpecDecodeAllocReservation:
         if self in pending:
             pending.remove(self)
 
+    def _maybe_scrub(self) -> None:
+        if not self.reqs:
+            return
+        if not all(
+            committed or rolled_back
+            for committed, rolled_back in zip(self._committed, self._rolled_back)
+        ):
+            return
+        self.reqs = []
+        self.cur_kv_lens_cpu = None
+        self.nxt_kv_lens_cpu = None
+        self._req_index = {}
+        self._committed = []
+        self._rolled_back = []
+
     def commit(self) -> None:
         for i, req in enumerate(self.reqs):
             if self._committed[i] or self._rolled_back[i]:
                 continue
             self._committed[i] = True
             self._detach_req(req)
+        self._maybe_scrub()
 
     def rollback_req(self, req: Req, tree_cache: BasePrefixCache) -> None:
         idx = self._req_index.get(id(req))
@@ -1357,6 +1373,13 @@ class SpecDecodeAllocReservation:
 
         self._rolled_back[idx] = True
         self._detach_req(req)
+        self._maybe_scrub()
+
+
+@dataclasses.dataclass
+class SpecDecodePostprocessState:
+    spec_decode_alloc_reservation: Optional[SpecDecodeAllocReservation] = None
+    scheduler_batch_uid: Optional[int] = None
 
 
 @dataclasses.dataclass
@@ -1473,6 +1496,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     spec_info: Optional[SpecInput] = None
     spec_decode_seq_lens_carrier: Optional[torch.Tensor] = None
     spec_decode_alloc_reservation: Optional[SpecDecodeAllocReservation] = None
+    spec_decode_postprocess_state: Optional[SpecDecodePostprocessState] = None
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -2690,6 +2714,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             lora_ids=[req.lora_id for req in self.reqs],
             sampling_info=self.sampling_info,
             launch_done=self.launch_done,
+            scheduler_batch_uid=id(self),
             input_embeds=self.input_embeds,
             ne_token_table=self.ne_token_table,
             token_type_ids=self.token_type_ids,
@@ -2747,6 +2772,37 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_seqlens=self.mamba_track_seqlens,
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
+        )
+
+    def make_postprocess_snapshot(self):
+        return ScheduleBatch(
+            reqs=self.reqs[:],
+            req_to_token_pool=self.req_to_token_pool,
+            req_pool_indices=self.req_pool_indices,
+            model_config=self.model_config,
+            forward_mode=self.forward_mode,
+            out_cache_loc=self.out_cache_loc,
+            return_logprob=self.return_logprob,
+            decoding_reqs=self.decoding_reqs,
+            spec_algorithm=self.spec_algorithm,
+            global_num_tokens=self.global_num_tokens,
+            global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
+            can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
+            all_extend_in_batch=self.all_extend_in_batch,
+            is_extend_in_batch=self.is_extend_in_batch,
+            is_prefill_only=self.is_prefill_only,
+            seq_lens_cpu=self.seq_lens_cpu,
+            enable_overlap=self.enable_overlap,
+            next_batch_sampling_info=self.next_batch_sampling_info,
+            mamba_track_indices=self.mamba_track_indices,
+            mamba_track_mask=self.mamba_track_mask,
+            mamba_track_seqlens=self.mamba_track_seqlens,
+            dp_cooperation_info=self.dp_cooperation_info,
+            prefill_stats=self.prefill_stats,
+            spec_decode_postprocess_state=SpecDecodePostprocessState(
+                spec_decode_alloc_reservation=self.spec_decode_alloc_reservation,
+                scheduler_batch_uid=id(self),
+            ),
         )
 
     def maybe_evict_swa(self):
@@ -2863,6 +2919,7 @@ class ModelWorkerBatch:
     sampling_info: SamplingBatchInfo
     # Cross-thread launch boundary for future non-eagle overlap workerization.
     launch_done: Optional[threading.Event] = None
+    scheduler_batch_uid: Optional[int] = None
 
     # The original sequence lengths, Qwen-1M related
     orig_seq_lens: Optional[torch.Tensor] = None

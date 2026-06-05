@@ -476,17 +476,26 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx = None
         return
 
-    allocator = tree_cache.token_to_kv_pool_allocator
+    saved_req_pool_idx = req.req_pool_idx
+    start_p, end_p = req.pop_overallocated_kv_cache()
+    if req.kv_allocated_len == end_p:
+        req.kv_allocated_len = start_p
+
     tree_cache.cache_finished_req(req, is_insert=is_insert)
 
     # FIXME: SessionAwareCache.cache_finished_req sets req_pool_idx = None to
-    # transfer KV ownership to the SessionSlot, so we skip the remaining
-    # cleanup (overalloc free + pool slot free). This means over-allocated
-    # tokens from speculative decoding are NOT freed between turns.
+    # transfer KV ownership to the SessionSlot. We still must free any
+    # speculative over-allocation using the pre-transfer req_pool_idx, but we
+    # must not free the req pool slot because ownership moved to the slot.
     if req.req_pool_idx is None:
+        free_req_kv_range(
+            req,
+            tree_cache,
+            start_p,
+            end_p,
+            req_pool_idx=saved_req_pool_idx,
+        )
         return
-
-    start_p, end_p = req.pop_overallocated_kv_cache()
 
     global_server_args = get_global_server_args()
     page_size = global_server_args.page_size
@@ -510,9 +519,14 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
 
 def free_req_kv_range(
-    req: Req, tree_cache: BasePrefixCache, start_p: int, end_p: int
+    req: Req,
+    tree_cache: BasePrefixCache,
+    start_p: int,
+    end_p: int,
+    req_pool_idx: Optional[torch.Tensor] = None,
 ) -> None:
-    if req.req_pool_idx is None or start_p >= end_p:
+    resolved_req_pool_idx = req.req_pool_idx if req_pool_idx is None else req_pool_idx
+    if resolved_req_pool_idx is None or start_p >= end_p:
         return
 
     page_size = get_global_server_args().page_size
@@ -520,7 +534,7 @@ def free_req_kv_range(
         start_p = ceil_align(start_p, page_size)
 
     if start_p < end_p:
-        indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
+        indices_to_free = tree_cache.req_to_token_pool.req_to_token[resolved_req_pool_idx][
             start_p:end_p
         ]
         tree_cache.token_to_kv_pool_allocator.free(indices_to_free)

@@ -1377,9 +1377,13 @@ class SpecDecodeAllocReservation:
 
 
 @dataclasses.dataclass
+class SpecDecodeCleanupState:
+    alloc_reservation: Optional[SpecDecodeAllocReservation] = None
+
+
+@dataclasses.dataclass
 class SpecDecodePostprocessState:
-    spec_decode_alloc_reservation: Optional[SpecDecodeAllocReservation] = None
-    scheduler_batch_uid: Optional[int] = None
+    cleanup_state: Optional[SpecDecodeCleanupState] = None
 
 
 @dataclasses.dataclass
@@ -1494,6 +1498,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     spec_algorithm: SpeculativeAlgorithm = None
     # spec_info: Optional[SpecInput] = None
     spec_info: Optional[SpecInput] = None
+    spec_decode_launch_schema: Optional["DecodePlaceholderLaunchSchema"] = None
     spec_decode_seq_lens_carrier: Optional[torch.Tensor] = None
     spec_decode_alloc_reservation: Optional[SpecDecodeAllocReservation] = None
     spec_decode_postprocess_state: Optional[SpecDecodePostprocessState] = None
@@ -2314,30 +2319,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     device=self.device, dtype=torch.int64
                 )
                 self._set_decode_seq_lens_tensors(shared_seq_lens)
-                # Keep carrier as a compat snapshot during the owner migration.
-                self.spec_decode_seq_lens_carrier = self.seq_lens
                 return True
-
-        if self.spec_decode_seq_lens_carrier is None:
-            return False
-
-        self._set_decode_seq_lens_tensors(self.spec_decode_seq_lens_carrier)
-        return True
-
-    def has_pending_spec_decode_state(self) -> bool:
-        if not self.is_spec_v2:
-            return False
-
-        if self.forward_mode.is_decode():
-            return False
-
-        if self.spec_decode_seq_lens_carrier is not None:
-            return True
-
-        draft_input: EagleDraftInput = self.spec_info
-        return bool(
-            draft_input is not None and getattr(draft_input, "verify_done", None) is not None
-        )
+        return False
 
     def get_spec_future_indices(self) -> Optional[FutureIndices]:
         draft_input = getattr(self, "spec_info", None)
@@ -2392,6 +2375,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             and self.spec_info is not None
         ):
             return None
+
+        existing_launch_schema = getattr(self, "spec_decode_launch_schema", None)
+        if existing_launch_schema is not None:
+            return existing_launch_schema
 
         from sglang.srt.managers.overlap_utils import DecodePlaceholderLaunchSchema
 
@@ -2456,13 +2443,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 "decode placeholder launch schema requires current "
                 "capture_hidden_mode"
             )
-        return DecodePlaceholderLaunchSchema(
+        launch_schema = DecodePlaceholderLaunchSchema(
             token_list_width=token_list_width,
             placeholder_dtype=placeholder_dtype,
             capture_hidden_mode=capture_hidden_mode,
             num_tokens_per_req=num_tokens_per_req,
             num_tokens_for_logprob_per_req=num_tokens_for_logprob_per_req,
         )
+        self.spec_decode_launch_schema = launch_schema
+        return launch_schema
 
     def materialize_spec_v2_decode_live_seq_lens(
         self, allow_compat_fallback: bool = False
@@ -2503,9 +2492,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.materialize_spec_v2_decode_live_seq_lens(
                 allow_compat_fallback=False
             )
-        if self.has_pending_spec_decode_state() and not self.forward_mode.is_decode():
-            self.maybe_wait_verify_done()
-            self.materialize_spec_decode_seq_lens_carrier()
 
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
@@ -2522,7 +2508,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests
             self.reqs = []
-            self.spec_decode_seq_lens_carrier = None
+            self.spec_decode_launch_schema = None
             return
 
         if len(keep_indices) == len(self.reqs):
@@ -2546,10 +2532,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens = self.seq_lens[keep_indices_device]
         self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
-        if self.spec_decode_seq_lens_carrier is not None:
-            self.spec_decode_seq_lens_carrier = self.spec_decode_seq_lens_carrier[
-                keep_indices_device
-            ]
         self.out_cache_loc = None
         self.seq_lens_sum = self.seq_lens.sum().item()
 
@@ -2598,12 +2580,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             other.materialize_spec_v2_decode_live_seq_lens(
                 allow_compat_fallback=False
             )
-        if self.has_pending_spec_decode_state() and not self.forward_mode.is_decode():
-            self.maybe_wait_verify_done()
-            self.materialize_spec_decode_seq_lens_carrier()
-        if other.has_pending_spec_decode_state() and not other.forward_mode.is_decode():
-            other.maybe_wait_verify_done()
-            other.materialize_spec_decode_seq_lens_carrier()
+
+        if self.spec_decode_launch_schema is None:
+            self.spec_decode_launch_schema = other.spec_decode_launch_schema
+        elif (
+            other.spec_decode_launch_schema is not None
+            and self.spec_decode_launch_schema != other.spec_decode_launch_schema
+        ):
+            raise RuntimeError(
+                "decode launch schema mismatch during merge_batch: "
+                f"lhs={self.spec_decode_launch_schema}, "
+                f"rhs={other.spec_decode_launch_schema}"
+            )
 
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
@@ -2620,23 +2608,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
         self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
-        if (
-            self.spec_decode_seq_lens_carrier is not None
-            or other.spec_decode_seq_lens_carrier is not None
-        ):
-            left_seq_lens = (
-                self.spec_decode_seq_lens_carrier
-                if self.spec_decode_seq_lens_carrier is not None
-                else self.seq_lens[: len(self.reqs)]
-            )
-            right_seq_lens = (
-                other.spec_decode_seq_lens_carrier
-                if other.spec_decode_seq_lens_carrier is not None
-                else other.seq_lens
-            )
-            self.spec_decode_seq_lens_carrier = torch.cat(
-                [left_seq_lens, right_seq_lens]
-            )
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
         if self.output_ids is not None:
@@ -2754,7 +2725,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             device=self.device,
-            spec_decode_seq_lens_carrier=self.spec_decode_seq_lens_carrier,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
@@ -2781,7 +2751,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_extend_in_batch=self.is_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
-            spec_decode_seq_lens_carrier=self.spec_decode_seq_lens_carrier,
             spec_decode_alloc_reservation=self.spec_decode_alloc_reservation,
             enable_overlap=self.enable_overlap,
             sampling_info=self.sampling_info,
@@ -2820,8 +2789,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
             spec_decode_postprocess_state=SpecDecodePostprocessState(
-                spec_decode_alloc_reservation=self.spec_decode_alloc_reservation,
-                scheduler_batch_uid=id(self),
+                cleanup_state=SpecDecodeCleanupState(
+                    alloc_reservation=self.spec_decode_alloc_reservation
+                )
             ),
         )
 
@@ -2984,7 +2954,6 @@ class ModelWorkerBatch:
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
     device: str = None
-    spec_decode_seq_lens_carrier: Optional[torch.Tensor] = None
 
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False

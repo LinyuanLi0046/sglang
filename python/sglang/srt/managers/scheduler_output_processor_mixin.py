@@ -166,12 +166,9 @@ class SchedulerOutputProcessorMixin:
     ):
         skip_stream_req = None
 
-        if self._use_non_spec_overlap_worker(batch):
-            result = self.non_spec_overlap_worker.resolve_last_batch_result(
-                result, launch_done
-            )
-        elif self._use_spec_overlap_worker(batch):
-            result = self.spec_overlap_worker.resolve_last_batch_result(result)
+        result = self._resolve_overlap_batch_result(
+            batch, result, launch_done=launch_done
+        )
 
         if self.is_generation:
             if result.copy_done is not None:
@@ -408,19 +405,68 @@ class SchedulerOutputProcessorMixin:
 
     def _commit_spec_decode_alloc_reservation(self, batch: ScheduleBatch) -> None:
         postprocess_state = getattr(batch, "spec_decode_postprocess_state", None)
-        if postprocess_state is not None:
-            reservation = getattr(
-                postprocess_state, "spec_decode_alloc_reservation", None
-            )
-        else:
-            reservation = getattr(batch, "spec_decode_alloc_reservation", None)
+        cleanup_state = (
+            getattr(postprocess_state, "cleanup_state", None)
+            if postprocess_state is not None
+            else None
+        )
+        reservation = (
+            getattr(cleanup_state, "alloc_reservation", None)
+            if cleanup_state is not None
+            else None
+        )
         if reservation is None:
             return
         reservation.commit()
-        if postprocess_state is not None:
-            postprocess_state.spec_decode_alloc_reservation = None
-        else:
-            batch.spec_decode_alloc_reservation = None
+        cleanup_state.alloc_reservation = None
+
+    def _future_indices_match(self, lhs, rhs) -> bool:
+        if lhs is None or rhs is None:
+            return False
+        if lhs is rhs:
+            return True
+        if getattr(lhs, "interval", None) != getattr(rhs, "interval", None):
+            return False
+        lhs_indices = getattr(lhs, "indices", None)
+        rhs_indices = getattr(rhs, "indices", None)
+        if lhs_indices is None or rhs_indices is None:
+            return False
+        return torch.equal(lhs_indices, rhs_indices)
+
+    def _ensure_spec_overlap_result_ready(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> None:
+        if not self._use_spec_overlap_worker(batch):
+            return
+        if not (batch.forward_mode.is_decode() and not batch.is_extend_in_batch):
+            return
+
+        spec_ready_event = getattr(result, "spec_ready_event", None)
+        if spec_ready_event is not None:
+            spec_ready_event.synchronize()
+
+        pending_decode_state = getattr(self, "pending_spec_decode_state", None)
+        if pending_decode_state is None:
+            return
+        if self._future_indices_match(
+            pending_decode_state.future_indices, getattr(result, "future_indices", None)
+        ):
+            self._ensure_pending_spec_decode_state_ready(pending_decode_state)
+
+    def _resolve_overlap_batch_result(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+        launch_done: Optional[threading.Event] = None,
+    ) -> GenerationBatchResult:
+        if self._use_non_spec_overlap_worker(batch):
+            return self.non_spec_overlap_worker.resolve_last_batch_result(
+                result, launch_done
+            )
+        if self._use_spec_overlap_worker(batch):
+            self._ensure_spec_overlap_result_ready(batch, result)
+            return self.spec_overlap_worker.resolve_last_batch_result(result)
+        return result
 
     def process_batch_result_idle(
         self: Scheduler,
@@ -429,6 +475,9 @@ class SchedulerOutputProcessorMixin:
     ):
         if result.copy_done is not None:
             result.copy_done.synchronize()
+
+        if getattr(batch, "spec_decode_postprocess_state", None) is not None:
+            self._commit_spec_decode_alloc_reservation(batch)
 
         self.stream_output_generation(
             batch.reqs, batch.return_logprob, is_idle_batch=True
@@ -440,12 +489,9 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
         launch_done: Optional[threading.Event] = None,
     ):
-        if self._use_non_spec_overlap_worker(batch):
-            result = self.non_spec_overlap_worker.resolve_last_batch_result(
-                result, launch_done
-            )
-        elif self._use_spec_overlap_worker(batch):
-            result = self.spec_overlap_worker.resolve_last_batch_result(result)
+        result = self._resolve_overlap_batch_result(
+            batch, result, launch_done=launch_done
+        )
 
         if result.copy_done is not None:
             result.copy_done.synchronize()

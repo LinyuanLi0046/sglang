@@ -29,9 +29,6 @@ class SpecOverlapApplyState:
     batch_uid: int
     future_indices: FutureIndices
     next_draft_input: Optional["EagleDraftInput"] = None
-    future_next_step_seq_lens_buf: Optional[torch.Tensor] = None
-    future_canonical_ready_buf: Optional[torch.Tensor] = None
-    requires_scheduler_apply: bool = True
 
 
 class SpecModelWorkerOverlapClient:
@@ -66,24 +63,9 @@ class SpecModelWorkerOverlapClient:
     def _validate_apply_state_contract(self, apply_state: SpecOverlapApplyState) -> None:
         if apply_state.future_indices is None:
             raise RuntimeError("Spec overlap apply state missing future_indices.")
-
-        if apply_state.requires_scheduler_apply:
-            if apply_state.next_draft_input is None:
-                raise RuntimeError(
-                    "Spec overlap apply state requiring scheduler apply must carry "
-                    "next_draft_input."
-                )
-            return
-
-        if apply_state.future_next_step_seq_lens_buf is None:
+        if apply_state.next_draft_input is None:
             raise RuntimeError(
-                "Decode canonical-only apply state must carry "
-                "future_next_step_seq_lens_buf."
-            )
-        if apply_state.future_canonical_ready_buf is None:
-            raise RuntimeError(
-                "Decode canonical-only apply state must carry "
-                "future_canonical_ready_buf."
+                "Spec overlap apply state must carry next_draft_input."
             )
 
     def _bind_thread_device(self) -> None:
@@ -133,6 +115,7 @@ class SpecModelWorkerOverlapClient:
             (
                 model_worker_batch,
                 future_indices,
+                spec_ready_event,
                 return_logprob,
                 needs_hidden_states,
                 copy_input_token_logprobs,
@@ -179,6 +162,8 @@ class SpecModelWorkerOverlapClient:
                 self.future_map.replace_canonical_payload_with_future_placeholders(
                     future_indices, batch_result.next_draft_input
                 )
+            if spec_ready_event is not None:
+                spec_ready_event.record()
 
             if not is_decode_placeholder_path:
                 if batch_result.next_draft_input is None:
@@ -190,29 +175,6 @@ class SpecModelWorkerOverlapClient:
                         batch_uid=model_worker_batch.scheduler_batch_uid,
                         future_indices=future_indices,
                         next_draft_input=batch_result.next_draft_input,
-                    )
-                )
-            else:
-                future_next_step_seq_lens_buf = self.future_map.next_step_seq_lens_buf
-                future_canonical_ready_buf = self.future_map.canonical_ready_buf
-                if future_next_step_seq_lens_buf is None:
-                    raise RuntimeError(
-                        "decode steady-state overlap worker must produce "
-                        "future next-step seq-lens companion for canonical "
-                        "placeholder apply"
-                    )
-                if future_canonical_ready_buf is None:
-                    raise RuntimeError(
-                        "decode steady-state overlap worker must produce "
-                        "canonical-ready companion for canonical placeholder apply"
-                    )
-                self.apply_queue.put(
-                    SpecOverlapApplyState(
-                        batch_uid=model_worker_batch.scheduler_batch_uid,
-                        future_indices=future_indices,
-                        future_next_step_seq_lens_buf=future_next_step_seq_lens_buf,
-                        future_canonical_ready_buf=future_canonical_ready_buf,
-                        requires_scheduler_apply=False,
                     )
                 )
 
@@ -240,6 +202,7 @@ class SpecModelWorkerOverlapClient:
 
         bs = len(model_worker_batch.seq_lens)
         future_indices = self.future_map.alloc_future_indices(bs)
+        spec_ready_event = None
         needs_hidden_states = bool(getattr(model_worker_batch, "return_hidden_states", False))
         copy_input_token_logprobs = bool(
             model_worker_batch.forward_mode.is_extend()
@@ -249,10 +212,13 @@ class SpecModelWorkerOverlapClient:
             model_worker_batch.forward_mode.is_extend()
             or model_worker_batch.is_extend_in_batch
         )
+        if model_worker_batch.forward_mode.is_decode() and not model_worker_batch.is_extend_in_batch:
+            spec_ready_event = torch.get_device_module(self.device).Event()
         self.input_queue.put(
             (
                 model_worker_batch,
                 future_indices,
+                spec_ready_event,
                 model_worker_batch.return_logprob,
                 needs_hidden_states,
                 copy_input_token_logprobs,
@@ -276,6 +242,7 @@ class SpecModelWorkerOverlapClient:
             next_token_ids=-future_indices.indices,
             future_indices=future_indices,
             next_draft_input=placeholder_next_draft_input,
+            spec_ready_event=spec_ready_event,
             scheduler_batch_uid=model_worker_batch.scheduler_batch_uid,
         )
 

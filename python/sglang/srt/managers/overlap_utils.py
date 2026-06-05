@@ -158,12 +158,6 @@ def clone_decode_placeholder_handle_contract(
         ),
         last_verified_ids=getattr(draft_input, "last_verified_ids", None),
         token_list=getattr(draft_input, "token_list", None),
-        verify_token_num=getattr(draft_input, "verify_token_num", -1),
-        capture_hidden_mode=getattr(draft_input, "capture_hidden_mode", None),
-        num_tokens_per_req=getattr(draft_input, "num_tokens_per_req", -1),
-        num_tokens_for_logprob_per_req=getattr(
-            draft_input, "num_tokens_for_logprob_per_req", -1
-        ),
     )
     return sanitize_decode_placeholder_handle_contract(placeholder_carrier)
 
@@ -178,42 +172,45 @@ def clone_spec_info_for_worker_launch(
 
     from sglang.srt.speculative.eagle_info import EagleDraftInput
 
-    capture_hidden_mode = getattr(draft_input, "capture_hidden_mode", None)
-    if capture_hidden_mode is None and launch_schema is not None:
-        capture_hidden_mode = launch_schema.capture_hidden_mode
+    if launch_schema is None:
+        raise RuntimeError(
+            "worker launch spec_info clone requires explicit decode launch schema"
+        )
 
-    num_tokens_per_req = int(getattr(draft_input, "num_tokens_per_req", -1) or -1)
-    if num_tokens_per_req <= 0 and launch_schema is not None:
-        num_tokens_per_req = int(getattr(launch_schema, "num_tokens_per_req", -1) or -1)
+    capture_hidden_mode = launch_schema.capture_hidden_mode
+    num_tokens_per_req = int(getattr(launch_schema, "num_tokens_per_req", -1) or -1)
     if num_tokens_per_req <= 0:
         raise RuntimeError(
-            "worker launch spec_info clone requires current draft_input.num_tokens_per_req"
+            "worker launch spec_info clone requires launch_schema.num_tokens_per_req"
         )
 
     num_tokens_for_logprob_per_req = int(
-        getattr(draft_input, "num_tokens_for_logprob_per_req", -1) or -1
+        getattr(launch_schema, "num_tokens_for_logprob_per_req", -1) or -1
     )
-    if num_tokens_for_logprob_per_req <= 0 and launch_schema is not None:
-        num_tokens_for_logprob_per_req = int(
-            getattr(launch_schema, "num_tokens_for_logprob_per_req", -1) or -1
-        )
     if num_tokens_for_logprob_per_req <= 0:
         raise RuntimeError(
             "worker launch spec_info clone requires current "
-            "draft_input.num_tokens_for_logprob_per_req"
+            "launch_schema.num_tokens_for_logprob_per_req"
         )
 
-    verify_token_num = int(getattr(draft_input, "verify_token_num", -1) or -1)
-    if verify_token_num <= 0 and launch_schema is not None:
-        verify_token_num = int(getattr(launch_schema, "token_list_width", -1) or -1) + 1
+    verify_token_num = int(getattr(launch_schema, "token_list_width", -1) or -1) + 1
     if verify_token_num <= 0:
         raise RuntimeError(
-            "worker launch spec_info clone requires current draft_input.verify_token_num"
+            "worker launch spec_info clone requires launch_schema.token_list_width"
         )
     if capture_hidden_mode is None:
         raise RuntimeError(
-            "worker launch spec_info clone requires current draft_input.capture_hidden_mode"
+            "worker launch spec_info clone requires launch_schema.capture_hidden_mode"
         )
+
+    token_list = getattr(draft_input, "token_list", None)
+    if token_list is not None and getattr(token_list, "ndim", 0) == 2:
+        expected_width = verify_token_num - 1
+        if token_list.shape[1] != expected_width:
+            raise RuntimeError(
+                "worker launch spec_info clone token_list width mismatch: "
+                f"expected={expected_width}, actual={token_list.shape[1]}"
+            )
 
     worker_private_spec_info = EagleDraftInput(
         future_indices=clone_future_indices_handle(
@@ -222,7 +219,7 @@ def clone_spec_info_for_worker_launch(
             else getattr(draft_input, "future_indices", None)
         ),
         last_verified_ids=getattr(draft_input, "last_verified_ids", None),
-        token_list=getattr(draft_input, "token_list", None),
+        token_list=token_list,
         new_seq_lens=getattr(draft_input, "new_seq_lens", None),
         next_step_seq_lens=getattr(draft_input, "next_step_seq_lens", None),
         verify_done=getattr(draft_input, "verify_done", None),
@@ -255,12 +252,6 @@ def build_decode_placeholder_canonical_draft_input(
         "token_list": placeholder_ids.unsqueeze(1)
         .expand(-1, token_list_width)
         .clone(),
-        "capture_hidden_mode": launch_schema.capture_hidden_mode,
-        "num_tokens_per_req": launch_schema.num_tokens_per_req,
-        "num_tokens_for_logprob_per_req": (
-            launch_schema.num_tokens_for_logprob_per_req
-        ),
-        "verify_token_num": token_list_width + 1,
     }
 
     return sanitize_decode_placeholder_handle_contract(

@@ -424,56 +424,10 @@ class EagleDraftInputV2Mixin:
             self.next_step_seq_lens = seq_lens_device
             return True
 
-        next_step_seq_lens = getattr(self, "next_step_seq_lens", None)
-        if next_step_seq_lens is not None:
-            seq_lens_device = next_step_seq_lens.to(
-                device=batch.seq_lens.device, dtype=torch.int64
-            )
-            seq_lens_cpu = seq_lens_device.cpu()
-            batch.seq_lens = seq_lens_device
-            batch.seq_lens_cpu = seq_lens_cpu
-            if getattr(batch, "orig_seq_lens", None) is not None:
-                batch.orig_seq_lens = batch.seq_lens.to(dtype=torch.int32)
-            batch.seq_lens_sum = int(seq_lens_cpu.sum().item())
-            return True
-
-        future_next_step_seq_lens_buf = getattr(
-            self, "future_next_step_seq_lens_buf", None
-        )
-        if future_next_step_seq_lens_buf is not None and self.future_indices is not None:
-            seq_lens_device = future_next_step_seq_lens_buf[self.future_indices.indices].to(
-                device=batch.seq_lens.device, dtype=torch.int64
-            )
-            seq_lens_cpu = seq_lens_device.cpu()
-            batch.seq_lens = seq_lens_device
-            batch.seq_lens_cpu = seq_lens_cpu
-            if getattr(batch, "orig_seq_lens", None) is not None:
-                batch.orig_seq_lens = batch.seq_lens.to(dtype=torch.int32)
-            batch.seq_lens_sum = int(seq_lens_cpu.sum().item())
-            self.next_step_seq_lens = seq_lens_device
-            return True
-
         if not allow_compat_fallback:
             return False
 
-        if hasattr(batch, "materialize_spec_decode_seq_lens_carrier"):
-            if batch.materialize_spec_decode_seq_lens_carrier():
-                return True
-
-        seq_lens_carrier = getattr(batch, "spec_decode_seq_lens_carrier", None)
-        if seq_lens_carrier is None:
-            return False
-
-        seq_lens_device = seq_lens_carrier.to(
-            device=batch.seq_lens.device, dtype=torch.int64
-        )
-        seq_lens_cpu = seq_lens_device.cpu()
-        batch.seq_lens = seq_lens_device
-        batch.seq_lens_cpu = seq_lens_cpu
-        if getattr(batch, "orig_seq_lens", None) is not None:
-            batch.orig_seq_lens = batch.seq_lens.to(dtype=torch.int32)
-        batch.seq_lens_sum = int(seq_lens_cpu.sum().item())
-        return True
+        return self._compat_materialize_decode_seq_lens_for_batch(batch)
 
     def _sync_decode_seq_lens_from_reqs_for_batch(self, batch: Any) -> None:
         if hasattr(batch, "sync_decode_seq_lens_from_reqs"):
@@ -504,9 +458,40 @@ class EagleDraftInputV2Mixin:
 
     def _compat_materialize_decode_seq_lens_for_batch(self, batch: Any) -> bool:
         self._wait_verify_done_for_batch(batch)
-        return self._materialize_decode_seq_lens_for_batch(
-            batch, allow_compat_fallback=True
+
+        next_step_seq_lens = getattr(self, "next_step_seq_lens", None)
+        if next_step_seq_lens is not None:
+            seq_lens_device = next_step_seq_lens.to(
+                device=batch.seq_lens.device, dtype=torch.int64
+            )
+            seq_lens_cpu = seq_lens_device.cpu()
+            batch.seq_lens = seq_lens_device
+            batch.seq_lens_cpu = seq_lens_cpu
+            if getattr(batch, "orig_seq_lens", None) is not None:
+                batch.orig_seq_lens = batch.seq_lens.to(dtype=torch.int32)
+            batch.seq_lens_sum = int(seq_lens_cpu.sum().item())
+            return True
+
+        future_next_step_seq_lens_buf = getattr(
+            self, "future_next_step_seq_lens_buf", None
         )
+        if future_next_step_seq_lens_buf is not None and self.future_indices is not None:
+            seq_lens_device = future_next_step_seq_lens_buf[self.future_indices.indices].to(
+                device=batch.seq_lens.device, dtype=torch.int64
+            )
+            seq_lens_cpu = seq_lens_device.cpu()
+            batch.seq_lens = seq_lens_device
+            batch.seq_lens_cpu = seq_lens_cpu
+            if getattr(batch, "orig_seq_lens", None) is not None:
+                batch.orig_seq_lens = batch.seq_lens.to(dtype=torch.int32)
+            batch.seq_lens_sum = int(seq_lens_cpu.sum().item())
+            self.next_step_seq_lens = seq_lens_device
+            return True
+
+        if hasattr(batch, "materialize_spec_decode_seq_lens_carrier"):
+            if batch.materialize_spec_decode_seq_lens_carrier():
+                return True
+        return False
 
     def prepare_decode_live_view(
         self: EagleDraftInput, batch: Any, allow_compat_fallback: bool = True

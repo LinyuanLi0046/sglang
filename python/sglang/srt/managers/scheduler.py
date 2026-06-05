@@ -154,6 +154,7 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import (
+    FutureIndices,
     FutureMap,
     clone_decode_placeholder_handle_contract,
 )
@@ -252,6 +253,12 @@ else:
     from torch.cuda import StreamContext as CudaStreamContext
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SpecDecodePendingState:
+    future_indices: FutureIndices
+    ready_event: Optional[torch.cuda.Event] = None
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
@@ -1155,6 +1162,7 @@ class Scheduler(
             self.spec_overlap_worker = None
             self.future_map = None
             self.pending_spec_state_batch = None
+            self.pending_spec_decode_state = None
             return
 
         if self.is_generation and self.spec_algorithm.is_none():
@@ -1166,6 +1174,7 @@ class Scheduler(
             self.spec_overlap_worker = None
             self.future_map = None
             self.pending_spec_state_batch = None
+            self.pending_spec_decode_state = None
             self.batch_record_buf = [None] * 2
             self.batch_record_ct = 0
             return
@@ -1189,6 +1198,7 @@ class Scheduler(
         else:
             self.spec_overlap_worker = None
         self.pending_spec_state_batch = None
+        self.pending_spec_decode_state = None
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
 
@@ -1420,8 +1430,6 @@ class Scheduler(
         ):
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
-            if use_spec_overlap_worker and getattr(tmp_batch, "is_spec_v2", False):
-                self._ensure_spec_overlap_postprocess_ready(tmp_batch)
             if use_non_spec_overlap_worker:
                 tmp_batch.next_batch_sampling_info = next_batch_sampling_info
             self.process_batch_result(tmp_batch, tmp_result, launch_done)
@@ -1434,9 +1442,13 @@ class Scheduler(
                 continue
 
             if use_spec_overlap_worker and self._spec_state_must_be_ready_for_selection():
-                self._ensure_pending_spec_state_ready(
-                    getattr(self, "pending_spec_state_batch", None)
-                )
+                pending_decode_state = getattr(self, "pending_spec_decode_state", None)
+                if pending_decode_state is not None:
+                    self._ensure_pending_spec_decode_state_ready(pending_decode_state)
+                else:
+                    self._ensure_pending_spec_state_ready(
+                        getattr(self, "pending_spec_state_batch", None)
+                    )
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
@@ -2798,26 +2810,6 @@ class Scheduler(
         batch: ScheduleBatch,
         apply_state: "SpecOverlapApplyState",
     ) -> None:
-        if not apply_state.requires_scheduler_apply:
-            existing_spec_info = getattr(batch, "spec_info", None)
-            if existing_spec_info is None:
-                raise RuntimeError(
-                    "decode canonical-only spec overlap apply requires existing "
-                    "batch.spec_info, but none was found."
-                )
-            if getattr(existing_spec_info, "future_indices", None) is None:
-                existing_spec_info.future_indices = apply_state.future_indices
-            existing_spec_info.verify_done = None
-            existing_spec_info.next_step_seq_lens = None
-            existing_spec_info.future_next_step_seq_lens_buf = (
-                apply_state.future_next_step_seq_lens_buf
-            )
-            existing_spec_info.future_canonical_ready_buf = (
-                apply_state.future_canonical_ready_buf
-            )
-            batch.spec_decode_seq_lens_carrier = None
-            return
-
         self._apply_spec_v2_future_state(
             batch,
             apply_state.next_draft_input,
@@ -2837,33 +2829,91 @@ class Scheduler(
         )
 
     def _spec_state_must_be_ready_for_selection(self) -> bool:
-        pending_batch = getattr(self, "pending_spec_state_batch", None)
-        if self.spec_overlap_worker is None or pending_batch is None:
+        if self.spec_overlap_worker is None:
             return False
 
-        # A-收口版下，batch-visible handle 回到单轨 `spec_info.future_indices`。
-        # 当前 decode steady-state 必须等 worker-owned stable-ready companion
-        #（future next-step seq-lens buf + canonical-ready buf）安装完成后，
-        # 才能安全参与 selection/filter/merge；否则下一拍会拿 submit-time
-        # placeholder handle 继续推进，最终命中 future_indices_batch_mismatch。
+        pending_decode_state = getattr(self, "pending_spec_decode_state", None)
+        if pending_decode_state is not None:
+            canonical_ready_buf = (
+                getattr(self.future_map, "canonical_ready_buf", None)
+                if self.future_map is not None
+                else None
+            )
+            if (
+                canonical_ready_buf is not None
+                and bool(
+                    torch.all(
+                        canonical_ready_buf[pending_decode_state.future_indices.indices]
+                    ).item()
+                )
+            ):
+                return False
+            return True
+
+        pending_batch = getattr(self, "pending_spec_state_batch", None)
+        if pending_batch is None:
+            return False
+
+        # A-收口版下，decode steady-state 不再等待 scheduler apply 安装 companion。
+        # selection 现在只看 worker-owned FutureMap canonical-ready 位；
+        # live seq-lens 主链已收口到 shared verified_lens。
         if (
             pending_batch.is_spec_v2
             and pending_batch.forward_mode.is_decode()
             and not pending_batch.is_extend_in_batch
         ):
-            draft_input = getattr(pending_batch, "spec_info", None)
             future_indices = pending_batch.get_spec_future_indices()
+            canonical_ready_buf = (
+                getattr(self.future_map, "canonical_ready_buf", None)
+                if self.future_map is not None
+                else None
+            )
             if (
                 future_indices is not None
-                and draft_input is not None
-                and getattr(draft_input, "future_next_step_seq_lens_buf", None)
-                is not None
-                and getattr(draft_input, "future_canonical_ready_buf", None)
-                is not None
+                and canonical_ready_buf is not None
+                and bool(torch.all(canonical_ready_buf[future_indices.indices]).item())
             ):
                 return False
 
         return True
+
+    def _ensure_pending_spec_decode_state_ready(
+        self,
+        pending_state: Optional[SpecDecodePendingState],
+    ) -> None:
+        current_pending_state = getattr(self, "pending_spec_decode_state", None)
+        if (
+            self.spec_overlap_worker is None
+            or pending_state is None
+            or current_pending_state is None
+            or current_pending_state is not pending_state
+        ):
+            return
+
+        canonical_ready_buf = (
+            getattr(self.future_map, "canonical_ready_buf", None)
+            if self.future_map is not None
+            else None
+        )
+        ready = False
+        if canonical_ready_buf is not None:
+            ready = bool(
+                torch.all(canonical_ready_buf[pending_state.future_indices.indices]).item()
+            )
+        if not ready and pending_state.ready_event is not None:
+            pending_state.ready_event.synchronize()
+            if canonical_ready_buf is not None:
+                ready = bool(
+                    torch.all(
+                        canonical_ready_buf[pending_state.future_indices.indices]
+                    ).item()
+                )
+        if not ready:
+            raise RuntimeError(
+                "spec-v2 decode stable-ready wait completed without FutureMap "
+                "canonical-ready becoming visible."
+            )
+        self.pending_spec_decode_state = None
 
     def _ensure_pending_spec_state_ready(
         self,
@@ -2881,29 +2931,14 @@ class Scheduler(
         self.spec_overlap_worker.ensure_batch_state_ready(
             batch, self._apply_spec_v2_overlap_state
         )
+        if batch.is_spec_v2 and not batch.forward_mode.is_decode():
+            batch.maybe_wait_verify_done()
+            if not batch.materialize_spec_decode_seq_lens_carrier():
+                raise RuntimeError(
+                    "spec-v2 non-decode pending apply requires shared verified_lens "
+                    "after verify_done."
+                )
         self.pending_spec_state_batch = None
-
-    def _ensure_spec_overlap_postprocess_ready(
-        self, batch_snapshot: Optional[ScheduleBatch]
-    ) -> None:
-        if self.spec_overlap_worker is None or batch_snapshot is None:
-            return
-
-        postprocess_state = getattr(batch_snapshot, "spec_decode_postprocess_state", None)
-        pending_batch_uid = (
-            getattr(postprocess_state, "scheduler_batch_uid", None)
-            if postprocess_state is not None
-            else None
-        )
-        pending_batch = getattr(self, "pending_spec_state_batch", None)
-        if (
-            pending_batch is None
-            or pending_batch_uid is None
-            or id(pending_batch) != pending_batch_uid
-        ):
-            return
-
-        self._ensure_pending_spec_state_ready(pending_batch)
 
     def run_batch(
         self,
@@ -2966,7 +3001,14 @@ class Scheduler(
                             batch_result.next_draft_input,
                             batch_result.future_indices,
                         )
-                    self.pending_spec_state_batch = batch
+                        self.pending_spec_decode_state = SpecDecodePendingState(
+                            future_indices=batch_result.future_indices,
+                            ready_event=batch_result.spec_ready_event,
+                        )
+                        self.pending_spec_state_batch = None
+                    else:
+                        self.pending_spec_state_batch = batch
+                        self.pending_spec_decode_state = None
                     future_indices_or_next_token_ids = batch_result.next_token_ids
                 else:
                     self.record_batch_in_overlap(model_worker_batch)
@@ -3625,10 +3667,6 @@ class Scheduler(
         if self.enable_overlap and self.last_batch:
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
-            if getattr(self, "spec_overlap_worker", None) is not None and getattr(
-                tmp_batch, "is_spec_v2", False
-            ):
-                self._ensure_spec_overlap_postprocess_ready(tmp_batch)
             self.process_batch_result(tmp_batch, tmp_result, None)
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():

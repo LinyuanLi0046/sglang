@@ -1446,8 +1446,17 @@ class Scheduler(
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
-            if disable_overlap_for_batch or must_resolve_prefill_before_first_decode:
+            if disable_overlap_for_batch:
                 pop_and_process()
+            elif must_resolve_prefill_before_first_decode:
+                pop_and_process()
+                # The candidate decode batch was derived before the previous
+                # prefill overlap result reinstalled live speculative state on
+                # the running batch. Drop it and let the next loop iteration
+                # rebuild first-decode launch state from the updated owner.
+                self.last_batch = None
+                self.cur_batch = None
+                continue
 
             # Launch the current batch
             if batch:

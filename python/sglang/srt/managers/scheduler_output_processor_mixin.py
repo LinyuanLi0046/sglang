@@ -453,7 +453,10 @@ class SchedulerOutputProcessorMixin:
                 "spec-v2 overlap non-decode result missing future_indices at "
                 "output-resolve boundary"
             )
-        self._apply_spec_v2_future_result(batch, result, future_indices)
+        live_batch = getattr(batch, "_postprocess_live_batch_ref", None)
+        if live_batch is None:
+            live_batch = batch
+        self._apply_spec_v2_future_result(live_batch, result, future_indices)
 
     def process_batch_result_idle(
         self: Scheduler,

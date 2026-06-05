@@ -1415,6 +1415,7 @@ class Scheduler(
         ):
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
+            setattr(tmp_batch, "_postprocess_live_batch_ref", self.last_batch)
             if use_non_spec_overlap_worker:
                 tmp_batch.next_batch_sampling_info = next_batch_sampling_info
             self.process_batch_result(tmp_batch, tmp_result, launch_done)
@@ -1430,10 +1431,22 @@ class Scheduler(
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+            must_resolve_prefill_before_first_decode = (
+                use_spec_overlap_worker
+                and batch is not None
+                and batch.is_spec_v2
+                and batch.forward_mode.is_decode()
+                and not batch.is_extend_in_batch
+                and getattr(batch, "spec_decode_launch_schema", None) is None
+                and self.last_batch is not None
+                and self.last_batch.is_spec_v2
+                and self.last_batch.forward_mode.is_extend()
+                and len(self.result_queue) > 0
+            )
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
-            if disable_overlap_for_batch:
+            if disable_overlap_for_batch or must_resolve_prefill_before_first_decode:
                 pop_and_process()
 
             # Launch the current batch

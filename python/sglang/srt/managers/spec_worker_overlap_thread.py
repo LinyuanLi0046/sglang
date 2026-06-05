@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import logging
 import threading
 import traceback
@@ -24,13 +23,6 @@ if False:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class SpecOverlapApplyState:
-    batch_uid: int
-    future_indices: FutureIndices
-    next_draft_input: Optional["EagleDraftInput"] = None
-
-
 class SpecModelWorkerOverlapClient:
     """Spec-v2 overlap client that moves resolve/store/copy off the scheduler thread."""
 
@@ -46,7 +38,6 @@ class SpecModelWorkerOverlapClient:
         self.keep_batch_reference_num = 2 * num_decode_steps
 
         self.input_queue: Queue = Queue()
-        self.apply_queue: Queue = Queue()
         self.output_queue: Queue = Queue()
         self.forward_stream = torch.get_device_module(self.device).Stream()
         self.forward_thread = threading.Thread(
@@ -59,14 +50,6 @@ class SpecModelWorkerOverlapClient:
     def _raise_if_thread_failed(self) -> None:
         if self.thread_exception is not None:
             raise self.thread_exception
-
-    def _validate_apply_state_contract(self, apply_state: SpecOverlapApplyState) -> None:
-        if apply_state.future_indices is None:
-            raise RuntimeError("Spec overlap apply state missing future_indices.")
-        if apply_state.next_draft_input is None:
-            raise RuntimeError(
-                "Spec overlap apply state must carry next_draft_input."
-            )
 
     def _bind_thread_device(self) -> None:
         if self.gpu_id is None:
@@ -99,7 +82,6 @@ class SpecModelWorkerOverlapClient:
                 f"SpecModelWorkerOverlapClient failed: {exc}\n{tb}"
             )
             logger.error("%s", self.thread_exception)
-            self.apply_queue.put(self.thread_exception)
             self.output_queue.put(self.thread_exception)
 
     @torch.no_grad()
@@ -160,19 +142,6 @@ class SpecModelWorkerOverlapClient:
             if should_placeholder_replace and batch_result.next_draft_input is not None:
                 self.future_map.replace_canonical_payload_with_future_placeholders(
                     future_indices, batch_result.next_draft_input
-                )
-
-            if not is_decode_placeholder_path:
-                if batch_result.next_draft_input is None:
-                    raise RuntimeError(
-                        "Spec overlap worker requires next_draft_input before apply-ready."
-                    )
-                self.apply_queue.put(
-                    SpecOverlapApplyState(
-                        batch_uid=model_worker_batch.scheduler_batch_uid,
-                        future_indices=future_indices,
-                        next_draft_input=batch_result.next_draft_input,
-                    )
                 )
 
             batch_result.copy_done = torch.get_device_module(self.device).Event()
@@ -237,25 +206,6 @@ class SpecModelWorkerOverlapClient:
             next_draft_input=placeholder_next_draft_input,
             scheduler_batch_uid=model_worker_batch.scheduler_batch_uid,
         )
-
-    def ensure_batch_state_ready(
-        self,
-        batch: ScheduleBatch,
-        apply_future_result: Callable[[ScheduleBatch, SpecOverlapApplyState], None],
-    ) -> None:
-        self._raise_if_thread_failed()
-
-        apply_state = self.apply_queue.get()
-        if isinstance(apply_state, RuntimeError):
-            raise apply_state
-
-        self._validate_apply_state_contract(apply_state)
-        if apply_state.batch_uid is not None and apply_state.batch_uid != id(batch):
-            raise RuntimeError(
-                "Spec overlap apply state batch_uid mismatch: "
-                f"expected={id(batch)}, actual={apply_state.batch_uid}"
-            )
-        apply_future_result(batch, apply_state)
 
     def resolve_last_batch_result(
         self,

@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 import torch
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
-from sglang.srt.distributed import get_longcat_moe_ep_group, get_moe_tp_group
+from sglang.srt.distributed import get_longcat_moe_ep_group
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import FusedMoEMode, npu_format_cast
 from sglang.srt.layers import deep_gemm_wrapper
@@ -218,26 +218,18 @@ class DeepEPMoE(FusedMoE):
         backend = group.device_group._get_backend(torch.device("npu"))
         return backend.get_hccl_comm_name(group.rank)
 
-    def _get_ops_deepep_tp_group_name(self) -> str:
-        if self.moe_tp_size <= 1:
-            return ""
-        group = get_moe_tp_group()
-        backend = group.device_group._get_backend(torch.device("npu"))
-        return backend.get_hccl_comm_name(group.rank)
-
     def _build_ops_deepep_dispatch_kwargs(
         self, copy_expert_num: int = 0
     ) -> Dict[str, Any]:
-        ep_group_name = self._get_ops_deepep_group_name()
-        tp_group_name = self._get_ops_deepep_tp_group_name()
+        group_name = self._get_ops_deepep_group_name()
         return {
-            "group_ep": ep_group_name,
+            "group_ep": group_name,
             "ep_world_size": self.moe_ep_size,
             "ep_rank_id": self.moe_ep_rank,
             "moe_expert_num": self.num_experts,
-            "group_tp": tp_group_name,
-            "tp_world_size": self.moe_tp_size if self.moe_tp_size > 1 else 0,
-            "tp_rank_id": self.moe_tp_rank if self.moe_tp_size > 1 else 0,
+            "group_tp": group_name,
+            "tp_world_size": self.moe_tp_size,
+            "tp_rank_id": self.moe_tp_rank,
             "expert_shard_type": 0,
             "shared_expert_rank_num": 0,
             "global_bs": 0,
@@ -248,16 +240,15 @@ class DeepEPMoE(FusedMoE):
     def _build_ops_deepep_combine_kwargs(
         self, copy_expert_num: int = 0
     ) -> Dict[str, Any]:
-        ep_group_name = self._get_ops_deepep_group_name()
-        tp_group_name = self._get_ops_deepep_tp_group_name()
+        group_name = self._get_ops_deepep_group_name()
         return {
-            "group_ep": ep_group_name,
+            "group_ep": group_name,
             "ep_world_size": self.moe_ep_size,
             "ep_rank_id": self.moe_ep_rank,
             "moe_expert_num": self.num_experts,
-            "group_tp": tp_group_name,
-            "tp_world_size": self.moe_tp_size if self.moe_tp_size > 1 else 0,
-            "tp_rank_id": self.moe_tp_rank if self.moe_tp_size > 1 else 0,
+            "group_tp": group_name,
+            "tp_world_size": self.moe_tp_size,
+            "tp_rank_id": self.moe_tp_rank,
             "expert_shard_type": 0,
             "shared_expert_rank_num": 0,
             "global_bs": 0,

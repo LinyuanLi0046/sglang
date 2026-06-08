@@ -42,6 +42,7 @@ from sglang.srt.layers.dp_attention import (
     dp_gather_partial,
     dp_reduce_scatter_tensor,
     dp_scatter,
+    gather_from_group_padded_shards,
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_dp_size,
@@ -51,6 +52,8 @@ from sglang.srt.layers.dp_attention import (
     get_local_dp_buffer,
     is_allocation_symmetric,
     is_dp_attention_enabled,
+    PaddedTokenShardMetadata,
+    shard_by_group_with_padding,
 )
 from sglang.srt.layers.flashinfer_comm_fusion import is_flashinfer_allreduce_unavailable
 from sglang.srt.layers.moe import (
@@ -357,6 +360,33 @@ class LayerScatterModes:
 
 def enable_moe_dense_fully_dp():
     return get_global_server_args().moe_dense_tp_size == 1
+
+
+def shard_tokens_for_decode_moe_ep(
+    hidden_states: torch.Tensor,
+    *,
+    group,
+    group_rank: int,
+    group_size: int,
+) -> Tuple[torch.Tensor, PaddedTokenShardMetadata]:
+    return shard_by_group_with_padding(
+        hidden_states,
+        group_rank=group_rank,
+        group_size=group_size,
+    )
+
+
+def restore_tokens_from_decode_moe_ep(
+    local_hidden_states: torch.Tensor,
+    meta: PaddedTokenShardMetadata,
+    *,
+    group,
+) -> torch.Tensor:
+    return gather_from_group_padded_shards(
+        local_hidden_states,
+        meta,
+        group=group,
+    )
 
 
 class LayerCommunicator:

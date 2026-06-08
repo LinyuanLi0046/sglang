@@ -50,7 +50,12 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerScatterModes,
+    restore_tokens_from_decode_moe_ep,
+    shard_tokens_for_decode_moe_ep,
+)
 from sglang.srt.layers.dp_attention import (
     dp_scatter,
     get_attention_tp_group,
@@ -317,29 +322,6 @@ class LongcatFlashMoE(nn.Module):
     def _get_ops_decode_ep_group(self):
         return get_longcat_moe_ep_group().device_group
 
-    def _split_ops_decode_input_by_ep_with_padding(
-        self, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, dict[str, int]]:
-        total_tokens = hidden_states.shape[0]
-        ep_size = self.experts.moe_ep_size
-        ep_rank = self.experts.moe_ep_rank
-        padded_tokens = (total_tokens + ep_size - 1) // ep_size
-        start = ep_rank * padded_tokens
-        end = min(start + padded_tokens, total_tokens)
-        valid_tokens = max(end - start, 0)
-
-        local_hidden_states = hidden_states.new_zeros(
-            (padded_tokens, hidden_states.shape[-1])
-        )
-        if valid_tokens > 0:
-            local_hidden_states[:valid_tokens].copy_(hidden_states[start:end])
-
-        return local_hidden_states, {
-            "total_tokens": total_tokens,
-            "valid_tokens": valid_tokens,
-            "padded_tokens": padded_tokens,
-        }
-
     def _mask_ops_decode_padding_topk(
         self,
         topk_idx: torch.Tensor,
@@ -355,22 +337,6 @@ class LongcatFlashMoE(nn.Module):
         )
         topk_idx[valid_tokens:] = padding_ids
         topk_weights[valid_tokens:].zero_()
-
-    def _restore_ops_decode_output_from_ep_padding(
-        self, local_hidden_states: torch.Tensor, meta: dict[str, int]
-    ) -> torch.Tensor:
-        total_tokens = meta["total_tokens"]
-        padded_tokens = meta["padded_tokens"]
-        ep_size = self.experts.moe_ep_size
-        gather_buffer = local_hidden_states.new_empty(
-            (padded_tokens * ep_size, local_hidden_states.shape[-1])
-        )
-        dist.all_gather_into_tensor(
-            gather_buffer,
-            local_hidden_states,
-            group=self._get_ops_decode_ep_group(),
-        )
-        return gather_buffer[:total_tokens]
 
     def _get_prefill_double_routing_group(self):
         return get_moe_ep_group().device_group
@@ -558,8 +524,11 @@ class LongcatFlashMoE(nn.Module):
         use_ops_prefill = self._use_ops_double_routing_prefill(forward_batch)
 
         if use_ops_decode:
-            hidden_states, ops_decode_meta = (
-                self._split_ops_decode_input_by_ep_with_padding(hidden_states)
+            hidden_states, ops_decode_meta = shard_tokens_for_decode_moe_ep(
+                hidden_states,
+                group=self._get_ops_decode_ep_group(),
+                group_rank=self.experts.moe_ep_rank,
+                group_size=self.experts.moe_ep_size,
             )
 
         # router_logits: (num_tokens, n_experts)
@@ -572,7 +541,7 @@ class LongcatFlashMoE(nn.Module):
             self._mask_ops_decode_padding_topk(
                 topk_idx,
                 topk_weights,
-                ops_decode_meta["valid_tokens"],
+                ops_decode_meta.valid_tokens,
             )
         zero_expert_result = None
         if self.zero_expert_type is not None and not use_ops_decode:
@@ -613,9 +582,10 @@ class LongcatFlashMoE(nn.Module):
                 copy_expert_num=self.zero_expert_num,
             )
             if ops_decode_meta is not None:
-                final_hidden_states = self._restore_ops_decode_output_from_ep_padding(
+                final_hidden_states = restore_tokens_from_decode_moe_ep(
                     final_hidden_states,
                     ops_decode_meta,
+                    group=self._get_ops_decode_ep_group(),
                 )
         else:
             final_hidden_states = self.experts(hidden_states, topk_output)

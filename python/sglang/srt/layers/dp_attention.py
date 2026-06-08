@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import functools
 import logging
+from dataclasses import dataclass
 from contextlib import contextmanager
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import triton
 import triton.language as tl
 
@@ -547,6 +549,61 @@ def dp_scatter(
         memcpy_triton(
             local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
         )
+
+
+@dataclass
+class PaddedTokenShardMetadata:
+    total_tokens: int
+    padded_tokens: int
+    valid_tokens: int
+    group_rank: int
+    group_size: int
+
+
+def shard_by_group_with_padding(
+    global_tokens: torch.Tensor,
+    *,
+    group_rank: int,
+    group_size: int,
+) -> Tuple[torch.Tensor, PaddedTokenShardMetadata]:
+    total_tokens = global_tokens.shape[0]
+    padded_tokens = (total_tokens + group_size - 1) // group_size
+    start = group_rank * padded_tokens
+    valid_tokens = max(min(total_tokens - start, padded_tokens), 0)
+
+    local_tokens = global_tokens.new_zeros((padded_tokens, *global_tokens.shape[1:]))
+    if valid_tokens > 0:
+        start_tensor = global_tokens.new_tensor(start, dtype=torch.int64)
+        valid_tokens_tensor = global_tokens.new_tensor(valid_tokens, dtype=torch.int64)
+        memcpy_triton(
+            local_tokens,
+            global_tokens,
+            0,
+            start_tensor,
+            valid_tokens_tensor,
+            True,
+        )
+
+    return local_tokens, PaddedTokenShardMetadata(
+        total_tokens=total_tokens,
+        padded_tokens=padded_tokens,
+        valid_tokens=valid_tokens,
+        group_rank=group_rank,
+        group_size=group_size,
+    )
+
+
+def gather_from_group_padded_shards(
+    local_tokens: torch.Tensor,
+    meta: PaddedTokenShardMetadata,
+    *,
+    group: dist.ProcessGroup,
+) -> torch.Tensor:
+    gather_buffer = local_tokens.new_empty(
+        (meta.padded_tokens * meta.group_size, *local_tokens.shape[1:])
+    )
+    dist.all_gather_into_tensor(gather_buffer, local_tokens, group=group)
+    return gather_buffer[: meta.total_tokens]
 
 
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):

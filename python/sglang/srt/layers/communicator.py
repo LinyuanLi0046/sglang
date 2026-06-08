@@ -369,6 +369,7 @@ class LayerCommunicator:
         allow_reduce_scatter: bool = False,
         is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
+        use_legacy_tp_allreduce_semantics: bool = False,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -376,6 +377,9 @@ class LayerCommunicator:
         self.allow_reduce_scatter = allow_reduce_scatter
         self.is_last_layer = is_last_layer
         self.qkv_latent_func = qkv_latent_func
+        self.use_legacy_tp_allreduce_semantics = (
+            use_legacy_tp_allreduce_semantics
+        )
 
         self._context = CommunicateContext.init_new()
         self._post_init_communicate()
@@ -460,11 +464,22 @@ class LayerCommunicator:
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
                     hidden_states, residual = (
                         self.input_layernorm.forward_with_allreduce_fusion(
-                            hidden_states, residual, use_attn_tp_group=True
+                            hidden_states,
+                            residual,
+                            use_attn_tp_group=(
+                                not self.use_legacy_tp_allreduce_semantics
+                            ),
                         )
                     )
                 else:
-                    hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
+                    if self.use_legacy_tp_allreduce_semantics:
+                        hidden_states = tensor_model_parallel_all_reduce(
+                            hidden_states
+                        )
+                    else:
+                        hidden_states = moe_tensor_model_parallel_all_reduce(
+                            hidden_states
+                        )
                     hidden_states, residual = self.input_layernorm(
                         hidden_states, residual
                     )

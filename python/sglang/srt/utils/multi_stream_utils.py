@@ -97,8 +97,8 @@ class MultiStreamUtils(metaclass=Singleton):
         if get_global_server_args().enable_longcat_double_stream:
             self.stream_moe = torch.npu.Stream()
             self.stream_attn = torch.npu.Stream()
-            # torch.npu.set_stream_limit(self.stream_moe, 16, 32)
-            # torch.npu.set_stream_limit(self.stream_attn, 12, 24)
+            torch.npu.set_stream_limit(self.stream_moe, 8, 16)
+            torch.npu.set_stream_limit(self.stream_attn, 24, 48)
             self.main_stream = None
             self.forward_moe_func = None
 

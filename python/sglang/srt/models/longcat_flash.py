@@ -669,7 +669,6 @@ class LongcatFlashDecoderLayer(nn.Module):
                 input_layernorm=self.input_layernorm[i],
                 post_attention_layernorm=self.post_attention_layernorm[i],
                 qkv_latent_func=self.self_attn[i].prepare_qkv_latent,
-                use_legacy_tp_allreduce_semantics=(i == 1),
             )
             for i in range(2)
         ]

@@ -599,11 +599,23 @@ def gather_from_group_padded_shards(
     *,
     group: dist.ProcessGroup,
 ) -> torch.Tensor:
-    gather_buffer = local_tokens.new_empty(
-        (meta.padded_tokens * meta.group_size, *local_tokens.shape[1:])
-    )
-    dist.all_gather_into_tensor(gather_buffer, local_tokens, group=group)
-    return gather_buffer[: meta.total_tokens]
+    global_tokens = local_tokens.new_zeros((meta.total_tokens, *local_tokens.shape[1:]))
+    if meta.valid_tokens > 0:
+        start_tensor = local_tokens.new_tensor(
+            meta.group_rank * meta.padded_tokens, dtype=torch.int64
+        )
+        valid_tokens_tensor = local_tokens.new_tensor(meta.valid_tokens, dtype=torch.int64)
+        memcpy_triton(
+            global_tokens,
+            local_tokens,
+            0,
+            start_tensor,
+            valid_tokens_tensor,
+            False,
+        )
+    if global_tokens.numel() > 0:
+        dist.all_reduce(global_tokens, group=group)
+    return global_tokens
 
 
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):

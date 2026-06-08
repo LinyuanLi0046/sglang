@@ -50,11 +50,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communicator import (
-    LayerCommunicator,
-    LayerScatterModes,
-    ScatterMode,
-)
+from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     dp_scatter,
     get_attention_tp_group,
@@ -693,19 +689,6 @@ class LongcatFlashDecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm[0],
             qkv_latent_func=self.self_attn[0].prepare_qkv_latent,
         )
-        self.ops_decode_moe_layer_scatter_modes = LayerScatterModes(
-            layer_input_mode=self.moe_layer_scatter_modes.layer_input_mode,
-            attn_mode=self.moe_layer_scatter_modes.attn_mode,
-            mlp_mode=ScatterMode.SCATTERED,
-            middle_residual_mode=ScatterMode.SCATTERED,
-            layer_output_mode=ScatterMode.TP_ATTN_FULL,
-        )
-        self.ops_decode_moe_layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.ops_decode_moe_layer_scatter_modes,
-            input_layernorm=self.input_layernorm[0],
-            post_attention_layernorm=self.post_attention_layernorm[0],
-            qkv_latent_func=self.self_attn[0].prepare_qkv_latent,
-        )
 
     def _aclgraph_limit_core_scope(self, aic_num: int, aiv_num: int):
         if not _is_npu:
@@ -720,17 +703,6 @@ class LongcatFlashDecoderLayer(nn.Module):
         except Exception:
             return nullcontext()
 
-    def _use_ops_decode_sparse_layout(
-        self, forward_batch: Optional[ForwardBatch]
-    ) -> bool:
-        return (
-            is_dp_attention_enabled()
-            and self.mlp._use_ops_deepep_decode(forward_batch)
-            and forward_batch is not None
-            and forward_batch.dp_padding_mode is not None
-            and forward_batch.dp_padding_mode.is_max_len()
-        )
-
     def forward(
         self,
         positions: torch.Tensor,
@@ -740,7 +712,6 @@ class LongcatFlashDecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
         use_sparse_layout = get_moe_a2a_backend().is_deepep()
-        use_ops_decode_sparse_layout = self._use_ops_decode_sparse_layout(forward_batch)
         if get_global_server_args().enable_longcat_double_stream and MultiStreamUtils().main_stream is None and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             MultiStreamUtils().main_stream = torch.npu.current_stream()
         # first_attn
@@ -757,11 +728,9 @@ class LongcatFlashDecoderLayer(nn.Module):
                 zero_allocator=zero_allocator,
             )
 
-        attn0_hidden_states = hidden_states
-        attn0_residual = residual
         hidden_states, residual = self.mlp_layer_communicator[0].prepare_mlp(
-            attn0_hidden_states,
-            attn0_residual,
+            hidden_states,
+            residual,
             forward_batch,
         )
         mlp_hidden_states = hidden_states.clone()
@@ -769,20 +738,8 @@ class LongcatFlashDecoderLayer(nn.Module):
             mlp_residual = self.attn_tp_group.all_gather(residual.contiguous(), dim=0)
         else:
             mlp_residual = residual.clone()
-        if use_ops_decode_sparse_layout:
-            (
-                moe_hidden_states_input,
-                moe_residual_input,
-            ) = self.ops_decode_moe_layer_communicator.prepare_mlp(
-                attn0_hidden_states,
-                attn0_residual,
-                forward_batch,
-            )
-            moe_postprocess_communicator = self.ops_decode_moe_layer_communicator
-        else:
-            moe_hidden_states_input = hidden_states
-            moe_residual_input = residual
-            moe_postprocess_communicator = self.moe_layer_communicator
+        moe_hidden_states_input = hidden_states
+        moe_residual_input = residual
 
         # ============= MOE放alt流 v1 ===============
         # if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
@@ -830,7 +787,7 @@ class LongcatFlashDecoderLayer(nn.Module):
                     moe_hidden_states = self.mlp(
                         moe_hidden_states_input, forward_batch=forward_batch
                     )
-                    moe_hidden_states, moe_residual = moe_postprocess_communicator.postprocess_layer(
+                    moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
                         moe_hidden_states, moe_residual_input, forward_batch
                     )
                     moe_hidden_states.record_stream(msu.main_stream)
@@ -923,7 +880,7 @@ class LongcatFlashDecoderLayer(nn.Module):
             moe_hidden_states = self.mlp(
                 moe_hidden_states_input, forward_batch=forward_batch
             )
-            moe_hidden_states, moe_residual = moe_postprocess_communicator.postprocess_layer(
+            moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
                 moe_hidden_states, moe_residual, forward_batch
             )
 

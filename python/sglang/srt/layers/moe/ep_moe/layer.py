@@ -118,6 +118,7 @@ class DeepEPMoE(FusedMoE):
         else:
             self.deprecate_flag = False
         self._ops_deepep_ctx: Optional[Dict[str, Any]] = None
+        self._ops_deepep_group_name: Optional[str] = None
 
         if self.deprecate_flag:
             return
@@ -171,6 +172,13 @@ class DeepEPMoE(FusedMoE):
             # the last one is invalid rank_id
             self.expert_mask[:-1] = 1
 
+        if _is_npu:
+            try:
+                self._ops_deepep_group_name = self._compute_ops_deepep_group_name()
+            except AssertionError:
+                # Longcat-only ops deepep group may be unavailable for non-longcat models.
+                self._ops_deepep_group_name = None
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -213,10 +221,15 @@ class DeepEPMoE(FusedMoE):
 
         return hidden_states
 
-    def _get_ops_deepep_group_name(self) -> str:
+    def _compute_ops_deepep_group_name(self) -> str:
         group = get_longcat_moe_ep_group()
         backend = group.device_group._get_backend(torch.device("npu"))
         return backend.get_hccl_comm_name(group.rank)
+
+    def _get_ops_deepep_group_name(self) -> str:
+        if self._ops_deepep_group_name is None:
+            self._ops_deepep_group_name = self._compute_ops_deepep_group_name()
+        return self._ops_deepep_group_name
 
     def _build_ops_deepep_dispatch_kwargs(
         self, copy_expert_num: int = 0

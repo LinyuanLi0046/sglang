@@ -179,14 +179,8 @@ class StandardDispatcher(BaseDispatcher):
 
         if self.local_expert_mapping is not None and not _use_aiter:
             if TopKOutputChecker.format_is_standard(topk_output):
-                valid_topk_mask = topk_output.topk_ids >= 0
-                remapped_topk_ids = torch.where(
-                    valid_topk_mask,
-                    self.local_expert_mapping[topk_output.topk_ids.clamp_min(0)],
-                    topk_output.topk_ids,
-                )
                 topk_output = topk_output._replace(
-                    topk_ids=remapped_topk_ids
+                    topk_ids=self.local_expert_mapping[topk_output.topk_ids]
                 )
             elif TopKOutputChecker.format_is_triton_kernels(topk_output):
                 raise NotImplementedError()

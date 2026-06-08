@@ -43,6 +43,7 @@ from sglang.srt.configs import LongcatFlashConfig
 from sglang.srt.distributed import (
     get_longcat_moe_ep_group,
     get_moe_ep_group,
+    get_moe_tp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
@@ -708,11 +709,21 @@ class LongcatFlashDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], int, int]:
+        moe_tp_group = get_moe_tp_group()
+        if moe_tp_group.world_size > 1:
+            raise RuntimeError(
+                "Ops-deepep decode sparse layout only supports moe_tp_size == 1."
+            )
+        moe_ep_group = get_longcat_moe_ep_group()
         total_tokens = hidden_states.shape[0]
-        max_local_tokens = (total_tokens + self.attn_tp_size - 1) // self.attn_tp_size
-        hidden_states = hidden_states.tensor_split(self.attn_tp_size)[self.attn_tp_rank]
+        max_local_tokens = (total_tokens + moe_ep_group.world_size - 1) // moe_ep_group.world_size
+        hidden_states = hidden_states.tensor_split(moe_ep_group.world_size)[
+            moe_ep_group.rank_in_group
+        ]
         if residual is not None:
-            residual = residual.tensor_split(self.attn_tp_size)[self.attn_tp_rank]
+            residual = residual.tensor_split(moe_ep_group.world_size)[
+                moe_ep_group.rank_in_group
+            ]
         return hidden_states, residual, total_tokens, max_local_tokens
 
     def _gather_ops_decode_moe_hidden_states(
@@ -721,11 +732,12 @@ class LongcatFlashDecoderLayer(nn.Module):
         total_tokens: int,
         max_local_tokens: int,
     ) -> torch.Tensor:
+        moe_ep_group = get_longcat_moe_ep_group()
         if hidden_states.shape[0] < max_local_tokens:
             pad_tokens = max_local_tokens - hidden_states.shape[0]
             padding = hidden_states.new_zeros((pad_tokens, *hidden_states.shape[1:]))
             hidden_states = torch.cat([hidden_states, padding], dim=0)
-        hidden_states = self.attn_tp_group.all_gather(hidden_states.contiguous(), dim=0)
+        hidden_states = moe_ep_group.all_gather(hidden_states.contiguous(), dim=0)
         return hidden_states[:total_tokens]
 
     def forward(

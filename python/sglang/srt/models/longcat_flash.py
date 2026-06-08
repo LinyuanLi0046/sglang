@@ -703,6 +703,31 @@ class LongcatFlashDecoderLayer(nn.Module):
         except Exception:
             return nullcontext()
 
+    def _split_ops_decode_moe_inputs(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], int, int]:
+        total_tokens = hidden_states.shape[0]
+        max_local_tokens = (total_tokens + self.attn_tp_size - 1) // self.attn_tp_size
+        hidden_states = hidden_states.tensor_split(self.attn_tp_size)[self.attn_tp_rank]
+        if residual is not None:
+            residual = residual.tensor_split(self.attn_tp_size)[self.attn_tp_rank]
+        return hidden_states, residual, total_tokens, max_local_tokens
+
+    def _gather_ops_decode_moe_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        total_tokens: int,
+        max_local_tokens: int,
+    ) -> torch.Tensor:
+        if hidden_states.shape[0] < max_local_tokens:
+            pad_tokens = max_local_tokens - hidden_states.shape[0]
+            padding = hidden_states.new_zeros((pad_tokens, *hidden_states.shape[1:]))
+            hidden_states = torch.cat([hidden_states, padding], dim=0)
+        hidden_states = self.attn_tp_group.all_gather(hidden_states.contiguous(), dim=0)
+        return hidden_states[:total_tokens]
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -743,14 +768,15 @@ class LongcatFlashDecoderLayer(nn.Module):
             mlp_residual = residual.clone()
         moe_hidden_states_input = hidden_states
         moe_residual_input = residual
+        ops_decode_total_tokens = hidden_states.shape[0]
+        ops_decode_max_local_tokens = hidden_states.shape[0]
         if use_ops_decode_sparse_layout:
-            moe_hidden_states_input = hidden_states.tensor_split(self.attn_tp_size)[
-                self.attn_tp_rank
-            ]
-            if residual is not None:
-                moe_residual_input = residual.tensor_split(self.attn_tp_size)[
-                    self.attn_tp_rank
-                ]
+            (
+                moe_hidden_states_input,
+                moe_residual_input,
+                ops_decode_total_tokens,
+                ops_decode_max_local_tokens,
+            ) = self._split_ops_decode_moe_inputs(hidden_states, residual)
 
         # ============= MOE放alt流 v1 ===============
         # if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
@@ -802,8 +828,10 @@ class LongcatFlashDecoderLayer(nn.Module):
                         moe_hidden_states, moe_residual_input, forward_batch
                     )
                     if use_ops_decode_sparse_layout:
-                        moe_hidden_states = self.attn_tp_group.all_gather(
-                            moe_hidden_states.contiguous(), dim=0
+                        moe_hidden_states = self._gather_ops_decode_moe_hidden_states(
+                            moe_hidden_states,
+                            ops_decode_total_tokens,
+                            ops_decode_max_local_tokens,
                         )
                     moe_hidden_states.record_stream(msu.main_stream)
                 MultiStreamUtils().forward_moe_func = None
@@ -899,8 +927,10 @@ class LongcatFlashDecoderLayer(nn.Module):
                 moe_hidden_states, moe_residual, forward_batch
             )
             if use_ops_decode_sparse_layout:
-                moe_hidden_states = self.attn_tp_group.all_gather(
-                    moe_hidden_states.contiguous(), dim=0
+                moe_hidden_states = self._gather_ops_decode_moe_hidden_states(
+                    moe_hidden_states,
+                    ops_decode_total_tokens,
+                    ops_decode_max_local_tokens,
                 )
 
             hidden_states, residual = self.forward_mlp(

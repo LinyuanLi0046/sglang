@@ -460,11 +460,23 @@ class LongcatFlashMoE(nn.Module):
 
             gathered_output = torch.cat([gathered_output, expanded_x1], dim=0)
 
-            routed_weight = topk_weights_chunk.clone()
-            routed_weight[topk_ids_chunk >= self.num_experts] = 0
+            valid_topk_mask = topk_ids_chunk >= 0
+            routed_topk_mask = valid_topk_mask & (topk_ids_chunk < self.num_experts)
+            zero_expert_topk_mask = valid_topk_mask & (
+                topk_ids_chunk >= self.num_experts
+            )
 
-            zero_expert_weight = topk_weights_chunk.clone()
-            zero_expert_weight[topk_ids_chunk < self.num_experts] = 0
+            routed_weight = torch.where(
+                routed_topk_mask,
+                topk_weights_chunk,
+                torch.zeros_like(topk_weights_chunk),
+            )
+
+            zero_expert_weight = torch.where(
+                zero_expert_topk_mask,
+                topk_weights_chunk,
+                torch.zeros_like(topk_weights_chunk),
+            )
 
             chunk_output = torch_npu.npu_moe_finalize_routing(
                 gathered_output,
@@ -492,20 +504,26 @@ class LongcatFlashMoE(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
-        use_sparse_layout = get_moe_a2a_backend().is_deepep()
+        use_sparse_layout = _use_longcat_sparse_a2a_runtime()
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+        use_ops_decode = self._use_ops_deepep_decode(forward_batch)
+        use_ops_prefill = self._use_ops_double_routing_prefill(forward_batch)
+        num_token_non_padded = (
+            forward_batch.num_token_non_padded
+            if forward_batch is not None and not use_ops_decode
+            else None
+        )
 
         # router_logits: (num_tokens, n_experts)
         router_logits = self.router(hidden_states)
         topk_weights, topk_idx, _ = self.topk(
             hidden_states,
             router_logits,
+            num_token_non_padded=num_token_non_padded,
         )
-        use_ops_decode = self._use_ops_deepep_decode(forward_batch)
-        use_ops_prefill = self._use_ops_double_routing_prefill(forward_batch)
         zero_expert_result = None
-        if self.zero_expert_type is not None and not use_ops_decode:
+        if self.zero_expert_type is not None and not use_ops_decode and not use_ops_prefill:
             if not _is_npu:
                 zero_expert_result = zero_experts_compute_triton(
                     expert_indices=topk_idx,
@@ -546,10 +564,14 @@ class LongcatFlashMoE(nn.Module):
             final_hidden_states = self.experts(hidden_states, topk_output)
         final_hidden_states *= self.routed_scaling_factor
 
-        if self.tp_size > 1 and use_sparse_layout:
+        if self.tp_size > 1 and use_sparse_layout and zero_expert_result is not None:
             zero_expert_result *= self.tp_size
 
-        if zero_expert_result is not None and not use_ops_decode and hidden_states.shape[0] > 0:
+        if (
+            zero_expert_result is not None
+            and not use_ops_decode
+            and hidden_states.shape[0] > 0
+        ):
             final_hidden_states += zero_expert_result.to(final_hidden_states.device)
 
         if self.tp_size > 1 and not _use_longcat_sparse_a2a_runtime():
@@ -680,6 +702,7 @@ class LongcatFlashDecoderLayer(nn.Module):
             is_previous_layer_sparse=True,
             # TODO: Check if the following is correct.
             is_next_layer_sparse=True,
+            force_sparse_mlp_scattered=_use_longcat_ops_deepep_runtime(),
         )
         self.moe_layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.moe_layer_scatter_modes,
@@ -709,7 +732,7 @@ class LongcatFlashDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-        use_sparse_layout = get_moe_a2a_backend().is_deepep()
+        use_sparse_layout = _use_longcat_sparse_a2a_runtime()
         if get_global_server_args().enable_longcat_double_stream and MultiStreamUtils().main_stream is None and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             MultiStreamUtils().main_stream = torch.npu.current_stream()
         # first_attn

@@ -266,6 +266,7 @@ class _LayerModeComputationContext:
     is_layer_sparse: bool
     is_previous_layer_sparse: Optional[bool]
     is_next_layer_sparse: Optional[bool]
+    force_sparse_mlp_scattered: bool = False
 
     def previous_layer(self):
         assert self.is_previous_layer_sparse is not None
@@ -310,6 +311,8 @@ class LayerScatterModes:
             return (
                 ScatterMode.SCATTERED
                 if (
+                    context.force_sparse_mlp_scattered
+                    or
                     # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
                     not get_moe_a2a_backend().is_none()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()

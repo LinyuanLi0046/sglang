@@ -501,7 +501,6 @@ class LongcatFlashMoE(nn.Module):
             hidden_states,
             router_logits,
         )
-        topk_weights *= self.routed_scaling_factor
         use_ops_decode = self._use_ops_deepep_decode(forward_batch)
         use_ops_prefill = self._use_ops_double_routing_prefill(forward_batch)
         zero_expert_result = None
@@ -544,12 +543,15 @@ class LongcatFlashMoE(nn.Module):
             )
         else:
             final_hidden_states = self.experts(hidden_states, topk_output)
-
-        if self.tp_size > 1 and not _use_longcat_sparse_a2a_runtime():
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        final_hidden_states *= self.routed_scaling_factor
 
         if zero_expert_result is not None and not use_ops_decode and hidden_states.shape[0] > 0:
             final_hidden_states += zero_expert_result.to(final_hidden_states.device)
+        elif  zero_expert_result is not None and use_ops_decode and hidden_states.shape[0] > 0:
+            final_hidden_states -= zero_expert_result.to(final_hidden_states.device) * (self.routed_scaling_factor-1)
+
+        if self.tp_size > 1 and not _use_longcat_sparse_a2a_runtime():
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 

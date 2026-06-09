@@ -771,18 +771,28 @@ class LongcatFlashDecoderLayer(nn.Module):
                 zero_allocator=zero_allocator,
             )
 
-        hidden_states, residual = self.mlp_layer_communicator[0].prepare_mlp(
-            hidden_states,
-            residual,
-            forward_batch,
-        )
-        mlp_hidden_states = hidden_states.clone()
-        if use_sparse_layout and not self.is_first_layer:
-            mlp_residual = self.attn_tp_group.all_gather(residual.contiguous(), dim=0)
+        attn0_hidden_states = hidden_states
+        attn0_residual = residual
+        if use_sparse_layout:
+            moe_hidden_states_input, moe_residual_input = (
+                self.moe_layer_communicator.prepare_mlp(
+                    attn0_hidden_states,
+                    attn0_residual,
+                    forward_batch,
+                )
+            )
+            mlp_hidden_states = attn0_hidden_states.clone()
+            mlp_residual = attn0_residual.clone()
         else:
+            hidden_states, residual = self.mlp_layer_communicator[0].prepare_mlp(
+                attn0_hidden_states,
+                attn0_residual,
+                forward_batch,
+            )
+            moe_hidden_states_input = hidden_states
+            moe_residual_input = residual
+            mlp_hidden_states = hidden_states.clone()
             mlp_residual = residual.clone()
-        moe_hidden_states_input = hidden_states
-        moe_residual_input = residual
 
         if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             msu = MultiStreamUtils()
@@ -811,6 +821,7 @@ class LongcatFlashDecoderLayer(nn.Module):
                     mlp_residual,
                     forward_batch,
                     zero_allocator,
+                    needs_prepare_mlp=use_sparse_layout,
                 )
 
                 if not self.is_last_layer and use_sparse_layout:
@@ -838,6 +849,7 @@ class LongcatFlashDecoderLayer(nn.Module):
                 mlp_residual,
                 forward_batch,
                 zero_allocator,
+                needs_prepare_mlp=use_sparse_layout,
             )
             if not self.is_last_layer and use_sparse_layout:
                 hidden_states = hidden_states.tensor_split(self.attn_tp_size)[
@@ -857,7 +869,19 @@ class LongcatFlashDecoderLayer(nn.Module):
         residual,
         forward_batch,
         zero_allocator,
+        needs_prepare_mlp: bool = False,
     ):
+        if needs_prepare_mlp:
+            hidden_states, residual = self.mlp_layer_communicator[0].prepare_mlp(
+                hidden_states,
+                residual,
+                forward_batch,
+            )
+            if not self.is_first_layer:
+                residual = self.attn_tp_group.all_gather(residual.contiguous(), dim=0)
+            else:
+                residual = residual.clone()
+
         hidden_states = self.mlps[0](hidden_states)
 
         # TP all_reduce

@@ -39,9 +39,6 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-_ATTN_TP_GROUP: Optional[GroupCoordinator] = None
-_ATTN_TP_RANK: Optional[int] = None
-_ATTN_TP_SIZE: Optional[int] = None
 _ATTN_DP_RANK: Optional[int] = None
 _ATTN_DP_SIZE: Optional[int] = None
 _LOCAL_ATTN_DP_SIZE: Optional[int] = None
@@ -277,9 +274,8 @@ def initialize_dp_attention(
     server_args: ServerArgs,
     model_config: ModelConfig,
 ):
-    global _ATTN_TP_GROUP, _ATTN_TP_RANK, _ATTN_TP_SIZE, _ATTN_DP_RANK, _ATTN_DP_SIZE
+    global _ATTN_DP_RANK, _ATTN_DP_SIZE
     global _LOCAL_ATTN_DP_SIZE, _LOCAL_ATTN_DP_RANK, _ENABLE_DP_ATTENTION_FLAG
-
     enable_dp_attention = server_args.enable_dp_attention
     dp_size = server_args.dp_size
     moe_dense_tp_size = server_args.moe_dense_tp_size
@@ -290,7 +286,7 @@ def initialize_dp_attention(
     tp_rank = get_tensor_model_parallel_rank()
     tp_size = get_tensor_model_parallel_world_size()
 
-    _ATTN_TP_RANK, _ATTN_TP_SIZE, _ATTN_DP_RANK = compute_dp_attention_world_info(
+    _, _, _ATTN_DP_RANK = compute_dp_attention_world_info(
         enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
     )
     _, _, _LOCAL_ATTN_DP_RANK = compute_dp_attention_local_info(
@@ -306,20 +302,6 @@ def initialize_dp_attention(
     else:
         _ATTN_DP_SIZE = 1
         _LOCAL_ATTN_DP_SIZE = 1
-
-    # Reuse the attention TP group created in initialize_model_parallel() to
-    # avoid creating a second HCCL group for the same attention_tp topology.
-    _ATTN_TP_GROUP = get_attn_tp_group()
-    runtime_attn_tp_rank = get_attn_tensor_model_parallel_rank()
-    runtime_attn_tp_size = get_attn_tensor_model_parallel_world_size()
-    assert runtime_attn_tp_rank == _ATTN_TP_RANK, (
-        "dp attention attention_tp rank mismatch: "
-        f"parallel_state={runtime_attn_tp_rank}, computed={_ATTN_TP_RANK}"
-    )
-    assert runtime_attn_tp_size == _ATTN_TP_SIZE, (
-        "dp attention attention_tp size mismatch: "
-        f"parallel_state={runtime_attn_tp_size}, computed={_ATTN_TP_SIZE}"
-    )
 
     _DpGatheredBufferWrapper.set_metadata(
         hidden_size=model_config.hidden_size,
@@ -337,18 +319,15 @@ def is_allocation_symmetric() -> bool:
 
 
 def get_attention_tp_group() -> GroupCoordinator:
-    assert _ATTN_TP_GROUP is not None, "dp attention not initialized!"
-    return _ATTN_TP_GROUP
+    return get_attn_tp_group()
 
 
 def get_attention_tp_rank() -> int:
-    assert _ATTN_TP_RANK is not None, "dp attention not initialized!"
-    return _ATTN_TP_RANK
+    return get_attn_tensor_model_parallel_rank()
 
 
 def get_attention_tp_size() -> int:
-    assert _ATTN_TP_SIZE is not None, "dp attention not initialized!"
-    return _ATTN_TP_SIZE
+    return get_attn_tensor_model_parallel_world_size()
 
 
 def get_attention_cp_group() -> GroupCoordinator:

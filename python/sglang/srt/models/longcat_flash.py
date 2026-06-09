@@ -784,13 +784,8 @@ class LongcatFlashDecoderLayer(nn.Module):
             else:
                 mlp_residual = attn0_residual.clone()
         else:
-            hidden_states, residual = self.mlp_layer_communicator[0].prepare_mlp(
-                attn0_hidden_states,
-                attn0_residual,
-                forward_batch,
-            )
-            moe_hidden_states_input = hidden_states
-            moe_residual_input = residual
+            moe_hidden_states_input = attn0_hidden_states
+            moe_residual_input = attn0_residual
             mlp_hidden_states = attn0_hidden_states.clone()
             mlp_residual = attn0_residual.clone()
 

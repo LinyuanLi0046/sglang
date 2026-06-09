@@ -41,7 +41,6 @@ from torch import nn
 
 from sglang.srt.configs import LongcatFlashConfig
 from sglang.srt.distributed import (
-    get_longcat_moe_ep_group,
     get_moe_ep_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -53,8 +52,6 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
-    restore_tokens_from_decode_moe_ep,
-    shard_tokens_for_decode_moe_ep,
 )
 from sglang.srt.layers.dp_attention import (
     dp_scatter,
@@ -149,10 +146,6 @@ logger = logging.getLogger(__name__)
 
 def _use_longcat_ops_deepep_runtime() -> bool:
     return _is_npu and get_bool_env_var("SGLANG_ASCEND_USE_OPS_DEEPEP")
-
-
-def _use_longcat_sparse_a2a_runtime() -> bool:
-    return _use_longcat_ops_deepep_runtime() or get_moe_a2a_backend().is_deepep()
 
 
 class LongcatFlashMLP(nn.Module):
@@ -318,25 +311,6 @@ class LongcatFlashMoE(nn.Module):
             and forward_batch is not None
             and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         )
-
-    def _get_ops_decode_ep_group(self):
-        return get_longcat_moe_ep_group().device_group
-
-    def _mask_ops_decode_padding_topk(
-        self,
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
-        valid_tokens: int,
-    ) -> None:
-        if valid_tokens >= topk_idx.shape[0]:
-            return
-
-        padding_ids = (
-            torch.arange(self.top_k, device=topk_idx.device, dtype=topk_idx.dtype)
-            % self.num_experts
-        )
-        topk_idx[valid_tokens:] = padding_ids
-        topk_weights[valid_tokens:].zero_()
 
     def _get_prefill_double_routing_group(self):
         return get_moe_ep_group().device_group
@@ -516,20 +490,10 @@ class LongcatFlashMoE(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
-        use_sparse_layout = get_moe_a2a_backend().is_deepep()
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-        ops_decode_meta = None
         use_ops_decode = self._use_ops_deepep_decode(forward_batch)
         use_ops_prefill = self._use_ops_double_routing_prefill(forward_batch)
-
-        if use_ops_decode:
-            hidden_states, ops_decode_meta = shard_tokens_for_decode_moe_ep(
-                hidden_states,
-                group=self._get_ops_decode_ep_group(),
-                group_rank=self.experts.moe_ep_rank,
-                group_size=self.experts.moe_ep_size,
-            )
 
         # router_logits: (num_tokens, n_experts)
         router_logits = self.router(hidden_states)
@@ -537,12 +501,6 @@ class LongcatFlashMoE(nn.Module):
             hidden_states,
             router_logits,
         )
-        if use_ops_decode and ops_decode_meta is not None:
-            self._mask_ops_decode_padding_topk(
-                topk_idx,
-                topk_weights,
-                ops_decode_meta.valid_tokens,
-            )
         zero_expert_result = None
         if self.zero_expert_type is not None and not use_ops_decode:
             if not _is_npu:
@@ -581,23 +539,17 @@ class LongcatFlashMoE(nn.Module):
                 topk_output,
                 copy_expert_num=self.zero_expert_num,
             )
-            if ops_decode_meta is not None:
-                final_hidden_states = restore_tokens_from_decode_moe_ep(
-                    final_hidden_states,
-                    ops_decode_meta,
-                    group=self._get_ops_decode_ep_group(),
-                )
         else:
             final_hidden_states = self.experts(hidden_states, topk_output)
         final_hidden_states *= self.routed_scaling_factor
 
-        if self.tp_size > 1 and use_sparse_layout:
+        if self.tp_size > 1 and get_moe_a2a_backend().is_deepep():
             zero_expert_result *= self.tp_size
 
         if zero_expert_result is not None and not use_ops_decode and hidden_states.shape[0] > 0:
             final_hidden_states += zero_expert_result.to(final_hidden_states.device)
 
-        if self.tp_size > 1 and not _use_longcat_sparse_a2a_runtime():
+        if self.tp_size > 1 and not get_moe_a2a_backend().is_deepep():
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
@@ -754,11 +706,10 @@ class LongcatFlashDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-        use_sparse_layout = get_moe_a2a_backend().is_deepep()
         if get_global_server_args().enable_longcat_double_stream and MultiStreamUtils().main_stream is None and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             MultiStreamUtils().main_stream = torch.npu.current_stream()
         # first_attn
-        if use_sparse_layout and not self.is_first_layer:
+        if get_moe_a2a_backend().is_deepep() and not self.is_first_layer:
             residual = residual.tensor_split(self.attn_tp_size)[self.attn_tp_rank]
         hidden_states, residual = self.moe_layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
@@ -773,7 +724,7 @@ class LongcatFlashDecoderLayer(nn.Module):
 
         attn0_hidden_states = hidden_states
         attn0_residual = residual
-        if use_sparse_layout:
+        if get_moe_a2a_backend().is_deepep():
             moe_hidden_states_input = attn0_hidden_states
             moe_residual_input = attn0_residual
             mlp_hidden_states = attn0_hidden_states.clone()
@@ -797,7 +748,7 @@ class LongcatFlashDecoderLayer(nn.Module):
                 nonlocal moe_hidden_states, moe_residual
                 with torch.npu.stream(MultiStreamUtils().stream_moe):
                     MultiStreamUtils().first_attn_finished.wait()
-                    if use_sparse_layout:
+                    if get_moe_a2a_backend().is_deepep():
                         prepared_moe_hidden_states, moe_residual = (
                             self.moe_layer_communicator.prepare_mlp(
                                 moe_hidden_states_input,
@@ -829,7 +780,7 @@ class LongcatFlashDecoderLayer(nn.Module):
                     zero_allocator,
                 )
 
-                if not self.is_last_layer and use_sparse_layout:
+                if not self.is_last_layer and get_moe_a2a_backend().is_deepep():
                     mlp_hidden_states = mlp_hidden_states.tensor_split(self.attn_tp_size)[
                         self.attn_tp_rank
                     ]
@@ -840,7 +791,7 @@ class LongcatFlashDecoderLayer(nn.Module):
             msu.main_stream.wait_stream(msu.stream_attn)
 
         else:
-            if use_sparse_layout:
+            if get_moe_a2a_backend().is_deepep():
                 prepared_moe_hidden_states, moe_residual = (
                     self.moe_layer_communicator.prepare_mlp(
                         moe_hidden_states_input,
@@ -865,7 +816,7 @@ class LongcatFlashDecoderLayer(nn.Module):
                 forward_batch,
                 zero_allocator,
             )
-            if not self.is_last_layer and use_sparse_layout:
+            if not self.is_last_layer and get_moe_a2a_backend().is_deepep():
                 hidden_states = hidden_states.tensor_split(self.attn_tp_size)[
                     self.attn_tp_rank
                 ]

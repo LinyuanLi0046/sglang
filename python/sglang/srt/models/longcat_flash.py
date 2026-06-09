@@ -771,23 +771,18 @@ class LongcatFlashDecoderLayer(nn.Module):
                 zero_allocator=zero_allocator,
             )
 
-        attn0_hidden_states = hidden_states
-        attn0_residual = residual
-        if use_sparse_layout:
-            moe_hidden_states_input = attn0_hidden_states
-            moe_residual_input = attn0_residual
-            mlp_hidden_states = attn0_hidden_states.clone()
-            if not self.is_first_layer:
-                mlp_residual = self.attn_tp_group.all_gather(
-                    attn0_residual.contiguous(), dim=0
-                )
-            else:
-                mlp_residual = attn0_residual.clone()
+        hidden_states, residual = self.mlp_layer_communicator[0].prepare_mlp(
+            hidden_states,
+            residual,
+            forward_batch,
+        )
+        mlp_hidden_states = hidden_states.clone()
+        if use_sparse_layout and not self.is_first_layer:
+            mlp_residual = self.attn_tp_group.all_gather(residual.contiguous(), dim=0)
         else:
-            moe_hidden_states_input = attn0_hidden_states
-            moe_residual_input = attn0_residual
-            mlp_hidden_states = attn0_hidden_states.clone()
-            mlp_residual = attn0_residual.clone()
+            mlp_residual = residual.clone()
+        moe_hidden_states_input = hidden_states
+        moe_residual_input = residual
 
         if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             msu = MultiStreamUtils()
@@ -797,22 +792,11 @@ class LongcatFlashDecoderLayer(nn.Module):
                 nonlocal moe_hidden_states, moe_residual
                 with torch.npu.stream(MultiStreamUtils().stream_moe):
                     MultiStreamUtils().first_attn_finished.wait()
-                    if use_sparse_layout:
-                        prepared_moe_hidden_states, moe_residual = (
-                            self.moe_layer_communicator.prepare_mlp(
-                                moe_hidden_states_input,
-                                moe_residual_input,
-                                forward_batch,
-                            )
-                        )
-                    else:
-                        prepared_moe_hidden_states = moe_hidden_states_input
-                        moe_residual = moe_residual_input
                     moe_hidden_states = self.mlp(
-                        prepared_moe_hidden_states, forward_batch=forward_batch
+                        moe_hidden_states_input, forward_batch=forward_batch
                     )
                     moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
-                        moe_hidden_states, moe_residual, forward_batch
+                        moe_hidden_states, moe_residual_input, forward_batch
                     )
                     moe_hidden_states.record_stream(msu.main_stream)
                 MultiStreamUtils().forward_moe_func = None
@@ -840,19 +824,9 @@ class LongcatFlashDecoderLayer(nn.Module):
             msu.main_stream.wait_stream(msu.stream_attn)
 
         else:
-            if use_sparse_layout:
-                prepared_moe_hidden_states, moe_residual = (
-                    self.moe_layer_communicator.prepare_mlp(
-                        moe_hidden_states_input,
-                        moe_residual_input,
-                        forward_batch,
-                    )
-                )
-            else:
-                prepared_moe_hidden_states = moe_hidden_states_input
-                moe_residual = moe_residual_input
+            moe_residual = moe_residual_input
             moe_hidden_states = self.mlp(
-                prepared_moe_hidden_states, forward_batch=forward_batch
+                moe_hidden_states_input, forward_batch=forward_batch
             )
             moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
                 moe_hidden_states, moe_residual, forward_batch
@@ -884,12 +858,6 @@ class LongcatFlashDecoderLayer(nn.Module):
         forward_batch,
         zero_allocator,
     ):
-        hidden_states, residual = self.mlp_layer_communicator[0].prepare_mlp(
-            hidden_states,
-            residual,
-            forward_batch,
-        )
-
         hidden_states = self.mlps[0](hidden_states)
 
         # TP all_reduce

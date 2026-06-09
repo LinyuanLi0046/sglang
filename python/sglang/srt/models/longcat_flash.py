@@ -55,6 +55,8 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
 )
 from sglang.srt.layers.dp_attention import (
+    attn_tp_all_gather_into_tensor,
+    attn_tp_reduce_scatter_tensor,
     dp_scatter,
     get_attention_tp_group,
     get_attention_tp_rank,
@@ -751,12 +753,12 @@ class LongcatFlashDecoderLayer(nn.Module):
         local_hidden_states = hidden_states.new_empty(
             local_tokens, *hidden_states.shape[1:]
         )
-        self.attn_tp_group.reduce_scatter_tensor(
+        attn_tp_reduce_scatter_tensor(
             local_hidden_states, hidden_states.contiguous()
         )
-        local_residual = residual.tensor_split(self.attn_tp_size)[
-            self.attn_tp_rank
-        ].contiguous()
+        local_residual = residual.narrow(
+            0, local_tokens * self.attn_tp_rank, local_tokens
+        ).contiguous()
         if local_hidden_states.shape[0] != 0:
             local_hidden_states, local_residual = self.post_attention_layernorm[0](
                 local_hidden_states,
@@ -769,7 +771,13 @@ class LongcatFlashDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         if self.attn_tp_size == 1:
             return hidden_states
-        return self.attn_tp_group.all_gather(hidden_states, dim=0)
+        global_hidden_states = hidden_states.new_empty(
+            hidden_states.shape[0] * self.attn_tp_size, *hidden_states.shape[1:]
+        )
+        attn_tp_all_gather_into_tensor(
+            global_hidden_states, hidden_states.contiguous()
+        )
+        return global_hidden_states
 
     def forward(
         self,

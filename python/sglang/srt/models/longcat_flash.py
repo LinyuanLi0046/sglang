@@ -53,8 +53,6 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
-    restore_tokens_from_decode_moe_ep,
-    shard_tokens_for_decode_moe_ep,
 )
 from sglang.srt.layers.dp_attention import (
     dp_scatter,
@@ -322,22 +320,6 @@ class LongcatFlashMoE(nn.Module):
     def _get_ops_decode_ep_group(self):
         return get_longcat_moe_ep_group().device_group
 
-    def _mask_ops_decode_padding_topk(
-        self,
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
-        valid_tokens: int,
-    ) -> None:
-        if valid_tokens >= topk_idx.shape[0]:
-            return
-
-        padding_ids = (
-            torch.arange(self.top_k, device=topk_idx.device, dtype=topk_idx.dtype)
-            % self.num_experts
-        )
-        topk_idx[valid_tokens:] = padding_ids
-        topk_weights[valid_tokens:].zero_()
-
     def _get_prefill_double_routing_group(self):
         return get_moe_ep_group().device_group
 
@@ -523,26 +505,12 @@ class LongcatFlashMoE(nn.Module):
         use_ops_decode = self._use_ops_deepep_decode(forward_batch)
         use_ops_prefill = self._use_ops_double_routing_prefill(forward_batch)
 
-        if use_ops_decode:
-            hidden_states, ops_decode_meta = shard_tokens_for_decode_moe_ep(
-                hidden_states,
-                group=self._get_ops_decode_ep_group(),
-                group_rank=self.experts.moe_ep_rank,
-                group_size=self.experts.moe_ep_size,
-            )
-
         # router_logits: (num_tokens, n_experts)
         router_logits = self.router(hidden_states)
         topk_weights, topk_idx, _ = self.topk(
             hidden_states,
             router_logits,
         )
-        if use_ops_decode and ops_decode_meta is not None:
-            self._mask_ops_decode_padding_topk(
-                topk_idx,
-                topk_weights,
-                ops_decode_meta.valid_tokens,
-            )
         zero_expert_result = None
         if self.zero_expert_type is not None and not use_ops_decode:
             if not _is_npu:
@@ -581,12 +549,6 @@ class LongcatFlashMoE(nn.Module):
                 topk_output,
                 copy_expert_num=self.zero_expert_num,
             )
-            if ops_decode_meta is not None:
-                final_hidden_states = restore_tokens_from_decode_moe_ep(
-                    final_hidden_states,
-                    ops_decode_meta,
-                    group=self._get_ops_decode_ep_group(),
-                )
         else:
             final_hidden_states = self.experts(hidden_states, topk_output)
         final_hidden_states *= self.routed_scaling_factor

@@ -362,33 +362,6 @@ def enable_moe_dense_fully_dp():
     return get_global_server_args().moe_dense_tp_size == 1
 
 
-def shard_tokens_for_decode_moe_ep(
-    hidden_states: torch.Tensor,
-    *,
-    group,
-    group_rank: int,
-    group_size: int,
-) -> Tuple[torch.Tensor, PaddedTokenShardMetadata]:
-    return shard_by_group_with_padding(
-        hidden_states,
-        group_rank=group_rank,
-        group_size=group_size,
-    )
-
-
-def restore_tokens_from_decode_moe_ep(
-    local_hidden_states: torch.Tensor,
-    meta: PaddedTokenShardMetadata,
-    *,
-    group,
-) -> torch.Tensor:
-    return gather_from_group_padded_shards(
-        local_hidden_states,
-        meta,
-        group=group,
-    )
-
-
 class LayerCommunicator:
     def __init__(
         self,

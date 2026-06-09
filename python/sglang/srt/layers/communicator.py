@@ -96,6 +96,18 @@ elif _is_npu:
 FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
 
 
+def _use_longcat_ops_deepep_sparse_runtime() -> bool:
+    if not (_is_npu and get_bool_env_var("SGLANG_ASCEND_USE_OPS_DEEPEP")):
+        return False
+
+    try:
+        model_config = get_global_server_args().get_model_config()
+    except Exception:
+        return False
+
+    return getattr(model_config.hf_config, "model_type", None) == "longcat_flash"
+
+
 def apply_flashinfer_allreduce_fusion(batch_size: int):
     return (
         # NOTE: flashinfer 0.6.1 caused performance regression on sm100 for allreduce fusion
@@ -315,6 +327,7 @@ class LayerScatterModes:
                 if (
                     # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
                     not get_moe_a2a_backend().is_none()
+                    or _use_longcat_ops_deepep_sparse_runtime()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 )
                 else ScatterMode.FULL

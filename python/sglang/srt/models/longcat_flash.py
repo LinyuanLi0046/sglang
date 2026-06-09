@@ -151,6 +151,10 @@ def _use_longcat_ops_deepep_runtime() -> bool:
     return _is_npu and get_bool_env_var("SGLANG_ASCEND_USE_OPS_DEEPEP")
 
 
+def _enable_longcat_ops_local_token_moe() -> bool:
+    return get_bool_env_var("SGLANG_LONGCAT_OPS_LOCAL_TOKEN_MOE")
+
+
 def _use_longcat_sparse_a2a_runtime() -> bool:
     return _use_longcat_ops_deepep_runtime() or get_moe_a2a_backend().is_deepep()
 
@@ -754,6 +758,8 @@ class LongcatFlashDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
     ) -> bool:
         return (
+            _enable_longcat_ops_local_token_moe()
+            and
             self._use_ops_sparse_decode_runtime(forward_batch)
             and hidden_states.shape[0] % self.attn_tp_size == 0
         )

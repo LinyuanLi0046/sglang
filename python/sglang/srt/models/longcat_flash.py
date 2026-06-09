@@ -247,10 +247,11 @@ class LongcatFlashMoE(nn.Module):
         self.num_experts = config.n_routed_experts
         self.top_k = config.moe_topk
         self.zero_expert_num = config.zero_expert_num
+        self.total_num_experts = self.num_experts + (self.zero_expert_num or 0)
         self.zero_expert_type = config.zero_expert_type
         self.prefill_chunk_max_len = 65536
         self.enable_perfect_eplb = get_bool_env_var("SGLANG_LONGCAT_PERFECT_EPLB")
-        self._perfect_eplb_topk_idx_cache: Dict[int, torch.Tensor] = {}
+        self._perfect_eplb_topk_idx_cache: Dict[Tuple[bool, int], torch.Tensor] = {}
 
         if config.rounter_params_dtype == "float32":
             self.rounter_params_dtype = torch.float32
@@ -332,17 +333,57 @@ class LongcatFlashMoE(nn.Module):
         return get_moe_ep_group().device_group
 
     def _get_perfect_eplb_topk_idx(
-        self, num_tokens: int, device: torch.device
+        self, is_prefill: bool, num_tokens: int, device: torch.device
     ) -> torch.Tensor:
-        topk_idx = self._perfect_eplb_topk_idx_cache.get(num_tokens)
+        cache_key = (is_prefill, num_tokens)
+        topk_idx = self._perfect_eplb_topk_idx_cache.get(cache_key)
         if topk_idx is None or topk_idx.device != device:
-            slot_ids = torch.arange(
-                num_tokens * self.top_k,
-                device=device,
-                dtype=torch.int32,
-            ).view(num_tokens, self.top_k)
-            topk_idx = (slot_ids + self.layer_id * self.top_k) % self.num_experts
-            self._perfect_eplb_topk_idx_cache[num_tokens] = topk_idx
+            global_rank = dist.get_rank()
+            if is_prefill:
+                step_prefill = num_tokens * self.top_k
+                topk_idx = torch.arange(
+                    step_prefill,
+                    device=device,
+                    dtype=torch.int32,
+                )
+                topk_idx = (topk_idx + global_rank) % self.total_num_experts
+                topk_idx = topk_idx.view(num_tokens, self.top_k)
+            else:
+                expanded_tokens = num_tokens * self.top_k
+                moe_ep_size = self.experts.moe_ep_size
+                moe_tp_size = self.experts.moe_tp_size
+                if moe_tp_size > 1:
+                    experts_per_rank = self.total_num_experts // moe_ep_size
+                    topk_idx = torch.empty(
+                        num_tokens, self.top_k, device=device, dtype=torch.int32
+                    )
+                    offset = 0
+                    for ep_offset in range(moe_ep_size):
+                        expert_start = ep_offset * experts_per_rank
+                        expert_end = expert_start + expanded_tokens
+                        rank_indices = torch.arange(
+                            expert_start,
+                            expert_end,
+                            device=device,
+                            dtype=torch.int32,
+                        )
+                        topk_idx.view(-1)[offset : offset + rank_indices.numel()] = rank_indices
+                        offset += rank_indices.numel()
+                else:
+                    step_gap = self.total_num_experts // moe_ep_size
+                    expanded_offset = expanded_tokens * global_rank + global_rank
+                    linear_idx = torch.arange(
+                        expanded_tokens,
+                        device=device,
+                        dtype=torch.int64,
+                    )
+                    shifted_idx = linear_idx + expanded_offset
+                    col = shifted_idx % moe_ep_size
+                    row = (shifted_idx // moe_ep_size) % step_gap
+                    topk_idx = (row + col * step_gap).to(torch.int32).view(
+                        num_tokens, self.top_k
+                    )
+            self._perfect_eplb_topk_idx_cache[cache_key] = topk_idx
         return topk_idx
 
     def _split_prefill_tensors(
@@ -524,6 +565,10 @@ class LongcatFlashMoE(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
         use_ops_decode = self._use_ops_deepep_decode(forward_batch)
         use_ops_prefill = self._use_ops_double_routing_prefill(forward_batch)
+        is_prefill = (
+            forward_batch is not None
+            and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+        )
 
         # router_logits: (num_tokens, n_experts)
         router_logits = self.router(hidden_states)
@@ -534,7 +579,9 @@ class LongcatFlashMoE(nn.Module):
         if self.enable_perfect_eplb:
             # Benchmark-only path: keep router weights but force a uniform expert id layout.
             topk_idx = self._get_perfect_eplb_topk_idx(
-                hidden_states.shape[0], hidden_states.device
+                is_prefill=is_prefill,
+                num_tokens=hidden_states.shape[0],
+                device=hidden_states.device,
             )
         zero_expert_result = None
         if self.zero_expert_type is not None and not use_ops_decode:
@@ -1000,6 +1047,9 @@ class LongcatFlashDecoderLayer(nn.Module):
         # TP all_reduce
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
+        if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+            MultiStreamUtils().forward_moe_func()
+
         # second_attn
         if is_dp_attention_enabled():
             hidden_states, global_hidden_states = (
@@ -1023,9 +1073,6 @@ class LongcatFlashDecoderLayer(nn.Module):
         hidden_states, residual = self.mlp_layer_communicator[1].prepare_mlp(
             hidden_states, residual, forward_batch
         )
-
-        if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
-            MultiStreamUtils().forward_moe_func()
 
         hidden_states = self.mlps[1](hidden_states)
 

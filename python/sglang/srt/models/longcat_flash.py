@@ -33,7 +33,7 @@
 import concurrent.futures
 import logging
 from contextlib import nullcontext
-from typing import Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -245,6 +245,8 @@ class LongcatFlashMoE(nn.Module):
         self.zero_expert_num = config.zero_expert_num
         self.zero_expert_type = config.zero_expert_type
         self.prefill_chunk_max_len = 65536
+        self.enable_perfect_eplb = get_bool_env_var("SGLANG_LONGCAT_PERFECT_EPLB")
+        self._perfect_eplb_topk_idx_cache: Dict[int, torch.Tensor] = {}
 
         if config.rounter_params_dtype == "float32":
             self.rounter_params_dtype = torch.float32
@@ -324,6 +326,20 @@ class LongcatFlashMoE(nn.Module):
 
     def _get_prefill_double_routing_group(self):
         return get_moe_ep_group().device_group
+
+    def _get_perfect_eplb_topk_idx(
+        self, num_tokens: int, device: torch.device
+    ) -> torch.Tensor:
+        topk_idx = self._perfect_eplb_topk_idx_cache.get(num_tokens)
+        if topk_idx is None or topk_idx.device != device:
+            slot_ids = torch.arange(
+                num_tokens * self.top_k,
+                device=device,
+                dtype=torch.int32,
+            ).view(num_tokens, self.top_k)
+            topk_idx = (slot_ids + self.layer_id * self.top_k) % self.num_experts
+            self._perfect_eplb_topk_idx_cache[num_tokens] = topk_idx
+        return topk_idx
 
     def _split_prefill_tensors(
         self,
@@ -511,6 +527,11 @@ class LongcatFlashMoE(nn.Module):
             hidden_states,
             router_logits,
         )
+        if self.enable_perfect_eplb:
+            # Benchmark-only path: keep router weights but force a uniform expert id layout.
+            topk_idx = self._get_perfect_eplb_topk_idx(
+                hidden_states.shape[0], hidden_states.device
+            )
         zero_expert_result = None
         if self.zero_expert_type is not None and not use_ops_decode:
             if not _is_npu:

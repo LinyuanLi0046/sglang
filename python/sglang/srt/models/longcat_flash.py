@@ -974,11 +974,11 @@ class LongcatFlashDecoderLayer(nn.Module):
                     moe_hidden_states = self.mlp(
                         prepared_moe_hidden_states, forward_batch=forward_batch
                     )
-                    if use_deepep_sparse_decode_runtime:
+                    if not use_ops_local_token_moe:
                         moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
                             moe_hidden_states, moe_residual, forward_batch
                         )
-                    elif use_ops_local_token_moe:
+                    else:
                         if not reorder_ops_local_token_moe_comm:
                             moe_hidden_states = self._restore_ops_local_token_moe_outputs(
                                 moe_hidden_states
@@ -1035,11 +1035,11 @@ class LongcatFlashDecoderLayer(nn.Module):
             moe_hidden_states = self.mlp(
                 prepared_moe_hidden_states, forward_batch=forward_batch
             )
-            if use_deepep_sparse_decode_runtime:
+            if not use_ops_local_token_moe:
                 moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
                     moe_hidden_states, moe_residual, forward_batch
                 )
-            elif use_ops_local_token_moe:
+            else:
                 moe_hidden_states = self._restore_ops_local_token_moe_outputs(
                     moe_hidden_states
                 )

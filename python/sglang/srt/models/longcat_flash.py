@@ -972,9 +972,10 @@ class LongcatFlashDecoderLayer(nn.Module):
                             moe_hidden_states, moe_residual, forward_batch
                         )
                     elif use_ops_local_token_moe:
-                        moe_hidden_states = self._restore_ops_local_token_moe_outputs(
-                            moe_hidden_states
-                        )
+                        if not reorder_ops_local_token_moe_comm:
+                            moe_hidden_states = self._restore_ops_local_token_moe_outputs(
+                                moe_hidden_states
+                            )
                     moe_hidden_states.record_stream(msu.main_stream)
                 MultiStreamUtils().forward_moe_func = None
             MultiStreamUtils().forward_moe_func = forward_moe_func
@@ -1000,6 +1001,10 @@ class LongcatFlashDecoderLayer(nn.Module):
 
             msu.main_stream.wait_stream(msu.stream_moe)
             msu.main_stream.wait_stream(msu.stream_attn)
+            if reorder_ops_local_token_moe_comm:
+                moe_hidden_states = self._restore_ops_local_token_moe_outputs(
+                    moe_hidden_states
+                )
 
         else:
             if use_deepep_sparse_decode_runtime:
@@ -1072,9 +1077,6 @@ class LongcatFlashDecoderLayer(nn.Module):
         # TP all_reduce
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
-        if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
-            MultiStreamUtils().forward_moe_func()
-
         # second_attn
         if is_dp_attention_enabled():
             hidden_states, global_hidden_states = (
@@ -1098,6 +1100,9 @@ class LongcatFlashDecoderLayer(nn.Module):
         hidden_states, residual = self.mlp_layer_communicator[1].prepare_mlp(
             hidden_states, residual, forward_batch
         )
+
+        if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+            MultiStreamUtils().forward_moe_func()
 
         hidden_states = self.mlps[1](hidden_states)
 

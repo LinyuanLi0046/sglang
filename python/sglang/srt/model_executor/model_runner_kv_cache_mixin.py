@@ -75,11 +75,22 @@ class ModelRunnerKVCacheMixin:
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
         if self.use_mla_backend:
-            cell_size = (
-                (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
-                * num_layers
-                * kv_size
-            )
+            if _is_npu and self.kv_cache_dtype == torch.float8_e4m3fn:
+                # On NPU MLA fp8 cache, latent KV is stored in fp8 while rope
+                # cache remains in bf16, so capacity estimation must account
+                # for the mixed storage dtypes.
+                cell_size = (
+                    self.model_config.kv_lora_rank
+                    * torch._utils._element_size(torch.float8_e4m3fn)
+                    + self.model_config.qk_rope_head_dim
+                    * torch._utils._element_size(torch.bfloat16)
+                ) * num_layers
+            else:
+                cell_size = (
+                    (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
+                    * num_layers
+                    * kv_size
+                )
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16

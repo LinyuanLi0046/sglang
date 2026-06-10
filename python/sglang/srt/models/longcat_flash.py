@@ -158,7 +158,7 @@ def _enable_longcat_ops_local_token_moe() -> bool:
 def _override_longcat_expert_config(config: LongcatFlashConfig) -> LongcatFlashConfig:
     if get_bool_env_var("SGLANG_LONGCAT_FORCE_64_EXPERTS"):
         config.n_routed_experts = 64
-        config.zero_expert_num = 0
+        config.zero_expert_num = 32
     return config
 
 

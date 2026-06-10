@@ -155,6 +155,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         self.quant_config = quant_config
         self.has_preprocess_weights = False
         self.dtype = None
+        self.quant_scale_ckv = None
 
         self.q_lora_rank = self.q_b_proj.input_size  # 1536
         self.kv_lora_rank = self.kv_a_layernorm.hidden_size  # 512
@@ -168,6 +169,11 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             self.q_b_proj_weight_scale = self.q_b_proj.weight_scale.view(1, -1).to(
                 torch.float
             ) if hasattr(self.q_b_proj, 'weight_scale') else None
+
+    def _get_quant_scale_ckv(self, device: torch.device) -> torch.Tensor:
+        if self.quant_scale_ckv is None or self.quant_scale_ckv.device != device:
+            self.quant_scale_ckv = torch.ones(1, dtype=torch.float32, device=device)
+        return self.quant_scale_ckv
 
     def preprocess_weights(self, hidden_states):
         self.dummy = torch.zeros(
@@ -649,7 +655,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             query_quant_mode = 1
             kc_scale = 1.0
             qc_qr_scale = 1.0
-            quant_scale_ckv = torch.ones(1, dtype=torch.float32, device=hidden_states.device)
+            quant_scale_ckv = self._get_quant_scale_ckv(hidden_states.device)
         else:
             kv_cache_quant_mode = 0
             query_quant_mode = 0

@@ -62,6 +62,10 @@ def _quantize_mla_query_for_fia_fp8(
     )
 
 
+def _get_fp8_kv_scale(device: torch.device) -> torch.Tensor:
+    return torch.ones(1, dtype=torch.float32, device=device)
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -232,6 +236,7 @@ class AscendAttnBackend(AttentionBackend):
         super().__init__()
         self.forward_metadata = None
         self.device = model_runner.device
+        self.fp8_kv_scale = _get_fp8_kv_scale(self.device)
         self.speculative_step_id = speculative_step_id
         self.speculative_step_offset_npu = torch.tensor(
             speculative_step_id + 1, device="npu"
@@ -1772,7 +1777,6 @@ class AscendAttnBackend(AttentionBackend):
             if self.use_fia_v2:
                 if self.kv_cache_dtype == "fp8_e4m3":
                     q_fp8, dequant_scale_query = q_nope, dequant_scale_q_nope
-                    kv_scale = torch.ones(1, dtype=torch.float32, device=q_nope.device)
                     attn_output = torch.empty_like(q_nope, dtype=torch.bfloat16, device=q_nope.device)
                     softmax_lse = torch.empty(1, dtype=torch.bfloat16, device=q_nope.device)
                     torch_npu.npu_fused_infer_attention_score_v2.out(
@@ -1792,8 +1796,8 @@ class AscendAttnBackend(AttentionBackend):
                         sparse_mode=3,
                         atten_mask=self.mtp_mask,
                         dequant_scale_query=dequant_scale_query,
-                        dequant_scale_key=kv_scale,
-                        dequant_scale_value=kv_scale,
+                        dequant_scale_key=self.fp8_kv_scale,
+                        dequant_scale_value=self.fp8_kv_scale,
                         key_quant_mode=0,
                         value_quant_mode=0,
                         query_quant_mode=3,
@@ -2024,7 +2028,6 @@ class AscendAttnBackend(AttentionBackend):
             if self.use_fia_v2:
                 if self.kv_cache_dtype == "fp8_e4m3":
                     q_fp8, dequant_scale_query = q_nope, dequant_scale_q_nope
-                    kv_scale = torch.ones(1, dtype=torch.float32, device=q_nope.device)
                     output = torch.empty_like(q_nope, dtype=torch.bfloat16, device=q_nope.device)
                     softmax_lse = torch.empty(1, dtype=torch.bfloat16, device=q_nope.device)
                     torch_npu.npu_fused_infer_attention_score_v2.out(
@@ -2042,8 +2045,8 @@ class AscendAttnBackend(AttentionBackend):
                         actual_seq_kvlen=actual_seq_len_kv,
                         sparse_mode=0,
                         dequant_scale_query=dequant_scale_query,
-                        dequant_scale_key=kv_scale,
-                        dequant_scale_value=kv_scale,
+                        dequant_scale_key=self.fp8_kv_scale,
+                        dequant_scale_value=self.fp8_kv_scale,
                         key_quant_mode=0,
                         value_quant_mode=0,
                         query_quant_mode=3,

@@ -865,6 +865,13 @@ class LongcatFlashDecoderLayer(nn.Module):
         use_ops_local_token_moe = self._should_use_ops_local_token_moe(
             forward_batch, hidden_states
         )
+        reorder_ops_local_token_moe_comm = (
+            _use_longcat_ops_deepep_runtime()
+            and _enable_longcat_ops_local_token_moe()
+            and use_ops_local_token_moe
+            and get_global_server_args().enable_longcat_double_stream
+            and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+        )
         if get_global_server_args().enable_longcat_double_stream and MultiStreamUtils().main_stream is None and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             MultiStreamUtils().main_stream = torch.npu.current_stream()
         # first_attn
@@ -895,23 +902,40 @@ class LongcatFlashDecoderLayer(nn.Module):
                 mlp_residual = attn0_residual.clone()
             mlp_inputs_prepared = False
         else:
-            (
-                prepared_hidden_states,
-                prepared_residual,
-            ) = self.mlp_layer_communicator[0].prepare_mlp(
-                attn0_hidden_states,
-                attn0_residual,
-                forward_batch,
+            if reorder_ops_local_token_moe_comm:
+                moe_hidden_states_input = attn0_hidden_states
+                moe_residual_input = attn0_residual
+                mlp_hidden_states = attn0_hidden_states
+                mlp_residual = attn0_residual
+                mlp_inputs_prepared = False
+            else:
+                (
+                    prepared_hidden_states,
+                    prepared_residual,
+                ) = self.mlp_layer_communicator[0].prepare_mlp(
+                    attn0_hidden_states,
+                    attn0_residual,
+                    forward_batch,
+                )
+                moe_hidden_states_input = (
+                    attn0_hidden_states
+                    if use_ops_local_token_moe
+                    else prepared_hidden_states
+                )
+                moe_residual_input = (
+                    attn0_residual if use_ops_local_token_moe else prepared_residual
+                )
+                mlp_hidden_states = prepared_hidden_states.clone()
+                mlp_residual = prepared_residual.clone()
+                mlp_inputs_prepared = True
+
+        if reorder_ops_local_token_moe_comm:
+            prepared_moe_hidden_states, moe_residual = (
+                self._prepare_ops_local_token_moe_inputs(
+                    moe_hidden_states_input,
+                    moe_residual_input,
+                )
             )
-            moe_hidden_states_input = (
-                attn0_hidden_states if use_ops_local_token_moe else prepared_hidden_states
-            )
-            moe_residual_input = (
-                attn0_residual if use_ops_local_token_moe else prepared_residual
-            )
-            mlp_hidden_states = prepared_hidden_states.clone()
-            mlp_residual = prepared_residual.clone()
-            mlp_inputs_prepared = True
 
         if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             msu = MultiStreamUtils()
@@ -930,12 +954,13 @@ class LongcatFlashDecoderLayer(nn.Module):
                             )
                         )
                     elif use_ops_local_token_moe:
-                        prepared_moe_hidden_states, moe_residual = (
-                            self._prepare_ops_local_token_moe_inputs(
-                                moe_hidden_states_input,
-                                moe_residual_input,
+                        if not reorder_ops_local_token_moe_comm:
+                            prepared_moe_hidden_states, moe_residual = (
+                                self._prepare_ops_local_token_moe_inputs(
+                                    moe_hidden_states_input,
+                                    moe_residual_input,
+                                )
                             )
-                        )
                     else:
                         prepared_moe_hidden_states = moe_hidden_states_input
                         moe_residual = moe_residual_input

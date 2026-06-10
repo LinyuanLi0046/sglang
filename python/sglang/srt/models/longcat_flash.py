@@ -1073,10 +1073,9 @@ class LongcatFlashDecoderLayer(nn.Module):
                             moe_hidden_states, moe_residual, forward_batch
                         )
                     else:
-                        if not reorder_ops_local_token_moe_comm:
-                            moe_hidden_states = self._restore_ops_local_token_moe_outputs(
-                                moe_hidden_states
-                            )
+                        moe_hidden_states = self._restore_ops_local_token_moe_outputs(
+                            moe_hidden_states
+                        )
                     self._debug_hidden_states_stats(
                         "moe_branch_after_postprocess",
                         moe_hidden_states,
@@ -1112,10 +1111,6 @@ class LongcatFlashDecoderLayer(nn.Module):
 
             msu.main_stream.wait_stream(msu.stream_moe)
             msu.main_stream.wait_stream(msu.stream_attn)
-            if reorder_ops_local_token_moe_comm:
-                moe_hidden_states = self._restore_ops_local_token_moe_outputs(
-                    moe_hidden_states
-                )
 
         else:
             if use_deepep_sparse_decode_runtime:

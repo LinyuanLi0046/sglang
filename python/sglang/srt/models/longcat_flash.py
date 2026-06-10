@@ -942,7 +942,7 @@ class LongcatFlashDecoderLayer(nn.Module):
             msu.main_stream.record_event(msu.first_attn_finished)
 
             def forward_moe_func():
-                nonlocal moe_hidden_states, moe_residual
+                nonlocal prepared_moe_hidden_states, moe_hidden_states, moe_residual
                 with torch.npu.stream(MultiStreamUtils().stream_moe):
                     MultiStreamUtils().first_attn_finished.wait()
                     if use_deepep_sparse_decode_runtime:

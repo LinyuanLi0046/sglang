@@ -54,6 +54,7 @@ from sglang.srt.entrypoints.engine_info_bootstrap_server import (
 )
 from sglang.srt.entrypoints.engine_score_mixin import EngineScoreMixin
 from sglang.srt.entrypoints.EngineBase import EngineBase
+from sglang.srt.environ import envs
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
@@ -93,6 +94,7 @@ from sglang.srt.utils import (
     is_cuda,
     kill_process_tree,
     launch_dummy_health_check_server,
+    maybe_set_process_affinity_from_spec,
     maybe_reindex_device_id,
     numa_utils,
     set_prometheus_multiproc_dir,
@@ -641,6 +643,11 @@ class Engine(EngineScoreMixin, EngineBase):
         _set_envs_and_config(server_args)
         server_args.check_server_args()
         _set_gc(server_args)
+        maybe_set_process_affinity_from_spec(
+            envs.SGLANG_CONTROL_CPUSET.get(),
+            bind_all_threads=envs.SGLANG_CONTROL_BIND_ALL_THREADS.get(),
+            debug_name="launch_server",
+        )
 
         # Allocate ports for inter-process communications
         if port_args is None:

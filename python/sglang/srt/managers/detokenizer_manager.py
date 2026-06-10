@@ -39,6 +39,7 @@ from sglang.srt.utils import (
     configure_logger,
     freeze_gc,
     kill_itself_when_parent_died,
+    maybe_set_process_affinity_from_spec,
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils.network import get_zmq_socket
@@ -394,6 +395,11 @@ def run_detokenizer_process(
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer")
     configure_logger(server_args)
+    maybe_set_process_affinity_from_spec(
+        envs.SGLANG_DETOKENIZER_CPUSET.get() or envs.SGLANG_CONTROL_CPUSET.get(),
+        bind_all_threads=envs.SGLANG_CONTROL_BIND_ALL_THREADS.get(),
+        debug_name="detokenizer",
+    )
     parent_process = psutil.Process().parent()
 
     manager = None

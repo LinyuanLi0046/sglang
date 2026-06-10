@@ -2069,6 +2069,73 @@ def set_gpu_proc_affinity(
     logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
 
 
+def parse_cpu_list_spec(cpu_list_spec: str) -> List[int]:
+    cpu_ids = set()
+    for part in cpu_list_spec.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        if "-" in token:
+            start_str, end_str = token.split("-", 1)
+            start = int(start_str.strip())
+            end = int(end_str.strip())
+            if end < start:
+                raise ValueError(f"Invalid CPU range: {token}")
+            cpu_ids.update(range(start, end + 1))
+        else:
+            cpu_ids.add(int(token))
+
+    if not cpu_ids:
+        raise ValueError("No CPUs parsed from CPU list spec")
+    return sorted(cpu_ids)
+
+
+def set_current_process_affinity(
+    cpu_ids: Sequence[int], bind_all_threads: bool = True
+) -> List[int]:
+    bind_cpus = sorted({int(cpu_id) for cpu_id in cpu_ids})
+    if not bind_cpus:
+        raise ValueError("cpu_ids must not be empty")
+
+    pid = os.getpid()
+    p = psutil.Process(pid)
+    p.cpu_affinity(bind_cpus)
+
+    if bind_all_threads and hasattr(os, "sched_setaffinity"):
+        for thread in p.threads():
+            try:
+                os.sched_setaffinity(thread.id, bind_cpus)
+            except Exception as e:
+                logger.debug("Failed to set affinity for tid %s: %s", thread.id, e)
+
+    return bind_cpus
+
+
+def maybe_set_process_affinity_from_spec(
+    cpu_list_spec: Optional[str],
+    *,
+    bind_all_threads: bool = True,
+    debug_name: str = "process",
+) -> Optional[List[int]]:
+    if cpu_list_spec is None:
+        return None
+
+    cpu_list_spec = cpu_list_spec.strip()
+    if not cpu_list_spec:
+        return None
+
+    bind_cpus = set_current_process_affinity(
+        parse_cpu_list_spec(cpu_list_spec), bind_all_threads=bind_all_threads
+    )
+    logger.info(
+        "PID %s | %s bound to CPUs: %s",
+        os.getpid(),
+        debug_name,
+        ",".join(str(cpu_id) for cpu_id in bind_cpus),
+    )
+    return bind_cpus
+
+
 def set_npu_david_proc_affinity(
     pp_size: int,
     tp_size: int,

@@ -155,6 +155,13 @@ def _enable_longcat_ops_local_token_moe() -> bool:
     return get_bool_env_var("SGLANG_LONGCAT_OPS_LOCAL_TOKEN_MOE")
 
 
+def _override_longcat_expert_config(config: LongcatFlashConfig) -> LongcatFlashConfig:
+    if get_bool_env_var("SGLANG_LONGCAT_FORCE_64_EXPERTS"):
+        config.n_routed_experts = 64
+        config.zero_expert_num = 0
+    return config
+
+
 def _use_longcat_sparse_a2a_runtime() -> bool:
     return _use_longcat_ops_deepep_runtime() or get_moe_a2a_backend().is_deepep()
 
@@ -1221,6 +1228,7 @@ class LongcatFlashForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        config = _override_longcat_expert_config(config)
 
         # for quark model load
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
@@ -1493,6 +1501,10 @@ class LongcatFlashForCausalLM(nn.Module):
                     requant_weight_ue8m0_inplace(w[0], w[1], weight_block_size)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+
+        if get_bool_env_var("SGLANG_LONGCAT_FORCE_64_EXPERTS"):
+            self.post_load_weights()
+            return
 
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)

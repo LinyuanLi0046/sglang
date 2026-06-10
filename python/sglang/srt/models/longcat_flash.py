@@ -32,6 +32,7 @@
 
 import concurrent.futures
 import logging
+import os
 from contextlib import nullcontext
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -164,6 +165,18 @@ def _override_longcat_expert_config(config: LongcatFlashConfig) -> LongcatFlashC
 
 def _use_longcat_sparse_a2a_runtime() -> bool:
     return _use_longcat_ops_deepep_runtime() or get_moe_a2a_backend().is_deepep()
+
+
+def _enable_longcat_double_stream_tensor_stats() -> bool:
+    return get_bool_env_var("SGLANG_LONGCAT_DEBUG_TENSOR_STATS")
+
+
+def _get_longcat_double_stream_tensor_stats_rank() -> int:
+    rank_str = os.getenv("SGLANG_LONGCAT_DEBUG_TENSOR_STATS_RANK", "0")
+    try:
+        return int(rank_str)
+    except ValueError:
+        return 0
 
 
 class LongcatFlashMLP(nn.Module):
@@ -774,6 +787,57 @@ class LongcatFlashDecoderLayer(nn.Module):
             qkv_latent_func=self.self_attn[0].prepare_qkv_latent,
         )
 
+    def _debug_hidden_states_stats(
+        self,
+        tag: str,
+        hidden_states: Optional[torch.Tensor],
+        forward_batch: Optional[ForwardBatch] = None,
+    ) -> None:
+        if not _enable_longcat_double_stream_tensor_stats():
+            return
+        if not get_global_server_args().enable_longcat_double_stream:
+            return
+        if (
+            forward_batch is not None
+            and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+        ):
+            return
+
+        if hidden_states is None:
+            tensor_desc = "none"
+        elif hidden_states.numel() == 0:
+            tensor_desc = (
+                f"shape={tuple(hidden_states.shape)} dtype={hidden_states.dtype} empty=true"
+            )
+        else:
+            stats_tensor = hidden_states.detach()
+            if not stats_tensor.is_floating_point():
+                stats_tensor = stats_tensor.float()
+            else:
+                stats_tensor = stats_tensor.to(torch.float32)
+            has_nan = torch.isnan(stats_tensor).any().item()
+            has_inf = torch.isinf(stats_tensor).any().item()
+            tensor_desc = (
+                f"shape={tuple(hidden_states.shape)} "
+                f"dtype={hidden_states.dtype} "
+                f"mean={stats_tensor.mean().item():.6e} "
+                f"min={stats_tensor.min().item():.6e} "
+                f"max={stats_tensor.max().item():.6e} "
+                f"has_nan={bool(has_nan)} "
+                f"has_inf={bool(has_inf)}"
+            )
+
+        if dist.is_available() and dist.is_initialized():
+            rank = dist.get_rank()
+        else:
+            rank = -1
+        if rank != _get_longcat_double_stream_tensor_stats_rank():
+            return
+        print(
+            f"[LONGCAT_DS_DEBUG][rank={rank}][layer={self.layer_id}] {tag}: {tensor_desc}",
+            flush=True,
+        )
+
     def _aclgraph_limit_core_scope(self, aic_num: int, aiv_num: int):
         if not _is_npu:
             return nullcontext()
@@ -897,6 +961,11 @@ class LongcatFlashDecoderLayer(nn.Module):
 
         attn0_hidden_states = hidden_states
         attn0_residual = residual
+        self._debug_hidden_states_stats(
+            "attn0_hidden_states",
+            attn0_hidden_states,
+            forward_batch,
+        )
         if use_deepep_sparse_decode_runtime:
             moe_hidden_states_input = attn0_hidden_states
             moe_residual_input = attn0_residual
@@ -935,6 +1004,11 @@ class LongcatFlashDecoderLayer(nn.Module):
                 mlp_hidden_states = prepared_hidden_states.clone()
                 mlp_residual = prepared_residual.clone()
                 mlp_inputs_prepared = True
+                self._debug_hidden_states_stats(
+                    "prepared_hidden_states_shared",
+                    prepared_hidden_states,
+                    forward_batch,
+                )
 
         if reorder_ops_local_token_moe_comm:
             prepared_moe_hidden_states, moe_residual = (
@@ -942,6 +1016,11 @@ class LongcatFlashDecoderLayer(nn.Module):
                     moe_hidden_states_input,
                     moe_residual_input,
                 )
+            )
+            self._debug_hidden_states_stats(
+                "prepared_moe_hidden_states_reordered",
+                prepared_moe_hidden_states,
+                forward_batch,
             )
 
         if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
@@ -952,6 +1031,11 @@ class LongcatFlashDecoderLayer(nn.Module):
                 nonlocal prepared_moe_hidden_states, moe_hidden_states, moe_residual
                 with torch.npu.stream(MultiStreamUtils().stream_moe):
                     MultiStreamUtils().first_attn_finished.wait()
+                    self._debug_hidden_states_stats(
+                        "moe_branch_input",
+                        moe_hidden_states_input,
+                        forward_batch,
+                    )
                     if use_deepep_sparse_decode_runtime:
                         prepared_moe_hidden_states, moe_residual = (
                             self.moe_layer_communicator.prepare_mlp(
@@ -971,8 +1055,18 @@ class LongcatFlashDecoderLayer(nn.Module):
                     else:
                         prepared_moe_hidden_states = moe_hidden_states_input
                         moe_residual = moe_residual_input
+                    self._debug_hidden_states_stats(
+                        "moe_branch_prepared",
+                        prepared_moe_hidden_states,
+                        forward_batch,
+                    )
                     moe_hidden_states = self.mlp(
                         prepared_moe_hidden_states, forward_batch=forward_batch
+                    )
+                    self._debug_hidden_states_stats(
+                        "moe_branch_after_mlp",
+                        moe_hidden_states,
+                        forward_batch,
                     )
                     if not use_ops_local_token_moe:
                         moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
@@ -983,6 +1077,11 @@ class LongcatFlashDecoderLayer(nn.Module):
                             moe_hidden_states = self._restore_ops_local_token_moe_outputs(
                                 moe_hidden_states
                             )
+                    self._debug_hidden_states_stats(
+                        "moe_branch_after_postprocess",
+                        moe_hidden_states,
+                        forward_batch,
+                    )
                     moe_hidden_states.record_stream(msu.main_stream)
                 MultiStreamUtils().forward_moe_func = None
             MultiStreamUtils().forward_moe_func = forward_moe_func
@@ -990,6 +1089,11 @@ class LongcatFlashDecoderLayer(nn.Module):
             with torch.npu.stream(MultiStreamUtils().stream_attn):
                 # mlp + mla + mlp
                 MultiStreamUtils().first_attn_finished.wait()
+                self._debug_hidden_states_stats(
+                    "dense_branch_input",
+                    mlp_hidden_states,
+                    forward_batch,
+                )
                 mlp_hidden_states, residual = self.forward_mlp(
                     mlp_hidden_states,
                     positions,
@@ -1035,6 +1139,11 @@ class LongcatFlashDecoderLayer(nn.Module):
             moe_hidden_states = self.mlp(
                 prepared_moe_hidden_states, forward_batch=forward_batch
             )
+            self._debug_hidden_states_stats(
+                "single_branch_moe_after_mlp",
+                moe_hidden_states,
+                forward_batch,
+            )
             if not use_ops_local_token_moe:
                 moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
                     moe_hidden_states, moe_residual, forward_batch
@@ -1043,6 +1152,11 @@ class LongcatFlashDecoderLayer(nn.Module):
                 moe_hidden_states = self._restore_ops_local_token_moe_outputs(
                     moe_hidden_states
                 )
+            self._debug_hidden_states_stats(
+                "single_branch_moe_after_postprocess",
+                moe_hidden_states,
+                forward_batch,
+            )
 
             hidden_states, residual = self.forward_mlp(
                 mlp_hidden_states,
@@ -1058,9 +1172,34 @@ class LongcatFlashDecoderLayer(nn.Module):
                 ]
         # hidden_states = moe_hidden_states + hidden_states
         if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+            self._debug_hidden_states_stats(
+                "before_add_moe_hidden_states",
+                moe_hidden_states,
+                forward_batch,
+            )
+            self._debug_hidden_states_stats(
+                "before_add_dense_hidden_states",
+                mlp_hidden_states,
+                forward_batch,
+            )
             hidden_states = moe_hidden_states + mlp_hidden_states
         else:
+            self._debug_hidden_states_stats(
+                "before_add_moe_hidden_states",
+                moe_hidden_states,
+                forward_batch,
+            )
+            self._debug_hidden_states_stats(
+                "before_add_dense_hidden_states",
+                hidden_states,
+                forward_batch,
+            )
             hidden_states = moe_hidden_states + hidden_states
+        self._debug_hidden_states_stats(
+            "after_add_hidden_states",
+            hidden_states,
+            forward_batch,
+        )
         return hidden_states, residual
 
     def forward_mlp(
@@ -1083,6 +1222,11 @@ class LongcatFlashDecoderLayer(nn.Module):
 
         # TP all_reduce
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        self._debug_hidden_states_stats(
+            "dense_after_mlp0_allreduce",
+            hidden_states,
+            forward_batch,
+        )
 
         # second_attn
         if is_dp_attention_enabled():
@@ -1091,8 +1235,18 @@ class LongcatFlashDecoderLayer(nn.Module):
                 hidden_states,
             )
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
+            self._debug_hidden_states_stats(
+                "dense_after_dp_scatter",
+                hidden_states,
+                forward_batch,
+            )
         hidden_states, residual = self.mlp_layer_communicator[1].prepare_attn(
             hidden_states, residual, forward_batch
+        )
+        self._debug_hidden_states_stats(
+            "dense_after_prepare_attn1",
+            hidden_states,
+            forward_batch,
         )
 
         if hidden_states.shape[0] != 0:
@@ -1102,10 +1256,20 @@ class LongcatFlashDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
                 zero_allocator=zero_allocator,
             )
+            self._debug_hidden_states_stats(
+                "dense_after_attn1",
+                hidden_states,
+                forward_batch,
+            )
 
         # second_mlp
         hidden_states, residual = self.mlp_layer_communicator[1].prepare_mlp(
             hidden_states, residual, forward_batch
+        )
+        self._debug_hidden_states_stats(
+            "dense_after_prepare_mlp1",
+            hidden_states,
+            forward_batch,
         )
 
         if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
@@ -1115,9 +1279,19 @@ class LongcatFlashDecoderLayer(nn.Module):
 
         # TP all_reduce
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        self._debug_hidden_states_stats(
+            "dense_after_mlp1_allreduce",
+            hidden_states,
+            forward_batch,
+        )
 
         hidden_states, residual = self.mlp_layer_communicator[1].postprocess_layer(
             hidden_states, residual, forward_batch
+        )
+        self._debug_hidden_states_stats(
+            "dense_after_postprocess",
+            hidden_states,
+            forward_batch,
         )
 
         return hidden_states, residual

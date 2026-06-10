@@ -43,7 +43,10 @@ def _reshape_kv_for_fia_nz(
     tensor: torch.Tensor, num_heads: int, head_dim: int, page_size: int
 ) -> torch.Tensor:
     """Reshapes a tensor for FIA NZ format."""
-    return tensor.view(-1, 1, num_heads * head_dim // 16, page_size, 16)
+    nz_last_dim = 32 if tensor.dtype == torch.float8_e4m3fn else 16
+    return tensor.view(
+        -1, 1, num_heads * head_dim // nz_last_dim, page_size, nz_last_dim
+    )
 
 def _quantize_mla_query_for_fia_fp8(
     query: torch.Tensor,

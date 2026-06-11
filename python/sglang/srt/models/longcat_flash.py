@@ -869,14 +869,10 @@ class LongcatFlashDecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
         use_deepep_sparse_decode_runtime = get_moe_a2a_backend().is_deepep()
-        use_ops_local_token_moe = self._should_use_ops_local_token_moe(
-            forward_batch, hidden_states
-        )
-        reorder_ops_local_token_moe_comm = (
-            _use_longcat_ops_deepep_runtime()
-            and _enable_longcat_ops_local_token_moe()
-            and use_ops_local_token_moe
-            and get_global_server_args().enable_longcat_double_stream
+        use_ops_local_token_moe = (
+            _enable_longcat_ops_local_token_moe() 
+            and self._use_ops_sparse_decode_runtime(forward_batch)
+            and hidden_states.shape[0] % self.attn_tp_size == 0
             and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         )
         if get_global_server_args().enable_longcat_double_stream and MultiStreamUtils().main_stream is None and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
@@ -907,43 +903,28 @@ class LongcatFlashDecoderLayer(nn.Module):
                 )
             else:
                 mlp_residual = attn0_residual.clone()
-            mlp_inputs_prepared = False
         else:
-            if reorder_ops_local_token_moe_comm:
-                moe_hidden_states_input = attn0_hidden_states
-                moe_residual_input = attn0_residual
-                mlp_hidden_states = attn0_hidden_states
-                mlp_residual = attn0_residual
-                mlp_inputs_prepared = False
-            else:
-                (
-                    prepared_hidden_states,
-                    prepared_residual,
-                ) = self.mlp_layer_communicator[0].prepare_mlp(
-                    attn0_hidden_states,
-                    attn0_residual,
-                    forward_batch,
-                )
-                moe_hidden_states_input = (
-                    attn0_hidden_states
-                    if use_ops_local_token_moe
-                    else prepared_hidden_states
-                )
-                moe_residual_input = (
-                    attn0_residual if use_ops_local_token_moe else prepared_residual
-                )
-                mlp_hidden_states = prepared_hidden_states.clone()
-                mlp_residual = prepared_residual.clone()
-                mlp_inputs_prepared = True
+            moe_hidden_states_input = attn0_hidden_states
+            moe_residual_input = attn0_residual
+            mlp_hidden_states = attn0_hidden_states.clone()
+            mlp_residual = attn0_residual.clone()
 
-        if reorder_ops_local_token_moe_comm:
+        if use_ops_local_token_moe:
             prepared_moe_hidden_states, moe_residual = (
                 self._prepare_ops_local_token_moe_inputs(
                     moe_hidden_states_input,
                     moe_residual_input,
                 )
             )
-
+        else:
+            prepared_moe_hidden_states, moe_residual = (
+                self.moe_layer_communicator.prepare_mlp(
+                    moe_hidden_states_input,
+                    moe_residual_input,
+                    forward_batch,
+                )
+            )
+        moe_hidden_states = None
         if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             msu = MultiStreamUtils()
             msu.main_stream.record_event(msu.first_attn_finished)
@@ -952,25 +933,6 @@ class LongcatFlashDecoderLayer(nn.Module):
                 nonlocal prepared_moe_hidden_states, moe_hidden_states, moe_residual
                 with torch.npu.stream(MultiStreamUtils().stream_moe):
                     MultiStreamUtils().first_attn_finished.wait()
-                    if use_deepep_sparse_decode_runtime:
-                        prepared_moe_hidden_states, moe_residual = (
-                            self.moe_layer_communicator.prepare_mlp(
-                                moe_hidden_states_input,
-                                moe_residual_input,
-                                forward_batch,
-                            )
-                        )
-                    elif use_ops_local_token_moe:
-                        if not reorder_ops_local_token_moe_comm:
-                            prepared_moe_hidden_states, moe_residual = (
-                                self._prepare_ops_local_token_moe_inputs(
-                                    moe_hidden_states_input,
-                                    moe_residual_input,
-                                )
-                            )
-                    else:
-                        prepared_moe_hidden_states = moe_hidden_states_input
-                        moe_residual = moe_residual_input
                     moe_hidden_states = self.mlp(
                         prepared_moe_hidden_states, forward_batch=forward_batch
                     )
@@ -995,7 +957,6 @@ class LongcatFlashDecoderLayer(nn.Module):
                     mlp_residual,
                     forward_batch,
                     zero_allocator,
-                    already_prepared=mlp_inputs_prepared,
                 )
 
                 if not self.is_last_layer and use_deepep_sparse_decode_runtime:
@@ -1009,24 +970,6 @@ class LongcatFlashDecoderLayer(nn.Module):
             msu.main_stream.wait_stream(msu.stream_attn)
 
         else:
-            if use_deepep_sparse_decode_runtime:
-                prepared_moe_hidden_states, moe_residual = (
-                    self.moe_layer_communicator.prepare_mlp(
-                        moe_hidden_states_input,
-                        moe_residual_input,
-                        forward_batch,
-                    )
-                )
-            elif use_ops_local_token_moe:
-                prepared_moe_hidden_states, moe_residual = (
-                    self._prepare_ops_local_token_moe_inputs(
-                        moe_hidden_states_input,
-                        moe_residual_input,
-                    )
-                )
-            else:
-                prepared_moe_hidden_states = moe_hidden_states_input
-                moe_residual = moe_residual_input
             moe_hidden_states = self.mlp(
                 prepared_moe_hidden_states, forward_batch=forward_batch
             )
@@ -1045,7 +988,6 @@ class LongcatFlashDecoderLayer(nn.Module):
                 mlp_residual,
                 forward_batch,
                 zero_allocator,
-                already_prepared=mlp_inputs_prepared,
             )
             if not self.is_last_layer and use_deepep_sparse_decode_runtime:
                 hidden_states = hidden_states.tensor_split(self.attn_tp_size)[
@@ -1065,14 +1007,12 @@ class LongcatFlashDecoderLayer(nn.Module):
         residual,
         forward_batch,
         zero_allocator,
-        already_prepared: bool = False,
     ):
-        if not already_prepared:
-            hidden_states, residual = self.mlp_layer_communicator[0].prepare_mlp(
-                hidden_states,
-                residual,
-                forward_batch,
-            )
+        hidden_states, residual = self.mlp_layer_communicator[0].prepare_mlp(
+            hidden_states,
+            residual,
+            forward_batch,
+        )
 
         hidden_states = self.mlps[0](hidden_states)
 

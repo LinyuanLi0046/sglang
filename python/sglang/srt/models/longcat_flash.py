@@ -951,7 +951,7 @@ class LongcatFlashDecoderLayer(nn.Module):
             with torch.npu.stream(MultiStreamUtils().stream_attn):
                 # mlp + mla + mlp
                 MultiStreamUtils().first_attn_finished.wait()
-                mlp_hidden_states, residual = self.forward_mlp(
+                mlp_hidden_states, mlp_residual = self.forward_mlp(
                     mlp_hidden_states,
                     positions,
                     mlp_residual,
@@ -982,7 +982,7 @@ class LongcatFlashDecoderLayer(nn.Module):
                     moe_hidden_states
                 )
 
-            hidden_states, residual = self.forward_mlp(
+            mlp_hidden_states, mlp_residual = self.forward_mlp(
                 mlp_hidden_states,
                 positions,
                 mlp_residual,
@@ -990,14 +990,11 @@ class LongcatFlashDecoderLayer(nn.Module):
                 zero_allocator,
             )
             if not self.is_last_layer and use_deepep_sparse_decode_runtime:
-                hidden_states = hidden_states.tensor_split(self.attn_tp_size)[
+                mlp_hidden_states = mlp_hidden_states.tensor_split(self.attn_tp_size)[
                     self.attn_tp_rank
                 ]
-        # hidden_states = moe_hidden_states + hidden_states
-        if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
-            hidden_states = moe_hidden_states + mlp_hidden_states
-        else:
-            hidden_states = moe_hidden_states + hidden_states
+        hidden_states = moe_hidden_states + mlp_hidden_states
+        residual = mlp_residual
         return hidden_states, residual
 
     def forward_mlp(

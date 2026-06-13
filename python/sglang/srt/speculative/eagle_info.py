@@ -629,6 +629,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
     # Inputs for extend
     # shape: (b,)
+    bonus_tokens: torch.Tensor = None
     verified_id: torch.Tensor = None
     accept_length: torch.Tensor = None
     accept_length_cpu: List[int] = None
@@ -690,6 +691,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         capture_hidden_mode: CaptureHiddenMode,
     ):
         return cls(
+            bonus_tokens=torch.empty((0,), device=device, dtype=torch.int32),
             verified_id=torch.empty((0,), device=device, dtype=torch.int32),
             hidden_states=torch.empty((0, hidden_size), device=device, dtype=dtype),
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
@@ -782,13 +784,19 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
             self.topk_p = self.topk_p[: len(new_indices)]
             self.topk_index = self.topk_index[: len(new_indices)]
-            self.hidden_states = self.hidden_states[: len(new_indices)]
+            if self.hidden_states is not None:
+                self.hidden_states = self.hidden_states[: len(new_indices)]
+            if self.bonus_tokens is not None:
+                self.bonus_tokens = self.bonus_tokens[: len(new_indices)]
             self.verified_id = self.verified_id[: len(new_indices)]
         else:
             # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
             self.topk_p = self.topk_p[new_indices]
             self.topk_index = self.topk_index[new_indices]
-            self.hidden_states = self.hidden_states[new_indices]
+            if self.hidden_states is not None:
+                self.hidden_states = self.hidden_states[new_indices]
+            if self.bonus_tokens is not None:
+                self.bonus_tokens = self.bonus_tokens[new_indices]
             self.verified_id = self.verified_id[new_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
@@ -801,17 +809,31 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             )
             return
 
-        if self.hidden_states is None:
+        if len(self.topk_index) == 0:
             self.hidden_states = spec_info.hidden_states
+            self.bonus_tokens = spec_info.bonus_tokens
             self.verified_id = spec_info.verified_id
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
             return
-        if spec_info.hidden_states is None:
+        if len(spec_info.topk_index) == 0:
             return
-        self.hidden_states = torch.cat(
-            [self.hidden_states, spec_info.hidden_states], axis=0
-        )
+        if self.hidden_states is not None and spec_info.hidden_states is not None:
+            self.hidden_states = torch.cat(
+                [self.hidden_states, spec_info.hidden_states], axis=0
+            )
+        elif self.hidden_states is None and spec_info.hidden_states is None:
+            pass
+        else:
+            raise ValueError("inconsistent hidden_states presence in EagleDraftInput")
+        if self.bonus_tokens is not None and spec_info.bonus_tokens is not None:
+            self.bonus_tokens = torch.cat(
+                [self.bonus_tokens, spec_info.bonus_tokens], axis=0
+            )
+        elif self.bonus_tokens is None and spec_info.bonus_tokens is None:
+            pass
+        else:
+            raise ValueError("inconsistent bonus_tokens presence in EagleDraftInput")
         self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])

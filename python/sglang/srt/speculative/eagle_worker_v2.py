@@ -357,7 +357,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
         return self._build_verify_input_from_tree(
             model_worker_batch=model_worker_batch,
-            verified_id=draft_input.verified_id,
+            tree_base_tokens=draft_input.verified_id,
             parent_list=parent_list,
             top_scores_index=top_scores_index,
             draft_tokens=draft_tokens,
@@ -367,12 +367,20 @@ class EagleDraftWorker(BaseDraftWorker):
         self, model_worker_batch: ModelWorkerBatch
     ) -> EagleVerifyInput:
         draft_input: EagleDraftInput = model_worker_batch.spec_info
+        if draft_input.bonus_tokens is None:
+            raise ValueError(
+                "zero-bubble requires EagleDraftInput.bonus_tokens in prepare_verify_fully_async_decoding"
+            )
+        if draft_input.topk_p is not None and draft_input.bonus_tokens.shape[0] != draft_input.topk_p.shape[0]:
+            raise ValueError(
+                "zero-bubble requires bonus_tokens batch size to match topk_p batch size"
+            )
         parent_list, top_scores_index, draft_tokens = (
             self._draft_forward_for_zero_bubble_prepare(draft_input)
         )
         return self._build_verify_input_from_tree(
             model_worker_batch=model_worker_batch,
-            verified_id=draft_input.verified_id,
+            tree_base_tokens=draft_input.bonus_tokens,
             parent_list=parent_list,
             top_scores_index=top_scores_index,
             draft_tokens=draft_tokens,
@@ -381,7 +389,7 @@ class EagleDraftWorker(BaseDraftWorker):
     def _build_verify_input_from_tree(
         self,
         model_worker_batch: ModelWorkerBatch,
-        verified_id: torch.Tensor,
+        tree_base_tokens: torch.Tensor,
         parent_list: torch.Tensor,
         top_scores_index: torch.Tensor,
         draft_tokens: torch.Tensor,
@@ -410,7 +418,7 @@ class EagleDraftWorker(BaseDraftWorker):
             retrive_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
-            verified_id,
+            tree_base_tokens,
             parent_list,
             top_scores_index,
             draft_tokens,
@@ -425,11 +433,11 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
         logger.error(
-            "build_verify_input_from_tree shapes: batch_size=%s verified_id=%s parent_list=%s top_scores_index=%s input_draft_tokens=%s output_draft_token=%s position=%s retrive_index=%s seq_lens=%s seq_lens_sum=%s draft_token_num=%s",
+            "build_verify_input_from_tree shapes: batch_size=%s tree_base_tokens=%s parent_list=%s top_scores_index=%s input_draft_tokens=%s output_draft_token=%s position=%s retrive_index=%s seq_lens=%s seq_lens_sum=%s draft_token_num=%s",
             len(model_worker_batch.seq_lens)
             if model_worker_batch.seq_lens is not None
             else None,
-            tuple(verified_id.shape) if verified_id is not None else None,
+            tuple(tree_base_tokens.shape) if tree_base_tokens is not None else None,
             tuple(parent_list.shape) if parent_list is not None else None,
             tuple(top_scores_index.shape) if top_scores_index is not None else None,
             input_draft_tokens_shape,
@@ -650,6 +658,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Construct spec_info
         next_draft_input = EagleDraftInput(
+            bonus_tokens=next_token_ids,
             hidden_states=target_hidden_states,
             verified_id=next_token_ids,
             new_seq_lens=batch.seq_lens,
@@ -1052,22 +1061,23 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         if not batch.forward_mode.is_idle():
             all_verified_id = predict[accept_index]
-            verified_id = torch.empty_like(accept_length, dtype=torch.int32)
+            bonus_tokens = torch.empty_like(accept_length, dtype=torch.int32)
             fill_new_verified_id[(bs,)](
                 all_verified_id,
                 accept_length,
-                verified_id,
+                bonus_tokens,
                 self.speculative_num_draft_tokens,
             )
         else:
-            verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
+            bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
 
         if batch.return_logprob and not batch.forward_mode.is_idle():
             self._compute_spec_v2_logprobs(batch, logits_output, predict, accept_index)
 
         # Construct the next draft input
         next_draft_input = EagleDraftInput(
-            verified_id=verified_id,
+            bonus_tokens=bonus_tokens,
+            verified_id=bonus_tokens,
             new_seq_lens=new_seq_lens,
             verify_done=verify_done,
         )

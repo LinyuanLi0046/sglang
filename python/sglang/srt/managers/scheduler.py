@@ -1156,6 +1156,8 @@ class Scheduler(
             self.model_config.context_len,
             self.device,
             self.spec_algorithm,
+            enable_spec_v2_zero_bubble=self.server_args.speculative_algorithm == "NEXTN"
+            and envs.SGLANG_SPEC_V2_ZERO_BUBBLE.get(),
         )
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0

@@ -50,6 +50,7 @@ class FutureMap:
         context_len: int,
         device: torch.device,
         spec_algo: Optional[SpeculativeAlgorithm] = None,
+        enable_spec_v2_zero_bubble: bool = False,
     ):
         # FIXME: the calculation of future_limit and future_buffer_len maybe too conservative
         self.future_ct = 0
@@ -68,6 +69,7 @@ class FutureMap:
         self.future_buffer_len = self.future_limit + 2 * max_running_requests
         self.device = device
         self.spec_algo = spec_algo
+        self.enable_spec_v2_zero_bubble = enable_spec_v2_zero_bubble
 
         if self.spec_algo.is_none():
             # For non-speculative decoding, we only need to store the token ids.
@@ -86,7 +88,14 @@ class FutureMap:
         # Get a reference for each tensor
         topk_p0 = draft_input.topk_p[0]
         topk_index0 = draft_input.topk_index[0]
-        verified_id0 = draft_input.verified_id[0]
+        if self.enable_spec_v2_zero_bubble:
+            if draft_input.bonus_tokens is None:
+                raise ValueError(
+                    "zero-bubble FutureMap requires EagleDraftInput.bonus_tokens"
+                )
+            bonus_token0 = draft_input.bonus_tokens[0]
+        else:
+            verified_id0 = draft_input.verified_id[0]
         new_seq_lens0 = draft_input.new_seq_lens[0]
 
         self.topk_p_buf = torch.empty(
@@ -99,11 +108,18 @@ class FutureMap:
             dtype=topk_index0.dtype,
             device=self.device,
         )
-        self.verified_id_buf = torch.empty(
-            (self.future_buffer_len, *verified_id0.shape),
-            dtype=verified_id0.dtype,
-            device=self.device,
-        )
+        if self.enable_spec_v2_zero_bubble:
+            self.bonus_tokens_buf = torch.empty(
+                (self.future_buffer_len, *bonus_token0.shape),
+                dtype=bonus_token0.dtype,
+                device=self.device,
+            )
+        else:
+            self.verified_id_buf = torch.empty(
+                (self.future_buffer_len, *verified_id0.shape),
+                dtype=verified_id0.dtype,
+                device=self.device,
+            )
         self.new_seq_lens_buf = torch.empty(
             (self.future_buffer_len, *new_seq_lens0.shape),
             dtype=new_seq_lens0.dtype,
@@ -144,12 +160,20 @@ class FutureMap:
             # caching allocator (torch GC) could reclaim the memory before
             # the GPU finishes reading it.
             indices.record_stream(torch.get_device_module(self.device).current_stream())
-            draft_input.future_topk_p_buf = self.topk_p_buf
-            draft_input.future_topk_index_buf = self.topk_index_buf
-            draft_input.future_verified_id_buf = self.verified_id_buf
-            draft_input.future_new_seq_lens_buf = self.new_seq_lens_buf
-            if spec_need_hidden_states():
-                draft_input.future_hidden_states_buf = self.hidden_states_buf
+            if self.enable_spec_v2_zero_bubble:
+                draft_input.topk_p = self.topk_p_buf[indices]
+                draft_input.topk_index = self.topk_index_buf[indices]
+                draft_input.bonus_tokens = self.bonus_tokens_buf[indices]
+                draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
+                if spec_need_hidden_states():
+                    draft_input.hidden_states = self.hidden_states_buf[indices]
+            else:
+                draft_input.future_topk_p_buf = self.topk_p_buf
+                draft_input.future_topk_index_buf = self.topk_index_buf
+                draft_input.future_verified_id_buf = self.verified_id_buf
+                draft_input.future_new_seq_lens_buf = self.new_seq_lens_buf
+                if spec_need_hidden_states():
+                    draft_input.future_hidden_states_buf = self.hidden_states_buf
 
     def is_empty_slice(self, s: slice) -> bool:
         start, stop, step = s.indices(self.future_buffer_len)
@@ -181,7 +205,14 @@ class FutureMap:
 
         self.topk_p_buf[intv] = draft_input.topk_p
         self.topk_index_buf[intv] = draft_input.topk_index
-        self.verified_id_buf[intv] = draft_input.verified_id
+        if self.enable_spec_v2_zero_bubble:
+            if draft_input.bonus_tokens is None:
+                raise ValueError(
+                    "zero-bubble FutureMap requires EagleDraftInput.bonus_tokens"
+                )
+            self.bonus_tokens_buf[intv] = draft_input.bonus_tokens
+        else:
+            self.verified_id_buf[intv] = draft_input.verified_id
         self.new_seq_lens_buf[intv] = draft_input.new_seq_lens
         if spec_need_hidden_states():
             self.hidden_states_buf[intv] = draft_input.hidden_states

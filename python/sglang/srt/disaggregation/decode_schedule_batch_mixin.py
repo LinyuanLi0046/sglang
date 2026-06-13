@@ -179,6 +179,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 topk_p=topk_p,
                 topk_index=topk_index,
                 hidden_states=hidden_states,
+                bonus_tokens=self.output_ids,
                 verified_id=self.output_ids,
                 new_seq_lens=self.seq_lens,
             )

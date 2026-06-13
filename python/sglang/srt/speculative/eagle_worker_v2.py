@@ -635,9 +635,9 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Construct spec_info
         next_draft_input = EagleDraftInput(
-            bonus_tokens=next_token_ids,
+            bonus_tokens=next_token_ids if self.enable_spec_v2_zero_bubble else None,
             hidden_states=target_hidden_states,
-            verified_id=next_token_ids,
+            verified_id=None if self.enable_spec_v2_zero_bubble else next_token_ids,
             new_seq_lens=batch.seq_lens,
             # draft mode is same with decode mode, only 1 token per req
             num_tokens_per_req=1,
@@ -1062,8 +1062,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Construct the next draft input
         next_draft_input = EagleDraftInput(
-            bonus_tokens=bonus_tokens,
-            verified_id=bonus_tokens,
+            bonus_tokens=bonus_tokens if self.enable_spec_v2_zero_bubble else None,
+            verified_id=None if self.enable_spec_v2_zero_bubble else bonus_tokens,
             new_seq_lens=new_seq_lens,
             verify_done=verify_done,
         )

@@ -690,9 +690,14 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         topk: int,
         capture_hidden_mode: CaptureHiddenMode,
     ):
+        use_zero_bubble = envs.SGLANG_SPEC_V2_ZERO_BUBBLE.get()
         return cls(
             bonus_tokens=torch.empty((0,), device=device, dtype=torch.int32),
-            verified_id=torch.empty((0,), device=device, dtype=torch.int32),
+            verified_id=(
+                None
+                if use_zero_bubble
+                else torch.empty((0,), device=device, dtype=torch.int32)
+            ),
             hidden_states=torch.empty((0, hidden_size), device=device, dtype=dtype),
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
@@ -771,6 +776,9 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.future_indices.indices = self.future_indices.indices[new_indices]
             return
 
+        use_zero_bubble = (
+            envs.SGLANG_SPEC_V2_ZERO_BUBBLE.get() and self.bonus_tokens is not None
+        )
         strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
         if has_been_filtered:
             # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
@@ -788,7 +796,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                 self.hidden_states = self.hidden_states[: len(new_indices)]
             if self.bonus_tokens is not None:
                 self.bonus_tokens = self.bonus_tokens[: len(new_indices)]
-            self.verified_id = self.verified_id[: len(new_indices)]
+            if not use_zero_bubble and self.verified_id is not None:
+                self.verified_id = self.verified_id[: len(new_indices)]
         else:
             # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
             self.topk_p = self.topk_p[new_indices]
@@ -797,7 +806,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                 self.hidden_states = self.hidden_states[new_indices]
             if self.bonus_tokens is not None:
                 self.bonus_tokens = self.bonus_tokens[new_indices]
-            self.verified_id = self.verified_id[new_indices]
+            if not use_zero_bubble and self.verified_id is not None:
+                self.verified_id = self.verified_id[new_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
         if self.future_indices is not None:
@@ -809,10 +819,16 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             )
             return
 
+        use_zero_bubble = (
+            envs.SGLANG_SPEC_V2_ZERO_BUBBLE.get() and self.bonus_tokens is not None
+        ) or (
+            envs.SGLANG_SPEC_V2_ZERO_BUBBLE.get() and spec_info.bonus_tokens is not None
+        )
         if len(self.topk_index) == 0:
             self.hidden_states = spec_info.hidden_states
             self.bonus_tokens = spec_info.bonus_tokens
-            self.verified_id = spec_info.verified_id
+            if not use_zero_bubble:
+                self.verified_id = spec_info.verified_id
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
             return
@@ -834,7 +850,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             pass
         else:
             raise ValueError("inconsistent bonus_tokens presence in EagleDraftInput")
-        self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
+        if not use_zero_bubble:
+            self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
 

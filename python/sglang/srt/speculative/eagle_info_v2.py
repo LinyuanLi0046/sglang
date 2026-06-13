@@ -317,6 +317,11 @@ class EagleVerifyInputV2Mixin:
                 batch.mamba_track_mask = None
                 batch.mamba_track_seqlens = None
 
+            # Keep verify input metadata aligned with the author PR so TBO
+            # consumers can reuse the already-prepared length information.
+            self.seq_lens_cpu = batch.seq_lens_cpu
+            self.seq_lens_sum = batch.seq_lens_sum
+
         # Get a forward batch
         batch.forward_mode = (
             ForwardMode.IDLE

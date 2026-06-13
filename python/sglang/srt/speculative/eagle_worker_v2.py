@@ -426,7 +426,9 @@ class EagleDraftWorker(BaseDraftWorker):
 
         logger.error(
             "build_verify_input_from_tree shapes: batch_size=%s verified_id=%s parent_list=%s top_scores_index=%s input_draft_tokens=%s output_draft_token=%s position=%s retrive_index=%s seq_lens=%s seq_lens_sum=%s draft_token_num=%s",
-            model_worker_batch.batch_size,
+            len(model_worker_batch.seq_lens)
+            if model_worker_batch.seq_lens is not None
+            else None,
             tuple(verified_id.shape) if verified_id is not None else None,
             tuple(parent_list.shape) if parent_list is not None else None,
             tuple(top_scores_index.shape) if top_scores_index is not None else None,

@@ -315,10 +315,6 @@ class DecodeInputBuffers(ForwardInputBuffers):
             dsts.append(self.encoder_lens[:raw_bs])
             srcs.append(forward_batch.encoder_lens)
 
-        if forward_batch.mrope_positions is not None:
-            dsts.append(self.mrope_positions[:, :raw_num_token])
-            srcs.append(forward_batch.mrope_positions)
-
         if require_gathered_buffer:
             self.global_num_tokens_gpu.fill_(bs * num_tokens_per_bs)
             self.global_num_tokens_for_logprob_gpu.fill_(bs * num_tokens_per_bs)
@@ -346,6 +342,11 @@ class DecodeInputBuffers(ForwardInputBuffers):
 
         # Batch all GPU copies, grouped by dtype pair.
         _grouped_foreach_copy_(dsts, srcs)
+
+        # Keep mrope positions out of foreach_copy on NPU because mixed-rank
+        # int64 tensor groups can fail in replay_prepare.
+        if forward_batch.mrope_positions is not None:
+            self.mrope_positions[:, :raw_num_token].copy_(forward_batch.mrope_positions)
 
         # CPU tensor copy (cannot be batched with GPU tensors).
         if forward_batch.seq_lens_cpu is not None:

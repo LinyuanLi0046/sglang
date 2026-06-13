@@ -113,8 +113,26 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
             groups[key] = ([], [])
         groups[key][0].append(dst)
         groups[key][1].append(src)
-    for group_dsts, group_srcs in groups.values():
-        foreach_copy(group_dsts, group_srcs)
+    for key, (group_dsts, group_srcs) in groups.items():
+        try:
+            foreach_copy(group_dsts, group_srcs)
+        except Exception:
+            logger.error(
+                "grouped_foreach_copy failed for dtype group %s with pairs=%s",
+                key,
+                [
+                    {
+                        "dst_shape": tuple(dst.shape),
+                        "src_shape": tuple(src.shape),
+                        "dst_dtype": str(dst.dtype),
+                        "src_dtype": str(src.dtype),
+                        "dst_device": str(dst.device),
+                        "src_device": str(src.device),
+                    }
+                    for dst, src in zip(group_dsts, group_srcs)
+                ],
+            )
+            raise
 
 
 @dataclass
@@ -315,6 +333,10 @@ class DecodeInputBuffers(ForwardInputBuffers):
             dsts.append(self.encoder_lens[:raw_bs])
             srcs.append(forward_batch.encoder_lens)
 
+        if forward_batch.mrope_positions is not None:
+            dsts.append(self.mrope_positions[:, :raw_num_token])
+            srcs.append(forward_batch.mrope_positions)
+
         if require_gathered_buffer:
             self.global_num_tokens_gpu.fill_(bs * num_tokens_per_bs)
             self.global_num_tokens_for_logprob_gpu.fill_(bs * num_tokens_per_bs)
@@ -341,12 +363,19 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 srcs.append(src)
 
         # Batch all GPU copies, grouped by dtype pair.
-        _grouped_foreach_copy_(dsts, srcs)
-
-        # Keep mrope positions out of foreach_copy on NPU because mixed-rank
-        # int64 tensor groups can fail in replay_prepare.
-        if forward_batch.mrope_positions is not None:
-            self.mrope_positions[:, :raw_num_token].copy_(forward_batch.mrope_positions)
+        try:
+            _grouped_foreach_copy_(dsts, srcs)
+        except Exception:
+            logger.error(
+                "populate_from_forward_batch foreach copy failed: raw_bs=%s raw_num_token=%s bs=%s num_tokens_per_bs=%s has_mrope=%s has_pp_proxy=%s",
+                raw_bs,
+                raw_num_token,
+                bs,
+                num_tokens_per_bs,
+                forward_batch.mrope_positions is not None,
+                pp_proxy_tensors is not None,
+            )
+            raise
 
         # CPU tensor copy (cannot be batched with GPU tensors).
         if forward_batch.seq_lens_cpu is not None:

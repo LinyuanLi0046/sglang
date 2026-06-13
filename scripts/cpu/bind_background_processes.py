@@ -14,9 +14,9 @@ Typical workflow:
    affinity masks.
 
 Foreground detection modes:
-- Default: use the whole detected sglang process tree.
-- Scheduler/control mode: use only scheduler processes plus explicitly
-  selected control processes.
+- The whole detected sglang process tree is always protected.
+- Worker CPUs are inferred from scheduler processes.
+- Control processes are moved to the configured control CPU set.
 """
 
 from __future__ import annotations
@@ -42,6 +42,11 @@ DEFAULT_CONTROL_ROOT_KEYWORDS = (
     "sglang.launch_server",
     "python -m sglang.launch_server",
 )
+DEFAULT_CONTROL_KEYWORDS = (
+    "sglang::detokenizer",
+    "sglang::detoken",
+)
+DEFAULT_CONTROL_CPUSET = "32-47,128-143"
 DEFAULT_SCHEDULER_KEYWORDS = (
     "sglang::scheduler",
     "scheduler",
@@ -356,21 +361,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Extra keyword for auto-detecting sglang roots from process name/cmdline.",
     )
     parser.add_argument(
-        "--scheduler-control-only",
-        action="store_true",
-        help=(
-            "Infer foreground CPUs from scheduler processes plus explicitly "
-            "selected control processes, instead of using the whole sglang "
-            "process tree."
-        ),
-    )
-    parser.add_argument(
         "--scheduler-keyword",
         action="append",
         default=[],
         help=(
-            "Extra keyword for matching scheduler processes when "
-            "--scheduler-control-only is enabled."
+            "Extra keyword for matching scheduler processes used to infer "
+            "worker CPUs."
         ),
     )
     parser.add_argument(
@@ -386,10 +382,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--control-keyword",
         action="append",
-        default=[],
+        default=list(DEFAULT_CONTROL_KEYWORDS),
         help=(
             "Keyword for matching control-plane processes to keep in the "
-            "service CPU set. Can be passed multiple times."
+            "service CPU set. Can be passed multiple times. "
+            f"Default: {', '.join(DEFAULT_CONTROL_KEYWORDS)}"
         ),
     )
     parser.add_argument(
@@ -404,11 +401,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--control-cpus",
         type=str,
-        default="",
+        default=DEFAULT_CONTROL_CPUSET,
         help=(
             "Explicit CPU set for control-plane processes. When set, the script "
             "first moves control processes to these CPUs, then infers worker "
-            "CPUs from scheduler processes only."
+            "CPUs from scheduler processes only. "
+            f"Default: {DEFAULT_CONTROL_CPUSET}"
         ),
     )
     parser.add_argument(
@@ -499,17 +497,7 @@ def main() -> int:
         )
         control_pids = sorted(set(control_pids + launch_server_pids))
 
-    if args.scheduler_control_only:
-        foreground_pids = set(scheduler_pids + control_pids)
-        if not foreground_pids:
-            print(
-                "Scheduler/control mode found no foreground processes. "
-                "Pass --control-pid/--control-keyword or check scheduler matching.",
-                file=sys.stderr,
-            )
-            return 2
-    else:
-        foreground_pids = full_service_tree
+    foreground_pids = full_service_tree
 
     control_cpus = parse_cpu_spec(args.control_cpus) if args.control_cpus else []
     rebound_control = []
@@ -566,7 +554,7 @@ def main() -> int:
         if not args.service_cpus and not control_cpus:
             hint = (
                 " Foreground CPUs may already cover all online CPUs; try "
-                "--scheduler-control-only or pass --control-cpus/--service-cpus."
+                "--control-cpus or pass --service-cpus explicitly."
             )
         print(f"Background CPU set is empty.{hint}", file=sys.stderr)
         return 2

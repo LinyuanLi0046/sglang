@@ -1475,6 +1475,7 @@ _MOE_DP: Optional[GroupCoordinator] = None
 _MOE_EP: Optional[GroupCoordinator] = None
 _MOE_TP: Optional[GroupCoordinator] = None
 _LONGCAT_MOE_EP: Optional[GroupCoordinator] = None
+_LONGCAT_OPS_DEEPEP_PREFILL_EP: Optional[GroupCoordinator] = None
 
 
 def get_moe_dp_group() -> GroupCoordinator:
@@ -1497,6 +1498,13 @@ def get_longcat_moe_ep_group() -> GroupCoordinator:
         _LONGCAT_MOE_EP is not None
     ), "longcat expert model parallel group is not initialized"
     return _LONGCAT_MOE_EP
+
+
+def get_longcat_ops_deepep_prefill_ep_group() -> GroupCoordinator:
+    assert (
+        _LONGCAT_OPS_DEEPEP_PREFILL_EP is not None
+    ), "longcat ops deepep prefill expert model parallel group is not initialized"
+    return _LONGCAT_OPS_DEEPEP_PREFILL_EP
 
 
 # kept for backward compatibility
@@ -1546,7 +1554,12 @@ def graph_capture(stream: Optional[torch.cuda.Stream] = None):
     ) as context, get_pp_group().graph_capture(context):
         with contextlib.ExitStack() as stack:
             seen = {id(_TP)}
-            for group in (_MOE_EP, _MOE_TP, _LONGCAT_MOE_EP):
+            for group in (
+                _MOE_EP,
+                _MOE_TP,
+                _LONGCAT_MOE_EP,
+                _LONGCAT_OPS_DEEPEP_PREFILL_EP,
+            ):
                 if group is not None and id(group) not in seen:
                     seen.add(id(group))
                     stack.enter_context(group.graph_capture(context))
@@ -1977,6 +1990,22 @@ def initialize_model_parallel(
             group_name="longcat_moe_ep",
         )
 
+    global _LONGCAT_OPS_DEEPEP_PREFILL_EP
+    assert (
+        _LONGCAT_OPS_DEEPEP_PREFILL_EP is None
+    ), "longcat ops deepep prefill expert model parallel group is already initialized"
+    if (
+        is_npu()
+        and get_bool_env_var("SGLANG_ASCEND_USE_OPS_DEEPEP")
+        and attention_dp_size > 1
+    ):
+        _LONGCAT_OPS_DEEPEP_PREFILL_EP = init_model_parallel_group(
+            moe_ep_group_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="longcat_ops_deepep_prefill_ep",
+        )
+
     global _MOE_TP
     assert _MOE_TP is None, "expert model parallel group is already initialized"
     if moe_tp_size == tensor_model_parallel_size:
@@ -2244,6 +2273,11 @@ def destroy_model_parallel():
     if _LONGCAT_MOE_EP:
         _LONGCAT_MOE_EP.destroy()
     _LONGCAT_MOE_EP = None
+
+    global _LONGCAT_OPS_DEEPEP_PREFILL_EP
+    if _LONGCAT_OPS_DEEPEP_PREFILL_EP:
+        _LONGCAT_OPS_DEEPEP_PREFILL_EP.destroy()
+    _LONGCAT_OPS_DEEPEP_PREFILL_EP = None
 
     global _MOE_TP
     if _MOE_TP:

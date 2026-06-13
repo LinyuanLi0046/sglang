@@ -764,13 +764,9 @@ class EagleDraftWorker(BaseDraftWorker):
         original_forward_mode = model_worker_batch.forward_mode
         original_seq_lens = model_worker_batch.seq_lens
         original_seq_lens_cpu = model_worker_batch.seq_lens_cpu
-        original_seq_lens_sum = model_worker_batch.seq_lens_sum
 
         model_worker_batch.forward_mode = ForwardMode.DECODE
         model_worker_batch.seq_lens = batch_result.next_draft_input.new_seq_lens
-        model_worker_batch.seq_lens_sum = (
-            batch_result.next_draft_input.new_seq_lens.sum().item()
-        )
         # When cuda graph is disabled, seq_lens_cpu must be synced because
         # init_forward_metadata derives actual_seq_lengths_kv from it, while
         # block_tables are derived from seq_lens (GPU). A mismatch between the
@@ -824,7 +820,6 @@ class EagleDraftWorker(BaseDraftWorker):
             model_worker_batch.forward_mode = original_forward_mode
             model_worker_batch.seq_lens = original_seq_lens
             model_worker_batch.seq_lens_cpu = original_seq_lens_cpu
-            model_worker_batch.seq_lens_sum = original_seq_lens_sum
 
 
 class EAGLEWorkerV2(BaseSpecWorker):

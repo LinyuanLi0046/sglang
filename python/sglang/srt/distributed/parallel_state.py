@@ -1997,7 +1997,7 @@ def initialize_model_parallel(
     if (
         is_npu()
         and get_bool_env_var("SGLANG_ASCEND_USE_OPS_DEEPEP")
-        and attention_dp_size > 1
+        and attn_dp_size > 1
     ):
         _LONGCAT_OPS_DEEPEP_PREFILL_EP = init_model_parallel_group(
             moe_ep_group_ranks,

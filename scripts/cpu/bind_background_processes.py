@@ -38,6 +38,10 @@ DEFAULT_ROOT_KEYWORDS = (
     "python -m sglang.launch_server",
     "sglang::scheduler",
 )
+DEFAULT_CONTROL_ROOT_KEYWORDS = (
+    "sglang.launch_server",
+    "python -m sglang.launch_server",
+)
 DEFAULT_SCHEDULER_KEYWORDS = (
     "sglang::scheduler",
     "scheduler",
@@ -169,6 +173,10 @@ def detect_processes_by_keywords(keywords: Sequence[str]) -> List[int]:
     return sorted(set(matched))
 
 
+def filter_child_pids(pids: Iterable[int], allowed_pids: Set[int]) -> List[int]:
+    return sorted({pid for pid in pids if pid in allowed_pids})
+
+
 def detect_service_cpus(foreground_pids: Iterable[int]) -> List[int]:
     service_cpus: Set[int] = set()
     for pid in foreground_pids:
@@ -222,17 +230,78 @@ def pick_background_candidates(
     return candidates
 
 
+def build_affinity_record(proc: psutil.Process, original: Sequence[int]) -> dict:
+    return {
+        "pid": proc.pid,
+        "name": get_name(proc),
+        "cmdline": get_cmdline(proc),
+        "original_affinity": list(original),
+    }
+
+
+def rebind_processes(
+    target_pids: Iterable[int],
+    target_cpus: Sequence[int],
+    *,
+    dry_run: bool,
+    verbose: bool,
+    label: str,
+) -> tuple[List[dict], int]:
+    changed = []
+    failed = 0
+    for pid in sorted(set(target_pids)):
+        try:
+            proc = psutil.Process(pid)
+            original = proc.cpu_affinity()
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            failed += 1
+            continue
+
+        if sorted(original) == sorted(target_cpus):
+            if verbose:
+                print(
+                    f"Keep {label} pid={proc.pid} name={get_name(proc)} "
+                    f"already on {format_cpu_spec(target_cpus)}"
+                )
+            continue
+
+        record = build_affinity_record(proc, original)
+        changed.append(record)
+
+        if verbose or dry_run:
+            print(
+                f"{'Plan' if dry_run else 'Move'} {label} "
+                f"pid={proc.pid} name={record['name']} "
+                f"{format_cpu_spec(original)} -> {format_cpu_spec(target_cpus)}"
+            )
+
+        if dry_run:
+            continue
+
+        try:
+            proc.cpu_affinity(list(target_cpus))
+        except (psutil.AccessDenied, psutil.NoSuchProcess) as exc:
+            failed += 1
+            print(f"Failed to move {label} pid={proc.pid}: {exc}", file=sys.stderr)
+
+    return changed, failed
+
+
 def backup_affinity(
     backup_path: str,
     service_cpus: Sequence[int],
     background_cpus: Sequence[int],
-    moved: Sequence[dict],
+    control_cpus: Sequence[int],
+    rebound_control: Sequence[dict],
+    moved_background: Sequence[dict],
 ) -> None:
     payload = {
         "created_at": int(time.time()),
         "service_cpus": list(service_cpus),
         "background_cpus": list(background_cpus),
-        "moved_processes": list(moved),
+        "control_cpus": list(control_cpus),
+        "control_processes": list(rebound_control),
+        "moved_processes": list(moved_background),
     }
     path = Path(backup_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -248,15 +317,16 @@ def restore_affinity(backup_path: str) -> int:
     data = json.loads(path.read_text(encoding="utf-8"))
     restored = 0
     skipped = 0
-    for item in data.get("moved_processes", []):
-        pid = item["pid"]
-        original = item["original_affinity"]
-        try:
-            psutil.Process(pid).cpu_affinity(original)
-            restored += 1
-        except (psutil.AccessDenied, psutil.NoSuchProcess) as exc:
-            skipped += 1
-            print(f"Skip restore pid={pid}: {exc}", file=sys.stderr)
+    for key in ("control_processes", "moved_processes"):
+        for item in data.get(key, []):
+            pid = item["pid"]
+            original = item["original_affinity"]
+            try:
+                psutil.Process(pid).cpu_affinity(original)
+                restored += 1
+            except (psutil.AccessDenied, psutil.NoSuchProcess) as exc:
+                skipped += 1
+                print(f"Skip restore pid={pid}: {exc}", file=sys.stderr)
 
     print(
         f"Restore done: restored={restored}, skipped={skipped}, "
@@ -332,6 +402,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--control-cpus",
+        type=str,
+        default="",
+        help=(
+            "Explicit CPU set for control-plane processes. When set, the script "
+            "first moves control processes to these CPUs, then infers worker "
+            "CPUs from scheduler processes only."
+        ),
+    )
+    parser.add_argument(
         "--background-cpus",
         type=str,
         default="",
@@ -398,14 +478,28 @@ def main() -> int:
         )
         return 2
 
+    full_service_tree = get_descendant_pids(root_pids)
+    if not full_service_tree:
+        print("Detected root pids have no live process tree.", file=sys.stderr)
+        return 2
+
+    scheduler_keywords = list(DEFAULT_SCHEDULER_KEYWORDS) + list(args.scheduler_keyword)
+    scheduler_pids = filter_child_pids(
+        detect_processes_by_keywords(scheduler_keywords),
+        full_service_tree,
+    )
+    control_pids = filter_child_pids(
+        args.control_pid + detect_processes_by_keywords(args.control_keyword),
+        full_service_tree,
+    )
+    if args.control_cpus:
+        launch_server_pids = filter_child_pids(
+            auto_detect_sglang_roots(DEFAULT_CONTROL_ROOT_KEYWORDS),
+            full_service_tree,
+        )
+        control_pids = sorted(set(control_pids + launch_server_pids))
+
     if args.scheduler_control_only:
-        scheduler_keywords = list(DEFAULT_SCHEDULER_KEYWORDS) + list(
-            args.scheduler_keyword
-        )
-        scheduler_pids = detect_processes_by_keywords(scheduler_keywords)
-        control_pids = sorted(
-            set(args.control_pid + detect_processes_by_keywords(args.control_keyword))
-        )
         foreground_pids = set(scheduler_pids + control_pids)
         if not foreground_pids:
             print(
@@ -415,13 +509,41 @@ def main() -> int:
             )
             return 2
     else:
-        foreground_pids = get_descendant_pids(root_pids)
-        if not foreground_pids:
-            print("Detected root pids have no live process tree.", file=sys.stderr)
+        foreground_pids = full_service_tree
+
+    control_cpus = parse_cpu_spec(args.control_cpus) if args.control_cpus else []
+    rebound_control = []
+    control_failed = 0
+    if control_cpus:
+        if not control_pids:
+            print(
+                "Control CPU mode found no control processes. "
+                "Pass --control-pid/--control-keyword explicitly.",
+                file=sys.stderr,
+            )
             return 2
+        rebound_control, control_failed = rebind_processes(
+            control_pids,
+            control_cpus,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+            label="control",
+        )
 
     if args.service_cpus:
         service_cpus = parse_cpu_spec(args.service_cpus)
+        if control_cpus:
+            service_cpus = sorted(set(service_cpus) | set(control_cpus))
+    elif control_cpus:
+        worker_cpus = detect_service_cpus(scheduler_pids)
+        if not worker_cpus:
+            print(
+                "Failed to infer worker CPUs from scheduler affinity while "
+                "--control-cpus is enabled. Pass --service-cpus explicitly.",
+                file=sys.stderr,
+            )
+            return 2
+        service_cpus = sorted(set(worker_cpus) | set(control_cpus))
     else:
         service_cpus = detect_service_cpus(foreground_pids)
 
@@ -440,7 +562,13 @@ def main() -> int:
         background_cpus = sorted(set(online_cpus) - set(service_cpus))
 
     if not background_cpus:
-        print("Background CPU set is empty.", file=sys.stderr)
+        hint = ""
+        if not args.service_cpus and not control_cpus:
+            hint = (
+                " Foreground CPUs may already cover all online CPUs; try "
+                "--scheduler-control-only or pass --control-cpus/--service-cpus."
+            )
+        print(f"Background CPU set is empty.{hint}", file=sys.stderr)
         return 2
 
     protected_pids = get_ancestor_pids(os.getpid())
@@ -456,13 +584,19 @@ def main() -> int:
     )
 
     print(f"Detected sglang root pids: {root_pids}")
+    if scheduler_pids:
+        print(f"Detected scheduler pids: {scheduler_pids}")
+    if control_pids:
+        print(f"Detected control pids: {control_pids}")
     print(f"Foreground process count: {len(foreground_pids)}")
+    if control_cpus:
+        print(f"Control CPUs: {format_cpu_spec(control_cpus)}")
     print(f"Service CPUs: {format_cpu_spec(service_cpus)}")
     print(f"Background CPUs: {format_cpu_spec(background_cpus)}")
     print(f"Candidate background process count: {len(candidates)}")
 
     moved = []
-    failed = 0
+    failed = control_failed
     for proc in candidates:
         try:
             original = proc.cpu_affinity()
@@ -475,12 +609,7 @@ def main() -> int:
                 print(f"Keep pid={proc.pid} name={get_name(proc)} already on background CPUs")
             continue
 
-        record = {
-            "pid": proc.pid,
-            "name": get_name(proc),
-            "cmdline": get_cmdline(proc),
-            "original_affinity": original,
-        }
+        record = build_affinity_record(proc, original)
         moved.append(record)
 
         if args.verbose or args.dry_run:
@@ -506,7 +635,14 @@ def main() -> int:
         )
         return 0
 
-    backup_affinity(args.backup_path, service_cpus, background_cpus, moved)
+    backup_affinity(
+        args.backup_path,
+        service_cpus,
+        background_cpus,
+        control_cpus,
+        rebound_control,
+        moved,
+    )
     print(
         f"Apply done: moved={len(moved)}, failed={failed}, "
         f"backup={args.backup_path}"

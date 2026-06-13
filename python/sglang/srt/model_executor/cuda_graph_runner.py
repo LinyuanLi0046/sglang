@@ -117,21 +117,6 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
         try:
             foreach_copy(group_dsts, group_srcs)
         except Exception:
-            logger.error(
-                "grouped_foreach_copy failed for dtype group %s with pairs=%s",
-                key,
-                [
-                    {
-                        "dst_shape": tuple(dst.shape),
-                        "src_shape": tuple(src.shape),
-                        "dst_dtype": str(dst.dtype),
-                        "src_dtype": str(src.dtype),
-                        "dst_device": str(dst.device),
-                        "src_device": str(src.device),
-                    }
-                    for dst, src in zip(group_dsts, group_srcs)
-                ],
-            )
             raise
 
 
@@ -366,15 +351,6 @@ class DecodeInputBuffers(ForwardInputBuffers):
         try:
             _grouped_foreach_copy_(dsts, srcs)
         except Exception:
-            logger.error(
-                "populate_from_forward_batch foreach copy failed: raw_bs=%s raw_num_token=%s bs=%s num_tokens_per_bs=%s has_mrope=%s has_pp_proxy=%s",
-                raw_bs,
-                raw_num_token,
-                bs,
-                num_tokens_per_bs,
-                forward_batch.mrope_positions is not None,
-                pp_proxy_tensors is not None,
-            )
             raise
 
         # CPU tensor copy (cannot be batched with GPU tensors).

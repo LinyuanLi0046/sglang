@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 import torch
 import triton
 import triton.language as tl
+import triton.backends.ascend.runtime
 
 from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_world_size,

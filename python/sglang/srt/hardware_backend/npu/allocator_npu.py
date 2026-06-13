@@ -8,7 +8,7 @@ from sglang.srt.mem_cache.allocator import (
 )
 from sglang.srt.utils import get_num_new_pages, next_power_of_2, is_npu_before_atlas_a5
 _is_npu_before_atlas_a5 = is_npu_before_atlas_a5()
-
+import triton.backends.ascend.runtime
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 

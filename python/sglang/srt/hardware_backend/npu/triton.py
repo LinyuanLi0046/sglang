@@ -7,6 +7,7 @@ import torch
 import triton
 import triton.language as tl
 import triton.runtime.driver as driver
+import triton.backends.ascend.runtime
 
 class TreeMaskMode(IntEnum):
     FULL_MASK = 0

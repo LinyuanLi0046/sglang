@@ -4,6 +4,7 @@ import time
 from typing import List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
@@ -27,7 +28,11 @@ from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
@@ -115,6 +120,11 @@ class EagleDraftWorker(BaseDraftWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.enable_spec_v2_zero_bubble = envs.SGLANG_SPEC_V2_ZERO_BUBBLE.get()
+        if self.enable_spec_v2_zero_bubble:
+            assert not server_args.enable_multi_layer_eagle
+            assert not self.speculative_algorithm.is_eagle3()
+            assert self.topk == 1
 
         # Do not capture cuda graph in `TpModelWorker` init,
         # will capture later with init_cuda_graphs()
@@ -345,6 +355,37 @@ class EagleDraftWorker(BaseDraftWorker):
                 forward_batch
             )
 
+        return self._build_verify_input_from_tree(
+            model_worker_batch=model_worker_batch,
+            verified_id=draft_input.verified_id,
+            parent_list=parent_list,
+            top_scores_index=top_scores_index,
+            draft_tokens=draft_tokens,
+        )
+
+    def prepare_verify_fully_async_decoding(
+        self, model_worker_batch: ModelWorkerBatch
+    ) -> EagleVerifyInput:
+        draft_input: EagleDraftInput = model_worker_batch.spec_info
+        parent_list, top_scores_index, draft_tokens = (
+            self._draft_forward_for_zero_bubble_prepare(draft_input)
+        )
+        return self._build_verify_input_from_tree(
+            model_worker_batch=model_worker_batch,
+            verified_id=draft_input.verified_id,
+            parent_list=parent_list,
+            top_scores_index=top_scores_index,
+            draft_tokens=draft_tokens,
+        )
+
+    def _build_verify_input_from_tree(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        verified_id: torch.Tensor,
+        parent_list: torch.Tensor,
+        top_scores_index: torch.Tensor,
+        draft_tokens: torch.Tensor,
+    ) -> EagleVerifyInput:
         if model_worker_batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
                 self.topk,
@@ -366,7 +407,7 @@ class EagleDraftWorker(BaseDraftWorker):
             retrive_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
-            draft_input.verified_id,
+            verified_id,
             parent_list,
             top_scores_index,
             draft_tokens,
@@ -396,7 +437,13 @@ class EagleDraftWorker(BaseDraftWorker):
             seq_lens_cpu=None,
         )
 
-    def draft_forward(self, forward_batch: ForwardBatch):
+    def _draft_forward_steps(
+        self, forward_batch: ForwardBatch
+    ) -> Tuple[
+        List[torch.Tensor],
+        List[torch.Tensor],
+        List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    ]:
         # Parse args
         spec_info: EagleDraftInput = forward_batch.spec_info
         out_cache_loc = forward_batch.out_cache_loc
@@ -418,10 +465,9 @@ class EagleDraftWorker(BaseDraftWorker):
             self.speculative_num_steps, -1
         )
 
-        # Return values
-        score_list: List[torch.Tensor] = []
-        token_list: List[torch.Tensor] = []
-        parents_list: List[torch.Tensor] = []
+        ret_topk_p_list: List[torch.Tensor] = []
+        ret_topk_index_list: List[torch.Tensor] = []
+        tree_info_list: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
         # Forward multiple steps
         scores = None
@@ -429,9 +475,7 @@ class EagleDraftWorker(BaseDraftWorker):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
-            score_list.append(tree_info[0])
-            token_list.append(tree_info[1])
-            parents_list.append(tree_info[2])
+            tree_info_list.append(tree_info)
 
             # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
             if i == self.speculative_num_steps - 1:
@@ -457,11 +501,20 @@ class EagleDraftWorker(BaseDraftWorker):
                 logits_output.next_token_logits.shape[-1],
                 f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
             )
+            ret_topk_p_list.append(topk_p)
+            ret_topk_index_list.append(topk_index)
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
 
-        # Organize the results
+        return ret_topk_p_list, ret_topk_index_list, tree_info_list
+
+    def _organize_draft_results(
+        self,
+        score_list: Tuple[torch.Tensor, ...],
+        token_list: Tuple[torch.Tensor, ...],
+        parents_list: Tuple[torch.Tensor, ...],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         score_list = torch.cat(score_list, dim=1).flatten(
             1
         )  # b, n, topk; n= 1 + (num_steps-1) * self.topk
@@ -488,6 +541,62 @@ class EagleDraftWorker(BaseDraftWorker):
             parent_list = torch.empty(batch_size, 0, device=parents_list[0].device)
 
         return parent_list, top_scores_index, draft_tokens
+
+    def draft_forward(self, forward_batch: ForwardBatch):
+        _, _, tree_info_list = self._draft_forward_steps(forward_batch)
+        score_list, token_list, parents_list = zip(*tree_info_list)
+        return self._organize_draft_results(score_list, token_list, parents_list)
+
+    def _draft_forward_for_zero_bubble_prepare(
+        self, draft_input: EagleDraftInput
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        topk_p = draft_input.topk_p
+        topk_index = draft_input.topk_index
+        if self.hot_token_id is not None:
+            topk_index = self.hot_token_id[topk_index]
+
+        batch_size = topk_p.shape[0]
+        k = self.topk
+        n = self.speculative_num_steps
+
+        step0_parents = torch.arange(
+            -1, k, dtype=torch.long, device=topk_p.device
+        ).expand(batch_size, -1)
+        if n > 1:
+            later_parents = (
+                torch.arange(1, n, dtype=torch.long, device=topk_p.device)
+                .view(1, -1, 1)
+                .expand(batch_size, -1, k)
+                .reshape(batch_size, -1)
+            )
+            parent_list = torch.cat(
+                [step0_parents, later_parents[:, : (n - 2) * k]], dim=1
+            )
+        else:
+            parent_list = torch.empty(
+                batch_size, 0, dtype=torch.long, device=topk_p.device
+            )
+
+        top_scores = torch.topk(topk_p, self.speculative_num_draft_tokens - 1, dim=-1)
+        top_scores_index = torch.sort(top_scores.indices).values
+        maybe_detect_oob(
+            top_scores_index,
+            0,
+            topk_index.shape[1],
+            "draft_forward_zero_bubble_prepare: top_scores_index OOB for gather on topk_index",
+        )
+        draft_tokens = torch.gather(topk_index, index=top_scores_index, dim=1)
+        return parent_list, top_scores_index, draft_tokens
+
+    def draft_forward_zero_bubble(
+        self, forward_batch: ForwardBatch
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        ret_topk_p_list, ret_topk_index_list, _ = self._draft_forward_steps(
+            forward_batch
+        )
+        ret_topk_p = torch.cat(ret_topk_p_list, dim=1)
+        ret_topk_index = torch.cat(ret_topk_index_list, dim=1)
+        return ret_topk_p, ret_topk_index
 
     def draft_extend(self):
         pass
@@ -539,11 +648,23 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Update spec_info for the next draft step
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-        next_draft_input.topk_p, next_draft_input.topk_index = fast_topk(
-            probs, self.topk, dim=-1
+        topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+        next_draft_input.topk_p, next_draft_input.topk_index = (
+            self._pad_topk_for_zero_bubble(topk_p, topk_index)
         )
         next_draft_input.hidden_states = logits_output.hidden_states
         return next_draft_input
+
+    def _pad_topk_for_zero_bubble(
+        self, topk_p: torch.Tensor, topk_index: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.enable_spec_v2_zero_bubble and self.speculative_num_steps > 1:
+            target_width = self.speculative_num_steps * self.topk
+            pad_size = target_width - topk_p.shape[-1]
+            if pad_size > 0:
+                topk_p = F.pad(topk_p, (0, pad_size))
+                topk_index = F.pad(topk_index, (0, pad_size))
+        return topk_p, topk_index
 
     def _draft_extend_for_decode(
         self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult
@@ -620,6 +741,68 @@ class EagleDraftWorker(BaseDraftWorker):
             ret_topk_index,
             ret_hidden_states,
         )
+        if self.enable_spec_v2_zero_bubble:
+            self.draft_zero_bubble(batch, batch_result, draft_input)
+
+    def draft_zero_bubble(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        batch_result: GenerationBatchResult,
+        draft_input: EagleDraftInput,
+    ) -> None:
+        if self.speculative_num_steps <= 1 or model_worker_batch.forward_mode.is_idle():
+            return
+
+        original_forward_mode = model_worker_batch.forward_mode
+        original_seq_lens = model_worker_batch.seq_lens
+        original_seq_lens_cpu = model_worker_batch.seq_lens_cpu
+        original_seq_lens_sum = model_worker_batch.seq_lens_sum
+
+        model_worker_batch.forward_mode = ForwardMode.DECODE
+        model_worker_batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+        model_worker_batch.seq_lens_sum = (
+            batch_result.next_draft_input.new_seq_lens.sum().item()
+        )
+        model_worker_batch.seq_lens_cpu = model_worker_batch.seq_lens.to("cpu")
+
+        try:
+            forward_batch, _ = draft_input.prepare_for_v2_draft(
+                self.req_to_token_pool,
+                model_worker_batch,
+                self.cuda_graph_runner,
+                self.draft_runner,
+                self.topk,
+                self.speculative_num_steps,
+            )
+
+            forward_batch.spec_info.hidden_states = (
+                batch_result.next_draft_input.hidden_states
+            )
+            forward_batch.spec_info.topk_p = batch_result.next_draft_input.topk_p
+            forward_batch.spec_info.topk_index = batch_result.next_draft_input.topk_index
+
+            if not forward_batch.forward_mode.is_idle():
+                self.draft_attn_backend.init_forward_metadata(forward_batch)
+            ret_topk_p, ret_topk_index = self.draft_forward_zero_bubble(forward_batch)
+
+            next_draft_input = batch_result.next_draft_input
+            next_draft_input.topk_p = torch.cat(
+                [next_draft_input.topk_p, ret_topk_p.reshape(next_draft_input.topk_p.shape[0], -1)],
+                dim=1,
+            ).clone()
+            next_draft_input.topk_index = torch.cat(
+                [
+                    next_draft_input.topk_index,
+                    ret_topk_index.reshape(next_draft_input.topk_index.shape[0], -1),
+                ],
+                dim=1,
+            ).clone()
+            next_draft_input.hidden_states = None
+        finally:
+            model_worker_batch.forward_mode = original_forward_mode
+            model_worker_batch.seq_lens = original_seq_lens
+            model_worker_batch.seq_lens_cpu = original_seq_lens_cpu
+            model_worker_batch.seq_lens_sum = original_seq_lens_sum
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
@@ -648,6 +831,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.enable_spec_v2_zero_bubble = envs.SGLANG_SPEC_V2_ZERO_BUBBLE.get()
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
@@ -693,51 +877,56 @@ class EAGLEWorkerV2(BaseSpecWorker):
             model_worker_batch.forward_mode.is_extend()
             or model_worker_batch.is_extend_in_batch
         ):
-            # Target prefill
-            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-            batch_output = self.target_worker.forward_batch_generation(
-                model_worker_batch
-            )
+            return self._forward_extend(model_worker_batch)
+        return self._forward_decode(model_worker_batch)
 
-            # Draft prefill
-            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-            with self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-                batch_output.next_draft_input = (
-                    self.draft_worker._draft_extend_for_prefill(
-                        model_worker_batch,
-                        batch_output.logits_output.hidden_states,
-                        batch_output.next_token_ids,
-                        batch_output.logits_output.mm_input_embeds,
-                    )
-                )
-                return batch_output
-        else:
-            if model_worker_batch.spec_info is None:
-                model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
-                    device=self.device,
-                    hidden_size=self.target_worker.model_config.hidden_size,
-                    dtype=self.target_worker.model_config.dtype,
-                    topk=self.topk,
-                    capture_hidden_mode=CaptureHiddenMode.LAST,
-                )
-            with self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-                verify_input: EagleVerifyInput = self.draft_worker.draft(
+    def _forward_extend(self, model_worker_batch: ModelWorkerBatch):
+        # Target prefill
+        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        batch_output = self.target_worker.forward_batch_generation(model_worker_batch)
+
+        # Draft prefill
+        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+        with self.draft_worker.draft_tp_context(
+            self.draft_worker.draft_runner.tp_group
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            batch_output.next_draft_input = self.draft_worker._draft_extend_for_prefill(
+                model_worker_batch,
+                batch_output.logits_output.hidden_states,
+                batch_output.next_token_ids,
+                batch_output.logits_output.mm_input_embeds,
+            )
+            return batch_output
+
+    def _forward_decode(self, model_worker_batch: ModelWorkerBatch):
+        if model_worker_batch.spec_info is None:
+            idle_topk = self.topk
+            if self.enable_spec_v2_zero_bubble:
+                idle_topk = self.topk * self.speculative_num_steps
+            model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
+                device=self.device,
+                hidden_size=self.target_worker.model_config.hidden_size,
+                dtype=self.target_worker.model_config.dtype,
+                topk=idle_topk,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
+            )
+        with self.draft_worker.draft_tp_context(
+            self.draft_worker.draft_runner.tp_group
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            if self.enable_spec_v2_zero_bubble:
+                verify_input = self.draft_worker.prepare_verify_fully_async_decoding(
                     model_worker_batch
                 )
-            assert verify_input.is_verify_input()
-            model_worker_batch.spec_info = verify_input
-            batch_output = self.verify(model_worker_batch)
-            with self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-                self.draft_worker._draft_extend_for_decode(
-                    model_worker_batch, batch_output
-                )
-            return batch_output
+            else:
+                verify_input = self.draft_worker.draft(model_worker_batch)
+        assert verify_input.is_verify_input()
+        model_worker_batch.spec_info = verify_input
+        batch_output = self.verify(model_worker_batch)
+        with self.draft_worker.draft_tp_context(
+            self.draft_worker.draft_runner.tp_group
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            self.draft_worker._draft_extend_for_decode(model_worker_batch, batch_output)
+        return batch_output
 
     def verify(self, batch: ModelWorkerBatch):
         # Since batch.seq_lens is allocated in another stream, we need

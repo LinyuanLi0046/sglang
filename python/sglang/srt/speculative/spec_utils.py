@@ -53,6 +53,9 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
     if server_args is None:
         server_args = get_global_server_args()
 
+    if envs.SGLANG_SPEC_V2_ZERO_BUBBLE.get():
+        return False
+
     # TODO(lsyin): also skip when 1) step = 1 or 2) standalone draft model
     return not server_args.enable_multi_layer_eagle
 

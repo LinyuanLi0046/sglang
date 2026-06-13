@@ -347,6 +347,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0
         self.init_new_workspace = False
+        self.enable_spec_v2_zero_bubble = envs.SGLANG_SPEC_V2_ZERO_BUBBLE.get()
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
 
@@ -2842,11 +2843,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.prepare_attn_tp_scatter_input(self)
 
         # Normalize num_token_non_padded to be local to this attention TP rank if needed.
+        skip_adjust_num_token_non_padded = (
+            self.enable_spec_v2_zero_bubble
+            and self.is_draft_worker
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and forward_batch.spec_algorithm is not None
+            and forward_batch.spec_algorithm.is_eagle()
+        )
         if (
             forward_batch.num_token_non_padded is not None
             and forward_batch.global_num_tokens_gpu is not None
             and require_gathered_buffer(self.server_args)
             and not is_nsa_enable_prefill_cp()
+            and not skip_adjust_num_token_non_padded
         ):
             forward_batch.adjust_num_token_non_padded_for_attn_tp(
                 server_args=self.server_args,

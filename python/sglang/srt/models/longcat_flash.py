@@ -46,6 +46,7 @@ from sglang.srt.distributed import (
     get_moe_ep_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
+    use_longcat_ops_deepep_prefill_tp_group,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -912,6 +913,11 @@ class LongcatFlashDecoderLayer(nn.Module):
             mlp_hidden_states = attn0_hidden_states.clone()
             mlp_residual = attn0_residual.clone()
 
+        use_ops_prefill_tp_group = (
+            is_dp_attention_enabled()
+            and self.mlp._use_ops_double_routing_prefill(forward_batch)
+        )
+
         if use_ops_local_token_moe:
             prepared_moe_hidden_states, moe_residual = (
                 self._prepare_ops_local_token_moe_inputs(
@@ -920,13 +926,16 @@ class LongcatFlashDecoderLayer(nn.Module):
                 )
             )
         else:
-            prepared_moe_hidden_states, moe_residual = (
-                self.moe_layer_communicator.prepare_mlp(
-                    moe_hidden_states_input,
-                    moe_residual_input,
-                    forward_batch,
+            with use_longcat_ops_deepep_prefill_tp_group(
+                use_ops_prefill_tp_group
+            ):
+                prepared_moe_hidden_states, moe_residual = (
+                    self.moe_layer_communicator.prepare_mlp(
+                        moe_hidden_states_input,
+                        moe_residual_input,
+                        forward_batch,
+                    )
                 )
-            )
         moe_hidden_states = None
         if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             msu = MultiStreamUtils()
@@ -940,9 +949,12 @@ class LongcatFlashDecoderLayer(nn.Module):
                         prepared_moe_hidden_states, forward_batch=forward_batch
                     )
                     if not use_ops_local_token_moe:
-                        moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
-                            moe_hidden_states, moe_residual, forward_batch
-                        )
+                        with use_longcat_ops_deepep_prefill_tp_group(
+                            use_ops_prefill_tp_group
+                        ):
+                            moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
+                                moe_hidden_states, moe_residual, forward_batch
+                            )
                     else:
                         moe_hidden_states = self._restore_ops_local_token_moe_outputs(
                             moe_hidden_states
@@ -977,9 +989,12 @@ class LongcatFlashDecoderLayer(nn.Module):
                 prepared_moe_hidden_states, forward_batch=forward_batch
             )
             if not use_ops_local_token_moe:
-                moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
-                    moe_hidden_states, moe_residual, forward_batch
-                )
+                with use_longcat_ops_deepep_prefill_tp_group(
+                    use_ops_prefill_tp_group
+                ):
+                    moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
+                        moe_hidden_states, moe_residual, forward_batch
+                    )
             else:
                 moe_hidden_states = self._restore_ops_local_token_moe_outputs(
                     moe_hidden_states

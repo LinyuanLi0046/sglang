@@ -27,6 +27,7 @@ import gc
 import logging
 import os
 import pickle
+import threading
 import weakref
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
@@ -1437,6 +1438,7 @@ _ATTN_CP: Optional[GroupCoordinator] = None
 _PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
 
 _ENABLE_PDMUX_P_TP: bool = False
+_TP_GROUP_OVERRIDE = threading.local()
 
 
 def set_pdmux_status(enable_prefill_multiplexing: bool):
@@ -1445,6 +1447,11 @@ def set_pdmux_status(enable_prefill_multiplexing: bool):
 
 
 def get_tp_group() -> GroupCoordinator:
+    if getattr(_TP_GROUP_OVERRIDE, "use_longcat_ops_deepep_prefill_tp", False):
+        assert (
+            _LONGCAT_OPS_DEEPEP_PREFILL_TP is not None
+        ), "longcat ops deepep prefill tensor model parallel group is not initialized"
+        return _LONGCAT_OPS_DEEPEP_PREFILL_TP
     if _ENABLE_PDMUX_P_TP:
         assert (
             _PDMUX_PREFILL_TP_GROUP is not None
@@ -1476,6 +1483,7 @@ _MOE_EP: Optional[GroupCoordinator] = None
 _MOE_TP: Optional[GroupCoordinator] = None
 _LONGCAT_MOE_EP: Optional[GroupCoordinator] = None
 _LONGCAT_OPS_DEEPEP_PREFILL_EP: Optional[GroupCoordinator] = None
+_LONGCAT_OPS_DEEPEP_PREFILL_TP: Optional[GroupCoordinator] = None
 
 
 def get_moe_dp_group() -> GroupCoordinator:
@@ -1505,6 +1513,28 @@ def get_longcat_ops_deepep_prefill_ep_group() -> GroupCoordinator:
         _LONGCAT_OPS_DEEPEP_PREFILL_EP is not None
     ), "longcat ops deepep prefill expert model parallel group is not initialized"
     return _LONGCAT_OPS_DEEPEP_PREFILL_EP
+
+
+def get_longcat_ops_deepep_prefill_tp_group() -> GroupCoordinator:
+    assert (
+        _LONGCAT_OPS_DEEPEP_PREFILL_TP is not None
+    ), "longcat ops deepep prefill tensor model parallel group is not initialized"
+    return _LONGCAT_OPS_DEEPEP_PREFILL_TP
+
+
+@contextmanager
+def use_longcat_ops_deepep_prefill_tp_group(enabled: bool = True):
+    if not enabled:
+        yield
+        return
+    previous = getattr(
+        _TP_GROUP_OVERRIDE, "use_longcat_ops_deepep_prefill_tp", False
+    )
+    _TP_GROUP_OVERRIDE.use_longcat_ops_deepep_prefill_tp = True
+    try:
+        yield
+    finally:
+        _TP_GROUP_OVERRIDE.use_longcat_ops_deepep_prefill_tp = previous
 
 
 # kept for backward compatibility
@@ -1559,6 +1589,7 @@ def graph_capture(stream: Optional[torch.cuda.Stream] = None):
                 _MOE_TP,
                 _LONGCAT_MOE_EP,
                 _LONGCAT_OPS_DEEPEP_PREFILL_EP,
+                _LONGCAT_OPS_DEEPEP_PREFILL_TP,
             ):
                 if group is not None and id(group) not in seen:
                     seen.add(id(group))
@@ -1994,6 +2025,10 @@ def initialize_model_parallel(
     assert (
         _LONGCAT_OPS_DEEPEP_PREFILL_EP is None
     ), "longcat ops deepep prefill expert model parallel group is already initialized"
+    global _LONGCAT_OPS_DEEPEP_PREFILL_TP
+    assert (
+        _LONGCAT_OPS_DEEPEP_PREFILL_TP is None
+    ), "longcat ops deepep prefill tensor model parallel group is already initialized"
     if (
         is_npu()
         and get_bool_env_var("SGLANG_ASCEND_USE_OPS_DEEPEP")
@@ -2004,6 +2039,15 @@ def initialize_model_parallel(
             get_world_group().local_rank,
             backend,
             group_name="longcat_ops_deepep_prefill_ep",
+        )
+        _LONGCAT_OPS_DEEPEP_PREFILL_TP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_message_queue_broadcaster=get_bool_env_var(
+                "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
+            ),
+            group_name="longcat_ops_deepep_prefill_tp",
         )
 
     global _MOE_TP
@@ -2278,6 +2322,11 @@ def destroy_model_parallel():
     if _LONGCAT_OPS_DEEPEP_PREFILL_EP:
         _LONGCAT_OPS_DEEPEP_PREFILL_EP.destroy()
     _LONGCAT_OPS_DEEPEP_PREFILL_EP = None
+
+    global _LONGCAT_OPS_DEEPEP_PREFILL_TP
+    if _LONGCAT_OPS_DEEPEP_PREFILL_TP:
+        _LONGCAT_OPS_DEEPEP_PREFILL_TP.destroy()
+    _LONGCAT_OPS_DEEPEP_PREFILL_TP = None
 
     global _MOE_TP
     if _MOE_TP:

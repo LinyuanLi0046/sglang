@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -37,6 +38,8 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_npu_before_atlas_a5 = is_npu_before_atlas_a5()
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
@@ -314,6 +317,22 @@ class EagleVerifyInputV2Mixin:
                 batch.mamba_track_mask = None
                 batch.mamba_track_seqlens = None
 
+            logger.error(
+                "prepare_for_v2_verify source shapes: bs=%s draft_token_num=%s batch_input_ids=%s verify_positions=%s out_cache_loc=%s req_pool_indices=%s seq_lens=%s seq_lens_sum=%s",
+                bs,
+                self.draft_token_num,
+                tuple(batch.input_ids.shape) if batch.input_ids is not None else None,
+                tuple(self.positions.shape) if self.positions is not None else None,
+                tuple(batch.out_cache_loc.shape)
+                if batch.out_cache_loc is not None
+                else None,
+                tuple(batch.req_pool_indices.shape)
+                if batch.req_pool_indices is not None
+                else None,
+                tuple(batch.seq_lens.shape) if batch.seq_lens is not None else None,
+                batch.seq_lens_sum,
+            )
+
         # Get a forward batch
         batch.forward_mode = (
             ForwardMode.IDLE
@@ -322,6 +341,30 @@ class EagleVerifyInputV2Mixin:
         )
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
+
+        logger.error(
+            "prepare_for_v2_verify forward_batch shapes: batch_size=%s input_ids=%s positions=%s out_cache_loc=%s req_pool_indices=%s seq_lens=%s mrope=%s num_token_non_padded_cpu=%s",
+            verify_forward_batch.batch_size,
+            tuple(verify_forward_batch.input_ids.shape)
+            if verify_forward_batch.input_ids is not None
+            else None,
+            tuple(verify_forward_batch.positions.shape)
+            if verify_forward_batch.positions is not None
+            else None,
+            tuple(verify_forward_batch.out_cache_loc.shape)
+            if verify_forward_batch.out_cache_loc is not None
+            else None,
+            tuple(verify_forward_batch.req_pool_indices.shape)
+            if verify_forward_batch.req_pool_indices is not None
+            else None,
+            tuple(verify_forward_batch.seq_lens.shape)
+            if verify_forward_batch.seq_lens is not None
+            else None,
+            tuple(verify_forward_batch.mrope_positions.shape)
+            if verify_forward_batch.mrope_positions is not None
+            else None,
+            verify_forward_batch.num_token_non_padded_cpu,
+        )
 
         # Run attention backend plan and cuda graph preparation
         can_run_cuda_graph = bool(

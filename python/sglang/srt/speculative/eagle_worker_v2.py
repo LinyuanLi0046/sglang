@@ -398,6 +398,9 @@ class EagleDraftWorker(BaseDraftWorker):
         tree_mask_buf, position_buf = (
             self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
         )
+        input_draft_tokens_shape = (
+            tuple(draft_tokens.shape) if draft_tokens is not None else None
+        )
 
         (
             tree_mask,
@@ -419,6 +422,23 @@ class EagleDraftWorker(BaseDraftWorker):
             self.tree_mask_mode,
             tree_mask_buf,
             position_buf,
+        )
+
+        logger.error(
+            "build_verify_input_from_tree shapes: batch_size=%s verified_id=%s parent_list=%s top_scores_index=%s input_draft_tokens=%s output_draft_token=%s position=%s retrive_index=%s seq_lens=%s seq_lens_sum=%s draft_token_num=%s",
+            model_worker_batch.batch_size,
+            tuple(verified_id.shape) if verified_id is not None else None,
+            tuple(parent_list.shape) if parent_list is not None else None,
+            tuple(top_scores_index.shape) if top_scores_index is not None else None,
+            input_draft_tokens_shape,
+            tuple(draft_tokens.shape) if draft_tokens is not None else None,
+            tuple(position.shape) if position is not None else None,
+            tuple(retrive_index.shape) if retrive_index is not None else None,
+            tuple(model_worker_batch.seq_lens.shape)
+            if model_worker_batch.seq_lens is not None
+            else None,
+            model_worker_batch.seq_lens_sum,
+            self.speculative_num_draft_tokens,
         )
 
         return EagleVerifyInput(

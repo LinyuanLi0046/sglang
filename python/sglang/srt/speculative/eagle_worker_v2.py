@@ -771,10 +771,17 @@ class EagleDraftWorker(BaseDraftWorker):
         model_worker_batch.seq_lens_sum = (
             batch_result.next_draft_input.new_seq_lens.sum().item()
         )
-        model_worker_batch.seq_lens_cpu = model_worker_batch.seq_lens.to("cpu")
+        # When cuda graph is disabled, seq_lens_cpu must be synced because
+        # init_forward_metadata derives actual_seq_lengths_kv from it, while
+        # block_tables are derived from seq_lens (GPU). A mismatch between the
+        # two causes an NPU kernel error. When cuda graph is enabled, the graph
+        # replay path tolerates the stale value (both sides are consistently
+        # off), so we skip the D2H copy to avoid the overhead.
+        if self.server_args.disable_cuda_graph:
+            model_worker_batch.seq_lens_cpu = model_worker_batch.seq_lens.to("cpu")
 
         try:
-            forward_batch, _ = draft_input.prepare_for_v2_draft(
+            forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
                 self.req_to_token_pool,
                 model_worker_batch,
                 self.cuda_graph_runner,
@@ -789,9 +796,16 @@ class EagleDraftWorker(BaseDraftWorker):
             forward_batch.spec_info.topk_p = batch_result.next_draft_input.topk_p
             forward_batch.spec_info.topk_index = batch_result.next_draft_input.topk_index
 
-            if not forward_batch.forward_mode.is_idle():
-                self.draft_attn_backend.init_forward_metadata(forward_batch)
-            ret_topk_p, ret_topk_index = self.draft_forward_zero_bubble(forward_batch)
+            if can_cuda_graph:
+                ret_topk_p, ret_topk_index = self.cuda_graph_runner.replay(
+                    forward_batch
+                )
+            else:
+                if not forward_batch.forward_mode.is_idle():
+                    self.draft_attn_backend.init_forward_metadata(forward_batch)
+                ret_topk_p, ret_topk_index = self.draft_forward_zero_bubble(
+                    forward_batch
+                )
 
             next_draft_input = batch_result.next_draft_input
             next_draft_input.topk_p = torch.cat(

@@ -2682,15 +2682,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.piecewise_cuda_graph_runner.can_run(forward_batch)
         )
 
-        if (
-            can_run_graph
-            and get_bool_env_var("SGLANG_ASCEND_USE_OPS_DEEPEP")
-            and getattr(self.model_config.hf_config, "model_type", None)
-            == "longcat_flash"
-            and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-        ):
-            can_run_graph = False
-
         if can_run_graph:
             return (
                 self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs),

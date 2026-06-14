@@ -590,6 +590,8 @@ class LongcatFlashMoE(nn.Module):
                 num_tokens=hidden_states.shape[0],
                 device=hidden_states.device,
             )
+        if hidden_states.shape[0] == 0:
+            return hidden_states.view(num_tokens, hidden_dim)
         zero_expert_result = None
         if self.zero_expert_type is not None and not use_ops_decode:
             if not _is_npu:
@@ -612,9 +614,6 @@ class LongcatFlashMoE(nn.Module):
                     ),
                 )
         topk_output = StandardTopKOutput(topk_weights, topk_idx, _)
-
-        if hidden_states.shape[0] == 0:
-            return hidden_states.view(num_tokens, hidden_dim)
 
         if use_ops_prefill:
             final_hidden_states = self._forward_prefill_double_routing(

@@ -670,14 +670,22 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         if batch.forward_mode.is_idle():
             return
 
+        use_zero_bubble = envs.SGLANG_SPEC_V2_ZERO_BUBBLE.get()
+        base_tokens = self.bonus_tokens if use_zero_bubble else self.verified_id
+        if base_tokens is None:
+            token_name = "bonus_tokens" if use_zero_bubble else "verified_id"
+            raise ValueError(
+                f"EagleDraftInput.prepare_for_extend requires {token_name}"
+            )
+
         # Prefill only generate 1 token.
-        assert len(self.verified_id) == len(batch.seq_lens)
+        assert len(base_tokens) == len(batch.seq_lens)
 
         pt = 0
         for i, extend_len in enumerate(batch.extend_lens):
             input_ids = batch.input_ids[pt : pt + extend_len]
             batch.input_ids[pt : pt + extend_len] = torch.cat(
-                (input_ids[1:], self.verified_id[i].reshape(1))
+                (input_ids[1:], base_tokens[i].reshape(1))
             )
             pt += extend_len
 

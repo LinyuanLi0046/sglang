@@ -585,23 +585,35 @@ class LongcatFlashMoE(nn.Module):
             and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         )
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits = self.router(hidden_states)
-        topk_weights, topk_idx, _ = self.topk(
-            hidden_states,
-            router_logits,
-        )
-        if self.enable_perfect_eplb:
-            # Benchmark-only path: keep router weights but force a uniform expert id layout.
-            topk_idx = self._get_perfect_eplb_topk_idx(
-                is_prefill=is_prefill,
-                num_tokens=hidden_states.shape[0],
-                device=hidden_states.device,
-            )
         if hidden_states.shape[0] == 0:
-            return hidden_states.view(num_tokens, hidden_dim)
+            if get_moe_a2a_backend().is_deepep() and not (
+                use_ops_decode or use_ops_prefill
+            ):
+                topk_output = self.topk.empty_topk_output(hidden_states.device)
+            else:
+                return hidden_states.view(num_tokens, hidden_dim)
+        else:
+            # router_logits: (num_tokens, n_experts)
+            router_logits = self.router(hidden_states)
+            topk_weights, topk_idx, _ = self.topk(
+                hidden_states,
+                router_logits,
+            )
+            if self.enable_perfect_eplb:
+                # Benchmark-only path: keep router weights but force a uniform expert id layout.
+                topk_idx = self._get_perfect_eplb_topk_idx(
+                    is_prefill=is_prefill,
+                    num_tokens=hidden_states.shape[0],
+                    device=hidden_states.device,
+                )
+            topk_output = StandardTopKOutput(topk_weights, topk_idx, _)
+
         zero_expert_result = None
-        if self.zero_expert_type is not None and not use_ops_decode:
+        if (
+            self.zero_expert_type is not None
+            and not use_ops_decode
+            and hidden_states.shape[0] > 0
+        ):
             if not _is_npu:
                 zero_expert_result = zero_experts_compute_triton(
                     expert_indices=topk_idx,
@@ -621,7 +633,6 @@ class LongcatFlashMoE(nn.Module):
                         -1 if get_moe_a2a_backend().is_deepep() else 0
                     ),
                 )
-        topk_output = StandardTopKOutput(topk_weights, topk_idx, _)
 
         if use_ops_prefill:
             final_hidden_states = self._forward_prefill_double_routing(

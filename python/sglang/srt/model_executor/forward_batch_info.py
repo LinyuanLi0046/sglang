@@ -877,6 +877,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             buffer_len, num_tokens, dp_padding_mode.is_max_len(), global_num_tokens
         )
         set_is_extend_in_batch(self.is_extend_in_batch)
+        bs = self.batch_size
         logger.error(
             "DP_ATTN_FORWARD_BATCH prepare_mlp_sync_batch forward_mode=%s "
             "is_extend_in_batch=%s attn_tp_rank=%s attn_tp_size=%s attn_cp_size=%s "

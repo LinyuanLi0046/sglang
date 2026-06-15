@@ -179,8 +179,12 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 topk_p=topk_p,
                 topk_index=topk_index,
                 hidden_states=hidden_states,
-                bonus_tokens=self.output_ids,
-                verified_id=None,
+                bonus_tokens=(
+                    self.output_ids if enable_spec_v2_zero_bubble else None
+                ),
+                verified_id=(
+                    None if enable_spec_v2_zero_bubble else self.output_ids
+                ),
                 new_seq_lens=self.seq_lens,
             )
             spec_info.prepare_for_extend(self)

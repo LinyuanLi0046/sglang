@@ -650,7 +650,11 @@ class LongcatFlashMoE(nn.Module):
             final_hidden_states = self.experts(hidden_states, topk_output)
         final_hidden_states *= self.routed_scaling_factor
 
-        if self.tp_size > 1 and get_moe_a2a_backend().is_deepep():
+        if (
+            self.tp_size > 1
+            and get_moe_a2a_backend().is_deepep()
+            and zero_expert_result is not None
+        ):
             zero_expert_result *= self.tp_size
 
         if zero_expert_result is not None and not use_ops_decode and hidden_states.shape[0] > 0:

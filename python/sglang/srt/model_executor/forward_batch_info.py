@@ -32,6 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
+import logging
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -77,6 +78,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 _is_npu = is_npu()
+logger = logging.getLogger(__name__)
 
 
 class ForwardMode(IntEnum):
@@ -835,6 +837,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         assert self.global_num_tokens_for_logprob_cpu is not None
 
         global_num_tokens = self.global_num_tokens_cpu
+        original_global_num_tokens = list(global_num_tokens)
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_attention_tp_size()
 
@@ -874,8 +877,25 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             buffer_len, num_tokens, dp_padding_mode.is_max_len(), global_num_tokens
         )
         set_is_extend_in_batch(self.is_extend_in_batch)
+        logger.error(
+            "DP_ATTN_FORWARD_BATCH prepare_mlp_sync_batch forward_mode=%s "
+            "is_extend_in_batch=%s attn_tp_rank=%s attn_tp_size=%s attn_cp_size=%s "
+            "attn_dp_rank=%s original_global_num_tokens=%s "
+            "aligned_global_num_tokens=%s dp_padding_mode=%s "
+            "global_dp_buffer_len=%s local_dp_buffer_len=%s",
+            self.forward_mode,
+            self.is_extend_in_batch,
+            get_attention_tp_rank(),
+            attn_tp_size,
+            attn_cp_size,
+            get_attention_dp_rank(),
+            original_global_num_tokens,
+            global_num_tokens,
+            dp_padding_mode.name,
+            buffer_len,
+            num_tokens,
+        )
 
-        bs = self.batch_size
 
         if (
             self.forward_mode.is_decode()

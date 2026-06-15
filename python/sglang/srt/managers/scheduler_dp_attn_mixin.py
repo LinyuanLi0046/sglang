@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
@@ -19,6 +20,7 @@ if TYPE_CHECKING:
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -102,6 +104,20 @@ class MLPSyncBatchInfo:
         self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(tp0_info[:, 5].tolist())
+        logger.error(
+            "DP_ATTN_SYNC all_gather dp_size=%s tp_size=%s cp_size=%s "
+            "local_info=%s global_num_tokens=%s global_num_tokens_for_logprob=%s "
+            "can_cuda_graph=%s is_extend_in_batch=%s tp_active_ranks=%s",
+            self.dp_size,
+            self.tp_size,
+            self.cp_size,
+            local_info_tensor.detach().cpu().tolist(),
+            self.global_num_tokens,
+            self.global_num_tokens_for_logprob,
+            self.can_cuda_graph,
+            self.is_extend_in_batch,
+            tp_active_ranks.detach().cpu().tolist(),
+        )
 
 
 def _update_gather_batch(

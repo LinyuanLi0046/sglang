@@ -287,13 +287,6 @@ class AscendAttnBackend(AttentionBackend):
         )
         if self.use_mla:
             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
-
-    def _resolve_fp8_kv_scale(
-        self, fp8_kv_scale: Optional[torch.Tensor], device: torch.device
-    ) -> torch.Tensor:
-        if fp8_kv_scale is None:
-            return _get_fp8_kv_scale(device)
-        return fp8_kv_scale.to(device=device, dtype=torch.float32)
         self.is_hybrid_swa = model_runner.is_hybrid_swa
         if self.is_hybrid_swa:
             self.full_to_swa_index_mapping = (
@@ -318,6 +311,13 @@ class AscendAttnBackend(AttentionBackend):
         if self.dllm_config is not None:
             self.is_dllm_model = True
             self.dllm_block_size = self.dllm_config.block_size
+
+    def _resolve_fp8_kv_scale(
+        self, fp8_kv_scale: Optional[torch.Tensor], device: torch.device
+    ) -> torch.Tensor:
+        if fp8_kv_scale is None:
+            return _get_fp8_kv_scale(device)
+        return fp8_kv_scale.to(device=device, dtype=torch.float32)
 
     def get_verify_buffers_to_fill_after_draft(self):
         """

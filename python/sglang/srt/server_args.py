@@ -6203,6 +6203,14 @@ class ServerArgs:
             assert (
                 self.chunked_prefill_size % self.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
+            if get_bool_env_var("SGLANG_USE_FIA_NZ"):
+                logger.warning(
+                    "SGLANG_USE_FIA_NZ is ignored because chunked prefill is enabled "
+                    f"(chunked_prefill_size={self.chunked_prefill_size}). "
+                    "FIA NZ currently has precision issues with chunked prefill on the "
+                    "Ascend MLA path, so it is automatically disabled."
+                )
+                os.environ["SGLANG_USE_FIA_NZ"] = "0"
 
         # Check pdmux
         if self.enable_pdmux:

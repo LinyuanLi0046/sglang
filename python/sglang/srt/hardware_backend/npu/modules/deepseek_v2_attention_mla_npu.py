@@ -103,7 +103,11 @@ def forward_mha_prepare_npu(
 
         if m.kv_cache_dtype == "fp8_e4m3":
             k_rope_scale = None
-            c_kv_scale = torch.ones(1, dtype=torch.float32, device=q.device)
+            c_kv_scale = getattr(m, "c8_scale", None)
+            if c_kv_scale is not None:
+                c_kv_scale = c_kv_scale.to(device=q.device, dtype=torch.float32)
+            else:
+                c_kv_scale = torch.ones(1, dtype=torch.float32, device=q.device)
         else:
             k_rope_scale = None
             c_kv_scale = None
@@ -185,7 +189,9 @@ def forward_mla_prepare_npu(
                 m.num_local_heads,
                 m.qk_nope_head_dim,
                 m.qk_rope_head_dim,
+                m.v_head_dim,
                 m.quant_config,
+                getattr(m, "c8_scale", None),
             )
         if is_longcat_mla_preprocess_enabled():
             (
@@ -309,6 +315,7 @@ def forward_mla_core_npu(
 
     if dequant_scale_q_nope is not None:
         extra_kwargs["dequant_scale_q_nope"] = dequant_scale_q_nope
+        extra_kwargs["fp8_kv_scale"] = getattr(m, "c8_scale", None)
 
     attn_output = m.attn_mqa(
         q_nope_out,
@@ -551,6 +558,7 @@ def npu_mla_preprocess(
             m.qk_rope_head_dim,
             m.v_head_dim,
             m.quant_config,
+            getattr(m, "c8_scale", None),
         )
     # mlaprolog does not require additional calculation of q_lora
     _is_mlaprolog = hasattr(m.quant_config, "ignore") and any(

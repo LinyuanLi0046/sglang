@@ -236,7 +236,7 @@ class AscendAttnBackend(AttentionBackend):
         super().__init__()
         self.forward_metadata = None
         self.device = model_runner.device
-        self.fp8_kv_scale = _get_fp8_kv_scale(self.device)
+        self.fp8_kv_scale = None
         self.speculative_step_id = speculative_step_id
         self.speculative_step_offset_npu = torch.tensor(
             speculative_step_id + 1, device="npu"
@@ -287,6 +287,13 @@ class AscendAttnBackend(AttentionBackend):
         )
         if self.use_mla:
             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
+
+    def _resolve_fp8_kv_scale(
+        self, fp8_kv_scale: Optional[torch.Tensor], device: torch.device
+    ) -> torch.Tensor:
+        if fp8_kv_scale is None:
+            return _get_fp8_kv_scale(device)
+        return fp8_kv_scale.to(device=device, dtype=torch.float32)
         self.is_hybrid_swa = model_runner.is_hybrid_swa
         if self.is_hybrid_swa:
             self.full_to_swa_index_mapping = (
@@ -993,6 +1000,7 @@ class AscendAttnBackend(AttentionBackend):
         v: torch.Tensor,
         forward_batch: ForwardBatch,
         layer: RadixAttention,
+        fp8_kv_scale: Optional[torch.Tensor] = None,
     ):
         num_token_padding = q.shape[0]
         # current chunk q, k, v
@@ -1047,9 +1055,11 @@ class AscendAttnBackend(AttentionBackend):
         # current chunk q, historial k, v
         if self.kv_cache_dtype == "fp8_e4m3":
             k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(torch.int8)
+            kv_scale = self._resolve_fp8_kv_scale(fp8_kv_scale, q.device).to(torch.bfloat16)
             kv_cached = torch.index_select(
                 k_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
             ).view(torch.float8_e4m3fn).to(torch.bfloat16)
+            kv_cached = kv_cached * kv_scale
         else:
             k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             kv_cached = torch.index_select(
@@ -1109,6 +1119,7 @@ class AscendAttnBackend(AttentionBackend):
         sinks: Optional[torch.Tensor] = None,
         slopes: Optional[torch.Tensor] = None,
         dequant_scale_q_nope: Optional[torch.Tensor] = None,
+        fp8_kv_scale: Optional[torch.Tensor] = None,
     ):
         if is_mla_preprocess_enabled():
             # MLAPO and MLAPROLOG do save kv_cache
@@ -1151,6 +1162,7 @@ class AscendAttnBackend(AttentionBackend):
                 q_rope=q_rope,
                 k_rope=k_rope,
                 dequant_scale_q_nope=dequant_scale_q_nope,
+                fp8_kv_scale=fp8_kv_scale,
             )
 
         if not self.use_mla:
@@ -1375,7 +1387,9 @@ class AscendAttnBackend(AttentionBackend):
                 )
             else:
                 if not _is_npu_before_atlas_a5:
-                   attn_output = self.forward_prefill_david(q, k, v, forward_batch, layer)
+                   attn_output = self.forward_prefill_david(
+                       q, k, v, forward_batch, layer, fp8_kv_scale=fp8_kv_scale
+                   )
                    return attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
                 num_token_padding = q.shape[0]
                 q, k, v = [
@@ -1659,6 +1673,7 @@ class AscendAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         dequant_scale_q_nope: Optional[torch.Tensor] = None,
+        fp8_kv_scale: Optional[torch.Tensor] = None,
     ):
         if save_kv_cache:
             if self.use_mla:
@@ -1777,6 +1792,7 @@ class AscendAttnBackend(AttentionBackend):
             if self.use_fia_v2:
                 if self.kv_cache_dtype == "fp8_e4m3":
                     q_fp8, dequant_scale_query = q_nope, dequant_scale_q_nope
+                    kv_scale = self._resolve_fp8_kv_scale(fp8_kv_scale, q_nope.device)
                     attn_output = torch.empty_like(q_nope, dtype=torch.bfloat16, device=q_nope.device)
                     softmax_lse = torch.empty(1, dtype=torch.bfloat16, device=q_nope.device)
                     torch_npu.npu_fused_infer_attention_score_v2.out(
@@ -1796,8 +1812,8 @@ class AscendAttnBackend(AttentionBackend):
                         sparse_mode=3,
                         atten_mask=self.mtp_mask,
                         dequant_scale_query=dequant_scale_query,
-                        dequant_scale_key=self.fp8_kv_scale,
-                        dequant_scale_value=self.fp8_kv_scale,
+                        dequant_scale_key=kv_scale,
+                        dequant_scale_value=kv_scale,
                         key_quant_mode=0,
                         value_quant_mode=0,
                         query_quant_mode=3,
@@ -1893,6 +1909,7 @@ class AscendAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
         dequant_scale_q_nope: Optional[torch.Tensor] = None,
+        fp8_kv_scale: Optional[torch.Tensor] = None,
     ):
         if save_kv_cache:
             if self.use_mla:
@@ -2028,6 +2045,7 @@ class AscendAttnBackend(AttentionBackend):
             if self.use_fia_v2:
                 if self.kv_cache_dtype == "fp8_e4m3":
                     q_fp8, dequant_scale_query = q_nope, dequant_scale_q_nope
+                    kv_scale = self._resolve_fp8_kv_scale(fp8_kv_scale, q_nope.device)
                     output = torch.empty_like(q_nope, dtype=torch.bfloat16, device=q_nope.device)
                     softmax_lse = torch.empty(1, dtype=torch.bfloat16, device=q_nope.device)
                     torch_npu.npu_fused_infer_attention_score_v2.out(
@@ -2045,8 +2063,8 @@ class AscendAttnBackend(AttentionBackend):
                         actual_seq_kvlen=actual_seq_len_kv,
                         sparse_mode=0,
                         dequant_scale_query=dequant_scale_query,
-                        dequant_scale_key=self.fp8_kv_scale,
-                        dequant_scale_value=self.fp8_kv_scale,
+                        dequant_scale_key=kv_scale,
+                        dequant_scale_value=kv_scale,
                         key_quant_mode=0,
                         value_quant_mode=0,
                         query_quant_mode=3,
@@ -2166,6 +2184,7 @@ class AscendAttnBackend(AttentionBackend):
         sinks: Optional[torch.Tensor] = None,
         slopes: Optional[torch.Tensor] = None,
         dequant_scale_q_nope: Optional[torch.Tensor] = None,
+        fp8_kv_scale: Optional[torch.Tensor] = None,
     ):
         if is_mla_preprocess_enabled():
             # MLAPO does saving kv_cache
@@ -2195,6 +2214,7 @@ class AscendAttnBackend(AttentionBackend):
                 k_rope=k_rope,
                 sinks=sinks,
                 dequant_scale_q_nope=dequant_scale_q_nope,
+                fp8_kv_scale=fp8_kv_scale,
             )
 
         if not self.use_mla:
@@ -2377,7 +2397,7 @@ class AscendAttnBackend(AttentionBackend):
                     if self.kv_cache_dtype == "fp8_e4m3":
                         # q_fp8, dequant_scale_query = _quantize_mla_query_for_fia_fp8(q)
                         q_fp8, dequant_scale_query = q, dequant_scale_q_nope
-                        kv_scale = torch.ones(1, dtype=torch.float32, device=q.device)
+                        kv_scale = self._resolve_fp8_kv_scale(fp8_kv_scale, q.device)
                         attn_output = torch.empty_like(q, dtype=torch.bfloat16, device=q.device)
                         softmax_lse = torch.empty(1, dtype=torch.bfloat16, device=q.device)
                         torch_npu.npu_fused_infer_attention_score_v2.out(

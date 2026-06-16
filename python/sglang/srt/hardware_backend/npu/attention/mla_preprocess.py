@@ -143,6 +143,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         qk_rope_head_dim,
         v_head_dim,
         quant_config: Optional["QuantizationConfig"] = None,
+        c8_scale: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.qkv_a_proj = fused_qkv_a_proj_with_mqa
@@ -156,6 +157,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         self.has_preprocess_weights = False
         self.dtype = None
         self.quant_scale_ckv = None
+        self.runtime_refs = {"c8_scale": c8_scale}
 
         self.q_lora_rank = self.q_b_proj.input_size  # 1536
         self.kv_lora_rank = self.kv_a_layernorm.hidden_size  # 512
@@ -171,6 +173,9 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             ) if hasattr(self.q_b_proj, 'weight_scale') else None
 
     def _get_quant_scale_ckv(self, device: torch.device) -> torch.Tensor:
+        c8_scale = self.runtime_refs.get("c8_scale")
+        if c8_scale is not None:
+            return c8_scale.to(device=device, dtype=torch.float32)
         if self.quant_scale_ckv is None or self.quant_scale_ckv.device != device:
             self.quant_scale_ckv = torch.ones(1, dtype=torch.float32, device=device)
         return self.quant_scale_ckv

@@ -1286,6 +1286,9 @@ class DeepseekV2AttentionMLA(
         self.w_kc = None
         self.w_vc = None
         self.w_scale = 1.0
+        self.c8_scale = nn.Parameter(
+            torch.ones(1, dtype=torch.float32), requires_grad=False
+        )
 
         self.w_scale_k = None
         self.w_scale_v = None

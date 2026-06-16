@@ -367,6 +367,16 @@ class EagleDraftWorker(BaseDraftWorker):
         self, model_worker_batch: ModelWorkerBatch
     ) -> EagleVerifyInput:
         draft_input: EagleDraftInput = model_worker_batch.spec_info
+        if (
+            model_worker_batch.forward_mode.is_idle()
+            or draft_input.bonus_tokens is None
+            or draft_input.bonus_tokens.shape[0] == 0
+        ):
+            return EagleVerifyInput.create_idle_input(
+                self.topk,
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
+            )
         if draft_input.bonus_tokens is None:
             raise ValueError(
                 "zero-bubble requires EagleDraftInput.bonus_tokens in prepare_verify_fully_async_decoding"

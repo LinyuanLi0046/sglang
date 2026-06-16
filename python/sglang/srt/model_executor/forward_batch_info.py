@@ -877,6 +877,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             buffer_len, num_tokens, dp_padding_mode.is_max_len(), global_num_tokens
         )
         set_is_extend_in_batch(self.is_extend_in_batch)
+        bs = self.batch_size
 
 
         if (

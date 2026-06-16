@@ -72,10 +72,6 @@ if _is_npu:
     import torch_npu
 
 
-def _ep_shape(tensor: Optional[torch.Tensor]) -> Optional[tuple[int, ...]]:
-    return None if tensor is None else tuple(tensor.shape)
-
-
 class DeepEPMoE(FusedMoE):
     """
     MoE Expert Parallel Impl based on DeepEP (https://github.com/deepseek-ai/DeepEP/tree/main)
@@ -214,67 +210,14 @@ class DeepEPMoE(FusedMoE):
                 topk_output,
             )
 
-        if get_moe_a2a_backend().is_deepep():
-            logger.error(
-                "DEEPEP_MOE layer=%s stage=forward_impl_begin hidden_shape=%s "
-                "topk_ids_shape=%s topk_weights_shape=%s moe_ep_rank=%s "
-                "moe_ep_size=%s moe_tp_rank=%s moe_tp_size=%s",
-                self.layer_id,
-                _ep_shape(hidden_states),
-                _ep_shape(topk_output.topk_ids),
-                _ep_shape(topk_output.topk_weights),
-                getattr(self, "moe_ep_rank", None),
-                getattr(self, "moe_ep_size", None),
-                getattr(self, "moe_tp_rank", None),
-                getattr(self, "moe_tp_size", None),
-            )
-
         # TODO: can we call super().forward here?
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
-        if get_moe_a2a_backend().is_deepep():
-            num_recv_tokens_per_expert = getattr(
-                dispatch_output, "num_recv_tokens_per_expert", None
-            )
-            masked_m = getattr(dispatch_output, "masked_m", None)
-            expected_m = getattr(dispatch_output, "expected_m", None)
-            logger.error(
-                "DEEPEP_MOE layer=%s stage=after_dispatch hidden_shape=%s "
-                "hidden_scale_shape=%s topk_ids_shape=%s topk_weights_shape=%s "
-                "num_recv_tokens_per_expert=%s masked_m_shape=%s expected_m=%s",
-                self.layer_id,
-                _ep_shape(dispatch_output.hidden_states),
-                _ep_shape(dispatch_output.hidden_states_scale),
-                _ep_shape(dispatch_output.topk_ids),
-                _ep_shape(dispatch_output.topk_weights),
-                (
-                    num_recv_tokens_per_expert.detach().cpu().tolist()
-                    if isinstance(num_recv_tokens_per_expert, torch.Tensor)
-                    else num_recv_tokens_per_expert
-                ),
-                _ep_shape(masked_m),
-                expected_m,
-            )
         combine_input = self.run_moe_core(dispatch_output)
-        if get_moe_a2a_backend().is_deepep():
-            logger.error(
-                "DEEPEP_MOE layer=%s stage=after_run_moe_core hidden_shape=%s "
-                "topk_ids_shape=%s topk_weights_shape=%s",
-                self.layer_id,
-                _ep_shape(combine_input.hidden_states),
-                _ep_shape(combine_input.topk_ids),
-                _ep_shape(combine_input.topk_weights),
-            )
         hidden_states = self.dispatcher.combine(
             combine_input=combine_input,
         )
-        if get_moe_a2a_backend().is_deepep():
-            logger.error(
-                "DEEPEP_MOE layer=%s stage=after_combine hidden_shape=%s",
-                self.layer_id,
-                _ep_shape(hidden_states),
-            )
 
         return hidden_states
 

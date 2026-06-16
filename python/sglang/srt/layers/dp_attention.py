@@ -37,9 +37,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _shape_of(tensor: Optional[torch.Tensor]) -> Optional[Tuple[int, ...]]:
-    return None if tensor is None else tuple(tensor.shape)
-
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -401,19 +398,6 @@ def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.
 
         forward_batch.dp_local_start_pos = local_start_pos
         forward_batch.dp_local_num_tokens = local_num_tokens
-        logger.error(
-            "DP_ATTN_LOCAL_INFO dp_rank=%s attn_tp_rank=%s attn_tp_size=%s "
-            "forward_mode=%s global_num_tokens_gpu=%s local_start_pos=%s "
-            "local_num_tokens=%s",
-            dp_rank,
-            get_attention_tp_rank(),
-            get_attention_tp_size(),
-            getattr(forward_batch, "forward_mode", None),
-            forward_batch.global_num_tokens_gpu.detach().cpu().tolist(),
-            int(local_start_pos.item()),
-            int(local_num_tokens.item()),
-        )
-
     return forward_batch.dp_local_start_pos, forward_batch.dp_local_num_tokens
 
 
@@ -565,22 +549,6 @@ def dp_scatter(
         memcpy_triton(
             local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
         )
-    logger.error(
-        "DP_ATTN_SCATTER forward_mode=%s dp_rank=%s attn_tp_rank=%s "
-        "dp_padding_mode=%s global_shape=%s local_shape=%s "
-        "local_start_pos=%s local_num_tokens=%s global_num_tokens_gpu=%s",
-        getattr(forward_batch, "forward_mode", None),
-        get_attention_dp_rank(),
-        get_attention_tp_rank(),
-        getattr(getattr(forward_batch, "dp_padding_mode", None), "name", None),
-        _shape_of(global_tokens),
-        _shape_of(local_tokens),
-        int(local_start_pos.item()),
-        int(local_num_tokens.item()),
-        forward_batch.global_num_tokens_gpu.detach().cpu().tolist(),
-    )
-
-
 @dataclass
 class PaddedTokenShardMetadata:
     total_tokens: int

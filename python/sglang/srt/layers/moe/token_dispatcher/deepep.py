@@ -60,16 +60,6 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 logger = logging.getLogger(__name__)
 
 
-def _deepep_shape(tensor: Optional[torch.Tensor]) -> Optional[Tuple[int, ...]]:
-    return None if tensor is None else tuple(tensor.shape)
-
-
-def _deepep_list(value):
-    if isinstance(value, torch.Tensor):
-        return value.detach().cpu().tolist()
-    return value
-
-
 class DeepEPPDispatchHooks(DispatcherBaseHooks):
 
     def __call__(self, dispatcher: BaseDispatcher):
@@ -443,18 +433,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         buffer = self._get_buffer()
         input_x = x[0] if isinstance(x, tuple) else x
         input_x_scale = x[1] if isinstance(x, tuple) else None
-        logger.error(
-            "DEEPEP_DISPATCH stage=before_layout group_size=%s async_finish=%s "
-            "is_extend_in_batch=%s hidden_shape=%s hidden_scale_shape=%s "
-            "topk_ids_shape=%s topk_weights_shape=%s",
-            buffer.group.size(),
-            self.async_finish,
-            get_is_extend_in_batch(),
-            _deepep_shape(input_x),
-            _deepep_shape(input_x_scale),
-            _deepep_shape(topk_ids),
-            _deepep_shape(topk_weights),
-        )
         (
             num_tokens_per_rank,
             num_tokens_per_rdma_rank,
@@ -467,15 +445,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             previous_event=previous_event,
             async_finish=self.async_finish,
             allocate_on_comm_stream=previous_event is not None,
-        )
-        logger.error(
-            "DEEPEP_DISPATCH stage=after_layout num_tokens_per_rank=%s "
-            "num_tokens_per_rdma_rank=%s num_tokens_per_expert=%s "
-            "is_token_in_rank_shape=%s",
-            _deepep_list(num_tokens_per_rank),
-            _deepep_list(num_tokens_per_rdma_rank),
-            _deepep_list(num_tokens_per_expert),
-            _deepep_shape(is_token_in_rank),
         )
         # FIXME: `handle` should be transmitted with tokens from dispatch to combine.
         # However, doing this would incur an unknown synchronization error, but keeping
@@ -501,18 +470,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
             expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
             config=DeepEPConfig.get_instance().normal_dispatch_config,
-        )
-        recv_hidden = recv_x[0] if isinstance(recv_x, tuple) else recv_x
-        recv_hidden_scale = recv_x[1] if isinstance(recv_x, tuple) else None
-        logger.error(
-            "DEEPEP_DISPATCH stage=after_dispatch recv_hidden_shape=%s "
-            "recv_hidden_scale_shape=%s recv_topk_ids_shape=%s "
-            "recv_topk_weights_shape=%s num_recv_tokens_per_expert=%s",
-            _deepep_shape(recv_hidden),
-            _deepep_shape(recv_hidden_scale),
-            _deepep_shape(recv_topk_ids),
-            _deepep_shape(recv_topk_weights),
-            _deepep_list(num_recv_tokens_per_expert),
         )
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
             num_recv_tokens_per_expert,
@@ -553,13 +510,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
 
     def _combine_core(self, x: torch.Tensor, previous_event):
         buffer = self._get_buffer()
-        logger.error(
-            "DEEPEP_COMBINE stage=before_combine input_shape=%s handle_is_none=%s "
-            "async_finish=%s",
-            _deepep_shape(x),
-            self.handle is None,
-            self.async_finish,
-        )
         combined_x, _, event = buffer.combine(
             x,
             self.handle,
@@ -567,10 +517,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             previous_event=previous_event,
             allocate_on_comm_stream=previous_event is not None,
             config=DeepEPConfig.get_instance().normal_combine_config,
-        )
-        logger.error(
-            "DEEPEP_COMBINE stage=after_combine output_shape=%s",
-            _deepep_shape(combined_x),
         )
         return combined_x, event
 

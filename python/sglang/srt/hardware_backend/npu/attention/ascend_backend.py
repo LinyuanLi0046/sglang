@@ -1094,6 +1094,142 @@ class AscendAttnBackend(AttentionBackend):
             )
         return output
 
+    def forward_prefill_david_fia_nz(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer: RadixAttention,
+    ):
+        num_token_padding = q.shape[0]
+        q, k, v = [
+            data[: forward_batch.num_token_non_padded_cpu] for data in [q, k, v]
+        ]
+        q_nope, q_rope = q.split(
+            [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+        k_nope, k_rope = k.split(
+            [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+
+        output = torch.empty(
+            q_nope.size(0),
+            layer.tp_q_head_num,
+            layer.v_head_dim,
+            dtype=q_nope.dtype,
+            device=q_nope.device,
+        )
+
+        if self.kv_cache_dtype == "fp8_e4m3":
+            k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
+                torch.int8
+            )
+        else:
+            k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+        assert layer.kv_b_proj is not None
+
+        q_offset = 0
+        prefix_lens = self.forward_metadata.prefix_lens.tolist()
+        for req_idx, (q_len, prefix_len) in enumerate(
+            zip(forward_batch.extend_seq_lens_cpu, prefix_lens)
+        ):
+            q_slice = q_nope[q_offset : q_offset + q_len]
+            q_rope_slice = q_rope[q_offset : q_offset + q_len]
+            k_slice = k_nope[q_offset : q_offset + q_len]
+            k_rope_slice = k_rope[q_offset : q_offset + q_len]
+            v_slice = v[q_offset : q_offset + q_len]
+
+            common_kwargs = {
+                "query_rope": q_rope_slice,
+                "key_rope": k_rope_slice,
+                "num_heads": layer.tp_q_head_num,
+                "num_key_value_heads": layer.tp_k_head_num,
+                "input_layout": "TND",
+                "atten_mask": self.fia_mask,
+                "sparse_mode": 3,
+                "scale": layer.scaling,
+                "antiquant_mode": 0,
+                "antiquant_scale": None,
+                "block_table": None,
+                "block_size": 0,
+                "softmax_lse_flag": True,
+                "actual_seq_lengths": [q_len],
+                "actual_seq_lengths_kv": [q_len],
+            }
+            cur_attn_output, cur_attn_lse = torch_npu.npu_fused_infer_attention_score(
+                q_slice, k_slice, v_slice, **common_kwargs
+            )
+            cur_attn_lse = cur_attn_lse.to(torch.float32)
+            out_list = [
+                cur_attn_output.reshape(q_len * layer.tp_q_head_num, layer.v_head_dim)
+            ]
+            lse_list = [cur_attn_lse.reshape(q_len * layer.tp_q_head_num)]
+
+            if prefix_len > 0:
+                prefix_page_num = (prefix_len + self.page_size - 1) // self.page_size
+                prefix_block_table = self.forward_metadata.block_tables[
+                    req_idx, :prefix_page_num
+                ]
+
+                if self.kv_cache_dtype == "fp8_e4m3":
+                    kv_cached = torch.index_select(k_buffer, 0, prefix_block_table).view(
+                        torch.float8_e4m3fn
+                    ).to(torch.bfloat16)
+                else:
+                    kv_cached = torch.index_select(k_buffer, 0, prefix_block_table)
+                k_rope_cached = torch.index_select(v_buffer, 0, prefix_block_table)
+
+                kv = layer.kv_b_proj(kv_cached)[0].view(
+                    -1, layer.tp_k_head_num, self.qk_nope_head_dim + layer.v_head_dim
+                )[:prefix_len]
+                prefix_k_nope, prefix_v = kv.split(
+                    [self.qk_nope_head_dim, layer.v_head_dim], dim=-1
+                )
+                prefix_k_rope = k_rope_cached.flatten(0, 1)[:prefix_len].expand(
+                    -1, layer.tp_k_head_num, -1
+                )
+
+                common_kwargs["atten_mask"] = None
+                common_kwargs["sparse_mode"] = 0
+                common_kwargs["key_rope"] = prefix_k_rope
+                common_kwargs["actual_seq_lengths_kv"] = [prefix_len]
+                prefix_attn_output, prefix_attn_lse = (
+                    torch_npu.npu_fused_infer_attention_score(
+                        q_slice, prefix_k_nope, prefix_v, **common_kwargs
+                    )
+                )
+                prefix_attn_lse = prefix_attn_lse.to(torch.float32)
+                out_list.append(
+                    prefix_attn_output.reshape(
+                        q_len * layer.tp_q_head_num, layer.v_head_dim
+                    )
+                )
+                lse_list.append(prefix_attn_lse.reshape(q_len * layer.tp_q_head_num))
+
+            req_output, _ = torch_npu.npu_attention_update(
+                tuple(lse_list), tuple(out_list), 0
+            )
+            output[q_offset : q_offset + q_len] = req_output.reshape(
+                q_len, layer.tp_q_head_num, layer.v_head_dim
+            )
+            q_offset += q_len
+
+        if num_token_padding != forward_batch.num_token_non_padded_cpu:
+            output = torch.cat(
+                [
+                    output,
+                    output.new_zeros(
+                        num_token_padding - output.shape[0],
+                        *output.shape[1:],
+                    ),
+                ],
+                dim=0,
+            )
+        return output
+
     def forward_extend(
         self,
         q,
@@ -1375,8 +1511,17 @@ class AscendAttnBackend(AttentionBackend):
                 )
             else:
                 if not _is_npu_before_atlas_a5:
-                   attn_output = self.forward_prefill_david(q, k, v, forward_batch, layer)
-                   return attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+                    if is_fia_nz():
+                        attn_output = self.forward_prefill_david_fia_nz(
+                            q, k, v, forward_batch, layer
+                        )
+                    else:
+                        attn_output = self.forward_prefill_david(
+                            q, k, v, forward_batch, layer
+                        )
+                    return attn_output.view(
+                        -1, layer.tp_q_head_num * layer.v_head_dim
+                    )
                 num_token_padding = q.shape[0]
                 q, k, v = [
                     data[: forward_batch.num_token_non_padded_cpu] for data in [q, k, v]

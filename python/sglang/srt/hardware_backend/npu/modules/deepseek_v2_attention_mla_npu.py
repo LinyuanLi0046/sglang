@@ -275,6 +275,7 @@ def forward_mla_prepare_npu(
                 forward_batch=forward_batch,
                 layer_id=m.layer_id,
             )
+        dequant_scale_q_nope = None
 
     return (
         q_pe,

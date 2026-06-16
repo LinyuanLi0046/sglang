@@ -338,7 +338,10 @@ class RotaryEmbedding(MultiPlatformOp):
         assert (
             fused_set_kv_buffer_arg is None
         ), "fused_set_kv_buffer_arg is not supported for npu implementation"
-        if (
+        if self.rotary_dim == 64 and not self.is_neox_style:
+            # NOTE: npu_interleave_rope only supports rotary_dim=64
+            return self.deepseek_npu_interleave_rope(positions, query, key, offsets)
+        elif (
             query.dtype == torch.bfloat16
             and self.cos_sin_cache.dtype == torch.float
             or key.ndim == 3
@@ -358,9 +361,6 @@ class RotaryEmbedding(MultiPlatformOp):
                 )
             else:
                 return self.forward_native(positions, query, key, offsets)
-        elif self.rotary_dim == 64 and not self.is_neox_style:
-            # NOTE: npu_interleave_rope only supports rotary_dim=64
-            return self.deepseek_npu_interleave_rope(positions, query, key, offsets)
         if self.is_neox_style:
             rotary_mode = "half"
         else:

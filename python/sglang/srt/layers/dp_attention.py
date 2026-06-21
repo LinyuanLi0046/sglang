@@ -449,6 +449,28 @@ def _dp_gather_via_all_reduce(
     is_partial: bool,
 ):
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
+    logger.error(
+        "DP_GATHER_ALLREDUCE phase=ENTER tp=%s/%s attn_tp=%s/%s dp=%s/%s "
+        "mode=%s is_extend_in_batch=%s partial=%s local_start=%s local_num=%s "
+        "gnt=%s pad=%s global=%s local=%s dtype=%s numel=%s",
+        get_tensor_model_parallel_rank(),
+        get_tensor_model_parallel_world_size(),
+        get_attention_tp_rank(),
+        get_attention_tp_size(),
+        get_attention_dp_rank(),
+        get_attention_dp_size(),
+        str(forward_batch.forward_mode),
+        getattr(forward_batch, "is_extend_in_batch", None),
+        is_partial,
+        local_start_pos,
+        local_num_tokens,
+        getattr(forward_batch, "global_num_tokens_cpu", None),
+        getattr(forward_batch, "dp_padding_mode", None),
+        tuple(global_tokens.shape),
+        tuple(local_tokens.shape),
+        str(global_tokens.dtype),
+        global_tokens.numel(),
+    )
 
     global_tokens.fill_(0)
     assert local_tokens.is_contiguous()
@@ -475,6 +497,28 @@ def _dp_gather_via_all_reduce(
 
     else:
         global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
+    logger.error(
+        "DP_GATHER_ALLREDUCE phase=EXIT tp=%s/%s attn_tp=%s/%s dp=%s/%s "
+        "mode=%s is_extend_in_batch=%s partial=%s local_start=%s local_num=%s "
+        "gnt=%s pad=%s global=%s local=%s dtype=%s numel=%s",
+        get_tensor_model_parallel_rank(),
+        get_tensor_model_parallel_world_size(),
+        get_attention_tp_rank(),
+        get_attention_tp_size(),
+        get_attention_dp_rank(),
+        get_attention_dp_size(),
+        str(forward_batch.forward_mode),
+        getattr(forward_batch, "is_extend_in_batch", None),
+        is_partial,
+        local_start_pos,
+        local_num_tokens,
+        getattr(forward_batch, "global_num_tokens_cpu", None),
+        getattr(forward_batch, "dp_padding_mode", None),
+        tuple(global_tokens.shape),
+        tuple(local_tokens.shape),
+        str(global_tokens.dtype),
+        global_tokens.numel(),
+    )
 
 
 def _dp_gather_via_all_gather(
@@ -518,7 +562,41 @@ def dp_gather_partial(
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
 ):
+    logger.error(
+        "DP_GATHER_PARTIAL phase=ENTER tp=%s/%s attn_tp=%s/%s dp=%s/%s "
+        "mode=%s is_extend_in_batch=%s gnt=%s pad=%s global=%s local=%s dtype=%s",
+        get_tensor_model_parallel_rank(),
+        get_tensor_model_parallel_world_size(),
+        get_attention_tp_rank(),
+        get_attention_tp_size(),
+        get_attention_dp_rank(),
+        get_attention_dp_size(),
+        str(forward_batch.forward_mode),
+        getattr(forward_batch, "is_extend_in_batch", None),
+        getattr(forward_batch, "global_num_tokens_cpu", None),
+        getattr(forward_batch, "dp_padding_mode", None),
+        tuple(global_tokens.shape),
+        tuple(local_tokens.shape),
+        str(global_tokens.dtype),
+    )
     _dp_gather(global_tokens, local_tokens, forward_batch, is_partial=True)
+    logger.error(
+        "DP_GATHER_PARTIAL phase=EXIT tp=%s/%s attn_tp=%s/%s dp=%s/%s "
+        "mode=%s is_extend_in_batch=%s gnt=%s pad=%s global=%s local=%s dtype=%s",
+        get_tensor_model_parallel_rank(),
+        get_tensor_model_parallel_world_size(),
+        get_attention_tp_rank(),
+        get_attention_tp_size(),
+        get_attention_dp_rank(),
+        get_attention_dp_size(),
+        str(forward_batch.forward_mode),
+        getattr(forward_batch, "is_extend_in_batch", None),
+        getattr(forward_batch, "global_num_tokens_cpu", None),
+        getattr(forward_batch, "dp_padding_mode", None),
+        tuple(global_tokens.shape),
+        tuple(local_tokens.shape),
+        str(global_tokens.dtype),
+    )
 
 
 def dp_gather_replicate(

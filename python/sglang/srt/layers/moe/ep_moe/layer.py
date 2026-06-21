@@ -211,12 +211,57 @@ class DeepEPMoE(FusedMoE):
             )
 
         # TODO: can we call super().forward here?
+        logger.error(
+            "DEEPEP_FORWARD phase=DISPATCH_ENTER layer=%s hidden=%s topk_ids=%s topk_weights=%s router_logits=%s dtype=%s",
+            self.layer_id,
+            tuple(hidden_states.shape),
+            tuple(topk_output.topk_ids.shape)
+            if getattr(topk_output, "topk_ids", None) is not None
+            else None,
+            tuple(topk_output.topk_weights.shape)
+            if getattr(topk_output, "topk_weights", None) is not None
+            else None,
+            tuple(topk_output.router_logits.shape)
+            if getattr(topk_output, "router_logits", None) is not None
+            else None,
+            str(hidden_states.dtype),
+        )
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
+        logger.error(
+            "DEEPEP_FORWARD phase=DISPATCH_EXIT layer=%s hidden=%s dispatch_output_type=%s "
+            "recv_tokens=%s recv_tokens_per_expert=%s",
+            self.layer_id,
+            tuple(hidden_states.shape),
+            type(dispatch_output).__name__,
+            getattr(dispatch_output, "num_recv_tokens", None),
+            getattr(dispatch_output, "num_recv_tokens_per_expert", None),
+        )
+        logger.error(
+            "DEEPEP_FORWARD phase=RUN_MOE_CORE_ENTER layer=%s dispatch_output_type=%s",
+            self.layer_id,
+            type(dispatch_output).__name__,
+        )
         combine_input = self.run_moe_core(dispatch_output)
+        logger.error(
+            "DEEPEP_FORWARD phase=RUN_MOE_CORE_EXIT layer=%s combine_input_type=%s",
+            self.layer_id,
+            type(combine_input).__name__,
+        )
+        logger.error(
+            "DEEPEP_FORWARD phase=COMBINE_ENTER layer=%s combine_input_type=%s",
+            self.layer_id,
+            type(combine_input).__name__,
+        )
         hidden_states = self.dispatcher.combine(
             combine_input=combine_input,
+        )
+        logger.error(
+            "DEEPEP_FORWARD phase=COMBINE_EXIT layer=%s hidden=%s dtype=%s",
+            self.layer_id,
+            tuple(hidden_states.shape),
+            str(hidden_states.dtype),
         )
 
         return hidden_states

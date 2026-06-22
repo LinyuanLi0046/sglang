@@ -873,6 +873,17 @@ class LongcatFlashDecoderLayer(nn.Module):
             and hidden_states.shape[0] % self.attn_tp_size == 0
         )
 
+    def _should_enable_double_stream(
+        self, forward_batch: Optional[ForwardBatch]
+    ) -> bool:
+        if forward_batch is None:
+            return False
+        return (
+            get_global_server_args().enable_longcat_double_stream
+            and not forward_batch.is_extend_in_batch
+            and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+        )
+
     def _prepare_ops_local_token_moe_inputs(
         self,
         hidden_states: torch.Tensor,
@@ -930,7 +941,8 @@ class LongcatFlashDecoderLayer(nn.Module):
             and hidden_states.shape[0] % self.attn_tp_size == 0
             and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         )
-        if get_global_server_args().enable_longcat_double_stream and MultiStreamUtils().main_stream is None and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+        use_double_stream = self._should_enable_double_stream(forward_batch)
+        if use_double_stream and MultiStreamUtils().main_stream is None:
             MultiStreamUtils().main_stream = torch.npu.current_stream()
         # first_attn
         if use_deepep_sparse_decode_runtime and not self.is_first_layer:
@@ -1000,7 +1012,7 @@ class LongcatFlashDecoderLayer(nn.Module):
                 extra=f"deepep_sparse={use_deepep_sparse_decode_runtime}",
             )
         moe_hidden_states = None
-        if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+        if use_double_stream:
             msu = MultiStreamUtils()
             msu.main_stream.record_event(msu.first_attn_finished)
 
@@ -1170,7 +1182,7 @@ class LongcatFlashDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+        if self._should_enable_double_stream(forward_batch):
             MultiStreamUtils().forward_moe_func()
 
         hidden_states = self.mlps[1](hidden_states)

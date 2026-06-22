@@ -82,7 +82,6 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_npu = is_npu()
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
-logger = logging.getLogger(__name__)
 
 if _use_aiter and _is_gfx95_supported:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
@@ -839,48 +838,13 @@ class CommunicateWithAllReduceAndLayerNormFn:
         *,
         residual_input_mode,
     ):
-        logger.error(
-            "COMM_GATHER_HS_RES phase=ENTER tp=%s/%s attn_tp=%s/%s attn_dp=%s "
-            "mode=%s is_extend_in_batch=%s gnt=%s pad=%s residual_input_mode=%s "
-            "hidden=%s residual=%s",
-            get_tensor_model_parallel_rank(),
-            get_tensor_model_parallel_world_size(),
-            context.attn_tp_rank,
-            context.attn_tp_size,
-            context.attn_dp_size,
-            str(forward_batch.forward_mode),
-            getattr(forward_batch, "is_extend_in_batch", None),
-            getattr(forward_batch, "global_num_tokens_cpu", None),
-            getattr(forward_batch, "dp_padding_mode", None),
-            residual_input_mode,
-            tuple(hidden_states.shape),
-            tuple(residual.shape),
-        )
         if get_attn_tp_context().input_scattered:
-            out_hidden_states, out_residual = CommunicateWithAllReduceAndLayerNormFn._tp_all_reduce_with_scattered_residual(
+            return CommunicateWithAllReduceAndLayerNormFn._tp_all_reduce_with_scattered_residual(
                 hidden_states,
                 residual,
                 layernorm,
                 context,
             )
-            logger.error(
-                "COMM_GATHER_HS_RES phase=EXIT tp=%s/%s attn_tp=%s/%s attn_dp=%s "
-                "mode=%s is_extend_in_batch=%s gnt=%s pad=%s residual_input_mode=%s "
-                "hidden=%s residual=%s scattered_input=True",
-                get_tensor_model_parallel_rank(),
-                get_tensor_model_parallel_world_size(),
-                context.attn_tp_rank,
-                context.attn_tp_size,
-                context.attn_dp_size,
-                str(forward_batch.forward_mode),
-                getattr(forward_batch, "is_extend_in_batch", None),
-                getattr(forward_batch, "global_num_tokens_cpu", None),
-                getattr(forward_batch, "dp_padding_mode", None),
-                residual_input_mode,
-                tuple(out_hidden_states.shape),
-                tuple(out_residual.shape),
-            )
-            return out_hidden_states, out_residual
 
         if residual_input_mode == ScatterMode.SCATTERED and context.attn_tp_size > 1:
             residual, local_residual = (
@@ -928,23 +892,6 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)
-        logger.error(
-            "COMM_GATHER_HS_RES phase=EXIT tp=%s/%s attn_tp=%s/%s attn_dp=%s "
-            "mode=%s is_extend_in_batch=%s gnt=%s pad=%s residual_input_mode=%s "
-            "hidden=%s residual=%s",
-            get_tensor_model_parallel_rank(),
-            get_tensor_model_parallel_world_size(),
-            context.attn_tp_rank,
-            context.attn_tp_size,
-            context.attn_dp_size,
-            str(forward_batch.forward_mode),
-            getattr(forward_batch, "is_extend_in_batch", None),
-            getattr(forward_batch, "global_num_tokens_cpu", None),
-            getattr(forward_batch, "dp_padding_mode", None),
-            residual_input_mode,
-            tuple(hidden_states.shape),
-            tuple(residual.shape),
-        )
         return hidden_states, residual
 
     @staticmethod

@@ -150,44 +150,6 @@ else:
 logger = logging.getLogger(__name__)
 
 
-def _shape_or_none(tensor: Optional[torch.Tensor]):
-    return None if tensor is None else tuple(tensor.shape)
-
-
-def _log_longcat_debug(
-    tag: str,
-    phase: str,
-    layer_id: int,
-    forward_batch: Optional[ForwardBatch],
-    *,
-    hidden_states: Optional[torch.Tensor] = None,
-    residual: Optional[torch.Tensor] = None,
-    positions: Optional[torch.Tensor] = None,
-    extra: str = "",
-):
-    logger.error(
-        "%s phase=%s layer=%s tp=%s/%s attn_tp=%s/%s dp=%s/%s mode=%s "
-        "is_extend_in_batch=%s gnt=%s pad=%s hidden=%s residual=%s positions=%s %s",
-        tag,
-        phase,
-        layer_id,
-        get_tensor_model_parallel_rank(),
-        get_tensor_model_parallel_world_size(),
-        get_attention_tp_rank(),
-        get_attention_tp_size(),
-        get_attention_dp_rank() if is_dp_attention_enabled() else 0,
-        get_attention_dp_size() if is_dp_attention_enabled() else 1,
-        str(forward_batch.forward_mode) if forward_batch is not None else None,
-        getattr(forward_batch, "is_extend_in_batch", None),
-        getattr(forward_batch, "global_num_tokens_cpu", None),
-        getattr(forward_batch, "dp_padding_mode", None),
-        _shape_or_none(hidden_states),
-        _shape_or_none(residual),
-        _shape_or_none(positions),
-        extra,
-    )
-
-
 def _use_longcat_ops_deepep_runtime() -> bool:
     return _is_npu and get_bool_env_var("SGLANG_ASCEND_USE_OPS_DEEPEP")
 
@@ -984,32 +946,12 @@ class LongcatFlashDecoderLayer(nn.Module):
                 )
             )
         else:
-            _log_longcat_debug(
-                "LONGCAT_MOE_PREPARE_MLP",
-                "ENTER",
-                self.layer_id,
-                forward_batch,
-                hidden_states=moe_hidden_states_input,
-                residual=moe_residual_input,
-                positions=positions,
-                extra=f"deepep_sparse={use_deepep_sparse_decode_runtime}",
-            )
             prepared_moe_hidden_states, moe_residual = (
                 self.moe_layer_communicator.prepare_mlp(
                     moe_hidden_states_input,
                     moe_residual_input,
                     forward_batch,
                 )
-            )
-            _log_longcat_debug(
-                "LONGCAT_MOE_PREPARE_MLP",
-                "EXIT",
-                self.layer_id,
-                forward_batch,
-                hidden_states=prepared_moe_hidden_states,
-                residual=moe_residual,
-                positions=positions,
-                extra=f"deepep_sparse={use_deepep_sparse_decode_runtime}",
             )
         moe_hidden_states = None
         if use_double_stream:
@@ -1069,32 +1011,12 @@ class LongcatFlashDecoderLayer(nn.Module):
                     moe_hidden_states
                 )
 
-            _log_longcat_debug(
-                "LONGCAT_DENSE_FORWARD_MLP",
-                "ENTER",
-                self.layer_id,
-                forward_batch,
-                hidden_states=mlp_hidden_states,
-                residual=mlp_residual,
-                positions=positions,
-                extra=f"deepep_sparse={use_deepep_sparse_decode_runtime}",
-            )
             mlp_hidden_states, mlp_residual = self.forward_mlp(
                 mlp_hidden_states,
                 positions,
                 mlp_residual,
                 forward_batch,
                 zero_allocator,
-            )
-            _log_longcat_debug(
-                "LONGCAT_DENSE_FORWARD_MLP",
-                "EXIT",
-                self.layer_id,
-                forward_batch,
-                hidden_states=mlp_hidden_states,
-                residual=mlp_residual,
-                positions=positions,
-                extra=f"deepep_sparse={use_deepep_sparse_decode_runtime}",
             )
             if not self.is_last_layer and use_deepep_sparse_decode_runtime:
                 mlp_hidden_states = mlp_hidden_states.tensor_split(self.attn_tp_size)[
@@ -1112,52 +1034,16 @@ class LongcatFlashDecoderLayer(nn.Module):
         forward_batch,
         zero_allocator,
     ):
-        _log_longcat_debug(
-            "LONGCAT_DENSE_PREPARE_MLP0",
-            "ENTER",
-            self.layer_id,
-            forward_batch,
-            hidden_states=hidden_states,
-            residual=residual,
-            positions=positions,
-        )
         hidden_states, residual = self.mlp_layer_communicator[0].prepare_mlp(
             hidden_states,
             residual,
             forward_batch,
         )
-        _log_longcat_debug(
-            "LONGCAT_DENSE_PREPARE_MLP0",
-            "EXIT",
-            self.layer_id,
-            forward_batch,
-            hidden_states=hidden_states,
-            residual=residual,
-            positions=positions,
-        )
 
         hidden_states = self.mlps[0](hidden_states)
 
         # TP all_reduce
-        _log_longcat_debug(
-            "LONGCAT_DENSE_TP_ALLREDUCE0",
-            "ENTER",
-            self.layer_id,
-            forward_batch,
-            hidden_states=hidden_states,
-            residual=residual,
-            positions=positions,
-        )
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-        _log_longcat_debug(
-            "LONGCAT_DENSE_TP_ALLREDUCE0",
-            "EXIT",
-            self.layer_id,
-            forward_batch,
-            hidden_states=hidden_states,
-            residual=residual,
-            positions=positions,
-        )
         # second_attn
         if is_dp_attention_enabled():
             hidden_states, global_hidden_states = (

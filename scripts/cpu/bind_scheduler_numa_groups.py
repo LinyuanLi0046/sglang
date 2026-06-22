@@ -49,6 +49,12 @@ DEFAULT_CONTROL_ROOT_KEYWORDS = (
     "sglang.launch_server",
     "python -m sglang.launch_server",
 )
+DEFAULT_DEDICATED_PYTHON_KEYWORDS = (
+    "sglang.launch_server",
+    "python -m sglang.launch_server",
+    "sglang.bench_serving",
+    "python -m sglang.bench_serving",
+)
 DEFAULT_DETOKEN_PROCESS_KEYWORDS = (
     "sglang::detokenizer",
     "sglang::detoken",
@@ -849,7 +855,7 @@ def build_cpu_status_lines(
 
     assign(control_cpus, "control")
     assign(background_cpus, "background")
-    assign(dedicated_reservation.python_cpus, "background-python")
+    assign(dedicated_reservation.python_cpus, "python")
     if dedicated_reservation.detoken_cpu is not None:
         assign([dedicated_reservation.detoken_cpu], "detoken")
     if special_thread_cpu is not None:
@@ -932,6 +938,16 @@ def split_background_python_candidates(
         else:
             other_candidates.append(proc)
     return python_candidates, other_candidates
+
+
+def collect_process_objects_by_pids(pids: Iterable[int]) -> List[psutil.Process]:
+    result: List[psutil.Process] = []
+    for pid in sorted(set(pids)):
+        try:
+            result.append(psutil.Process(pid))
+        except psutil.NoSuchProcess:
+            continue
+    return result
 
 
 def rebind_special_thread(
@@ -1520,6 +1536,7 @@ def main() -> int:
     full_service_tree: Set[int] = set()
     control_pids: List[int] = []
     detoken_pids: List[int] = []
+    dedicated_python_control_pids: List[int] = []
     helper_numas: List[int] = []
     background_python_candidates: List[psutil.Process] = []
     background_other_candidates: List[psutil.Process] = []
@@ -1542,6 +1559,10 @@ def main() -> int:
                 full_service_tree,
             )
             control_pids = sorted(set(control_pids + launch_server_pids))
+            dedicated_python_control_pids = filter_pids_by_keywords(
+                control_pids,
+                DEFAULT_DEDICATED_PYTHON_KEYWORDS,
+            )
             detoken_pids = filter_pids_by_keywords(
                 control_pids,
                 DEFAULT_DETOKEN_PROCESS_KEYWORDS,
@@ -1561,7 +1582,7 @@ def main() -> int:
         plans=plans,
         free_cpus_by_numa=free_cpus_by_numa,
         cpus_per_proc=args.cpus_per_proc,
-        need_python=bool(background_python_candidates),
+        need_python=bool(dedicated_python_control_pids or background_python_candidates),
         need_detoken=bool(detoken_pids),
         need_uvb=len(special_thread_matches) == 1,
     )
@@ -1573,13 +1594,13 @@ def main() -> int:
     special_thread_records: List[dict] = []
     if dedicated_reservation.python_cpus:
         print(
-            f"Dedicated background python CPUs: "
+            f"Dedicated python CPUs: "
             f"{format_cpu_spec(dedicated_reservation.python_cpus)} "
             f"({dedicated_reservation.python_source})"
         )
-    elif background_python_candidates:
+    elif dedicated_python_control_pids or background_python_candidates:
         print(
-            "Skip dedicated background python binding: insufficient dedicated CPUs.",
+            "Skip dedicated python binding: insufficient dedicated CPUs.",
             file=sys.stderr,
         )
     if dedicated_reservation.detoken_cpu is not None:
@@ -1659,7 +1680,11 @@ def main() -> int:
                 file=sys.stderr,
             )
         else:
-            generic_control_pids = [pid for pid in control_pids if pid not in detoken_pids]
+            generic_control_pids = [
+                pid
+                for pid in control_pids
+                if pid not in detoken_pids and pid not in dedicated_python_control_pids
+            ]
 
             if args.control_cpus:
                 control_cpus = parse_cpu_spec(args.control_cpus)
@@ -1726,6 +1751,22 @@ def main() -> int:
                     total_failed += detoken_failed
                     backup_payload["dedicated_detoken_processes"] = list(detoken_records)
 
+                dedicated_python_records: List[dict] = []
+                if (
+                    dedicated_python_control_pids
+                    and len(dedicated_reservation.python_cpus) == 2
+                ):
+                    control_python_records, control_python_failed = rebind_processes(
+                        dedicated_python_control_pids,
+                        dedicated_reservation.python_cpus,
+                        dry_run=args.dry_run,
+                        verbose=args.verbose,
+                        label="control-python",
+                    )
+                    total_changed += len(control_python_records)
+                    total_failed += control_python_failed
+                    dedicated_python_records.extend(control_python_records)
+
                 if background_other_candidates and background_cpus:
                     moved_background, background_failed = rebind_process_objects(
                         background_other_candidates,
@@ -1739,16 +1780,18 @@ def main() -> int:
                     total_failed += background_failed
 
                 if background_python_candidates and len(dedicated_reservation.python_cpus) == 2:
-                    python_records, python_failed = rebind_process_objects(
+                    background_python_records, background_python_failed = rebind_process_objects(
                         background_python_candidates,
                         dedicated_reservation.python_cpus,
                         dry_run=args.dry_run,
                         verbose=args.verbose,
                         label="background-python",
                     )
-                    total_changed += len(python_records)
-                    total_failed += python_failed
-                    backup_payload["dedicated_python_processes"] = list(python_records)
+                    total_changed += len(background_python_records)
+                    total_failed += background_python_failed
+                    dedicated_python_records.extend(background_python_records)
+
+                backup_payload["dedicated_python_processes"] = list(dedicated_python_records)
 
                 backup_payload["helper_numas"] = list(helper_numas)
                 backup_payload["control_cpus"] = list(control_cpus)
@@ -1756,13 +1799,14 @@ def main() -> int:
 
                 print(f"Detected sglang root pids: {root_pids}")
                 print(f"Detected control pids: {control_pids}")
+                print(f"Dedicated python control pids: {dedicated_python_control_pids}")
                 print(f"Dedicated detoken pids: {detoken_pids}")
                 print(f"Helper NUMAs: {helper_numas}")
                 print(f"Scheduler service CPUs: {format_cpu_spec(scheduler_service_cpus)}")
                 print(f"Control CPUs: {format_cpu_spec(control_cpus)}")
                 print(f"Background CPUs: {format_cpu_spec(background_cpus)}")
                 print(
-                    f"Background python candidate count: {len(background_python_candidates)}"
+                    f"Dedicated background python candidate count: {len(background_python_candidates)}"
                 )
                 print(
                     f"Other background candidate count: {len(background_other_candidates)}"

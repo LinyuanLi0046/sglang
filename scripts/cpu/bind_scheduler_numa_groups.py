@@ -633,7 +633,7 @@ def plan_schedulers(
             process_cpus = process_ranges[index]
             hot_cluster = process_cpus[:cluster_size]
             runtime_cpus = process_cpus[:runtime_count]
-            cold_cpus = process_cpus[-cold_count:]
+            cold_cpus = process_cpus[-cold_count:] if cold_count > 0 else []
             scheduler_cpus = (
                 process_cpus[runtime_count:-cold_count]
                 if cold_count > 0
@@ -817,6 +817,7 @@ def build_cpu_status_lines(
     plans: Sequence[SchedulerPlan],
     dedicated_reservation: DedicatedCpuReservation,
     special_thread_cpu: Optional[int],
+    ignore_cold_threads: bool,
 ) -> List[str]:
     cpu_to_numa: Dict[int, int] = {}
     cpu_to_roles: Dict[int, List[str]] = {}
@@ -835,7 +836,8 @@ def build_cpu_status_lines(
         if plan.runtime_cpus[1:2]:
             assign(plan.runtime_cpus[1:2], f"rank{plan.logical_rank}:release")
         assign(plan.scheduler_cpus, f"rank{plan.logical_rank}:scheduler")
-        assign(plan.cold_cpus, f"rank{plan.logical_rank}:cold")
+        if not ignore_cold_threads:
+            assign(plan.cold_cpus, f"rank{plan.logical_rank}:cold")
 
     assign(dedicated_reservation.python_cpus, "python")
     if dedicated_reservation.detoken_cpu is not None:
@@ -879,18 +881,24 @@ def build_cpu_status_lines(
     return lines
 
 
-def build_rank_layout_lines(plans: Sequence[SchedulerPlan]) -> List[str]:
+def build_rank_layout_lines(
+    plans: Sequence[SchedulerPlan],
+    *,
+    ignore_cold_threads: bool,
+) -> List[str]:
     lines: List[str] = []
     for plan in plans:
         acl_cpu = format_cpu_spec(plan.runtime_cpus[:1])
         release_cpu = format_cpu_spec(plan.runtime_cpus[1:2])
-        lines.append(
+        line = (
             f"rank{plan.logical_rank} pid={plan.pid} numa={plan.target_numa_id} "
             f"cpus={format_cpu_spec(plan.process_cpus)} | "
             f"acl={acl_cpu} | release={release_cpu} | "
-            f"scheduler={format_cpu_spec(plan.scheduler_cpus)} | "
-            f"cold={format_cpu_spec(plan.cold_cpus)}"
+            f"scheduler={format_cpu_spec(plan.scheduler_cpus)}"
         )
+        if not ignore_cold_threads:
+            line += f" | cold={format_cpu_spec(plan.cold_cpus)}"
+        lines.append(line)
     return lines
 
 
@@ -900,6 +908,7 @@ def print_cpu_status_after_bind(
     plans: Sequence[SchedulerPlan],
     dedicated_reservation: DedicatedCpuReservation,
     special_thread_cpu: Optional[int],
+    ignore_cold_threads: bool,
     dry_run: bool,
 ) -> None:
     print(
@@ -908,7 +917,10 @@ def print_cpu_status_after_bind(
         else "Current per-rank / per-8-core layout after bind:"
     )
     print("Per-rank summary:")
-    for line in build_rank_layout_lines(plans):
+    for line in build_rank_layout_lines(
+        plans,
+        ignore_cold_threads=ignore_cold_threads,
+    ):
         print(f"  {line}")
     print("Per-8-core blocks:")
     for line in build_cpu_status_lines(
@@ -916,6 +928,7 @@ def print_cpu_status_after_bind(
         plans=plans,
         dedicated_reservation=dedicated_reservation,
         special_thread_cpu=special_thread_cpu,
+        ignore_cold_threads=ignore_cold_threads,
     ):
         print(f"  {line}")
 
@@ -1766,6 +1779,7 @@ def main() -> int:
             plans=plans,
             dedicated_reservation=dedicated_reservation,
             special_thread_cpu=special_thread_cpu,
+            ignore_cold_threads=not args.keep_cold_threads_separate,
             dry_run=args.dry_run,
         )
 

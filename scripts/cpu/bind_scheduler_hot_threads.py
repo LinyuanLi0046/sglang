@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
-"""Bind scheduler threads with a cluster-aware runtime/hot/cold layout.
+"""Bind scheduler threads with a fixed 20-core per-card layout.
 
 This script targets the current Ascend machine layout where each hardware
-cluster contains 8 CPUs. Inside one NUMA, scheduler processes are packed as:
+cluster contains 8 CPUs and each NUMA has 6 clusters. Scheduler processes are
+assigned by logical rank:
 
-- 1 hot cluster per scheduler process.
-- The hot cluster is split into 4 runtime CPUs + 4 scheduler-hot CPUs.
-- One cold cluster is shared by every adjacent pair of schedulers, each taking
-  4 CPUs for helper/cold threads.
+- rank 0-1 -> numa0
+- rank 2-3 -> numa1
+- rank 4-5 -> numa2
+- rank 6-7 -> numa3
 
-For example, if one NUMA has clusters [C0, C1, C2, C3, C4, C5] and four
-schedulers on that NUMA, the script plans:
+Inside one NUMA, the layout for the two local scheduler processes is:
 
-- scheduler0: runtime=C0[0:4], hot=C0[4:8], cold=C1[0:4]
-- scheduler1: runtime=C2[0:4], hot=C2[4:8], cold=C1[4:8]
-- scheduler2: runtime=C3[0:4], hot=C3[4:8], cold=C4[0:4]
-- scheduler3: runtime=C5[0:4], hot=C5[4:8], cold=C4[4:8]
+- cluster 0: rankA runtime/ACL cluster (8 CPUs)
+- cluster 1: rankA scheduler cluster (8 CPUs)
+- cluster 2: rankB runtime/ACL cluster (8 CPUs)
+- cluster 3: rankB scheduler cluster (8 CPUs)
+- cluster 5: shared cold cluster, front 4 CPUs for rankA and back 4 CPUs for rankB
+- cluster 4 is left free for process isolation / helper processes
 
 Thread groups are fixed:
 
@@ -28,7 +30,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import re
 import sys
@@ -56,6 +57,9 @@ DEFAULT_CONTROL_ROOT_KEYWORDS = (
 DEFAULT_CONTROL_KEYWORDS = (
     "sglang::detokenizer",
     "sglang::detoken",
+)
+DEFAULT_SPECIAL_THREAD_PATTERNS = (
+    r"^uvb_poll_window_thread$",
 )
 DEFAULT_RUNTIME_PATTERNS = (
     r"^acl_thread$",
@@ -94,10 +98,13 @@ class ThreadInfo:
 
 @dataclass
 class SchedulerPlan:
+    logical_rank: int
     pid: int
-    numa_id: int
+    current_numa_id: int
+    target_numa_id: int
     current_worker_cpus: List[int]
-    hot_cluster_cpus: List[int]
+    runtime_cluster_cpus: List[int]
+    scheduler_cluster_cpus: List[int]
     cold_cluster_cpus: List[int]
     runtime_cpus: List[int]
     scheduler_cpus: List[int]
@@ -473,6 +480,32 @@ def split_cluster(cluster_cpus: Sequence[int], subgroup_size: int) -> Tuple[List
     return ordered[:subgroup_size], ordered[subgroup_size : subgroup_size * 2]
 
 
+def build_scheduler_entries(
+    scheduler_pids: Sequence[int],
+    cpu_to_numa: Dict[int, int],
+) -> List[Tuple[int, int, List[int], int]]:
+    entries = []
+    for pid in scheduler_pids:
+        proc = psutil.Process(pid)
+        worker_cpus = sorted(proc.cpu_affinity())
+        current_numa = detect_process_numa(worker_cpus, cpu_to_numa)
+        entries.append((pid, worker_cpus, current_numa))
+
+    entries.sort(key=lambda item: (min(item[1]), item[0]))
+    ranked = []
+    for logical_rank, (pid, worker_cpus, current_numa) in enumerate(entries):
+        ranked.append((logical_rank, pid, worker_cpus, current_numa))
+    return ranked
+
+
+def infer_target_numa(logical_rank: int) -> int:
+    if logical_rank < 0 or logical_rank > 7:
+        raise RuntimeError(
+            f"Unsupported logical rank {logical_rank}. This script expects 8 TP ranks."
+        )
+    return logical_rank // 2
+
+
 def plan_schedulers(
     scheduler_pids: Sequence[int],
     cluster_size: int,
@@ -481,82 +514,59 @@ def plan_schedulers(
     numa_to_cpus = read_numa_to_cpus()
     numa_to_clusters = build_numa_clusters(numa_to_cpus, cluster_size)
     cpu_to_numa = build_cpu_to_numa(numa_to_cpus)
+    ranked_entries = build_scheduler_entries(scheduler_pids, cpu_to_numa)
 
-    schedulers_by_numa: Dict[int, List[Tuple[int, List[int]]]] = {}
-    for pid in scheduler_pids:
-        proc = psutil.Process(pid)
-        worker_cpus = sorted(proc.cpu_affinity())
-        numa_id = detect_process_numa(worker_cpus, cpu_to_numa)
-        schedulers_by_numa.setdefault(numa_id, []).append((pid, worker_cpus))
+    schedulers_by_target_numa: Dict[int, List[Tuple[int, int, List[int], int]]] = {}
+    for logical_rank, pid, worker_cpus, current_numa in ranked_entries:
+        target_numa = infer_target_numa(logical_rank)
+        schedulers_by_target_numa.setdefault(target_numa, []).append(
+            (logical_rank, pid, worker_cpus, current_numa)
+        )
 
     plans: List[SchedulerPlan] = []
-    for numa_id, entries in sorted(schedulers_by_numa.items()):
-        entries.sort(key=lambda item: (min(item[1]), item[0]))
-        clusters = numa_to_clusters.get(numa_id, [])
-        required_clusters = len(entries) + math.ceil(len(entries) / 2)
+    for target_numa, entries in sorted(schedulers_by_target_numa.items()):
+        entries.sort(key=lambda item: item[0])
+        clusters = numa_to_clusters.get(target_numa, [])
+        required_clusters = len(entries) * 2 + math.ceil(len(entries) / 2)
         if len(clusters) < required_clusters:
             raise RuntimeError(
-                f"NUMA {numa_id} has only {len(clusters)} clusters "
+                f"NUMA {target_numa} has only {len(clusters)} clusters "
                 f"({[format_cpu_spec(cluster) for cluster in clusters]}), "
                 f"but {len(entries)} schedulers need at least {required_clusters} "
-                "clusters for the 12-core runtime/hot/cold layout."
+                "clusters for the 20-core runtime/scheduler/cold layout."
             )
 
-        index = 0
-        pair_start = 0
-        while pair_start < len(entries):
-            left_pid, left_worker = entries[pair_start]
-            left_hot_cluster = clusters[index]
-            index += 1
-            shared_cold_cluster = clusters[index]
-            index += 1
-
-            left_runtime_cpus, left_scheduler_cpus = split_cluster(
-                left_hot_cluster, subgroup_size
+        shared_cold_cluster = sorted(clusters[-1])
+        if len(shared_cold_cluster) < subgroup_size * 2 and len(entries) > 1:
+            raise RuntimeError(
+                f"Cold cluster {format_cpu_spec(shared_cold_cluster)} does not have "
+                f"enough CPUs for both schedulers on NUMA {target_numa}"
             )
-            left_cold_cpus = sorted(shared_cold_cluster)[:subgroup_size]
+
+        for local_index, (logical_rank, pid, worker_cpus, current_numa) in enumerate(entries):
+            runtime_cluster = sorted(clusters[local_index * 2])
+            scheduler_cluster = sorted(clusters[local_index * 2 + 1])
+            if local_index == 0:
+                cold_cpus = shared_cold_cluster[:subgroup_size]
+            else:
+                cold_cpus = shared_cold_cluster[subgroup_size : subgroup_size * 2]
             plans.append(
                 SchedulerPlan(
-                    pid=left_pid,
-                    numa_id=numa_id,
-                    current_worker_cpus=left_worker,
-                    hot_cluster_cpus=sorted(left_hot_cluster),
-                    cold_cluster_cpus=sorted(shared_cold_cluster),
-                    runtime_cpus=left_runtime_cpus,
-                    scheduler_cpus=left_scheduler_cpus,
-                    cold_cpus=left_cold_cpus,
+                    logical_rank=logical_rank,
+                    pid=pid,
+                    current_numa_id=current_numa,
+                    target_numa_id=target_numa,
+                    current_worker_cpus=worker_cpus,
+                    runtime_cluster_cpus=runtime_cluster,
+                    scheduler_cluster_cpus=scheduler_cluster,
+                    cold_cluster_cpus=shared_cold_cluster,
+                    runtime_cpus=runtime_cluster,
+                    scheduler_cpus=scheduler_cluster,
+                    cold_cpus=sorted(cold_cpus),
                 )
             )
 
-            if pair_start + 1 < len(entries):
-                right_pid, right_worker = entries[pair_start + 1]
-                right_hot_cluster = clusters[index]
-                index += 1
-                right_runtime_cpus, right_scheduler_cpus = split_cluster(
-                    right_hot_cluster, subgroup_size
-                )
-                right_cold_cpus = sorted(shared_cold_cluster)[subgroup_size : subgroup_size * 2]
-                if len(right_cold_cpus) < subgroup_size:
-                    raise RuntimeError(
-                        f"Cold cluster {format_cpu_spec(shared_cold_cluster)} does not "
-                        f"have enough CPUs for both schedulers on NUMA {numa_id}"
-                    )
-                plans.append(
-                    SchedulerPlan(
-                        pid=right_pid,
-                        numa_id=numa_id,
-                        current_worker_cpus=right_worker,
-                        hot_cluster_cpus=sorted(right_hot_cluster),
-                        cold_cluster_cpus=sorted(shared_cold_cluster),
-                        runtime_cpus=right_runtime_cpus,
-                        scheduler_cpus=right_scheduler_cpus,
-                        cold_cpus=right_cold_cpus,
-                    )
-                )
-
-            pair_start += 2
-
-    plans.sort(key=lambda item: item.pid)
+    plans.sort(key=lambda item: item.logical_rank)
     return plans
 
 
@@ -575,28 +585,29 @@ def infer_aux_process_cpu_sets(
     numa_to_cpus: Dict[int, List[int]],
     control_cpus_per_aux_numa: int,
 ) -> Tuple[List[int], List[int], List[int]]:
-    worker_numas = sorted({plan.numa_id for plan in plans})
-    auxiliary_numas = sorted(set(numa_to_cpus) - set(worker_numas))
-    if not auxiliary_numas:
-        raise RuntimeError(
-            "Failed to infer auxiliary NUMA nodes for control/background processes."
-        )
-
+    service_cpus = set(collect_scheduler_service_cpus(plans))
+    helper_numas: List[int] = []
     control_cpus: List[int] = []
     background_cpus: List[int] = []
-    aux_pool: List[int] = []
-    for numa_id in auxiliary_numas:
-        cpus = sorted(numa_to_cpus[numa_id])
-        aux_pool.extend(cpus)
-        reserve = min(control_cpus_per_aux_numa, len(cpus))
-        control_cpus.extend(cpus[:reserve])
-        background_cpus.extend(cpus[reserve:])
+    for numa_id, cpus in sorted(numa_to_cpus.items()):
+        free_cpus = [cpu for cpu in sorted(cpus) if cpu not in service_cpus]
+        if not free_cpus:
+            continue
+        helper_numas.append(numa_id)
+        reserve = min(control_cpus_per_aux_numa, len(free_cpus) // 2)
+        if reserve > 0:
+            control_cpus.extend(free_cpus[:reserve])
+            background_cpus.extend(free_cpus[reserve:])
+        else:
+            background_cpus.extend(free_cpus)
 
+    if not helper_numas:
+        raise RuntimeError("Failed to infer helper CPUs for control/background processes.")
     if not control_cpus:
         raise RuntimeError("Derived control CPU set is empty.")
     if not background_cpus:
         raise RuntimeError("Derived background CPU set is empty.")
-    return auxiliary_numas, sorted(control_cpus), sorted(background_cpus)
+    return helper_numas, sorted(control_cpus), sorted(background_cpus)
 
 
 def classify_thread_group(
@@ -633,16 +644,97 @@ def build_backup_record(
         )
 
     return {
+        "logical_rank": plan.logical_rank,
         "pid": plan.pid,
-        "numa_id": plan.numa_id,
+        "current_numa_id": plan.current_numa_id,
+        "target_numa_id": plan.target_numa_id,
         "current_worker_cpus": list(plan.current_worker_cpus),
-        "hot_cluster_cpus": list(plan.hot_cluster_cpus),
+        "runtime_cluster_cpus": list(plan.runtime_cluster_cpus),
+        "scheduler_cluster_cpus": list(plan.scheduler_cluster_cpus),
         "cold_cluster_cpus": list(plan.cold_cluster_cpus),
         "runtime_cpus": list(plan.runtime_cpus),
         "scheduler_cpus": list(plan.scheduler_cpus),
         "cold_cpus": list(plan.cold_cpus),
         "threads": threads,
     }
+
+
+def build_plan_summary_lines(plans: Sequence[SchedulerPlan]) -> List[str]:
+    lines: List[str] = []
+    for plan in plans:
+        lines.append(
+            f"rank{plan.logical_rank} pid={plan.pid} "
+            f"current_numa={plan.current_numa_id} target_numa={plan.target_numa_id} "
+            f"current_worker={format_cpu_spec(plan.current_worker_cpus)} | "
+            f"runtime_cluster={format_cpu_spec(plan.runtime_cluster_cpus)} | "
+            f"scheduler_cluster={format_cpu_spec(plan.scheduler_cluster_cpus)} | "
+            f"shared_cold_cluster={format_cpu_spec(plan.cold_cluster_cpus)} | "
+            f"cold={format_cpu_spec(plan.cold_cpus)}"
+        )
+    return lines
+
+
+def detect_threads_by_patterns(
+    patterns: Sequence[Pattern[str]],
+) -> List[Tuple[int, ThreadInfo]]:
+    matches: List[Tuple[int, ThreadInfo]] = []
+    for proc in psutil.process_iter(["pid"]):
+        try:
+            pid = proc.pid
+            thread_infos = collect_thread_infos(pid)
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            continue
+
+        for info in thread_infos.values():
+            if matches_any(info.name, patterns):
+                matches.append((pid, info))
+    return matches
+
+
+def rebind_special_thread(
+    pid: int,
+    info: ThreadInfo,
+    target_cpu: int,
+    *,
+    dry_run: bool,
+    verbose: bool,
+    label: str,
+) -> Tuple[Optional[dict], int]:
+    target_cpus = [target_cpu]
+    if sorted(info.affinity) == target_cpus:
+        if verbose:
+            print(
+                f"Keep {label} pid={pid} tid={info.tid} name={info.name} "
+                f"already on {format_cpu_spec(target_cpus)}"
+            )
+        return None, 0
+
+    record = {
+        "pid": pid,
+        "tid": info.tid,
+        "name": info.name,
+        "original_affinity": list(info.affinity),
+        "target_cpu": target_cpu,
+    }
+    if verbose or dry_run:
+        print(
+            f"{'Plan' if dry_run else 'Move'} {label} pid={pid} tid={info.tid} "
+            f"name={info.name} {format_cpu_spec(info.affinity)} -> "
+            f"{format_cpu_spec(target_cpus)}"
+        )
+
+    if dry_run:
+        return record, 0
+
+    try:
+        os.sched_setaffinity(info.tid, set(target_cpus))
+    except OSError as exc:
+        print(
+            f"Failed to move {label} pid={pid} tid={info.tid} name={info.name}: {exc}",
+            file=sys.stderr,
+        )
+        return None, 1
+    return record, 0
 
 
 def backup_affinity(
@@ -738,6 +830,17 @@ def restore_affinity(backup_path: str) -> int:
                 skipped += 1
                 print(f"Skip restore pid={pid}: {exc}", file=sys.stderr)
 
+    for item in data.get("special_threads", []):
+        try:
+            os.sched_setaffinity(item["tid"], set(item["original_affinity"]))
+            restored += 1
+        except OSError as exc:
+            skipped += 1
+            print(
+                f"Skip restore tid={item['tid']} name={item['name']}: {exc}",
+                file=sys.stderr,
+            )
+
     print(
         f"Restore done: restored={restored}, skipped={skipped}, backup={backup_path}"
     )
@@ -747,8 +850,8 @@ def restore_affinity(backup_path: str) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Bind scheduler threads with a fixed 12-core layout per scheduler: "
-            "4 runtime CPUs + 4 scheduler-hot CPUs + 4 cold-helper CPUs."
+            "Bind scheduler threads with a fixed 20-core layout per scheduler: "
+            "8 runtime CPUs + 8 scheduler CPUs + 4 shared cold CPUs."
         )
     )
     parser.add_argument(
@@ -801,7 +904,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=list(DEFAULT_RUNTIME_PATTERNS),
         help=(
-            "Regex for runtime threads that go to the runtime 4-core half cluster. "
+            "Regex for runtime threads that go to the full 8-core runtime cluster. "
             f"Default: {', '.join(DEFAULT_RUNTIME_PATTERNS)}"
         ),
     )
@@ -810,8 +913,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=list(DEFAULT_SCHEDULER_THREAD_PATTERNS),
         help=(
-            "Regex for scheduler threads that go to the scheduler-hot 4-core "
-            f"half cluster. Default: {', '.join(DEFAULT_SCHEDULER_THREAD_PATTERNS)}"
+            "Regex for scheduler threads that go to the full 8-core scheduler "
+            f"cluster. Default: {', '.join(DEFAULT_SCHEDULER_THREAD_PATTERNS)}"
+        ),
+    )
+    parser.add_argument(
+        "--special-thread-pattern",
+        action="append",
+        default=list(DEFAULT_SPECIAL_THREAD_PATTERNS),
+        help=(
+            "Regex for special threads that should get one dedicated CPU from the "
+            "background CPU pool. Default: "
+            f"{', '.join(DEFAULT_SPECIAL_THREAD_PATTERNS)}"
         ),
     )
     parser.add_argument(
@@ -828,8 +941,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_SUBGROUP_SIZE,
         help=(
-            "CPUs used by each sub-group inside one scheduler plan: runtime, "
-            f"scheduler-hot, or one half of a shared cold cluster. Default: {DEFAULT_SUBGROUP_SIZE}"
+            "CPUs used by each half of the shared cold cluster. Default: "
+            f"{DEFAULT_SUBGROUP_SIZE}"
         ),
     )
     parser.add_argument(
@@ -930,6 +1043,7 @@ def main() -> int:
 
     runtime_patterns = compile_patterns(args.runtime_pattern)
     scheduler_patterns = compile_patterns(args.scheduler_thread_pattern)
+    special_thread_patterns = compile_patterns(args.special_thread_pattern)
     numa_to_cpus = read_numa_to_cpus()
 
     try:
@@ -954,11 +1068,15 @@ def main() -> int:
         "scheduler_service_cpus": [],
         "control_cpus": [],
         "background_cpus": [],
+        "special_threads": [],
     }
     total_changed = 0
     total_failed = 0
 
     print(f"Detected scheduler pids: {scheduler_pids}")
+    print("Per-rank 20-core layout summary:")
+    for line in build_plan_summary_lines(plans):
+        print(f"  {line}")
     for plan in plans:
         try:
             thread_infos = collect_thread_infos(plan.pid)
@@ -971,16 +1089,6 @@ def main() -> int:
             print(f"Skip pid={plan.pid}: no live threads found.", file=sys.stderr)
             total_failed += 1
             continue
-
-        print(
-            f"Scheduler pid={plan.pid} numa={plan.numa_id} "
-            f"current_worker={format_cpu_spec(plan.current_worker_cpus)} "
-            f"hot_cluster={format_cpu_spec(plan.hot_cluster_cpus)} "
-            f"cold_cluster={format_cpu_spec(plan.cold_cluster_cpus)} "
-            f"runtime={format_cpu_spec(plan.runtime_cpus)} "
-            f"scheduler_hot={format_cpu_spec(plan.scheduler_cpus)} "
-            f"cold={format_cpu_spec(plan.cold_cpus)}"
-        )
 
         backup_payload["processes"].append(
             build_backup_record(plan, thread_infos, runtime_patterns, scheduler_patterns)
@@ -1037,9 +1145,9 @@ def main() -> int:
         scheduler_service_cpus = collect_scheduler_service_cpus(plans)
         if args.control_cpus:
             control_cpus = parse_cpu_spec(args.control_cpus)
-            auxiliary_numas = sorted(set(numa_to_cpus) - {plan.numa_id for plan in plans})
+            auxiliary_numas = sorted(set(numa_to_cpus) - {plan.target_numa_id for plan in plans})
         elif args.background_cpus:
-            auxiliary_numas = sorted(set(numa_to_cpus) - {plan.numa_id for plan in plans})
+            auxiliary_numas = sorted(set(numa_to_cpus) - {plan.target_numa_id for plan in plans})
             inferred_control = []
             for numa_id in auxiliary_numas:
                 cpus = sorted(numa_to_cpus[numa_id])
@@ -1058,7 +1166,7 @@ def main() -> int:
             if args.control_cpus:
                 online_cpus = get_online_cpus()
                 aux_pool = []
-                for numa_id in sorted(set(numa_to_cpus) - {plan.numa_id for plan in plans}):
+                for numa_id in sorted(set(numa_to_cpus) - {plan.target_numa_id for plan in plans}):
                     aux_pool.extend(numa_to_cpus[numa_id])
                 if aux_pool:
                     background_cpus = sorted(set(aux_pool) - set(control_cpus))
@@ -1081,6 +1189,25 @@ def main() -> int:
             print("Background CPU set is empty.", file=sys.stderr)
             return 2
 
+        special_matches = detect_threads_by_patterns(special_thread_patterns)
+        special_background_cpu: Optional[int] = None
+        if len(special_matches) > 1:
+            print(
+                "Skip special thread isolation: detected multiple matching threads "
+                f"{[(pid, info.tid, info.name) for pid, info in special_matches]}",
+                file=sys.stderr,
+            )
+        elif len(special_matches) == 1:
+            if len(background_cpus) <= 1:
+                print(
+                    "Skip special thread isolation: background CPU set needs at least "
+                    "2 CPUs so one can be dedicated to the special thread.",
+                    file=sys.stderr,
+                )
+            else:
+                special_background_cpu = background_cpus[-1]
+                background_cpus = background_cpus[:-1]
+
         control_records, control_failed = rebind_processes(
             control_pids,
             control_cpus,
@@ -1091,7 +1218,7 @@ def main() -> int:
         backup_payload["control_processes"] = list(control_records)
         backup_payload["root_pids"] = list(root_pids)
         backup_payload["control_pids"] = list(control_pids)
-        backup_payload["worker_numas"] = sorted({plan.numa_id for plan in plans})
+        backup_payload["worker_numas"] = sorted({plan.target_numa_id for plan in plans})
         backup_payload["auxiliary_numas"] = list(auxiliary_numas)
         backup_payload["scheduler_service_cpus"] = list(scheduler_service_cpus)
         backup_payload["control_cpus"] = list(control_cpus)
@@ -1112,11 +1239,13 @@ def main() -> int:
 
         print(f"Detected sglang root pids: {root_pids}")
         print(f"Detected control pids: {control_pids}")
-        print(f"Process isolation worker NUMAs: {sorted({plan.numa_id for plan in plans})}")
-        print(f"Process isolation auxiliary NUMAs: {auxiliary_numas}")
+        print(f"Process isolation worker NUMAs: {sorted({plan.target_numa_id for plan in plans})}")
+        print(f"Process isolation helper NUMAs: {auxiliary_numas}")
         print(f"Scheduler service CPUs: {format_cpu_spec(scheduler_service_cpus)}")
         print(f"Control CPUs: {format_cpu_spec(control_cpus)}")
         print(f"Background CPUs: {format_cpu_spec(background_cpus)}")
+        if special_background_cpu is not None:
+            print(f"Dedicated special-thread CPU: {special_background_cpu}")
         print(f"Candidate background process count: {len(candidates)}")
 
         moved_background = []
@@ -1154,6 +1283,21 @@ def main() -> int:
 
         backup_payload["moved_processes"] = list(moved_background)
         total_changed += len(moved_background)
+
+        if len(special_matches) == 1 and special_background_cpu is not None:
+            special_pid, special_info = special_matches[0]
+            special_record, special_failed = rebind_special_thread(
+                special_pid,
+                special_info,
+                special_background_cpu,
+                dry_run=args.dry_run,
+                verbose=args.verbose,
+                label="special-thread",
+            )
+            if special_record is not None:
+                backup_payload["special_threads"].append(special_record)
+                total_changed += 1
+            total_failed += special_failed
 
     if args.dry_run:
         print(

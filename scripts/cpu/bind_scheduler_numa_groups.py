@@ -511,13 +511,17 @@ def derive_group_sizes(
     scheduler_cpus: Optional[int],
     runtime_cpus: Optional[int],
     cold_cpus: Optional[int],
+    ignore_cold_threads: bool,
 ) -> Tuple[int, int, int]:
     if scheduler_cpus is None and runtime_cpus is None and cold_cpus is None:
-        if cpus_per_proc < 4:
-            raise RuntimeError("cpus_per_proc must be at least 4 for acl/release/cold layout.")
-        scheduler_count = cpus_per_proc - 4
+        min_required = 2 if ignore_cold_threads else 4
+        if cpus_per_proc < min_required:
+            raise RuntimeError(
+                f"cpus_per_proc must be at least {min_required} for the selected layout."
+            )
+        scheduler_count = cpus_per_proc - (2 if ignore_cold_threads else 4)
         runtime_count = 2
-        cold_count = 2
+        cold_count = 0 if ignore_cold_threads else 2
     else:
         if None in (scheduler_cpus, runtime_cpus, cold_cpus):
             raise RuntimeError(
@@ -532,10 +536,11 @@ def derive_group_sizes(
         raise RuntimeError("scheduler_cpus must be positive.")
     if runtime_count < 0 or cold_count < 0:
         raise RuntimeError("runtime_cpus and cold_cpus must be non-negative.")
-    if runtime_count != 2 or cold_count != 2:
+    expected_cold = 0 if ignore_cold_threads else 2
+    if runtime_count != 2 or cold_count != expected_cold:
         raise RuntimeError(
-            "Current layout requires runtime_cpus=2 and cold_cpus=2 "
-            "(acl_thread=1, release_thread=1, cold tail=2)."
+            "Current layout requires runtime_cpus=2 and "
+            f"cold_cpus={expected_cold} for the selected ignore-cold mode."
         )
     if scheduler_count + runtime_count + cold_count != cpus_per_proc:
         raise RuntimeError(
@@ -629,7 +634,11 @@ def plan_schedulers(
             hot_cluster = process_cpus[:cluster_size]
             runtime_cpus = process_cpus[:runtime_count]
             cold_cpus = process_cpus[-cold_count:]
-            scheduler_cpus = process_cpus[runtime_count:-cold_count]
+            scheduler_cpus = (
+                process_cpus[runtime_count:-cold_count]
+                if cold_count > 0
+                else process_cpus[runtime_count:]
+            )
             plans.append(
                 SchedulerPlan(
                     logical_rank=logical_rank,
@@ -1065,6 +1074,7 @@ def classify_thread_group(
     runtime_patterns: Sequence[Pattern[str]],
     scheduler_patterns: Sequence[Pattern[str]],
     cold_patterns: Sequence[Pattern[str]],
+    ignore_cold_threads: bool,
 ) -> str:
     if info.name == "acl_thread":
         return "acl"
@@ -1075,7 +1085,7 @@ def classify_thread_group(
     if matches_any(info.name, scheduler_patterns):
         return "scheduler"
     if matches_any(info.name, cold_patterns):
-        return "cold"
+        return "scheduler" if ignore_cold_threads else "cold"
     return "scheduler"
 
 
@@ -1085,6 +1095,7 @@ def build_backup_record(
     runtime_patterns: Sequence[Pattern[str]],
     scheduler_patterns: Sequence[Pattern[str]],
     cold_patterns: Sequence[Pattern[str]],
+    ignore_cold_threads: bool,
 ) -> dict:
     threads = []
     for info in sorted(thread_infos.values(), key=lambda item: item.tid):
@@ -1094,6 +1105,7 @@ def build_backup_record(
             runtime_patterns,
             scheduler_patterns,
             cold_patterns,
+            ignore_cold_threads,
         )
         threads.append(
             {
@@ -1170,6 +1182,7 @@ def apply_thread_affinity(
     runtime_patterns: Sequence[Pattern[str]],
     scheduler_patterns: Sequence[Pattern[str]],
     cold_patterns: Sequence[Pattern[str]],
+    ignore_cold_threads: bool,
     *,
     dry_run: bool,
     verbose: bool,
@@ -1199,6 +1212,7 @@ def apply_thread_affinity(
             runtime_patterns,
             scheduler_patterns,
             cold_patterns,
+            ignore_cold_threads,
         )
         if group == "scheduler":
             continue
@@ -1331,7 +1345,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--cold-cpus",
         type=int,
         default=None,
-        help="Override cold/helper CPU count. Current layout requires 2.",
+        help=(
+            "Override cold/helper CPU count. Default mode requires 0; "
+            "--keep-cold-threads-separate requires 2."
+        ),
+    )
+    parser.add_argument(
+        "--keep-cold-threads-separate",
+        action="store_true",
+        help=(
+            "Disable the default ignore-cold mode. When set, cold/helper threads use "
+            "the last 2 CPUs of each per-card range."
+        ),
     )
     parser.add_argument(
         "--cluster-size",
@@ -1449,6 +1474,7 @@ def main() -> int:
         scheduler_cpus=args.scheduler_cpus,
         runtime_cpus=args.runtime_cpus,
         cold_cpus=args.cold_cpus,
+        ignore_cold_threads=not args.keep_cold_threads_separate,
     )
 
     keywords = list(DEFAULT_SCHEDULER_KEYWORDS) + list(args.scheduler_keyword)
@@ -1503,6 +1529,7 @@ def main() -> int:
         "special_thread_cpu": None,
         "special_thread_source": "",
         "special_threads": [],
+        "ignore_cold_threads": not args.keep_cold_threads_separate,
     }
 
     total_changed = 0
@@ -1512,7 +1539,8 @@ def main() -> int:
     print(
         "Planner preset: "
         f"cpus_per_proc={args.cpus_per_proc} "
-        f"scheduler={scheduler_count} runtime={runtime_count} cold={cold_count}"
+        f"scheduler={scheduler_count} runtime={runtime_count} cold={cold_count} "
+        f"ignore_cold_threads={not args.keep_cold_threads_separate}"
     )
 
     free_cpus_by_numa = collect_free_cpus_by_numa(plans=plans, numa_to_cpus=numa_to_cpus)
@@ -1619,6 +1647,7 @@ def main() -> int:
                 runtime_patterns,
                 scheduler_patterns,
                 cold_patterns,
+                not args.keep_cold_threads_separate,
             )
         )
 
@@ -1628,6 +1657,7 @@ def main() -> int:
             runtime_patterns,
             scheduler_patterns,
             cold_patterns,
+            not args.keep_cold_threads_separate,
             dry_run=args.dry_run,
             verbose=args.verbose,
         )

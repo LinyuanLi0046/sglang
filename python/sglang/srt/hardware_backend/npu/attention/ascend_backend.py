@@ -319,6 +319,48 @@ class AscendAttnBackend(AttentionBackend):
             return _get_fp8_kv_scale(device)
         return fp8_kv_scale.to(device=device, dtype=torch.float32)
 
+    def _align_fp8_scale_for_query_rope(
+        self, scale: torch.Tensor, query_rope: torch.Tensor
+    ) -> torch.Tensor:
+        scale = scale.to(device=query_rope.device, dtype=torch.float32)
+        if scale.dim() == 0:
+            scale = scale.view(1)
+
+        while scale.dim() < query_rope.dim() - 1:
+            scale = scale.unsqueeze(0)
+        if scale.dim() == query_rope.dim() - 1:
+            scale = scale.unsqueeze(-1)
+
+        head_dim = query_rope.dim() - 2
+        target_heads = query_rope.shape[head_dim]
+        if scale.shape[head_dim] == target_heads or scale.shape[head_dim] == 1:
+            return scale
+        if scale.shape[head_dim] < target_heads:
+            pad_shape = list(scale.shape)
+            pad_shape[head_dim] = target_heads - scale.shape[head_dim]
+            pad = torch.ones(
+                pad_shape, dtype=torch.float32, device=query_rope.device
+            )
+            return torch.cat([scale, pad], dim=head_dim)
+        raise RuntimeError(
+            "fp8 query rope scale shape mismatch: "
+            f"scale={tuple(scale.shape)}, query_rope={tuple(query_rope.shape)}"
+        )
+
+    def _scale_fp8_mla_query_rope(
+        self,
+        query_rope: torch.Tensor,
+        dequant_scale_q_nope: torch.Tensor,
+        kv_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        query_scale = self._align_fp8_scale_for_query_rope(
+            dequant_scale_q_nope, query_rope
+        )
+        kv_scale = self._align_fp8_scale_for_query_rope(kv_scale, query_rope)
+        return (
+            query_rope.to(torch.float32) / query_scale / kv_scale
+        ).to(torch.bfloat16).contiguous()
+
     def get_verify_buffers_to_fill_after_draft(self):
         """
         Return buffers for verify attention kernels that needs to be filled after draft.
@@ -1793,6 +1835,9 @@ class AscendAttnBackend(AttentionBackend):
                 if self.kv_cache_dtype == "fp8_e4m3":
                     q_fp8, dequant_scale_query = q_nope, dequant_scale_q_nope
                     kv_scale = self._resolve_fp8_kv_scale(fp8_kv_scale, q_nope.device)
+                    q_rope = self._scale_fp8_mla_query_rope(
+                        q_rope, dequant_scale_query, kv_scale
+                    )
                     attn_output = torch.empty_like(q_nope, dtype=torch.bfloat16, device=q_nope.device)
                     softmax_lse = torch.empty(1, dtype=torch.bfloat16, device=q_nope.device)
                     torch_npu.npu_fused_infer_attention_score_v2.out(
@@ -2046,6 +2091,9 @@ class AscendAttnBackend(AttentionBackend):
                 if self.kv_cache_dtype == "fp8_e4m3":
                     q_fp8, dequant_scale_query = q_nope, dequant_scale_q_nope
                     kv_scale = self._resolve_fp8_kv_scale(fp8_kv_scale, q_nope.device)
+                    q_rope = self._scale_fp8_mla_query_rope(
+                        q_rope, dequant_scale_query, kv_scale
+                    )
                     output = torch.empty_like(q_nope, dtype=torch.bfloat16, device=q_nope.device)
                     softmax_lse = torch.empty(1, dtype=torch.bfloat16, device=q_nope.device)
                     torch_npu.npu_fused_infer_attention_score_v2.out(
@@ -2398,6 +2446,9 @@ class AscendAttnBackend(AttentionBackend):
                         # q_fp8, dequant_scale_query = _quantize_mla_query_for_fia_fp8(q)
                         q_fp8, dequant_scale_query = q, dequant_scale_q_nope
                         kv_scale = self._resolve_fp8_kv_scale(fp8_kv_scale, q.device)
+                        q_rope = self._scale_fp8_mla_query_rope(
+                            q_rope, dequant_scale_query, kv_scale
+                        )
                         attn_output = torch.empty_like(q, dtype=torch.bfloat16, device=q.device)
                         softmax_lse = torch.empty(1, dtype=torch.bfloat16, device=q.device)
                         torch_npu.npu_fused_infer_attention_score_v2.out(

@@ -1286,7 +1286,15 @@ class DeepseekV2AttentionMLA(
         self.w_kc = None
         self.w_vc = None
         self.w_scale = 1.0
-        self.c8_scale = nn.Parameter(
+        self.fa_k = nn.Module()
+        self.fa_k.register_parameter(
+            "scale",
+            nn.Parameter(torch.ones(1, dtype=torch.float32), requires_grad=False),
+        )
+        self.fak_descale_float = nn.Parameter(
+            torch.ones(1, dtype=torch.float32), requires_grad=False
+        )
+        self.fak_descale_reciprocal = nn.Parameter(
             torch.ones(1, dtype=torch.float32), requires_grad=False
         )
 
@@ -1319,6 +1327,16 @@ class DeepseekV2AttentionMLA(
         self.init_mla_forward()
         self.init_mla_fused_rope_rocm_forward()
         self.init_mla_fused_rope_cpu_forward()
+        self.refresh_fa_k_scale_params()
+
+    def refresh_fa_k_scale_params(self) -> None:
+        fa_k_scale = torch.squeeze(self.fa_k.scale).unsqueeze(0)
+        self.fak_descale_float = nn.Parameter(
+            fa_k_scale.to(torch.float32), requires_grad=False
+        )
+        self.fak_descale_reciprocal = nn.Parameter(
+            torch.reciprocal(fa_k_scale.to(torch.float32)), requires_grad=False
+        )
 
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch

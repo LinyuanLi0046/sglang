@@ -1397,6 +1397,7 @@ class LongcatFlashForCausalLM(nn.Module):
                     )
                     self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                     self_attn.use_deep_gemm_bmm = True
+                self_attn.refresh_fa_k_scale_params()
 
                 if self.config.mla_scale_q_lora:
                     self_attn.q_a_layernorm.weight.data *= (

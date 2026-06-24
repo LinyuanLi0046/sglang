@@ -103,7 +103,7 @@ def forward_mha_prepare_npu(
 
         if m.kv_cache_dtype == "fp8_e4m3":
             k_rope_scale = None
-            c_kv_scale = getattr(m, "c8_scale", None)
+            c_kv_scale = getattr(m, "fak_descale_reciprocal", None)
             if c_kv_scale is not None:
                 c_kv_scale = c_kv_scale.to(device=q.device, dtype=torch.float32)
             else:
@@ -191,7 +191,7 @@ def forward_mla_prepare_npu(
                 m.qk_rope_head_dim,
                 m.v_head_dim,
                 m.quant_config,
-                getattr(m, "c8_scale", None),
+                getattr(m, "fak_descale_reciprocal", None),
             )
         if is_longcat_mla_preprocess_enabled():
             (
@@ -218,6 +218,7 @@ def forward_mla_prepare_npu(
             ) = m.mla_preprocess.forward(
                 positions, hidden_states, forward_batch, zero_allocator
             )
+            dequant_scale_q_nope = None
         topk_indices = None
     else:
         q_lora = None
@@ -315,7 +316,7 @@ def forward_mla_core_npu(
 
     if dequant_scale_q_nope is not None:
         extra_kwargs["dequant_scale_q_nope"] = dequant_scale_q_nope
-        extra_kwargs["fp8_kv_scale"] = getattr(m, "c8_scale", None)
+        extra_kwargs["fp8_kv_scale"] = getattr(m, "fak_descale_float", None)
 
     attn_output = m.attn_mqa(
         q_nope_out,
@@ -558,7 +559,7 @@ def npu_mla_preprocess(
             m.qk_rope_head_dim,
             m.v_head_dim,
             m.quant_config,
-            getattr(m, "c8_scale", None),
+            getattr(m, "fak_descale_reciprocal", None),
         )
     # mlaprolog does not require additional calculation of q_lora
     _is_mlaprolog = hasattr(m.quant_config, "ignore") and any(

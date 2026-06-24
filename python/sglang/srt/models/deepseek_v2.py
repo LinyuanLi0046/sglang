@@ -147,6 +147,7 @@ from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
     add_prefix,
+    get_bool_env_var,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
     make_layers,
@@ -1330,12 +1331,15 @@ class DeepseekV2AttentionMLA(
         self.refresh_fa_k_scale_params()
 
     def refresh_fa_k_scale_params(self) -> None:
-        fa_k_scale = torch.squeeze(self.fa_k.scale).unsqueeze(0)
+        fa_k_scale = torch.squeeze(self.fa_k.scale).unsqueeze(0).to(torch.float32)
+        if get_bool_env_var("SGLANG_NPU_FORCE_FA_K_SCALE_ONE"):
+            fa_k_scale = torch.ones_like(fa_k_scale)
+
         self.fak_descale_float = nn.Parameter(
-            fa_k_scale.to(torch.float32), requires_grad=False
+            fa_k_scale, requires_grad=False
         )
         self.fak_descale_reciprocal = nn.Parameter(
-            torch.reciprocal(fa_k_scale.to(torch.float32)), requires_grad=False
+            torch.reciprocal(fa_k_scale), requires_grad=False
         )
 
     def dispatch_attn_forward_method(

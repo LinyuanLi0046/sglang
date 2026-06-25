@@ -640,14 +640,18 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             and deep_gemm_wrapper.DEEPGEMM_BLACKWELL
         )
-        use_ue8m0 = round_scale
         use_mxfp4 = False
         if input_global_scale is not None:
             use_nvfp4 = True
         elif not envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
             use_fp8 = True
 
-        if _is_npu and input_global_scale is None:
+        if not _is_npu:
+            use_ue8m0 = (
+                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL
+            )
+        else:
             quant_type = envs.SGLANG_NPU_DEEPEP_QUANT.get().strip().upper()
             if quant_type == "":
                 quant_type = "BF16"

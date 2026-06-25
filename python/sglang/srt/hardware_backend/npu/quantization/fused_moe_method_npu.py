@@ -1271,6 +1271,7 @@ class NPUW8A8MxFp8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         group_list,
         output_dtype,
     ):
+        hidden_states_scale = hidden_states_scale.reshape(hidden_states.shape[0], hidden_states.shape[1] // 64, 2)
         hidden_states = mxfp8_gmm_npu(
             input=hidden_states,
             input_scale=hidden_states_scale,
@@ -1348,6 +1349,7 @@ class NPUW4A8MxFpDynamicMoEMethod(_NPUFusedMoEMethodBase):
         group_list,
         output_dtype,
     ):
+        hidden_states_scale = hidden_states_scale.reshape(hidden_states.shape[0], hidden_states.shape[1] // 64, 2)
         hidden_states = w4a8_mxfp_gmm_npu(
             input=hidden_states,
             input_scale=hidden_states_scale,
@@ -1448,6 +1450,7 @@ class NPUW4A4MxFp4DynamicMoEMethod(_NPUFusedMoEMethodBase):
         group_list,
         output_dtype,
     ):
+        hidden_states_scale = hidden_states_scale.reshape(hidden_states.shape[0], hidden_states.shape[1] // 64, 2)
         hidden_states = mxfp4_gmm_npu(
             input=hidden_states,
             input_scale=hidden_states_scale,

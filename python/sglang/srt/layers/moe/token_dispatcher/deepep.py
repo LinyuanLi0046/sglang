@@ -406,11 +406,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 if use_int8_quant:
                     quant_type = "INT8"
                 else:
-                    quant_type = "NO"
-            elif quant_type in ("NONE", "BF16"):
-                quant_type = "NO"
+                    quant_type = "BF16"
 
-            if quant_type == "NO" and not use_int8_quant:
+            if quant_type == "BF16" and not use_int8_quant:
                 quant_type_tensor = None
             elif quant_type == "INT8" or use_int8_quant:
                 quant_type_tensor = torch.empty(0, dtype=torch.int8, device=hidden_states.device)
@@ -651,32 +649,31 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
         if _is_npu and input_global_scale is None:
             quant_type = envs.SGLANG_NPU_DEEPEP_QUANT.get().strip().upper()
-            if quant_type in ("NONE", "BF16"):
-                quant_type = "NO"
+            if quant_type == "":
+                quant_type = "BF16"
 
-            if quant_type != "":
-                if quant_type == "NO":
-                    use_fp8 = False
-                    use_ue8m0 = False
-                    use_mxfp4 = False
-                elif quant_type == "INT8":
-                    use_fp8 = True
-                    use_ue8m0 = False
-                    use_mxfp4 = False
-                elif quant_type == "MXFP8":
-                    if _is_npu_before_atlas_a5:
-                        raise ValueError("MXFP8 is not supported on NPU before Atlas A5")
-                    use_fp8 = True
-                    use_ue8m0 = True
-                    use_mxfp4 = False
-                elif quant_type == "MXFP4":
-                    if _is_npu_before_atlas_a5:
-                        raise ValueError("MXFP4 is not supported on NPU before Atlas A5")
-                    use_fp8 = True
-                    use_ue8m0 = True
-                    use_mxfp4 = True
-                else:
-                    raise ValueError(f"Unknown quant type {quant_type}")
+            if quant_type == "BF16":
+                use_fp8 = False
+                use_ue8m0 = False
+                use_mxfp4 = False
+            elif quant_type == "INT8":
+                use_fp8 = True
+                use_ue8m0 = False
+                use_mxfp4 = False
+            elif quant_type == "MXFP8":
+                if _is_npu_before_atlas_a5:
+                    raise ValueError("MXFP8 is not supported on NPU before Atlas A5")
+                use_fp8 = True
+                use_ue8m0 = True
+                use_mxfp4 = False
+            elif quant_type == "MXFP4":
+                if _is_npu_before_atlas_a5:
+                    raise ValueError("MXFP4 is not supported on NPU before Atlas A5")
+                use_fp8 = True
+                use_ue8m0 = True
+                use_mxfp4 = True
+            else:
+                raise ValueError(f"Unknown quant type {quant_type}")
         buffer = self._get_buffer()
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(

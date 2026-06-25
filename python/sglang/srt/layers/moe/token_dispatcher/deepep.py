@@ -30,10 +30,12 @@ from sglang.srt.utils import (
     is_blackwell,
     is_hip,
     is_npu,
+    is_npu_before_atlas_a5,
     load_json_config,
 )
 
 _is_npu = is_npu()
+_is_npu_before_atlas_a5 = is_npu_before_atlas_a5()
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
@@ -397,6 +399,33 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             )
+        elif _is_npu:
+            quant_type = envs.SGLANG_NPU_DEEPEP_QUANT.get().strip().upper()
+            use_int8_quant = get_bool_env_var("DEEP_NORMAL_MODE_USE_INT8_QUANT")
+            if quant_type == "":
+                if use_int8_quant:
+                    quant_type = "INT8"
+                else:
+                    quant_type = "NO"
+            elif quant_type in ("NONE", "BF16"):
+                quant_type = "NO"
+
+            if quant_type == "NO" and not use_int8_quant:
+                quant_type_tensor = None
+            elif quant_type == "INT8" or use_int8_quant:
+                quant_type_tensor = torch.empty(0, dtype=torch.int8, device=hidden_states.device)
+            elif quant_type == "MXFP8":
+                if _is_npu_before_atlas_a5:
+                    raise ValueError("MXFP8 is not supported on NPU before Atlas A5")
+                quant_type_tensor = torch.empty(0, dtype=torch.float8_e4m3fn, device=hidden_states.device)
+            elif quant_type == "MXFP4":
+                if _is_npu_before_atlas_a5:
+                    raise ValueError("MXFP4 is not supported on NPU before Atlas A5")
+                quant_type_tensor = torch.empty(0, dtype=torch.float4_e2m1fn_x2, device=hidden_states.device)
+            else:
+                raise ValueError(f"Unknown quant type {quant_type}")
+            if quant_type_tensor is not None:
+                hidden_states = (hidden_states, quant_type_tensor)
         previous_event = Buffer.capture() if self.async_finish else None
         return hidden_states, topk_ids, topk_weights, previous_event
 
@@ -609,11 +638,45 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         use_nvfp4 = use_fp8 = False
         input_global_scale = self.quant_config.get("input_global_scale", None)
+        round_scale = (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and deep_gemm_wrapper.DEEPGEMM_BLACKWELL
+        )
+        use_ue8m0 = round_scale
+        use_mxfp4 = False
         if input_global_scale is not None:
             use_nvfp4 = True
         elif not envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
             use_fp8 = True
 
+        if _is_npu and input_global_scale is None:
+            quant_type = envs.SGLANG_NPU_DEEPEP_QUANT.get().strip().upper()
+            if quant_type in ("NONE", "BF16"):
+                quant_type = "NO"
+
+            if quant_type != "":
+                if quant_type == "NO":
+                    use_fp8 = False
+                    use_ue8m0 = False
+                    use_mxfp4 = False
+                elif quant_type == "INT8":
+                    use_fp8 = True
+                    use_ue8m0 = False
+                    use_mxfp4 = False
+                elif quant_type == "MXFP8":
+                    if _is_npu_before_atlas_a5:
+                        raise ValueError("MXFP8 is not supported on NPU before Atlas A5")
+                    use_fp8 = True
+                    use_ue8m0 = True
+                    use_mxfp4 = False
+                elif quant_type == "MXFP4":
+                    if _is_npu_before_atlas_a5:
+                        raise ValueError("MXFP4 is not supported on NPU before Atlas A5")
+                    use_fp8 = True
+                    use_ue8m0 = True
+                    use_mxfp4 = True
+                else:
+                    raise ValueError(f"Unknown quant type {quant_type}")
         buffer = self._get_buffer()
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
@@ -630,10 +693,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 ),
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
-                round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
-                use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+                round_scale=round_scale,
+                use_ue8m0=use_ue8m0,
+                use_mxfp4=use_mxfp4,
             )
         )
         return packed_recv_hidden, self.packed_recv_count, event, hook

@@ -1450,7 +1450,7 @@ class NPUW4A4MxFp4DynamicMoEMethod(_NPUFusedMoEMethodBase):
         group_list,
         output_dtype,
     ):
-        hidden_states_scale = hidden_states_scale.reshape(hidden_states.shape[0], hidden_states.shape[1] // 64, 2)
+        hidden_states_scale = hidden_states_scale.reshape(hidden_states.shape[0], hidden_states.shape[1] // 32, 2)
         hidden_states = mxfp4_gmm_npu(
             input=hidden_states,
             input_scale=hidden_states_scale,

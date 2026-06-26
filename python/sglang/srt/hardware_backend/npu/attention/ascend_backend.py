@@ -19,6 +19,9 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.hardware_backend.npu.triton import (
+    init_replay_block_tables_npu_triton,
+)
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -560,19 +563,23 @@ class AscendAttnBackend(AttentionBackend):
             )
             metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
             metadata.block_tables_swa[bs:, :].fill_(0)
-        metadata.block_tables[:bs, :max_seq_pages].copy_(
-            self.req_to_token[req_pool_indices[:bs], :max_len][:, :: self.page_size]
-            // self.page_size
-        )
-
-        metadata.block_tables[:bs, max_seq_pages:].fill_(0)
-        metadata.block_tables[bs:, :].fill_(0)
-
+        seq_len_offset = 0
         if forward_mode.is_target_verify():
-            seq_lens = seq_lens + self.speculative_num_draft_tokens
+            seq_len_offset = self.speculative_num_draft_tokens
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
-            seq_lens = seq_lens + self.speculative_step_offset_npu
-        metadata.seq_lens[:bs].copy_(seq_lens[:bs])
+            seq_len_offset = self.speculative_step_id + 1
+
+        init_replay_block_tables_npu_triton(
+            req_to_token=self.req_to_token,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            block_tables=metadata.block_tables,
+            out_seq_lens=metadata.seq_lens,
+            bs=bs,
+            max_seq_pages=max_seq_pages,
+            page_size=self.page_size,
+            seq_len_offset=seq_len_offset,
+        )
 
         self.forward_metadata = metadata
 

@@ -320,7 +320,7 @@ class AscendAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         if fp8_kv_scale is None:
             return _get_fp8_kv_scale(device)
-        return fp8_kv_scale.to(device=device, dtype=torch.float32)
+        return fp8_kv_scale.reshape(-1).to(device=device, dtype=torch.float32)
 
     def get_verify_buffers_to_fill_after_draft(self):
         """

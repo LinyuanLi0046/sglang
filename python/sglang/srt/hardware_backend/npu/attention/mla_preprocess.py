@@ -175,7 +175,9 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
     def _get_quant_scale_ckv(self, device: torch.device) -> torch.Tensor:
         fak_descale_reciprocal = self.runtime_refs.get("fak_descale_reciprocal")
         if fak_descale_reciprocal is not None:
-            return fak_descale_reciprocal.to(device=device, dtype=torch.float32)
+            return fak_descale_reciprocal.reshape(-1).to(
+                device=device, dtype=torch.float32
+            )
         if self.quant_scale_ckv is None or self.quant_scale_ckv.device != device:
             self.quant_scale_ckv = torch.ones(1, dtype=torch.float32, device=device)
         return self.quant_scale_ckv

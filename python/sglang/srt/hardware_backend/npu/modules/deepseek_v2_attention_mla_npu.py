@@ -222,6 +222,7 @@ def forward_mla_prepare_npu(
         topk_indices = None
     else:
         q_lora = None
+        dequant_scale_q_nope = None
         if m.q_lora_rank is not None:
             q, latent_cache = (
                 get_attn_tp_context()
@@ -268,6 +269,61 @@ def forward_mla_prepare_npu(
 
         q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
+        if (m.kv_cache_dtype == "fp8_e4m3"):
+            cos = m.rotary_emb.cos_cached.to(q_nope_out.device)
+            sin = m.rotary_emb.sin_cached.to(q_nope_out.device)
+            q_nope_shape = q_nope_out.shape
+            q_nope_out, dequant_scale_q_nope = torch_npu.npu_dynamic_quant(
+                q_nope_out.reshape(-1, q_nope_shape[-1]),
+                dst_type=torch.float8_e4m3fn,
+            )
+            q_nope_out = q_nope_out.view(q_nope_shape)
+            dequant_scale_q_nope = dequant_scale_q_nope.view(q_nope_shape[:-1]).to(
+                torch.float32
+            )
+
+            fp8_kv_scale = getattr(m, "fak_descale_float", None)
+            if fp8_kv_scale is None:
+                fp8_kv_scale = torch.ones(1, dtype=torch.float32, device=q_pe.device)
+            q_pe = (
+                q_pe
+                / dequant_scale_q_nope.unsqueeze(-1)
+                / fp8_kv_scale.to(device=q_pe.device, dtype=torch.float32)
+            ).to(torch.bfloat16)
+
+            ckv_cache, k_rope_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                m.layer_id
+            )
+            c_kv_scale = getattr(m, "fak_descale_reciprocal", None)
+            if c_kv_scale is not None:
+                c_kv_scale = c_kv_scale.to(
+                    device=q_nope_out.device, dtype=torch.float32
+                )
+            else:
+                c_kv_scale = torch.ones(
+                    1, dtype=torch.float32, device=q_nope_out.device
+                )
+
+            _, _, k_pe, k_nope = torch_npu.npu_kv_rmsnorm_rope_cache(
+                latent_cache.view(-1, 1, 1, m.kv_lora_rank + m.qk_rope_head_dim),
+                m.kv_a_layernorm.weight,
+                cos,
+                sin,
+                forward_batch.out_cache_loc.to(torch.int64),
+                k_rope_cache,
+                ckv_cache,
+                k_rope_scale=None,
+                c_kv_scale=c_kv_scale,
+                k_rope_offset=None,
+                c_kv_offset=None,
+                epsilon=m.kv_a_layernorm.variance_epsilon,
+                cache_mode="PA_NZ" if is_fia_nz() else "PA_BNSD",
+                is_output_kv=True,
+            )
+            k_pe = k_pe.reshape(-1, 1, m.qk_rope_head_dim)
+            k_nope = k_nope.reshape(-1, 1, m.kv_lora_rank)
+            dequant_scale_q_nope = dequant_scale_q_nope.unsqueeze(-1)
+
         if nsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
             k_nope, k_pe = m.rebuild_cp_kv_cache(
@@ -282,7 +338,6 @@ def forward_mla_prepare_npu(
                 forward_batch=forward_batch,
                 layer_id=m.layer_id,
             )
-        dequant_scale_q_nope = None
 
     return (
         q_pe,
@@ -317,6 +372,11 @@ def forward_mla_core_npu(
     if dequant_scale_q_nope is not None:
         extra_kwargs["dequant_scale_q_nope"] = dequant_scale_q_nope
         extra_kwargs["fp8_kv_scale"] = getattr(m, "fak_descale_float", None)
+        if (
+            m.kv_cache_dtype == "fp8_e4m3"
+            and forward_batch.forward_mode.is_decode_or_idle()
+        ):
+            extra_kwargs["save_kv_cache"] = False
 
     attn_output = m.attn_mqa(
         q_nope_out,

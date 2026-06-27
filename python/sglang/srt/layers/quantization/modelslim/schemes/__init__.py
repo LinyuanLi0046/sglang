@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from .modelslim_scheme import ModelSlimLinearScheme, ModelSlimMoEScheme
+from .modelslim_q_fp8_dynamic_kv_fp8 import ModelSlimQFP8DynamicKVFP8Scheme
+from .modelslim_scheme import (
+    ModelSlimKVSchemeBase,
+    ModelSlimLinearScheme,
+    ModelSlimMoEScheme,
+)
 from .modelslim_w4a4_int4 import ModelSlimW4A4Int4
 from .modelslim_w4a4_int4_moe import ModelSlimW4A4Int4MoE
 from .modelslim_w4a4_mxfp4 import ModelSlimW4A4MxFp4
@@ -16,6 +21,8 @@ from .modelslim_w8a8_mxfp8_moe import ModelSlimW8A8MxFp8MoE
 __all__ = [
     "ModelSlimLinearScheme",
     "ModelSlimMoEScheme",
+    "ModelSlimKVSchemeBase",
+    "ModelSlimQFP8DynamicKVFP8Scheme",
     "ModelSlimW8A8Int8",
     "ModelSlimW4A4Int4",
     "ModelSlimW4A4MxFp4",

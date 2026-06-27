@@ -147,7 +147,6 @@ from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
     add_prefix,
-    get_bool_env_var,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
     make_layers,
@@ -1118,6 +1117,7 @@ class DeepseekV2AttentionMLA(
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
         self.quant_config = quant_config
+        self.kv_quant_method = None
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
         self.use_nsa = is_deepseek_nsa(config)
@@ -1130,6 +1130,7 @@ class DeepseekV2AttentionMLA(
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
+        self.num_local_kv_heads = 1
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -1287,17 +1288,7 @@ class DeepseekV2AttentionMLA(
         self.w_kc = None
         self.w_vc = None
         self.w_scale = 1.0
-        self.fa_k = nn.Module()
-        self.fa_k.register_parameter(
-            "scale",
-            nn.Parameter(torch.ones(1, dtype=torch.float32), requires_grad=False),
-        )
-        self.fak_descale_float = nn.Parameter(
-            torch.ones(1, dtype=torch.float32), requires_grad=False
-        )
-        self.fak_descale_reciprocal = nn.Parameter(
-            torch.ones(1, dtype=torch.float32), requires_grad=False
-        )
+        self._init_kv_quant_weights(quant_config, prefix)
 
         self.w_scale_k = None
         self.w_scale_v = None
@@ -1328,19 +1319,28 @@ class DeepseekV2AttentionMLA(
         self.init_mla_forward()
         self.init_mla_fused_rope_rocm_forward()
         self.init_mla_fused_rope_cpu_forward()
-        self.refresh_fa_k_scale_params()
+
+    def _init_kv_quant_weights(
+        self, quant_config: Optional[QuantizationConfig], prefix: str
+    ) -> None:
+        if quant_config is None or not _is_npu:
+            return
+
+        self.kv_quant_method = quant_config.get_quant_method(self, prefix=prefix)
+        if self.kv_quant_method is None:
+            return
+
+        self.kv_quant_method.create_weights(
+            self,
+            num_heads=self.num_local_heads,
+            num_kv_heads=self.num_local_kv_heads,
+            kv_lora_rank=self.kv_lora_rank,
+            params_dtype=torch.float32,
+        )
 
     def refresh_fa_k_scale_params(self) -> None:
-        fa_k_scale = torch.squeeze(self.fa_k.scale).unsqueeze(0).to(torch.float32)
-        if get_bool_env_var("SGLANG_NPU_FORCE_FA_K_SCALE_ONE"):
-            fa_k_scale = torch.ones_like(fa_k_scale)
-
-        self.fak_descale_float = nn.Parameter(
-            fa_k_scale, requires_grad=False
-        )
-        self.fak_descale_reciprocal = nn.Parameter(
-            torch.reciprocal(fa_k_scale), requires_grad=False
-        )
+        if self.kv_quant_method is not None:
+            self.kv_quant_method.process_weights_after_loading(self)
 
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch

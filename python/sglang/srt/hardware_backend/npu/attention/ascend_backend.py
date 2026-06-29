@@ -93,6 +93,9 @@ class ForwardMetadata:
     # prefix cache
     prefix_lens: Optional[torch.Tensor] = None
     flatten_prefix_block_tables: Optional[torch.Tensor] = None
+    prefix_block_tables: Optional[torch.Tensor] = None
+    prefix_seq_lens_npu: Optional[torch.Tensor] = None
+    prefix_seq_starts: Optional[torch.Tensor] = None
 
 
 class AscendAttnMaskBuilder:
@@ -322,6 +325,79 @@ class AscendAttnBackend(AttentionBackend):
             return _get_fp8_kv_scale(device)
         return fp8_kv_scale.reshape(-1).to(device=device, dtype=torch.float32)
 
+    def _load_prefix_kv_cache_david(
+        self,
+        forward_batch: ForwardBatch,
+        layer: RadixAttention,
+        fp8_kv_scale: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            not _is_npu_before_atlas_a5
+            and self.forward_metadata.prefix_block_tables is not None
+            and self.forward_metadata.prefix_seq_lens_npu is not None
+            and self.forward_metadata.prefix_seq_starts is not None
+            and hasattr(torch_npu, "npu_gather_pa_kv_cache")
+        ):
+            ckv_cache, k_rope_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                layer.layer_id
+            )
+            total_prefix_tokens = int(self.forward_metadata.prefix_lens.sum().item())
+            kv_cached = torch.empty(
+                (
+                    total_prefix_tokens,
+                    ckv_cache.shape[-2],
+                    ckv_cache.shape[-1],
+                ),
+                dtype=ckv_cache.dtype,
+                device=ckv_cache.device,
+            )
+            k_rope_cached = torch.empty(
+                (
+                    total_prefix_tokens,
+                    k_rope_cache.shape[-2],
+                    k_rope_cache.shape[-1],
+                ),
+                dtype=k_rope_cache.dtype,
+                device=k_rope_cache.device,
+            )
+            torch_npu.npu_gather_pa_kv_cache(
+                ckv_cache,
+                k_rope_cache,
+                self.forward_metadata.prefix_block_tables,
+                self.forward_metadata.prefix_seq_lens_npu.contiguous(),
+                seq_offset=self.forward_metadata.prefix_seq_starts,
+                key=kv_cached,
+                value=k_rope_cached,
+            )
+            if self.kv_cache_dtype == "fp8_e4m3":
+                kv_scale = self._resolve_fp8_kv_scale(
+                    fp8_kv_scale, kv_cached.device
+                ).to(torch.bfloat16)
+                kv_cached = kv_cached.to(torch.bfloat16) * kv_scale
+            return kv_cached, k_rope_cached
+
+        if self.kv_cache_dtype == "fp8_e4m3":
+            k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(
+                layer.layer_id
+            ).view(torch.int8)
+            kv_scale = self._resolve_fp8_kv_scale(fp8_kv_scale, k_buffer.device).to(
+                torch.bfloat16
+            )
+            kv_cached = torch.index_select(
+                k_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
+            ).view(torch.float8_e4m3fn).to(torch.bfloat16)
+            kv_cached = kv_cached * kv_scale
+        else:
+            k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            kv_cached = torch.index_select(
+                k_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
+            )
+        v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        k_rope_cached = torch.index_select(
+            v_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
+        ).flatten(0, 1)
+        return kv_cached, k_rope_cached
+
     def get_verify_buffers_to_fill_after_draft(self):
         """
         Return buffers for verify attention kernels that needs to be filled after draft.
@@ -405,6 +481,9 @@ class AscendAttnBackend(AttentionBackend):
                 "cpu"
             )
             seq_prefix_lens = self.forward_metadata.prefix_lens.tolist()
+            prefix_block_tables = []
+            prefix_seq_starts = []
+            prefix_token_offset = 0
             self.forward_metadata.flatten_prefix_block_tables = torch.empty(
                 0, dtype=torch.int32
             ).to(self.device)
@@ -415,12 +494,34 @@ class AscendAttnBackend(AttentionBackend):
                 req_prefix_block_tables = (
                     req_indices[:seq_len][:: self.page_size] // self.page_size
                 )
+                prefix_block_tables.append(req_prefix_block_tables.to(torch.int32))
+                prefix_seq_starts.append(prefix_token_offset)
+                prefix_token_offset += seq_len
                 self.forward_metadata.flatten_prefix_block_tables = torch.cat(
                     (
                         self.forward_metadata.flatten_prefix_block_tables,
                         torch.flatten(req_prefix_block_tables),
                     )
                 )
+            max_prefix_pages = max(
+                (table.numel() for table in prefix_block_tables), default=0
+            )
+            self.forward_metadata.prefix_block_tables = torch.zeros(
+                (len(prefix_block_tables), max_prefix_pages),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            for i, table in enumerate(prefix_block_tables):
+                if table.numel() > 0:
+                    self.forward_metadata.prefix_block_tables[i, : table.numel()] = (
+                        table.to(device=self.device, dtype=torch.int32)
+                    )
+            self.forward_metadata.prefix_seq_lens_npu = (
+                self.forward_metadata.prefix_lens.to(device=self.device).int()
+            )
+            self.forward_metadata.prefix_seq_starts = torch.tensor(
+                prefix_seq_starts, dtype=torch.int64, device=self.device
+            )
 
         self.graph_mode = False
 
@@ -1060,24 +1161,9 @@ class AscendAttnBackend(AttentionBackend):
         lse_list = [attn_lse.reshape(num_tokens * layer.tp_q_head_num)]
 
         # current chunk q, historial k, v
-        if self.kv_cache_dtype == "fp8_e4m3":
-            k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(torch.int8)
-            kv_scale = self._resolve_fp8_kv_scale(fp8_kv_scale, q.device).to(torch.bfloat16)
-            kv_cached = torch.index_select(
-                k_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
-            ).view(torch.float8_e4m3fn).to(torch.bfloat16)
-            kv_cached = kv_cached * kv_scale
-        else:
-            k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            kv_cached = torch.index_select(
-                k_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
-            )
-        v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(
-            layer.layer_id
+        kv_cached, k_rope_cached = self._load_prefix_kv_cache_david(
+            forward_batch, layer, fp8_kv_scale=fp8_kv_scale
         )
-        k_rope_cached = torch.index_select(
-            v_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
-        ).flatten(0, 1)
 
         assert layer.kv_b_proj is not None
         kv = layer.kv_b_proj(kv_cached)[0].view(

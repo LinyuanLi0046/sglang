@@ -325,77 +325,50 @@ class AscendAttnBackend(AttentionBackend):
             return _get_fp8_kv_scale(device)
         return fp8_kv_scale.reshape(-1).to(device=device, dtype=torch.float32)
 
-    def _load_prefix_kv_cache_david(
+    def _load_prefix_kv_cache_A5(
         self,
         forward_batch: ForwardBatch,
         layer: RadixAttention,
         fp8_kv_scale: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if (
-            not _is_npu_before_atlas_a5
-            and self.forward_metadata.prefix_block_tables is not None
-            and self.forward_metadata.prefix_seq_lens_npu is not None
-            and self.forward_metadata.prefix_seq_starts is not None
-            and hasattr(torch_npu, "npu_gather_pa_kv_cache")
-        ):
-            ckv_cache, k_rope_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-                layer.layer_id
-            )
-            total_prefix_tokens = int(self.forward_metadata.prefix_lens.sum().item())
-            kv_cached = torch.empty(
-                (
-                    total_prefix_tokens,
-                    ckv_cache.shape[-2],
-                    ckv_cache.shape[-1],
-                ),
-                dtype=ckv_cache.dtype,
-                device=ckv_cache.device,
-            )
-            k_rope_cached = torch.empty(
-                (
-                    total_prefix_tokens,
-                    k_rope_cache.shape[-2],
-                    k_rope_cache.shape[-1],
-                ),
-                dtype=k_rope_cache.dtype,
-                device=k_rope_cache.device,
-            )
-            torch_npu.npu_gather_pa_kv_cache(
-                ckv_cache,
-                k_rope_cache,
-                self.forward_metadata.prefix_block_tables,
-                self.forward_metadata.prefix_seq_lens_npu.contiguous(),
-                seq_offset=self.forward_metadata.prefix_seq_starts,
-                key=kv_cached,
-                value=k_rope_cached,
-            )
-            if self.kv_cache_dtype == "fp8_e4m3":
-                kv_scale = self._resolve_fp8_kv_scale(
-                    fp8_kv_scale, kv_cached.device
-                ).to(torch.bfloat16)
-                kv_cached = kv_cached.to(torch.bfloat16) * kv_scale
-            return kv_cached, k_rope_cached
-
+        ckv_cache, k_rope_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+            layer.layer_id
+        )
+        total_prefix_tokens = int(self.forward_metadata.prefix_lens.sum().item())
+        kv_cached = torch.empty(
+            (
+                total_prefix_tokens,
+                ckv_cache.shape[-2],
+                ckv_cache.shape[-1],
+            ),
+            dtype=ckv_cache.dtype,
+            device=ckv_cache.device,
+        )
+        k_rope_cached = torch.empty(
+            (
+                total_prefix_tokens,
+                k_rope_cache.shape[-2],
+                k_rope_cache.shape[-1],
+            ),
+            dtype=k_rope_cache.dtype,
+            device=k_rope_cache.device,
+        )
+        torch_npu.npu_gather_pa_kv_cache(
+            ckv_cache,
+            k_rope_cache,
+            self.forward_metadata.prefix_block_tables,
+            self.forward_metadata.prefix_seq_lens_npu.contiguous(),
+            seq_offset=self.forward_metadata.prefix_seq_starts,
+            key=kv_cached,
+            value=k_rope_cached,
+        )
         if self.kv_cache_dtype == "fp8_e4m3":
-            k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(
-                layer.layer_id
-            ).view(torch.int8)
-            kv_scale = self._resolve_fp8_kv_scale(fp8_kv_scale, k_buffer.device).to(
+            kv_scale = self._resolve_fp8_kv_scale(
+                fp8_kv_scale, kv_cached.device
+            )
+            kv_cached = torch.mul(kv_cached.to(kv_scale.dtype), kv_scale).to(
                 torch.bfloat16
             )
-            kv_cached = torch.index_select(
-                k_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
-            ).view(torch.float8_e4m3fn).to(torch.bfloat16)
-            kv_cached = kv_cached * kv_scale
-        else:
-            k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            kv_cached = torch.index_select(
-                k_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
-            )
-        v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
-        k_rope_cached = torch.index_select(
-            v_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
-        ).flatten(0, 1)
         return kv_cached, k_rope_cached
 
     def get_verify_buffers_to_fill_after_draft(self):
@@ -1101,7 +1074,7 @@ class AscendAttnBackend(AttentionBackend):
     #         )
     #     return output
 
-    def forward_prefill_david(
+    def forward_extend_prefix_A5(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -1110,6 +1083,17 @@ class AscendAttnBackend(AttentionBackend):
         layer: RadixAttention,
         fp8_kv_scale: Optional[torch.Tensor] = None,
     ):
+        # This path handles chunked prefill on A5 ascend NPU (950PR/DT)
+        # By the current aclnnFusedInferAttentionScoreV5 document, MLA prefill
+        # does not support quantized modes
+        # We also do not reuse the older ATB-based path here because ATB operators are
+        # deprecated on A5 and should not be the backend for this prefix-cache flow.
+        # Therefore we keep the historical two-pass structure here:
+        # 1. run attention for the current chunk;
+        # 2. load prefix KV from paged cache and manually dequantize FP8 KV with the
+        #    runtime kv scale before kv_b_proj.
+        # The manual dequantization is required because the prefix KV must be materialized
+        # as dense BF16 tensors for kv_b_proj and the follow-up V1 attention path.
         num_token_padding = q.shape[0]
         # current chunk q, k, v
         q, k, v = [
@@ -1161,7 +1145,7 @@ class AscendAttnBackend(AttentionBackend):
         lse_list = [attn_lse.reshape(num_tokens * layer.tp_q_head_num)]
 
         # current chunk q, historial k, v
-        kv_cached, k_rope_cached = self._load_prefix_kv_cache_david(
+        kv_cached, k_rope_cached = self._load_prefix_kv_cache_A5(
             forward_batch, layer, fp8_kv_scale=fp8_kv_scale
         )
 
@@ -1480,7 +1464,7 @@ class AscendAttnBackend(AttentionBackend):
                 )
             else:
                 if not _is_npu_before_atlas_a5:
-                   attn_output = self.forward_prefill_david(
+                   attn_output = self.forward_extend_prefix_A5(
                        q, k, v, forward_batch, layer, fp8_kv_scale=fp8_kv_scale
                    )
                    return attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)

@@ -454,6 +454,62 @@ class LongcatFlashMoE(nn.Module):
         )
         return self.experts.forward_npu(dispatch_output)
 
+    def _log_zero_expert_debug(
+        self,
+        stage: str,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        zero_expert_mask_before: torch.Tensor,
+        all_zero_tokens_before: torch.Tensor,
+        hidden_states: torch.Tensor,
+        zero_expert_result: Optional[torch.Tensor],
+        use_ops_prefill: bool,
+        use_ops_decode: bool,
+    ) -> None:
+        if topk_ids.numel() == 0:
+            return
+
+        zero_expert_slots_before = int(zero_expert_mask_before.sum().item())
+        all_zero_tokens = int(all_zero_tokens_before.sum().item())
+        invalid_slots_after = int((topk_ids == -1).sum().item())
+        remaining_zero_expert_slots = int((topk_ids >= self.num_experts).sum().item())
+        dummy_zero_weight_slots = int(
+            ((topk_ids == 0) & (topk_weights == 0)).sum().item()
+        )
+        invalid_weight_abs_max = 0.0
+        invalid_mask = topk_ids == -1
+        if invalid_mask.any():
+            invalid_weight_abs_max = float(topk_weights[invalid_mask].abs().max().item())
+
+        zero_result_abs_max = None
+        if zero_expert_result is not None and zero_expert_result.numel() > 0:
+            zero_result_abs_max = float(zero_expert_result.abs().max().item())
+
+        logger.error(
+            "LongCat zero expert debug [%s]: layer=%s deepep=%s "
+            "use_ops_prefill=%s use_ops_decode=%s tp_size=%s hidden_shape=%s "
+            "topk_shape=%s zero_slots_before=%s all_zero_tokens_before=%s "
+            "invalid_slots_after=%s remaining_zero_slots_after=%s "
+            "dummy_expert0_zero_weight_slots=%s invalid_weight_abs_max=%s "
+            "zero_result_abs_max=%s routed_scaling_factor=%s",
+            stage,
+            self.layer_id,
+            get_moe_a2a_backend().is_deepep(),
+            use_ops_prefill,
+            use_ops_decode,
+            self.tp_size,
+            tuple(hidden_states.shape),
+            tuple(topk_ids.shape),
+            zero_expert_slots_before,
+            all_zero_tokens,
+            invalid_slots_after,
+            remaining_zero_expert_slots,
+            dummy_zero_weight_slots,
+            invalid_weight_abs_max,
+            zero_result_abs_max,
+            self.routed_scaling_factor,
+        )
+
     def _forward_prefill_double_routing(
         self,
         hidden_states: torch.Tensor,
@@ -609,6 +665,8 @@ class LongcatFlashMoE(nn.Module):
             and not use_ops_decode
             and hidden_states.shape[0] > 0
         ):
+            zero_expert_mask_before = topk_idx >= self.num_experts
+            all_zero_tokens_before = zero_expert_mask_before.all(dim=1)
             if not _is_npu:
                 zero_expert_result = zero_experts_compute_triton(
                     expert_indices=topk_idx,
@@ -628,6 +686,17 @@ class LongcatFlashMoE(nn.Module):
                         -1 if get_moe_a2a_backend().is_deepep() else 0
                     ),
                 )
+            self._log_zero_expert_debug(
+                stage="after_zero_expert_compute",
+                topk_ids=topk_idx,
+                topk_weights=topk_weights,
+                zero_expert_mask_before=zero_expert_mask_before,
+                all_zero_tokens_before=all_zero_tokens_before,
+                hidden_states=hidden_states,
+                zero_expert_result=zero_expert_result,
+                use_ops_prefill=use_ops_prefill,
+                use_ops_decode=use_ops_decode,
+            )
 
         if use_ops_prefill:
             final_hidden_states = self._forward_prefill_double_routing(
@@ -651,9 +720,35 @@ class LongcatFlashMoE(nn.Module):
             and zero_expert_result is not None
         ):
             zero_expert_result *= self.tp_size
+            logger.error(
+                "LongCat zero expert debug [after_deepep_tp_scale]: layer=%s "
+                "tp_size=%s zero_result_abs_max=%s",
+                self.layer_id,
+                self.tp_size,
+                (
+                    float(zero_expert_result.abs().max().item())
+                    if zero_expert_result.numel() > 0
+                    else None
+                ),
+            )
 
         if zero_expert_result is not None and not use_ops_decode and hidden_states.shape[0] > 0:
             final_hidden_states += zero_expert_result.to(final_hidden_states.device)
+            logger.error(
+                "LongCat zero expert debug [after_zero_expert_add]: layer=%s "
+                "final_hidden_abs_max=%s zero_result_abs_max=%s",
+                self.layer_id,
+                (
+                    float(final_hidden_states.abs().max().item())
+                    if final_hidden_states.numel() > 0
+                    else None
+                ),
+                (
+                    float(zero_expert_result.abs().max().item())
+                    if zero_expert_result.numel() > 0
+                    else None
+                ),
+            )
 
         if self.tp_size > 1 and not _use_longcat_sparse_a2a_runtime():
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)

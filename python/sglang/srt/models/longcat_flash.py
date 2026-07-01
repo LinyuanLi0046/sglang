@@ -650,8 +650,7 @@ class LongcatFlashMoE(nn.Module):
             and get_moe_a2a_backend().is_deepep()
             and zero_expert_result is not None
         ):
-            # zero_expert_result *= self.tp_size
-            zero_expert_result = tensor_model_parallel_all_reduce(zero_expert_result)
+            zero_expert_result *= self.tp_size
 
         if zero_expert_result is not None and not use_ops_decode and hidden_states.shape[0] > 0:
             final_hidden_states += zero_expert_result.to(final_hidden_states.device)

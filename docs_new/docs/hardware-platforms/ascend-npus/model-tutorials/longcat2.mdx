@@ -1,0 +1,213 @@
+---
+title: "LongCat 2.0"
+metatags:
+  description: "Deploy the LongCat 2.0 INT8 model with SGLang on Ascend NPUs using a four-node Atlas 800I A3 cluster."
+---
+
+## Introduction
+
+LongCat 2.0 is a large-scale language model released by Meituan. This document describes how to deploy the INT8 version of
+LongCat 2.0 with SGLang on Ascend NPUs.
+
+The deployment described here targets the **LongCat 2.0 1.6T INT8** model and uses a **four-node Atlas 800I A3 (64 GB x 16)**
+cluster. Each node runs the same launch script after updating the node-specific variables such as IP addresses, network
+interface names, ports, and model paths.
+
+## Prerequisites
+
+### Environment
+
+Before following this tutorial, complete the environment setup in the documents below:
+
+- [Ascend NPU Quickstart](/docs/hardware-platforms/ascend-npus/ascend_npu_quick_start) — the fastest way to get started.
+- [SGLang Installation with NPU Support](/docs/hardware-platforms/ascend-npus/ascend_npu) — the full installation guide.
+
+### Model weights
+
+<Warning>
+If you need to download model weights, check the model size before downloading to reserve enough space.
+</Warning>
+
+- Download link: [LongCat-2.0-INT8](https://modelscope.cn/models/meituan-longcat/LongCat-2.0-INT8/files)
+
+If you download the **compressed-tensor INT8** package, you must convert it to the **ModelSlim** quantization format before
+deploying it with SGLang on Ascend NPUs.
+
+<Note>
+- Replace the original `config.json` in the model directory with a ModelSlim-compatible version.
+- Add `quant_model_description.json` to the model directory.
+- This tutorial assumes the final model directory is already prepared in the ModelSlim-compatible format required by
+  `--quantization modelslim`.
+</Note>
+
+## Installation
+
+<Warning>
+Ensure sufficient disk space before pulling images. The Docker image requires at least **30 GB** of free space.
+</Warning>
+
+The required Ascend NPU runtime dependencies are already included in the Docker image below.
+
+```bash Command
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.0.0-a3-meituan-20260630
+
+docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
+--privileged=true --net=host \
+-v /mnt:/mnt \
+-v /home:/home \
+-v /data:/data \
+-v /var/queue_schedule:/var/queue_schedule \
+-v /etc/ascend_install.info:/etc/ascend_install.info \
+-v /usr/local/sbin:/usr/local/sbin \
+-v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+-v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+--device=/dev/davinci0:/dev/davinci0  \
+--device=/dev/davinci1:/dev/davinci1  \
+--device=/dev/davinci2:/dev/davinci2  \
+--device=/dev/davinci3:/dev/davinci3  \
+--device=/dev/davinci4:/dev/davinci4  \
+--device=/dev/davinci5:/dev/davinci5  \
+--device=/dev/davinci6:/dev/davinci6  \
+--device=/dev/davinci7:/dev/davinci7  \
+--device=/dev/davinci8:/dev/davinci8  \
+--device=/dev/davinci9:/dev/davinci9  \
+--device=/dev/davinci10:/dev/davinci10  \
+--device=/dev/davinci11:/dev/davinci11  \
+--device=/dev/davinci12:/dev/davinci12  \
+--device=/dev/davinci13:/dev/davinci13  \
+--device=/dev/davinci14:/dev/davinci14  \
+--device=/dev/davinci15:/dev/davinci15  \
+--device=/dev/davinci_manager:/dev/davinci_manager \
+--device=/dev/hisi_hdc:/dev/hisi_hdc \
+--entrypoint=bash \
+swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.0.0-a3-meituan-20260630
+```
+
+<Tip>
+- Replace `${NAME}` with your own container name or remove `--name` to use the default name.
+- Mount the model directory into the container if your model weights are stored outside the container filesystem.
+</Tip>
+
+## Online service deployment
+
+Deploying the **LongCat 2.0 1.6T INT8** model requires at least **four Atlas 800I A3 nodes**. After entering the container,
+run the same script on all four machines after updating the network interface, node IPs, port, Python path, and model path.
+
+```shell
+# ============================================================
+# Before running, update the following variables:
+#   PYTHONPATH: Python search path for your environment
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+#   NODE0_IP / NODE1_IP / NODE2_IP / NODE3_IP: cluster node IPs
+#   MODEL_PATH: path to the prepared ModelSlim model directory
+#   SERVER_PORT: service port
+# ============================================================
+
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+# bind cpu
+export SGLANG_SET_CPU_AFFINITY=1
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+# cann
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export STREAMS_PER_DEVICE=32
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_NPU_USE_MULTI_STREAM=1
+export HCCL_BUFFSIZE=512
+export HCCL_OP_EXPANSION_MODE=AIV
+
+export PYTHONPATH=xxx
+
+export HCCL_SOCKET_IFNAME=enp196s0f0
+export GLOO_SOCKET_IFNAME=enp196s0f0
+
+export SGLANG_NPU_USE_MLAPO=0
+export TRANSFORMERS_VERBOSITY=error
+
+export NODE0_IP=<node-0-ip>
+export NODE1_IP=<node-1-ip>
+export NODE2_IP=<node-2-ip>
+export NODE3_IP=<node-3-ip>
+
+P_IP=(
+  "${NODE0_IP}"
+  "${NODE1_IP}"
+  "${NODE2_IP}"
+  "${NODE3_IP}"
+)
+
+MASTER_PORT=5000
+P_MASTER="${P_IP[0]}:${MASTER_PORT}"
+
+NNODES=${#P_IP[@]}
+TP_SIZE=64
+
+MODEL_PATH=xxx
+SERVER_HOST=0.0.0.0
+SERVER_PORT=6677
+SERVED_MODEL_NAME=longcat-flash-pro
+
+LOCAL_IPS="$(hostname -I)"
+NODE_RANK=""
+
+echo "Local IPs: ${LOCAL_IPS}"
+echo "Cluster IPs: ${P_IP[*]}"
+echo "Master: ${P_MASTER}"
+
+for i in "${!P_IP[@]}"; do
+  if [[ " ${LOCAL_IPS} " == *" ${P_IP[$i]} "* ]]; then
+    NODE_RANK="${i}"
+    break
+  fi
+done
+
+if [[ -z "${NODE_RANK}" ]]; then
+  echo "ERROR: local IPs [${LOCAL_IPS}] not found in P_IP=[${P_IP[*]}]"
+  exit 1
+fi
+
+python3 -m sglang.launch_server \
+  --model-path "${MODEL_PATH}" \
+  --served-model-name "${SERVED_MODEL_NAME}" \
+  --host "${SERVER_HOST}" \
+  --port "${SERVER_PORT}" \
+  --trust-remote-code \
+  --nnodes "${NNODES}" \
+  --node-rank "${NODE_RANK}" \
+  --dist-init-addr "${P_MASTER}" \
+  --tp-size "${TP_SIZE}" \
+  --mem-fraction-static 0.8 \
+  --attention-backend ascend \
+  --device npu \
+  --max-running-requests 32 \
+  --context-length 34816 \
+  --disable-radix-cache \
+  --chunked-prefill-size 8192 \
+  --watchdog-timeout 9000 \
+  --quantization modelslim
+```
+
+## Functional verification
+
+Once the server prints `The server is fired up and ready to roll!` in the logs, it is ready to accept requests.
+
+For more testing examples, including Health Check, Generate, and Chat Completions, see
+[Testing the Service](/docs/hardware-platforms/ascend-npus/ascend_npu#testing-the-service).
+
+## Support PR
+
+LongCat 2.0 support depends on the following pull requests:
+
+- SGLang PR: [#29741](https://github.com/sgl-project/sglang/pull/29741)
+- sgl-kernel-npu PR: [#579](https://github.com/sgl-project/sgl-kernel-npu/pull/579)

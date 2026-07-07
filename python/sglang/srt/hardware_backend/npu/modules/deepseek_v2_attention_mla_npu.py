@@ -461,6 +461,12 @@ def forward_dsa_core_npu(
     zero_allocator: "BumpAllocator",
     positions: torch.Tensor,
 ) -> torch.Tensor:
+    if forward_batch.forward_mode.is_mixed():
+        assert topk_indices.shape[0] == q_nope_out.shape[0], (
+            "DSA mixed-chunk requires topk_indices to align with the mixed query "
+            "token layout."
+        )
+
     attn_output = m.attn_mqa(
         q_nope_out.contiguous(),
         k_nope.contiguous(),

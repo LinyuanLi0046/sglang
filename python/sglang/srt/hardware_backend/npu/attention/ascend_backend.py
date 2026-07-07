@@ -2783,11 +2783,19 @@ class AscendAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ):
-        if (
-            topk_indices is not None
-            or self.use_mla
-            or (not self.use_fia and layer.qk_head_dim > 128)
-        ):
+        if topk_indices is not None:
+            return self.forward_sparse(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+                q_rope=q_rope,
+                k_rope=k_rope,
+                topk_indices=topk_indices,
+            )
+        if self.use_mla or (not self.use_fia and layer.qk_head_dim > 128):
             raise NotImplementedError(
                 "The 'enable-mixed-chunk' feature is currently unsupported in the following scenarios: "
                 "1. When using the MLA backend on Ascend NPU devices, "

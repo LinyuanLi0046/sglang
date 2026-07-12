@@ -2076,6 +2076,163 @@ def set_gpu_proc_affinity(
     logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
 
 
+_CPU_ID_LIST_RE = re.compile(r"^\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$")
+
+
+def _parse_cpu_id_list(cpu_id_list: str) -> List[int]:
+    cpus = set()
+    for part in cpu_id_list.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_str, end_str = part.split("-", 1)
+            start, end = int(start_str), int(end_str)
+            if end < start:
+                raise ValueError(f"Invalid CPU range: {part}")
+            cpus.update(range(start, end + 1))
+        else:
+            cpus.add(int(part))
+    return sorted(cpus)
+
+
+def format_cpu_id_list(cpu_ids: Sequence[int]) -> str:
+    cpus = sorted(set(cpu_ids))
+    if not cpus:
+        return ""
+
+    ranges = []
+    start = prev = cpus[0]
+    for cpu in cpus[1:]:
+        if cpu == prev + 1:
+            prev = cpu
+            continue
+        ranges.append(f"{start}" if start == prev else f"{start}-{prev}")
+        start = prev = cpu
+    ranges.append(f"{start}" if start == prev else f"{start}-{prev}")
+    return ",".join(ranges)
+
+
+def _parse_npu_topo_cpu_affinity(topo_output: str) -> Dict[int, Tuple[int, ...]]:
+    npu_cpu_affinity = {}
+    for raw_line in topo_output.splitlines():
+        line = raw_line.strip().strip("|")
+        if not line.startswith("NPU"):
+            continue
+
+        tokens = re.split(r"\s+", line.replace("|", " ").strip())
+        if not tokens:
+            continue
+
+        npu_match = re.fullmatch(r"NPU(\d+)", tokens[0])
+        if npu_match is None:
+            continue
+
+        for token in reversed(tokens[1:]):
+            if not _CPU_ID_LIST_RE.fullmatch(token):
+                continue
+            try:
+                npu_cpu_affinity[int(npu_match.group(1))] = tuple(
+                    _parse_cpu_id_list(token)
+                )
+            except ValueError as e:
+                logger.warning("Invalid NPU CPU affinity %s: %s", token, e)
+            break
+
+    return npu_cpu_affinity
+
+
+@lru_cache(maxsize=1)
+def get_npu_topo_cpu_affinity_map() -> Dict[int, Tuple[int, ...]]:
+    try:
+        result = subprocess.run(
+            ["npu-smi", "info", "-t", "topo"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError) as e:
+        logger.debug("Failed to query npu-smi topology: %s", e)
+        return {}
+
+    return _parse_npu_topo_cpu_affinity(result.stdout)
+
+
+def _get_lscpu_field(row: Dict[str, Any], field: str) -> Any:
+    lower_value = row.get(field.lower())
+    return lower_value if lower_value is not None else row.get(field.upper())
+
+
+def _to_optional_int(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+@lru_cache(maxsize=1)
+def _get_lscpu_cpu_core_node_entries() -> Tuple[Tuple[int, int, Optional[int]], ...]:
+    try:
+        result = subprocess.run(
+            ["lscpu", "-e=CPU,CORE,NODE", "-J"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        json_out = json.loads(result.stdout)
+    except (FileNotFoundError, subprocess.SubprocessError, JSONDecodeError) as e:
+        logger.warning("Parse lscpu info failed: %s", e)
+        return ()
+
+    entries = []
+    for row in json_out.get("cpus", []):
+        cpu = _to_optional_int(_get_lscpu_field(row, "cpu"))
+        core = _to_optional_int(_get_lscpu_field(row, "core"))
+        node = _to_optional_int(_get_lscpu_field(row, "node"))
+        if cpu is None or core is None:
+            continue
+        entries.append((cpu, core, node))
+    return tuple(entries)
+
+
+def _get_core_cpu_groups(
+    cpu_ids: Optional[Sequence[int]] = None,
+    numa_node: Optional[int] = None,
+) -> List[List[int]]:
+    allowed_cpu_ids = set(cpu_ids) if cpu_ids is not None else None
+    core_to_cpus = {}
+    for cpu, core, node in _get_lscpu_cpu_core_node_entries():
+        if allowed_cpu_ids is not None and cpu not in allowed_cpu_ids:
+            continue
+        if numa_node is not None and node != numa_node:
+            continue
+        key = (node if node is not None else -1, core)
+        core_to_cpus.setdefault(key, []).append(cpu)
+
+    if not core_to_cpus and allowed_cpu_ids is not None:
+        # If lscpu is unavailable, still honor the NPU-reported CPU list.
+        return [[cpu] for cpu in sorted(allowed_cpu_ids)]
+
+    return [
+        sorted(cpus)
+        for cpus in sorted(core_to_cpus.values(), key=lambda cpus: min(cpus))
+    ]
+
+
+def get_numa_node_from_cpu_ids(cpu_ids: Sequence[int]) -> Optional[int]:
+    allowed_cpu_ids = set(cpu_ids)
+    node_counts = defaultdict(int)
+    for cpu, _core, node in _get_lscpu_cpu_core_node_entries():
+        if node is not None and cpu in allowed_cpu_ids:
+            node_counts[node] += 1
+
+    if not node_counts:
+        return None
+    return max(sorted(node_counts), key=lambda node: node_counts[node])
+
+
 def set_npu_david_proc_affinity(
     pp_size: int,
     tp_size: int,
@@ -2097,34 +2254,6 @@ def set_npu_david_proc_affinity(
             )
             return default
 
-    def _get_target_node_core_cpu_map(target_node):
-        target_node_cores = {}
-        result = subprocess.run(
-            ['lscpu', '-e=CPU,CORE,NODE', '-J'], 
-            capture_output=True, text=True, check=True
-        )
-        json_out = json.loads(result.stdout)
-        cpu_info = json_out.get('cpus')
-        if not cpu_info:
-            logger.warning("Parse lscpu info failed!")
-            return target_node_cores
-
-        # TODO LKL: assert key exsits
-        for c in cpu_info:
-            node_val = c.get('node') if c.get('node') is not None else c.get('NODE')
-            core_val = c.get('core') if c.get('core') is not None else c.get('CORE')
-            cpu_val = c.get('cpu') if c.get('cpu') is not None else c.get('CPU')
-            
-            node = int(node_val)
-            if node == target_node:
-                core = int(core_val)
-                lcpu = int(cpu_val)
-                if core not in target_node_cores:
-                    target_node_cores[core] = []
-                target_node_cores[core].append(lcpu)
-
-        return target_node_cores
-    
     def _bind_numa(target_node):
         import ctypes.util
         libnuma_path = ctypes.util.find_library("numa")
@@ -2152,50 +2281,74 @@ def set_npu_david_proc_affinity(
     bind_all_threads = get_bool_env_var("SGLANG_NPU_AFFINITY_ALL_THREADS")
     disable_smt = get_bool_env_var("SGLANG_NPU_AFFINITY_DISABLE_SMT")
     max_pcores = _get_env_int("SGLANG_NPU_AFFINITY_PCORES_PER_PROC", 0)
-    
+
     # TODO LKL: remove hard code after 910D released
     NPU_TO_NUMA = {
         0: 0, 1: 0, 2: 0, 3: 0,
         4: 2, 5: 2, 6: 2, 7: 2
     }
 
-    target_node = NPU_TO_NUMA[npu_id]
-    target_node_cores = _get_target_node_core_cpu_map(target_node)
+    target_node = None
+    source_msg = "npu-smi topo CPU Affinity"
+    npu_cpu_affinity = get_npu_topo_cpu_affinity_map()
+    target_cpu_ids = npu_cpu_affinity.get(npu_id)
 
-    if not target_node_cores:
+    if target_cpu_ids:
+        core_cpu_groups = _get_core_cpu_groups(cpu_ids=target_cpu_ids)
+        npus_of_this_group = sorted(
+            npu
+            for npu, cpu_ids in npu_cpu_affinity.items()
+            if cpu_ids == target_cpu_ids
+        )
+        target_node = get_numa_node_from_cpu_ids(target_cpu_ids)
+    else:
+        target_node = NPU_TO_NUMA.get(npu_id)
+        if target_node is None:
+            logger.warning("No CPU affinity mapping found for NPU %s", npu_id)
+            return
+        source_msg = "fallback NUMA mapping"
+        core_cpu_groups = _get_core_cpu_groups(numa_node=target_node)
+        npus_of_this_group = sorted(
+            npu for npu, node in NPU_TO_NUMA.items() if node == target_node
+        )
+
+    if not core_cpu_groups:
+        logger.warning("No CPU cores found for NPU %s affinity source", npu_id)
         return
 
-    sorted_physical_cores = sorted(target_node_cores.keys())
-    npus_of_this_node = sorted([g for g, n in NPU_TO_NUMA.items() if n == target_node])
-    rank_in_node = npus_of_this_node.index(npu_id)
-    total_npus_in_node = len(npus_of_this_node)
+    rank_in_group = npus_of_this_group.index(npu_id)
+    total_npus_in_group = len(npus_of_this_group)
 
     nnodes_per_tp_group = max(nnodes // pp_size, 1)
-    tp_size_per_node = tp_size // nnodes_per_tp_group
+    tp_size_per_node = max(tp_size // nnodes_per_tp_group, 1)
 
-    total_node_cores = len(sorted_physical_cores)
-    cores_per_npu = total_node_cores // min(total_npus_in_node, tp_size_per_node)
+    total_group_cores = len(core_cpu_groups)
+    cores_per_npu = total_group_cores // min(total_npus_in_group, tp_size_per_node)
     if max_pcores > 0:
         cores_per_npu = min(cores_per_npu, max_pcores)
     cores_per_npu = max(1, cores_per_npu)
-    start_idx = (rank_in_node * cores_per_npu) % total_node_cores
-    
+    start_idx = (rank_in_group * cores_per_npu) % total_group_cores
+
     if max_pcores > 0:
-        end_idx = min(start_idx + cores_per_npu, total_node_cores)
-    elif rank_in_node == total_npus_in_node - 1:
-        end_idx = total_node_cores
+        end_idx = min(start_idx + cores_per_npu, total_group_cores)
+    elif rank_in_group == total_npus_in_group - 1:
+        end_idx = total_group_cores
     else:
         end_idx = start_idx + cores_per_npu
 
     bind_cpus = []
-    for core_id in sorted_physical_cores[start_idx:end_idx]:
-        sibling_cpus = sorted(target_node_cores[core_id])
+    selected_core_groups = core_cpu_groups[start_idx:end_idx]
+    for sibling_cpus in selected_core_groups:
         if disable_smt:
             bind_cpus.append(sibling_cpus[0])
         else:
             bind_cpus.extend(sibling_cpus)
 
     bind_cpus = sorted(bind_cpus)
+    if not bind_cpus:
+        logger.warning("No CPUs selected for NPU %s affinity binding", npu_id)
+        return
+
     p.cpu_affinity(bind_cpus)
 
     if bind_all_threads and hasattr(os, "sched_setaffinity"):
@@ -2212,10 +2365,14 @@ def set_npu_david_proc_affinity(
     #     except Exception as e:
     #         mem_msg = f"NUMA binding failed: {e}"
 
+    node_msg = (
+        f"NUMA Node {target_node}" if target_node is not None else "NUMA Node unknown"
+    )
     logging.info(
-        f"PID {pid} | NPU {npu_id} -> Bound to NUMA Node {target_node} | "
-        f"Allocated {len(bind_cpus)} logical cores (Physical cores {sorted_physical_cores[start_idx]}~{sorted_physical_cores[end_idx-1]}) | "
-        f"Core list: {bind_cpus[0]}...{bind_cpus[-1]} | "
+        f"PID {pid} | NPU {npu_id} -> Bound by {source_msg} ({node_msg}) | "
+        f"Allocated {len(bind_cpus)} logical cores from "
+        f"{len(selected_core_groups)} physical cores | "
+        f"CPU list: {format_cpu_id_list(bind_cpus)} | "
         f"all_threads={bind_all_threads} | disable_smt={disable_smt} | {mem_msg}"
     )
 

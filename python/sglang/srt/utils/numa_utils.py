@@ -16,7 +16,11 @@ import psutil
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_cuda
-from sglang.srt.utils.common import is_npu_before_atlas_a5
+from sglang.srt.utils.common import (
+    get_npu_topo_cpu_affinity_map,
+    get_numa_node_from_cpu_ids,
+    is_npu_before_atlas_a5,
+)
 
 _is_cuda = is_cuda()
 
@@ -44,11 +48,7 @@ def configure_subprocess(server_args: ServerArgs, gpu_id: int):
         and server_args.device == "npu"
         and not is_npu_before_atlas_a5()
     ):
-        if server_args.numa_node is not None:
-            numa_node = server_args.numa_node[gpu_id]
-        else:
-            # Keep the current David platform mapping unchanged for now.
-            numa_node = 0 if gpu_id < 4 else 2
+        numa_node = _get_npu_memory_preferred_numa_node(server_args, gpu_id)
         executable, debug_str = _create_numactl_executable(
             numactl_args=f"--preferred={numa_node}"
         )
@@ -56,6 +56,20 @@ def configure_subprocess(server_args: ServerArgs, gpu_id: int):
             yield
             return
     yield
+
+
+def _get_npu_memory_preferred_numa_node(server_args: ServerArgs, gpu_id: int) -> int:
+    if server_args.numa_node is not None:
+        return server_args.numa_node[gpu_id]
+
+    cpu_affinity = get_npu_topo_cpu_affinity_map().get(gpu_id)
+    if cpu_affinity:
+        numa_node = get_numa_node_from_cpu_ids(cpu_affinity)
+        if numa_node is not None:
+            return numa_node
+
+    # Keep the current David platform mapping as a fallback.
+    return 0 if gpu_id < 4 else 2
 
 
 def _create_numactl_executable(numactl_args: str):

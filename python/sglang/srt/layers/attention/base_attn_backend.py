@@ -90,7 +90,18 @@ class AttentionBackend(ABC):
     ):
         """Run forward on an attention layer."""
         if forward_batch.forward_mode.is_idle():
-            return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+            # An FP8 query is an input quantization format; attention outputs
+            # consumed by the following projection remain BF16.
+            output_dtype = (
+                torch.bfloat16
+                if q.dtype == torch.float8_e4m3fn and is_npu()
+                else q.dtype
+            )
+            return torch.empty(
+                (q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
+                dtype=output_dtype,
+                device=q.device,
+            )
         elif forward_batch.forward_mode.is_decode():
             return self.forward_decode(
                 q,

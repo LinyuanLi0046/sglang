@@ -2,14 +2,8 @@ import ctypes
 import unittest
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.utils.common import (
-    _parse_npu_topo_cpu_affinity,
-    format_cpu_id_list,
-    get_numa_node_from_cpu_ids,
-)
 from sglang.srt.utils.numa_utils import (
     _is_numa_available,
-    _get_npu_memory_preferred_numa_node,
     _query_numa_node_for_gpu,
     get_numa_node_if_available,
 )
@@ -18,55 +12,6 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
 register_cuda_ci(est_time=10, suite="stage-c-test-4-gpu-gb200")
 register_cuda_ci(est_time=10, suite="stage-c-test-8-gpu-b200")
-
-
-class TestNpuTopoCpuAffinity(unittest.TestCase):
-    def test_parse_npu_smi_topo_cpu_affinity(self):
-        topo_output = """
-           NPU0       NPU1       NPU2       NPU3       CPU Affinity
-NPU0       X          UB         UB         UB         144-191
-NPU1       UB         X          UB         UB         144-191
-NPU4       UB         UB         UB         UB         48-95
-"""
-
-        result = _parse_npu_topo_cpu_affinity(topo_output)
-
-        self.assertEqual(result[0], tuple(range(144, 192)))
-        self.assertEqual(result[1], tuple(range(144, 192)))
-        self.assertEqual(result[4], tuple(range(48, 96)))
-
-    def test_format_cpu_id_list(self):
-        self.assertEqual(format_cpu_id_list([8, 1, 2, 3, 7, 5]), "1-3,5,7-8")
-
-    @patch(
-        "sglang.srt.utils.common._get_lscpu_cpu_core_node_entries",
-        return_value=((48, 0, 1), (49, 1, 1), (144, 0, 3), (145, 1, 3)),
-    )
-    def test_get_numa_node_from_cpu_ids(self, _mock_lscpu):
-        self.assertEqual(get_numa_node_from_cpu_ids([144, 145]), 3)
-        self.assertEqual(get_numa_node_from_cpu_ids([48, 49]), 1)
-
-
-class TestNpuMemoryPreferredBind(unittest.TestCase):
-    def _make_server_args(self, numa_node=None):
-        args = MagicMock()
-        args.numa_node = numa_node
-        return args
-
-    def test_explicit_numa_node_takes_precedence(self):
-        args = self._make_server_args(numa_node=[3, 3, 3, 3, 1, 1, 1, 1])
-        self.assertEqual(_get_npu_memory_preferred_numa_node(args, 4), 1)
-
-    @patch("sglang.srt.utils.numa_utils.get_numa_node_from_cpu_ids", return_value=3)
-    @patch(
-        "sglang.srt.utils.numa_utils.get_npu_topo_cpu_affinity_map",
-        return_value={0: tuple(range(144, 192))},
-    )
-    def test_infers_numa_node_from_npu_topo_cpu_affinity(
-        self, _mock_topo, _mock_node
-    ):
-        args = self._make_server_args()
-        self.assertEqual(_get_npu_memory_preferred_numa_node(args, 0), 3)
 
 
 class TestIsNumaAvailable(unittest.TestCase):

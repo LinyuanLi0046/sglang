@@ -70,6 +70,7 @@ from sglang.srt.model_loader.utils import should_deepgemm_weight_requant_ue8m0
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.longcat_flash import LongcatFlashForCausalLM, LongcatFlashMLP
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     BumpAllocator,
     add_prefix,
@@ -137,6 +138,14 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
             if _is_modelslim_quant_config(quant_config)
             else "mlps"
         )
+        attention_oproj_tp_size = get_global_server_args().attention_oproj_tp_size
+        if attention_oproj_tp_size is not None:
+            assert (
+                config.num_attention_heads * config.v_head_dim
+            ) % attention_oproj_tp_size == 0, (
+                "LongCat attention output width must be divisible by "
+                f"attention_oproj_tp_size={attention_oproj_tp_size}."
+            )
 
         self.self_attn = DeepseekV2AttentionMLA(
             config=config,
@@ -157,6 +166,7 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
             quant_config=quant_config,
             layer_id=layer_id,
             reduce_results=False,
+            o_proj_tp_size=attention_oproj_tp_size,
             prefix=add_prefix(f"self_attn", prefix),
             alt_stream=self.alt_stream,
         )

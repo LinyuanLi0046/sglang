@@ -6,6 +6,7 @@ import torch
 import torch_npu
 from sgl_kernel_npu.norm.fused_split_qk_norm import fused_split_qk_norm
 
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     NPUFusedMLAPreprocess,
@@ -25,6 +26,47 @@ if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
     from sglang.srt.utils import BumpAllocator
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
+
+
+def forward_attention_oproj_npu(
+    m: "DeepseekV2AttentionMLA",
+    attn_output: torch.Tensor,
+    forward_batch: "ForwardBatch",
+) -> torch.Tensor:
+    if m.o_proj_tp_size == m.attn_tp_size:
+        return m.o_proj(attn_output)[0]
+
+    assert m.attn_tp_size == 1
+    assert forward_batch.dp_padding_mode is not None
+    assert forward_batch.dp_padding_mode.is_max_len(), (
+        "Independent attention OProj TP requires equal token counts across "
+        "the DP ranks."
+    )
+
+    tp_group = get_tp_group()
+    oproj_tp_size = m.o_proj_tp_size
+    assert tp_group.world_size == oproj_tp_size
+
+    num_tokens = attn_output.shape[0]
+    partition_width = m.o_proj.input_size_per_partition
+    assert attn_output.shape[-1] == partition_width * oproj_tp_size
+
+    # Send head shard i to OProj TP rank i. Equal DP padding makes every
+    # all-to-all split contain exactly num_tokens rows.
+    all_to_all_input = (
+        attn_output.reshape(num_tokens, oproj_tp_size, partition_width)
+        .transpose(0, 1)
+        .contiguous()
+        .reshape(num_tokens * oproj_tp_size, partition_width)
+    )
+    all_to_all_output = torch.empty_like(all_to_all_input)
+    tp_group.all_to_all_single(all_to_all_output, all_to_all_input)
+
+    partial_output = m.o_proj(all_to_all_output)[0]
+    partial_output = partial_output.contiguous()
+    output = partial_output.new_empty((num_tokens, partial_output.shape[-1]))
+    tp_group.reduce_scatter_tensor(output, partial_output)
+    return output
 
 
 # region MHA
@@ -168,8 +210,7 @@ def forward_mha_core_npu(
         fp8_kv_scale=fp8_kv_scale,
     )
     attn_output = attn_output.reshape(-1, m.num_local_heads * m.v_head_dim)
-    output, _ = m.o_proj(attn_output)
-    return output
+    return forward_attention_oproj_npu(m, attn_output, forward_batch)
 
 
 # endregion
@@ -416,9 +457,7 @@ def forward_mla_core_npu(
     # )
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
-    output, _ = m.o_proj(attn_bmm_output)
-
-    return output
+    return forward_attention_oproj_npu(m, attn_bmm_output, forward_batch)
 
 
 # endregion

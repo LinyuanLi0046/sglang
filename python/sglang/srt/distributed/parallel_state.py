@@ -732,6 +732,16 @@ class GroupCoordinator:
         else:
             reg_reduce_scatter_tensor(output, input, group_name=self.unique_name)
 
+    def all_to_all_single(
+        self, output: torch.Tensor, input: torch.Tensor
+    ) -> torch.Tensor:
+        torch.distributed.all_to_all_single(
+            output,
+            input,
+            group=self.device_group,
+        )
+        return output
+
     def reduce_scatter(
         self,
         output: torch.Tensor,

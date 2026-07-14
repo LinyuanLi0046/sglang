@@ -45,6 +45,7 @@ _ATTN_DP_SIZE: Optional[int] = None
 _LOCAL_ATTN_DP_SIZE: Optional[int] = None
 _LOCAL_ATTN_DP_RANK: Optional[int] = None
 _ENABLE_DP_ATTENTION_FLAG: bool = False
+_FORCE_DP_MAX_PADDING: bool = False
 
 _is_hip = is_hip()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
@@ -67,6 +68,9 @@ class DpPaddingMode(IntEnum):
     def get_dp_padding_mode(
         cls, is_extend_in_batch, global_num_tokens: List[int]
     ) -> DpPaddingMode:
+        if _FORCE_DP_MAX_PADDING:
+            return cls.MAX_LEN
+
         dp_size = get_attention_dp_size()
 
         # When is_extend_in_batch and dp_size > 1, use SUM_LEN to avoid padding
@@ -87,6 +91,9 @@ class DpPaddingMode(IntEnum):
 
     @classmethod
     def get_default_mode_in_cuda_graph(cls) -> DpPaddingMode:
+        if _FORCE_DP_MAX_PADDING:
+            return cls.MAX_LEN
+
         # TODO(kkhuang-amd): noqa, temporary work-around for rocm 7.0.0 alpha
         # it can be safely removed later, once RCCL fixed
         if _USE_ROCM700A_WA:
@@ -277,12 +284,14 @@ def initialize_dp_attention(
 ):
     global _ATTN_DP_RANK, _ATTN_DP_SIZE
     global _LOCAL_ATTN_DP_SIZE, _LOCAL_ATTN_DP_RANK, _ENABLE_DP_ATTENTION_FLAG
+    global _FORCE_DP_MAX_PADDING
     enable_dp_attention = server_args.enable_dp_attention
     dp_size = server_args.dp_size
     moe_dense_tp_size = server_args.moe_dense_tp_size
     attn_cp_size = server_args.attn_cp_size
 
     _ENABLE_DP_ATTENTION_FLAG = enable_dp_attention
+    _FORCE_DP_MAX_PADDING = server_args.attention_oproj_tp_size is not None
 
     tp_rank = get_tensor_model_parallel_rank()
     tp_size = get_tensor_model_parallel_world_size()

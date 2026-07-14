@@ -633,6 +633,7 @@ class ServerArgs:
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
+    attention_oproj_tp_size: Optional[int] = None
     enable_dp_lm_head: bool = False
     enable_two_batch_overlap: bool = False
     enable_single_batch_overlap: bool = False
@@ -806,6 +807,7 @@ class ServerArgs:
         self._handle_hicache()
 
         # Handle data parallelism.
+        self._handle_attention_oproj_tensor_parallelism()
         self._handle_data_parallelism()
 
         # Handle context parallelism.
@@ -2667,6 +2669,47 @@ class ServerArgs:
             assert (
                 self.enable_dp_attention
             ), "Please enable dp attention when setting enable_dp_lm_head. "
+
+    def _handle_attention_oproj_tensor_parallelism(self):
+        if self.attention_oproj_tp_size is None:
+            return
+
+        if self.attention_oproj_tp_size != 8:
+            raise ValueError(
+                "--attention-oproj-tp-size currently only supports 8."
+            )
+        if self.device != "npu":
+            raise ValueError(
+                "--attention-oproj-tp-size is currently only supported on NPU."
+            )
+        if self.tp_size != 8 or self.dp_size != 8:
+            raise ValueError(
+                "--attention-oproj-tp-size 8 requires --tp-size 8 and --dp-size 8."
+            )
+        if not self.enable_dp_attention:
+            raise ValueError(
+                "--attention-oproj-tp-size 8 requires --enable-dp-attention."
+            )
+        if self.attn_cp_size != 1:
+            raise ValueError(
+                "--attention-oproj-tp-size 8 does not support attention "
+                "context parallelism."
+            )
+        if self.pp_size != 1:
+            raise ValueError(
+                "--attention-oproj-tp-size 8 currently requires --pp-size 1."
+            )
+
+        architectures = self.get_model_config().hf_config.architectures or []
+        supported_architectures = {
+            "LongcatFlashForCausalLM",
+            "LongcatFlashForCausalLMNextN",
+        }
+        if not supported_architectures.intersection(architectures):
+            raise ValueError(
+                "--attention-oproj-tp-size 8 is currently only supported by "
+                "LongcatFlashForCausalLM and LongcatFlashForCausalLMNextN."
+            )
 
     def _handle_moe_kernel_config(self):
         if self.quantization == "mxfp8":
@@ -5525,7 +5568,16 @@ class ServerArgs:
         parser.add_argument(
             "--enable-dp-attention",
             action="store_true",
-            help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently DeepSeek-V2 and Qwen 2/3 MoE models are supported.",
+            help="Enabling data parallelism for attention and tensor parallelism "
+            "for FFN. The dp size should be equal to the tp size. Currently "
+            "DeepSeek-V2, Qwen 2/3 MoE, and LongCat models are supported.",
+        )
+        parser.add_argument(
+            "--attention-oproj-tp-size",
+            type=int,
+            default=ServerArgs.attention_oproj_tp_size,
+            help="Tensor parallel size for LongCat attention output projection. "
+            "Currently only NPU DP8=TP8 with value 8 is supported.",
         )
         parser.add_argument(
             "--enable-dp-lm-head",

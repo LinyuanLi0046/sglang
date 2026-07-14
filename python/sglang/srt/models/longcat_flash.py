@@ -688,6 +688,14 @@ class LongcatFlashDecoderLayer(nn.Module):
         self.alt_stream = alt_stream
         self.is_last_layer = layer_id == config.num_hidden_layers - 1
         self.is_first_layer = layer_id == 0
+        attention_oproj_tp_size = get_global_server_args().attention_oproj_tp_size
+        if attention_oproj_tp_size is not None:
+            assert (
+                config.num_attention_heads * config.v_head_dim
+            ) % attention_oproj_tp_size == 0, (
+                "LongCat attention output width must be divisible by "
+                f"attention_oproj_tp_size={attention_oproj_tp_size}."
+            )
         self.self_attn = nn.ModuleList(
             [
                 DeepseekV2AttentionMLA(
@@ -713,6 +721,7 @@ class LongcatFlashDecoderLayer(nn.Module):
                     ),
                     layer_id=layer_id * 2 + i,
                     reduce_results=False,
+                    o_proj_tp_size=attention_oproj_tp_size,
                     prefix=add_prefix(f"self_attn.{i}", prefix),
                     alt_stream=self.alt_stream,
                 )

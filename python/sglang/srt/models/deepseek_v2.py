@@ -43,6 +43,7 @@ from sglang.srt.distributed import (
     divide,
     get_moe_expert_parallel_world_size,
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
@@ -1106,6 +1107,7 @@ class DeepseekV2AttentionMLA(
         alt_stream: Optional[torch.cuda.Stream] = None,
         skip_rope: bool = False,
         is_nextn: bool = False,
+        o_proj_tp_size: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -1120,6 +1122,27 @@ class DeepseekV2AttentionMLA(
         self.kv_quant_method = None
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
+        self.attn_tp_size = attn_tp_size
+        if o_proj_tp_size is None:
+            o_proj_tp_rank = attn_tp_rank
+            o_proj_tp_size = attn_tp_size
+        else:
+            model_tp_size = get_tensor_model_parallel_world_size()
+            assert attn_tp_size == 1, (
+                "Independent attention OProj TP requires attention TP size 1, "
+                f"but got {attn_tp_size}."
+            )
+            assert o_proj_tp_size == model_tp_size, (
+                "Independent attention OProj TP must use the complete model TP "
+                f"group, but got o_proj_tp_size={o_proj_tp_size} and "
+                f"model_tp_size={model_tp_size}."
+            )
+            assert not reduce_results, (
+                "Independent attention OProj TP performs its reduction with "
+                "reduce-scatter and requires reduce_results=False."
+            )
+            o_proj_tp_rank = get_tensor_model_parallel_rank()
+        self.o_proj_tp_size = o_proj_tp_size
         self.use_nsa = is_deepseek_nsa(config)
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
@@ -1237,8 +1260,8 @@ class DeepseekV2AttentionMLA(
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("o_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            tp_rank=o_proj_tp_rank,
+            tp_size=o_proj_tp_size,
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 

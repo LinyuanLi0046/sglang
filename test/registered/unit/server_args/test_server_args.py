@@ -33,6 +33,62 @@ class TestPrepareServerArgs(CustomTestCase):
             {"rope_scaling": {"factor": 2.0, "rope_type": "linear"}},
         )
 
+    def test_attention_oproj_tp_size_cli(self):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--attention-oproj-tp-size",
+                "8",
+            ]
+        )
+        self.assertEqual(server_args.attention_oproj_tp_size, 8)
+
+
+class TestAttentionOprojTensorParallelism(unittest.TestCase):
+    @staticmethod
+    def _make_server_args(**overrides):
+        kwargs = {
+            "model_path": "dummy",
+            "device": "npu",
+            "tp_size": 8,
+            "dp_size": 8,
+            "pp_size": 1,
+            "attn_cp_size": 1,
+            "enable_dp_attention": True,
+            "attention_oproj_tp_size": 8,
+        }
+        kwargs.update(overrides)
+        server_args = ServerArgs(**kwargs)
+        server_args.model_config = MagicMock()
+        server_args.model_config.hf_config.architectures = ["LongcatFlashForCausalLM"]
+        return server_args
+
+    def test_accepts_complete_longcat_dp8_tp8(self):
+        server_args = self._make_server_args()
+        server_args._handle_attention_oproj_tensor_parallelism()
+
+    def test_rejects_non_dp8_tp8(self):
+        server_args = self._make_server_args(dp_size=4)
+        with self.assertRaisesRegex(ValueError, "--dp-size 8"):
+            server_args._handle_attention_oproj_tensor_parallelism()
+
+    def test_rejects_non_longcat_model(self):
+        server_args = self._make_server_args()
+        server_args.model_config.hf_config.architectures = ["DeepseekV3ForCausalLM"]
+        with self.assertRaisesRegex(ValueError, "LongcatFlashForCausalLM"):
+            server_args._handle_attention_oproj_tensor_parallelism()
+
+    def test_oproj_tp_forces_equal_dp_padding(self):
+        from sglang.srt.layers import dp_attention
+
+        with patch.object(dp_attention, "_FORCE_DP_MAX_PADDING", True):
+            mode = dp_attention.DpPaddingMode.get_dp_padding_mode(
+                is_extend_in_batch=True,
+                global_num_tokens=[1, 8, 3, 5, 2, 7, 4, 6],
+            )
+        self.assertEqual(mode, dp_attention.DpPaddingMode.MAX_LEN)
+
 
 class TestLoadBalanceMethod(unittest.TestCase):
     def test_non_pd_defaults_to_round_robin(self):

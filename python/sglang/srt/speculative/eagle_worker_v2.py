@@ -768,23 +768,39 @@ class EagleDraftWorker(BaseDraftWorker):
         batch_result: GenerationBatchResult,
         draft_input: EagleDraftInput,
     ) -> None:
-        if self.speculative_num_steps <= 1 or model_worker_batch.forward_mode.is_idle():
+        if self.speculative_num_steps <= 1:
             return
+
+        is_idle = model_worker_batch.forward_mode.is_idle()
+        if is_idle:
+            # With DP attention and tensor-parallel OProj, every rank in the
+            # OProj group must execute the same A2A/OProj/RS sequence.  An idle
+            # local DP rank therefore still has to run the zero-bubble draft
+            # steps when another DP rank has work.  The global token counts are
+            # identical on all DP ranks and let all-idle batches keep the old
+            # fast path.  When they are unavailable (for example, without DP
+            # attention), preserve the original local-idle behavior.
+            global_num_tokens = model_worker_batch.global_num_tokens
+            if global_num_tokens is None or not any(global_num_tokens):
+                return
 
         original_forward_mode = model_worker_batch.forward_mode
         original_seq_lens = model_worker_batch.seq_lens
         original_seq_lens_cpu = model_worker_batch.seq_lens_cpu
 
-        model_worker_batch.forward_mode = ForwardMode.DECODE
-        model_worker_batch.seq_lens = batch_result.next_draft_input.new_seq_lens
-        # When cuda graph is disabled, seq_lens_cpu must be synced because
-        # init_forward_metadata derives actual_seq_lengths_kv from it, while
-        # block_tables are derived from seq_lens (GPU). A mismatch between the
-        # two causes an NPU kernel error. When cuda graph is enabled, the graph
-        # replay path tolerates the stale value (both sides are consistently
-        # off), so we skip the D2H copy to avoid the overhead.
-        if self.server_args.disable_cuda_graph:
-            model_worker_batch.seq_lens_cpu = model_worker_batch.seq_lens.to("cpu")
+        if not is_idle:
+            model_worker_batch.forward_mode = ForwardMode.DECODE
+            model_worker_batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+            # When cuda graph is disabled, seq_lens_cpu must be synced because
+            # init_forward_metadata derives actual_seq_lengths_kv from it, while
+            # block_tables are derived from seq_lens (GPU). A mismatch between the
+            # two causes an NPU kernel error. When cuda graph is enabled, the graph
+            # replay path tolerates the stale value (both sides are consistently
+            # off), so we skip the D2H copy to avoid the overhead.
+            if self.server_args.disable_cuda_graph:
+                model_worker_batch.seq_lens_cpu = model_worker_batch.seq_lens.to(
+                    "cpu"
+                )
 
         try:
             forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
@@ -813,19 +829,28 @@ class EagleDraftWorker(BaseDraftWorker):
                     forward_batch
                 )
 
-            next_draft_input = batch_result.next_draft_input
-            next_draft_input.topk_p = torch.cat(
-                [next_draft_input.topk_p, ret_topk_p.reshape(next_draft_input.topk_p.shape[0], -1)],
-                dim=1,
-            ).clone()
-            next_draft_input.topk_index = torch.cat(
-                [
-                    next_draft_input.topk_index,
-                    ret_topk_index.reshape(next_draft_input.topk_index.shape[0], -1),
-                ],
-                dim=1,
-            ).clone()
-            next_draft_input.hidden_states = None
+            # Idle ranks participate only to keep the OProj collectives
+            # matched.  Keep their local speculative state unchanged, just as
+            # the previous early-return path did.
+            if not is_idle:
+                next_draft_input = batch_result.next_draft_input
+                next_draft_input.topk_p = torch.cat(
+                    [
+                        next_draft_input.topk_p,
+                        ret_topk_p.reshape(next_draft_input.topk_p.shape[0], -1),
+                    ],
+                    dim=1,
+                ).clone()
+                next_draft_input.topk_index = torch.cat(
+                    [
+                        next_draft_input.topk_index,
+                        ret_topk_index.reshape(
+                            next_draft_input.topk_index.shape[0], -1
+                        ),
+                    ],
+                    dim=1,
+                ).clone()
+                next_draft_input.hidden_states = None
         finally:
             model_worker_batch.forward_mode = original_forward_mode
             model_worker_batch.seq_lens = original_seq_lens

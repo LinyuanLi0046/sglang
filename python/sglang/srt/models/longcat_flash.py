@@ -262,6 +262,9 @@ class LongcatFlashMoE(nn.Module):
         self.prefill_chunk_max_len = 65536
         self.enable_perfect_eplb = get_bool_env_var("SGLANG_LONGCAT_PERFECT_EPLB")
         self._perfect_eplb_topk_idx_cache: Dict[Tuple[bool, int], torch.Tensor] = {}
+        self._perfect_eplb_dispatch_idx_cache: Dict[
+            Tuple[bool, int], torch.Tensor
+        ] = {}
 
         if config.rounter_params_dtype == "float32":
             self.rounter_params_dtype = torch.float32
@@ -394,7 +397,24 @@ class LongcatFlashMoE(nn.Module):
                         num_tokens, self.top_k
                     )
             self._perfect_eplb_topk_idx_cache[cache_key] = topk_idx
+            self._perfect_eplb_dispatch_idx_cache.pop(cache_key, None)
         return topk_idx
+
+    def _get_perfect_eplb_dispatch_idx(
+        self,
+        is_prefill: bool,
+        num_tokens: int,
+        logical_topk_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        cache_key = (is_prefill, num_tokens)
+        dispatch_topk_idx = self._perfect_eplb_dispatch_idx_cache.get(cache_key)
+        if (
+            dispatch_topk_idx is None
+            or dispatch_topk_idx.device != logical_topk_idx.device
+        ):
+            dispatch_topk_idx = torch.empty_like(logical_topk_idx)
+            self._perfect_eplb_dispatch_idx_cache[cache_key] = dispatch_topk_idx
+        return dispatch_topk_idx
 
     def _split_prefill_tensors(
         self,
@@ -596,11 +616,28 @@ class LongcatFlashMoE(nn.Module):
             )
             if self.enable_perfect_eplb:
                 # Benchmark-only path: keep router weights but force a uniform expert id layout.
-                topk_idx = self._get_perfect_eplb_topk_idx(
+                logical_topk_idx = self._get_perfect_eplb_topk_idx(
                     is_prefill=is_prefill,
                     num_tokens=hidden_states.shape[0],
                     device=hidden_states.device,
                 )
+                if (
+                    _is_npu
+                    and self.zero_expert_type is not None
+                    and get_moe_a2a_backend().is_deepep()
+                    and not (use_ops_decode or use_ops_prefill)
+                ):
+                    # The DeepEP zero-expert kernel rewrites zero-expert IDs to
+                    # -1 in place. Refresh a reusable work buffer so the cached
+                    # logical 512+256 (or 64+32) layout remains unchanged.
+                    topk_idx = self._get_perfect_eplb_dispatch_idx(
+                        is_prefill=is_prefill,
+                        num_tokens=hidden_states.shape[0],
+                        logical_topk_idx=logical_topk_idx,
+                    )
+                    topk_idx.copy_(logical_topk_idx)
+                else:
+                    topk_idx = logical_topk_idx
             topk_output = StandardTopKOutput(topk_weights, topk_idx, _)
 
         zero_expert_result = None

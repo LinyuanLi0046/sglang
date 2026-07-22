@@ -6,9 +6,12 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.speculative.greedy_trace import (
     _extract_full_mask_tails,
+    _parse_int_ranges,
+    _stage_tensor_fingerprint,
     _topk_snapshot,
     build_topk1_reference,
     capture_raw_logits,
+    npu_mtp_stage_trace_enabled,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -134,7 +137,37 @@ class TestEagleMTPGreedyTrace(unittest.TestCase):
             ],
         )
 
+    def test_stage_trace_integer_ranges(self):
+        self.assertEqual(_parse_int_ranges("1,4-6, 9"), {1, 4, 5, 6, 9})
+        with self.assertRaisesRegex(ValueError, "descending"):
+            _parse_int_ranges("6-4")
+
+    def test_stage_trace_requires_master_switch_and_positions(self):
+        with (
+            envs.SGLANG_NPU_MTP_GREEDY_TRACE.override(True),
+            envs.SGLANG_NPU_MTP_STAGE_TRACE_POSITIONS.override("2876-2878"),
+        ):
+            self.assertTrue(npu_mtp_stage_trace_enabled())
+        with (
+            envs.SGLANG_NPU_MTP_GREEDY_TRACE.override(False),
+            envs.SGLANG_NPU_MTP_STAGE_TRACE_POSITIONS.override("2876"),
+        ):
+            self.assertFalse(npu_mtp_stage_trace_enabled())
+
+    def test_stage_tensor_fingerprint_is_stable_and_value_sensitive(self):
+        tensor = torch.tensor([1.0, -2.0, 3.5], dtype=torch.bfloat16)
+
+        cpu_tensor, first = _stage_tensor_fingerprint(tensor)
+        _, second = _stage_tensor_fingerprint(tensor.clone())
+        _, changed = _stage_tensor_fingerprint(
+            torch.tensor([1.0, -2.0, 4.0], dtype=torch.bfloat16)
+        )
+
+        self.assertEqual(cpu_tensor.dtype, torch.float32)
+        self.assertEqual(first["source_dtype"], "torch.bfloat16")
+        self.assertEqual(first["sha256"], second["sha256"])
+        self.assertNotEqual(first["sha256"], changed["sha256"])
+
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -8,11 +8,13 @@ only, not performance measurements.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import torch
@@ -27,6 +29,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 TRACE_TAG = "[SGLANG_NPU_MTP_GREEDY_TRACE]"
+
+_STAGE_TRACE_COUNTS: dict[tuple[Any, ...], int] = {}
+_STAGE_TRACE_GRAPH_WARNING_EMITTED = False
 
 
 @dataclass(frozen=True)
@@ -271,6 +276,361 @@ def _parse_dump_positions() -> set[int]:
         if item:
             positions.add(int(item))
     return positions
+
+
+@lru_cache(maxsize=16)
+def _parse_int_ranges(raw: str) -> set[int]:
+    """Parse comma-separated integers and inclusive ranges such as ``1,4-6``."""
+
+    values: set[int] = set()
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "-" not in item:
+            values.add(int(item))
+            continue
+        start_raw, end_raw = item.split("-", maxsplit=1)
+        start = int(start_raw.strip())
+        end = int(end_raw.strip())
+        if end < start:
+            raise ValueError(
+                f"Invalid descending integer range {item!r}: {end} < {start}"
+            )
+        values.update(range(start, end + 1))
+    return values
+
+
+def _stage_trace_positions() -> set[int]:
+    return _parse_int_ranges(
+        envs.SGLANG_NPU_MTP_STAGE_TRACE_POSITIONS.get().strip()
+    )
+
+
+def _stage_trace_layers() -> Optional[set[int]]:
+    raw = envs.SGLANG_NPU_MTP_STAGE_TRACE_LAYERS.get().strip()
+    return _parse_int_ranges(raw) if raw else None
+
+
+def npu_mtp_stage_trace_enabled() -> bool:
+    """Whether the eager-only NPU target/decode stage trace is requested."""
+
+    return greedy_trace_enabled() and bool(_stage_trace_positions())
+
+
+def _is_device_graph_capturing() -> bool:
+    for backend_name in ("npu", "cuda"):
+        backend = getattr(torch, backend_name, None)
+        is_capturing = getattr(backend, "is_current_stream_capturing", None)
+        if is_capturing is None:
+            continue
+        try:
+            if bool(is_capturing()):
+                return True
+        except RuntimeError:
+            # Some backends expose the API before their runtime is initialized.
+            continue
+    return False
+
+
+def _warn_stage_trace_graph_capture_once() -> None:
+    global _STAGE_TRACE_GRAPH_WARNING_EMITTED
+    if _STAGE_TRACE_GRAPH_WARNING_EMITTED:
+        return
+    logger.warning(
+        "%s internal stage trace skipped during device graph capture; "
+        "rerun with --disable-cuda-graph",
+        TRACE_TAG,
+    )
+    _STAGE_TRACE_GRAPH_WARNING_EMITTED = True
+
+
+def _selected_stage_rows(
+    positions: torch.Tensor,
+    forward_batch: "ForwardBatch",
+) -> tuple[list[int], list[int], Optional[list[int]]]:
+    """Return selected flattened rows and all input positions for this forward.
+
+    The result is cached on ForwardBatch so tracing all layers adds only one
+    position-tensor synchronization per model forward.
+    """
+
+    cache = getattr(forward_batch, "_npu_mtp_stage_trace_position_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(forward_batch, "_npu_mtp_stage_trace_position_cache", cache)
+    key = (int(positions.data_ptr()), tuple(positions.shape), str(positions.dtype))
+    if key not in cache:
+        position_values = (
+            positions.detach().reshape(-1).to(torch.int64).cpu().tolist()
+        )
+        selected_positions = _stage_trace_positions()
+        selected_rows = [
+            row
+            for row, position in enumerate(position_values)
+            if int(position) + 1 in selected_positions
+        ]
+        input_ids = getattr(forward_batch, "input_ids", None)
+        input_id_values = None
+        if (
+            isinstance(input_ids, torch.Tensor)
+            and input_ids.numel() == len(position_values)
+        ):
+            input_id_values = (
+                input_ids.detach().reshape(-1).to(torch.int64).cpu().tolist()
+            )
+        cache[key] = (
+            selected_rows,
+            [int(value) for value in position_values],
+            (
+                [int(value) for value in input_id_values]
+                if input_id_values is not None
+                else None
+            ),
+        )
+    return cache[key]
+
+
+def npu_mtp_stage_trace_forward_selected(
+    *,
+    positions: torch.Tensor,
+    forward_batch: "ForwardBatch",
+    layer_id: int,
+) -> bool:
+    """Return whether this eager target/decode forward contains a traced row."""
+
+    if not npu_mtp_stage_trace_enabled():
+        return False
+    mode = forward_batch.forward_mode
+    if not (mode.is_decode() or mode.is_target_verify()):
+        return False
+    selected_layers = _stage_trace_layers()
+    if selected_layers is not None and int(layer_id) not in selected_layers:
+        return False
+    if _is_device_graph_capturing():
+        _warn_stage_trace_graph_capture_once()
+        return False
+    selected_rows, _, _ = _selected_stage_rows(positions, forward_batch)
+    return bool(selected_rows)
+
+
+def _stage_tensor_fingerprint(
+    tensor: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Copy one selected row to CPU and build a stable value fingerprint."""
+
+    source_dtype = str(tensor.dtype)
+    if tensor.is_floating_point():
+        cpu_tensor = tensor.detach().to(torch.float32).cpu().contiguous()
+        hash_tensor = cpu_tensor
+        finite = torch.isfinite(cpu_tensor)
+        finite_count = int(finite.sum().item())
+        if finite_count:
+            finite_values = cpu_tensor[finite].to(torch.float64)
+            stats = {
+                "finite_count": finite_count,
+                "nan_count": int(torch.isnan(cpu_tensor).sum().item()),
+                "posinf_count": int(torch.isposinf(cpu_tensor).sum().item()),
+                "neginf_count": int(torch.isneginf(cpu_tensor).sum().item()),
+                "min": float(finite_values.min().item()),
+                "max": float(finite_values.max().item()),
+                "sum": float(finite_values.sum().item()),
+                "abs_sum": float(finite_values.abs().sum().item()),
+                "l2_sq": float((finite_values * finite_values).sum().item()),
+            }
+        else:
+            stats = {
+                "finite_count": 0,
+                "nan_count": int(torch.isnan(cpu_tensor).sum().item()),
+                "posinf_count": int(torch.isposinf(cpu_tensor).sum().item()),
+                "neginf_count": int(torch.isneginf(cpu_tensor).sum().item()),
+                "min": None,
+                "max": None,
+                "sum": None,
+                "abs_sum": None,
+                "l2_sq": None,
+            }
+        head_values = cpu_tensor.reshape(-1)[:8].tolist()
+    else:
+        cpu_tensor = tensor.detach().to(torch.int64).cpu().contiguous()
+        hash_tensor = cpu_tensor
+        flattened = cpu_tensor.reshape(-1)
+        stats = {
+            "min": int(flattened.min().item()) if flattened.numel() else None,
+            "max": int(flattened.max().item()) if flattened.numel() else None,
+            "sum": int(flattened.sum().item()) if flattened.numel() else 0,
+        }
+        head_values = flattened[:32].tolist()
+
+    digest = hashlib.sha256(hash_tensor.numpy().tobytes()).hexdigest()
+    return cpu_tensor, {
+        "source_dtype": source_dtype,
+        "canonical_dtype": str(cpu_tensor.dtype),
+        "shape": list(tensor.shape),
+        "numel": int(tensor.numel()),
+        "sha256": digest,
+        "head_values": head_values,
+        "stats": stats,
+    }
+
+
+def _maybe_dump_stage_tensor(
+    *,
+    cpu_tensor: torch.Tensor,
+    metadata: dict[str, Any],
+    occurrence: int,
+) -> Optional[str]:
+    if not envs.SGLANG_NPU_MTP_STAGE_TRACE_SAVE_TENSORS.get():
+        return None
+
+    dump_dir = envs.SGLANG_NPU_MTP_GREEDY_TRACE_DUMP_DIR.get()
+    os.makedirs(dump_dir, exist_ok=True)
+    filename = (
+        f"{_safe_name(_trace_label() or 'run')}_stage_"
+        f"rank{metadata['rank']}_mode{_safe_name(metadata['forward_mode'])}_"
+        f"layer{metadata['layer_id']}_{_safe_name(metadata['stage'])}_"
+        f"pred{metadata['pred_position']}_tok{metadata['input_token']}_"
+        f"occ{occurrence}.pt"
+    )
+    path = os.path.join(dump_dir, filename)
+    torch.save(
+        {
+            "tensor": cpu_tensor,
+            "metadata": metadata,
+        },
+        path,
+    )
+    return path
+
+
+def trace_npu_mtp_stage_tensor(
+    *,
+    stage: str,
+    tensor: Any,
+    positions: torch.Tensor,
+    forward_batch: "ForwardBatch",
+    layer_id: int,
+    token_dim: int = 0,
+    extra: Optional[dict[str, Any]] = None,
+) -> None:
+    """Fingerprint selected target/decode rows at an internal model stage.
+
+    This diagnostic is deliberately eager-only.  It traces normal ``DECODE``
+    and target-model ``TARGET_VERIFY`` but excludes draft-model forwards.  A
+    tuple/list is expanded into independently named tensor components.
+    """
+
+    if not npu_mtp_stage_trace_enabled():
+        return
+    mode = forward_batch.forward_mode
+    if not (mode.is_decode() or mode.is_target_verify()):
+        return
+
+    selected_layers = _stage_trace_layers()
+    if selected_layers is not None and int(layer_id) not in selected_layers:
+        return
+
+    if _is_device_graph_capturing():
+        _warn_stage_trace_graph_capture_once()
+        return
+
+    if isinstance(tensor, (tuple, list)):
+        for index, component in enumerate(tensor):
+            trace_npu_mtp_stage_tensor(
+                stage=f"{stage}.{index}",
+                tensor=component,
+                positions=positions,
+                forward_batch=forward_batch,
+                layer_id=layer_id,
+                token_dim=token_dim,
+                extra=extra,
+            )
+        return
+    if tensor is None or not isinstance(tensor, torch.Tensor):
+        return
+
+    selected_rows, position_values, input_id_values = _selected_stage_rows(
+        positions, forward_batch
+    )
+    if not selected_rows:
+        return
+
+    group = _trace_group()
+    if group.rank_in_group != 0:
+        return
+
+    normalized_token_dim = token_dim if token_dim >= 0 else tensor.ndim + token_dim
+    if (
+        tensor.ndim == 0
+        or normalized_token_dim < 0
+        or normalized_token_dim >= tensor.ndim
+        or tensor.shape[normalized_token_dim] != len(position_values)
+    ):
+        _emit(
+            "npu_stage_shape_mismatch",
+            {
+                **_rank_fields(group),
+                "forward_mode": str(mode),
+                "layer_id": int(layer_id),
+                "stage": stage,
+                "positions_shape": list(positions.shape),
+                "positions_numel": len(position_values),
+                "tensor_shape": list(tensor.shape),
+                "token_dim": int(token_dim),
+                **(extra or {}),
+            },
+        )
+        return
+
+    for row in selected_rows:
+        input_position = int(position_values[row])
+        input_token = (
+            int(input_id_values[row]) if input_id_values is not None else None
+        )
+        selected_tensor = tensor.select(normalized_token_dim, row)
+        cpu_tensor, fingerprint = _stage_tensor_fingerprint(selected_tensor)
+        count_key = (
+            int(group.rank),
+            str(mode),
+            int(layer_id),
+            stage,
+            input_position,
+            input_token,
+        )
+        occurrence = _STAGE_TRACE_COUNTS.get(count_key, 0)
+        _STAGE_TRACE_COUNTS[count_key] = occurrence + 1
+        metadata = {
+            **_rank_fields(group),
+            "forward_mode": str(mode),
+            "layer_id": int(layer_id),
+            "stage": stage,
+            "input_position": input_position,
+            "pred_position": input_position + 1,
+            "input_token": input_token,
+            "row_in_forward": int(row),
+            "tokens_in_forward": len(position_values),
+            "token_dim": int(token_dim),
+            "occurrence": occurrence,
+            "fingerprint": fingerprint,
+            **(extra or {}),
+        }
+        if "topk" in stage and not selected_tensor.is_floating_point():
+            flattened_indices = cpu_tensor.reshape(-1)
+            metadata["topk_summary"] = {
+                "unique_count": int(torch.unique(flattened_indices).numel()),
+                "negative_count": int((flattened_indices < 0).sum().item()),
+                "future_count": int(
+                    (flattened_indices > input_position).sum().item()
+                ),
+            }
+        dump_path = _maybe_dump_stage_tensor(
+            cpu_tensor=cpu_tensor,
+            metadata=metadata,
+            occurrence=occurrence,
+        )
+        if dump_path is not None:
+            metadata["tensor_dump"] = dump_path
+        _emit("npu_stage", metadata)
 
 
 def _safe_name(value: Any) -> str:

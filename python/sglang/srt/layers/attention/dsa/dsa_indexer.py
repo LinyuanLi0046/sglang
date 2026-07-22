@@ -99,8 +99,14 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.greedy_trace import (
+    npu_mtp_stage_trace_forward_selected,
+    npu_mtp_stage_trace_enabled,
+    trace_npu_mtp_stage_tensor,
+)
 
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
+_enable_npu_mtp_stage_trace = _is_npu and npu_mtp_stage_trace_enabled()
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
@@ -1698,6 +1704,21 @@ class Indexer(MultiPlatformOp):
         layer_scatter_modes=None,
         dynamic_scale: torch.Tensor = None,
     ) -> torch.Tensor:
+        trace_main_model = _enable_npu_mtp_stage_trace and (
+            getattr(
+                forward_batch,
+                "_npu_mtp_stage_trace_target_layer_id",
+                None,
+            )
+            == layer_id
+        )
+        trace_selected_forward = trace_main_model and (
+            npu_mtp_stage_trace_forward_selected(
+                positions=positions,
+                forward_batch=forward_batch,
+                layer_id=layer_id,
+            )
+        )
         if get_attn_backend().forward_metadata.seq_lens_cpu_int is None:
             actual_seq_lengths_kv = get_attn_backend().forward_metadata.seq_lens
         else:
@@ -1858,7 +1879,11 @@ class Indexer(MultiPlatformOp):
                 torch.npu.current_stream(),
             )
 
-        is_use_quant_lightning_indexer = get_token_to_kv_pool().dtype == torch.float8_e4m3fn
+        is_use_quant_lightning_indexer = (
+            get_token_to_kv_pool().dtype == torch.float8_e4m3fn
+        )
+        k_before_quant = k if trace_selected_forward else None
+        k_scale = None
         if is_use_quant_lightning_indexer:
             k, k_scale = torch_npu.npu_dynamic_quant(
                 k, dst_type=get_token_to_kv_pool().dtype
@@ -1962,6 +1987,60 @@ class Indexer(MultiPlatformOp):
             weights = scattered_to_tp_attn_full(weights, forward_batch)
         block_table = get_attn_backend().forward_metadata.block_tables
 
+        if trace_selected_forward:
+            trace_extra = {
+                "quant_lightning_indexer": bool(is_use_quant_lightning_indexer),
+                "indexer_bs": int(indexer_bs),
+                "projected_bs": int(bs),
+                "actual_seq_lengths_query": (
+                    actual_seq_lengths_q.detach()
+                    .reshape(-1)
+                    .to(torch.int64)
+                    .cpu()
+                    .tolist()
+                ),
+                "actual_seq_lengths_kv": (
+                    actual_seq_lengths_kv.detach()
+                    .reshape(-1)
+                    .to(torch.int64)
+                    .cpu()
+                    .tolist()
+                ),
+                "block_table_shape": list(block_table.shape),
+            }
+            current_cache_locs = forward_batch.out_cache_loc[: k.shape[0]].to(
+                torch.int64
+            )
+            cached_current_k = torch.index_select(
+                past_key_states.view(-1, 1, self.head_dim),
+                0,
+                current_cache_locs,
+            )
+            cached_current_scale = None
+            if is_use_quant_lightning_indexer:
+                cached_current_scale = torch.index_select(
+                    past_key_states_scale.view(-1, 1),
+                    0,
+                    current_cache_locs,
+                )
+            for stage, tensor in (
+                ("indexer.q_post_rope", q),
+                ("indexer.k_pre_quant", k_before_quant),
+                ("indexer.k_to_cache", k),
+                ("indexer.k_cache_readback", cached_current_k),
+                ("indexer.k_scale", k_scale),
+                ("indexer.k_scale_cache_readback", cached_current_scale),
+                ("indexer.weights", weights),
+            ):
+                trace_npu_mtp_stage_tensor(
+                    stage=stage,
+                    tensor=tensor,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    layer_id=layer_id,
+                    extra=trace_extra,
+                )
+
         if (
             is_prefill
             and self.dsa_enable_prefill_cp
@@ -1996,6 +2075,35 @@ class Indexer(MultiPlatformOp):
                     dst_type=get_token_to_kv_pool().dtype
                 )
 
+                if trace_selected_forward:
+                    trace_npu_mtp_stage_tensor(
+                        stage="indexer.query_scale_to_op",
+                        tensor=indexer_query_scale,
+                        positions=positions,
+                        forward_batch=forward_batch,
+                        layer_id=layer_id,
+                        extra=trace_extra,
+                    )
+
+            if trace_selected_forward:
+                trace_npu_mtp_stage_tensor(
+                    stage="indexer.query_to_op",
+                    tensor=indexer_query,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    layer_id=layer_id,
+                    extra=trace_extra,
+                )
+                trace_npu_mtp_stage_tensor(
+                    stage="indexer.weights_to_op",
+                    tensor=indexer_weights,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    layer_id=layer_id,
+                    extra=trace_extra,
+                )
+
+            if is_use_quant_lightning_indexer:
                 topk_indices = torch_npu.npu_quant_lightning_indexer(
                     query=indexer_query,
                     key=past_key_states,

@@ -298,7 +298,9 @@ class Envs:
     # multi-token TARGET_VERIFY.  Positions are predicted-token positions,
     # matching SGLANG_NPU_MTP_GREEDY_TRACE_DUMP_POSITIONS; an empty layer list
     # means all layers.  Full tensor rows are optional because compact SHA256
-    # fingerprints are always emitted for selected rows.
+    # fingerprints are always emitted for selected rows.  On NPU, saving full
+    # tensors also enables read-only LightningIndexer repeat/T1/cache-prefix
+    # diagnostics for the selected layer and position.
     SGLANG_NPU_MTP_STAGE_TRACE_POSITIONS = EnvStr("")
     SGLANG_NPU_MTP_STAGE_TRACE_LAYERS = EnvStr("")
     SGLANG_NPU_MTP_STAGE_TRACE_SAVE_TENSORS = EnvBool(False)

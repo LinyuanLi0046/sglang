@@ -37,6 +37,46 @@ TRACE_TAG = "[SGLANG_NPU_MTP_GREEDY_TRACE]"
 STAGE_EVENT = "npu_stage"
 SHAPE_EVENT = "npu_stage_shape_mismatch"
 
+TOPK_PRODUCTION_STAGE = "indexer.topk_production"
+TOPK_REPEAT_STAGE = "indexer.topk_repeat_same_shape"
+TOPK_T1_REPLAY_STAGE = "indexer.topk_t1_replay"
+LEGACY_TOPK_PRODUCTION_STAGE = "dsa.indexer_topk"
+
+
+def _diagnostic_stage_role(stage: str) -> Optional[str]:
+    """Map optional shadow-diagnostic stage names to stable semantic roles.
+
+    The exact names above are emitted by the current diagnostic.  Matching the
+    final component keeps the analyzer useful if a caller adds a harmless
+    namespace prefix.  ``dsa.indexer_topk`` is accepted only as a fallback
+    production checkpoint, which lets a newly instrumented MTP log be compared
+    with an older no-MTP reference log.
+    """
+
+    normalized = stage.strip().lower()
+    tail = normalized.rsplit(".", 1)[-1]
+    if normalized == LEGACY_TOPK_PRODUCTION_STAGE:
+        return "topk_production_legacy"
+    if tail == "topk_production":
+        return "topk_production"
+    if tail == "topk_repeat_same_shape":
+        return "topk_repeat_same_shape"
+    if tail == "topk_t1_replay":
+        return "topk_t1_replay"
+    if tail == "history_k_logical":
+        return "history_k_logical"
+    if tail in {"history_k_scale_logical", "history_scale_logical"}:
+        return "history_k_scale_logical"
+    return None
+
+
+def _is_shadow_only_stage(stage: str) -> bool:
+    return _diagnostic_stage_role(stage) in {
+        "topk_production",
+        "topk_repeat_same_shape",
+        "topk_t1_replay",
+    }
+
 
 @dataclass(frozen=True)
 class TraceEvent:
@@ -137,6 +177,42 @@ class Comparison:
     candidate: Optional[TraceEvent]
     status: str
     tensor_metrics: Optional[TensorMetrics] = None
+    note: Optional[str] = None
+
+
+@dataclass
+class LogicalTensorDifference:
+    """First differing logical-token coordinate in a saved history tensor."""
+
+    available: bool
+    reason: Optional[str] = None
+    reference_path: Optional[str] = None
+    candidate_path: Optional[str] = None
+    reference_shape: Optional[list[int]] = None
+    candidate_shape: Optional[list[int]] = None
+    logical_token_axis: int = 0
+    common_logical_tokens: Optional[int] = None
+    changed_logical_tokens: Optional[int] = None
+    first_logical_token: Optional[int] = None
+    first_element_flat_index: Optional[int] = None
+    first_index: Optional[list[int]] = None
+    reference_value: Optional[float | int] = None
+    candidate_value: Optional[float | int] = None
+    abs_diff: Optional[float] = None
+
+
+@dataclass
+class DiagnosticComparison:
+    """A same-run shadow replay or cross-run history/replay comparison."""
+
+    category: str
+    left_side: str
+    right_side: str
+    left: TraceEvent
+    right: TraceEvent
+    status: str
+    tensor_metrics: Optional[TensorMetrics] = None
+    logical_difference: Optional[LogicalTensorDifference] = None
     note: Optional[str] = None
 
 
@@ -339,6 +415,181 @@ def align_events(
         if id(cand_event) not in paired_candidate_ids:
             comparisons.append(Comparison(None, cand_event, "missing_reference"))
     return comparisons, duplicate_reference, duplicate_candidate
+
+
+def _event_pair_status(left: TraceEvent, right: TraceEvent) -> str:
+    if _shape(left) != _shape(right):
+        return "shape_mismatch"
+    if _source_dtype(left) != _source_dtype(right):
+        return "dtype_mismatch"
+    if _sha(left) is not None and _sha(left) == _sha(right):
+        return "exact"
+    return "value_mismatch"
+
+
+def _local_diagnostic_key(event: TraceEvent) -> tuple[Any, ...]:
+    return (
+        event.record.get("label", ""),
+        event.record.get("rank"),
+        event.record.get("attention_dp_rank"),
+        event.record.get("forward_mode"),
+        event.layer_id,
+        event.pred_position,
+        event.input_token,
+        event.record.get("row_in_forward"),
+        event.occurrence,
+    )
+
+
+def _cross_run_diagnostic_key(event: TraceEvent) -> tuple[Any, ...]:
+    return (
+        event.pred_position,
+        event.input_token,
+        event.layer_id,
+        event.occurrence,
+    )
+
+
+def _role_events(
+    events: list[TraceEvent],
+) -> dict[tuple[tuple[Any, ...], str], list[TraceEvent]]:
+    grouped: dict[tuple[tuple[Any, ...], str], list[TraceEvent]] = defaultdict(list)
+    for event in events:
+        role = _diagnostic_stage_role(event.stage)
+        if role is None:
+            continue
+        grouped[(_local_diagnostic_key(event), role)].append(event)
+    return grouped
+
+
+def _preferred_production_event(events: list[TraceEvent]) -> Optional[TraceEvent]:
+    if not events:
+        return None
+    nonlegacy = [
+        event
+        for event in events
+        if _diagnostic_stage_role(event.stage) == "topk_production"
+    ]
+    return (nonlegacy or events)[0]
+
+
+def _build_within_run_diagnostics(
+    events: list[TraceEvent], side: str
+) -> list[DiagnosticComparison]:
+    grouped = _role_events(events)
+    keys = sorted(
+        {key for key, _ in grouped},
+        key=lambda key: tuple("" if value is None else str(value) for value in key),
+    )
+    result: list[DiagnosticComparison] = []
+    for key in keys:
+        production = _preferred_production_event(
+            grouped.get((key, "topk_production"), [])
+            + grouped.get((key, "topk_production_legacy"), [])
+        )
+        if production is None:
+            continue
+        for role, category in (
+            ("topk_repeat_same_shape", "within_run_production_vs_repeat"),
+            ("topk_t1_replay", "within_run_production_vs_t1_replay"),
+        ):
+            peers = grouped.get((key, role), [])
+            if not peers:
+                continue
+            peer = peers[0]
+            note = None
+            if len(peers) > 1:
+                note = f"multiple {role} events matched this row; the first was used"
+            result.append(
+                DiagnosticComparison(
+                    category=category,
+                    left_side=side,
+                    right_side=side,
+                    left=production,
+                    right=peer,
+                    status=_event_pair_status(production, peer),
+                    note=note,
+                )
+            )
+    return result
+
+
+def _cross_role_map(
+    events: list[TraceEvent], roles: set[str]
+) -> dict[tuple[Any, ...], list[TraceEvent]]:
+    grouped: dict[tuple[Any, ...], list[TraceEvent]] = defaultdict(list)
+    for event in events:
+        if _diagnostic_stage_role(event.stage) in roles:
+            grouped[_cross_run_diagnostic_key(event)].append(event)
+    return grouped
+
+
+def build_diagnostic_comparisons(
+    reference: list[TraceEvent], candidate: list[TraceEvent]
+) -> list[DiagnosticComparison]:
+    """Build optional shadow-replay and logical-history comparisons.
+
+    These stages are deliberately analyzed outside normal stage alignment:
+    repeat/replay checkpoints commonly exist only in the MTP run and should not
+    be reported as ordinary ``missing_reference`` events.
+    """
+
+    result = _build_within_run_diagnostics(reference, "reference")
+    result.extend(_build_within_run_diagnostics(candidate, "candidate"))
+
+    ref_production = _cross_role_map(
+        reference, {"topk_production", "topk_production_legacy"}
+    )
+    candidate_replay = _cross_role_map(candidate, {"topk_t1_replay"})
+    for key in sorted(
+        set(ref_production) & set(candidate_replay),
+        key=lambda item: tuple("" if value is None else str(value) for value in item),
+    ):
+        left = _preferred_production_event(ref_production[key])
+        assert left is not None
+        right = candidate_replay[key][0]
+        result.append(
+            DiagnosticComparison(
+                category="cross_run_reference_production_vs_candidate_t1_replay",
+                left_side="reference",
+                right_side="candidate",
+                left=left,
+                right=right,
+                status=_event_pair_status(left, right),
+            )
+        )
+
+    for role in ("history_k_logical", "history_k_scale_logical"):
+        ref_history = _cross_role_map(reference, {role})
+        candidate_history = _cross_role_map(candidate, {role})
+        for key in sorted(
+            set(ref_history) & set(candidate_history),
+            key=lambda item: tuple(
+                "" if value is None else str(value) for value in item
+            ),
+        ):
+            left = ref_history[key][0]
+            right = candidate_history[key][0]
+            result.append(
+                DiagnosticComparison(
+                    category=f"cross_run_{role}",
+                    left_side="reference",
+                    right_side="candidate",
+                    left=left,
+                    right=right,
+                    status=_event_pair_status(left, right),
+                )
+            )
+
+    return sorted(
+        result,
+        key=lambda item: (
+            item.left.pred_position if item.left.pred_position is not None else -1,
+            item.left.layer_id if item.left.layer_id is not None else -1,
+            item.left.record.get("row_in_forward", -1),
+            item.category,
+        ),
+    )
 
 
 class DumpResolver:
@@ -669,6 +920,210 @@ def attach_tensor_metrics(
     return compared, unavailable
 
 
+def locate_first_logical_tensor_difference(
+    reference_path: Path,
+    candidate_path: Path,
+    *,
+    atol: float,
+    rtol: float,
+    logical_token_axis: int = 0,
+) -> LogicalTensorDifference:
+    """Locate the first changed logical token and element in two history dumps."""
+
+    torch = _import_torch()
+    try:
+        reference = _load_saved_tensor(reference_path)
+        candidate = _load_saved_tensor(candidate_path)
+    except Exception as exc:
+        return LogicalTensorDifference(
+            available=False,
+            reason=f"failed to load history tensor: {type(exc).__name__}: {exc}",
+            reference_path=str(reference_path),
+            candidate_path=str(candidate_path),
+            logical_token_axis=logical_token_axis,
+        )
+
+    result = LogicalTensorDifference(
+        available=True,
+        reference_path=str(reference_path),
+        candidate_path=str(candidate_path),
+        reference_shape=list(reference.shape),
+        candidate_shape=list(candidate.shape),
+        logical_token_axis=logical_token_axis,
+    )
+    if reference.ndim == 0 or candidate.ndim == 0:
+        result.available = False
+        result.reason = "history tensor is scalar; no logical-token axis exists"
+        return result
+    axis = logical_token_axis
+    if axis < 0:
+        axis += reference.ndim
+    if (
+        axis < 0
+        or axis >= reference.ndim
+        or reference.ndim != candidate.ndim
+        or axis >= candidate.ndim
+    ):
+        result.available = False
+        result.reason = (
+            "invalid/incompatible logical-token axis for tensor ranks "
+            f"{reference.ndim} and {candidate.ndim}"
+        )
+        return result
+
+    ref = torch.movedim(reference, axis, 0)
+    cand = torch.movedim(candidate, axis, 0)
+    ref_tokens, cand_tokens = int(ref.shape[0]), int(cand.shape[0])
+    common_tokens = min(ref_tokens, cand_tokens)
+    result.common_logical_tokens = common_tokens
+    if tuple(ref.shape[1:]) != tuple(cand.shape[1:]):
+        result.reason = (
+            "per-token tensor shapes differ: "
+            f"{tuple(ref.shape[1:])} != {tuple(cand.shape[1:])}"
+        )
+        result.first_logical_token = 0 if max(ref_tokens, cand_tokens) else None
+        return result
+
+    if common_tokens:
+        ref_common = ref[:common_tokens]
+        cand_common = cand[:common_tokens]
+        if ref_common.is_floating_point() or cand_common.is_floating_point():
+            ref_values = ref_common.to(torch.float64)
+            cand_values = cand_common.to(torch.float64)
+            equal = torch.isclose(
+                ref_values,
+                cand_values,
+                atol=atol,
+                rtol=rtol,
+                equal_nan=True,
+            )
+        else:
+            ref_values = ref_common.to(torch.int64)
+            cand_values = cand_common.to(torch.int64)
+            equal = ref_values == cand_values
+        changed = ~equal
+        flat_changed = changed.reshape(common_tokens, -1)
+        changed_by_token = flat_changed.any(dim=1)
+        result.changed_logical_tokens = int(changed_by_token.sum().item()) + abs(
+            ref_tokens - cand_tokens
+        )
+        changed_tokens = torch.nonzero(changed_by_token, as_tuple=False).flatten()
+        if changed_tokens.numel():
+            token = int(changed_tokens[0].item())
+            element = int(
+                torch.nonzero(flat_changed[token], as_tuple=False)[0].item()
+            )
+            tail_index = _flat_index_to_index(element, ref.shape[1:])
+            moved_index = [token, *tail_index]
+            original_index: list[int] = []
+            tail_iter = iter(tail_index)
+            for dim in range(reference.ndim):
+                original_index.append(token if dim == axis else next(tail_iter))
+            ref_value = ref_values[tuple(moved_index)].item()
+            cand_value = cand_values[tuple(moved_index)].item()
+            result.first_logical_token = token
+            result.first_element_flat_index = element
+            result.first_index = original_index
+            result.reference_value = ref_value
+            result.candidate_value = cand_value
+            if isinstance(ref_value, (int, float)) and isinstance(
+                cand_value, (int, float)
+            ):
+                result.abs_diff = abs(float(cand_value) - float(ref_value))
+            return result
+    else:
+        result.changed_logical_tokens = abs(ref_tokens - cand_tokens)
+
+    if ref_tokens != cand_tokens:
+        result.first_logical_token = common_tokens
+        result.reason = (
+            "logical history lengths differ after an equal common prefix: "
+            f"{ref_tokens} != {cand_tokens}"
+        )
+    return result
+
+
+def attach_diagnostic_tensor_metrics(
+    diagnostics: list[DiagnosticComparison],
+    *,
+    reference_resolver: DumpResolver,
+    candidate_resolver: DumpResolver,
+    atol: float,
+    rtol: float,
+    top_elements: int,
+) -> tuple[int, int]:
+    compared = 0
+    unavailable = 0
+    resolvers = {
+        "reference": reference_resolver,
+        "candidate": candidate_resolver,
+    }
+    for diagnostic in diagnostics:
+        if diagnostic.status not in {
+            "value_mismatch",
+            "shape_mismatch",
+            "dtype_mismatch",
+        }:
+            continue
+        left_path, left_error = resolvers[diagnostic.left_side].resolve(
+            diagnostic.left
+        )
+        right_path, right_error = resolvers[diagnostic.right_side].resolve(
+            diagnostic.right
+        )
+        if left_path is None or right_path is None:
+            reasons = [
+                reason for reason in (left_error, right_error) if reason is not None
+            ]
+            diagnostic.tensor_metrics = TensorMetrics(
+                available=False,
+                reason="; ".join(reasons),
+                reference_path=str(left_path) if left_path else None,
+                candidate_path=str(right_path) if right_path else None,
+            )
+            unavailable += 1
+            continue
+        try:
+            same_dump = left_path.resolve() == right_path.resolve()
+        except OSError:
+            same_dump = False
+        if same_dump:
+            diagnostic.tensor_metrics = TensorMetrics(
+                available=False,
+                reason="diagnostic stages resolved to the same .pt file",
+                reference_path=str(left_path),
+                candidate_path=str(right_path),
+            )
+            unavailable += 1
+            continue
+        diagnostic.tensor_metrics = compare_saved_tensors(
+            left_path,
+            right_path,
+            atol=atol,
+            rtol=rtol,
+            top_elements=top_elements,
+        )
+        if diagnostic.tensor_metrics.available:
+            compared += 1
+        else:
+            unavailable += 1
+        if diagnostic.category.startswith("cross_run_history_"):
+            axis = _optional_int(
+                diagnostic.left.record.get(
+                    "history_logical_token_dim",
+                    diagnostic.left.record.get("logical_token_dim", 0),
+                )
+            )
+            diagnostic.logical_difference = locate_first_logical_tensor_difference(
+                left_path,
+                right_path,
+                atol=atol,
+                rtol=rtol,
+                logical_token_axis=axis if axis is not None else 0,
+            )
+    return compared, unavailable
+
+
 def _event_name(event: Optional[TraceEvent]) -> str:
     if event is None:
         return "<missing>"
@@ -709,6 +1164,42 @@ def _metrics_summary(metrics: Optional[TensorMetrics]) -> str:
         f"changed={metrics.changed_count}/{_format_number(metrics.changed_fraction)} "
         f"max_index={metrics.max_abs_index} "
         f"values={metrics.reference_at_max}->{metrics.candidate_at_max}"
+    )
+
+
+def _logical_difference_summary(
+    difference: Optional[LogicalTensorDifference],
+) -> str:
+    if difference is None:
+        return "logical-first-diff=not requested/found"
+    if not difference.available:
+        return f"logical-first-diff=unavailable ({difference.reason})"
+    if difference.first_logical_token is None:
+        return (
+            "logical history is equal over all saved tokens"
+            + (f" ({difference.reason})" if difference.reason else "")
+        )
+    if difference.first_index is None:
+        return (
+            f"first differing logical token={difference.first_logical_token}; "
+            f"{difference.reason or 'element coordinate unavailable'}"
+        )
+    return (
+        f"first differing logical token={difference.first_logical_token} "
+        f"element_flat={difference.first_element_flat_index} "
+        f"index={difference.first_index} "
+        f"values={difference.reference_value}->{difference.candidate_value} "
+        f"abs_diff={_format_number(difference.abs_diff)} "
+        f"changed_logical_tokens={difference.changed_logical_tokens}"
+    )
+
+
+def _diagnostic_checkpoint(diagnostic: DiagnosticComparison) -> str:
+    return (
+        f"pos={diagnostic.left.pred_position} tok={diagnostic.left.input_token} "
+        f"L{diagnostic.left.layer_id} row="
+        f"{diagnostic.left.record.get('row_in_forward')} "
+        f"{diagnostic.left.stage} -> {diagnostic.right.stage}"
     )
 
 
@@ -899,11 +1390,14 @@ def build_human_report(
     reference: ParsedLog,
     candidate: ParsedLog,
     comparisons: list[Comparison],
+    diagnostics: list[DiagnosticComparison],
     *,
     duplicate_reference: int,
     duplicate_candidate: int,
     tensor_compared: int,
     tensor_unavailable: int,
+    diagnostic_tensor_compared: int,
+    diagnostic_tensor_unavailable: int,
     context: int,
     top: int,
     atol: float,
@@ -975,6 +1469,11 @@ def build_human_report(
         f"unavailable={tensor_unavailable}, allclose tolerance: "
         f"atol={atol:g}, rtol={rtol:g}"
     )
+    if diagnostics:
+        lines.append(
+            f"diagnostic tensor comparisons={diagnostic_tensor_compared}, "
+            f"unavailable={diagnostic_tensor_unavailable}"
+        )
     if reference.malformed_trace_lines or candidate.malformed_trace_lines:
         lines.append(
             "malformed trace lines: "
@@ -1039,6 +1538,125 @@ def build_human_report(
                 f"    {reason}: {_event_name(source)} -> {readback.stage} "
                 f"(readback line={readback.line_no})"
             )
+
+    replay_diagnostics = [
+        item for item in diagnostics if "topk" in item.left.stage.lower()
+        or "topk" in item.right.stage.lower()
+    ]
+    if replay_diagnostics:
+        lines.append("")
+        lines.append("INDEXER SAME-SHAPE REPEAT / T=1 SHADOW REPLAY")
+        for item in replay_diagnostics:
+            lines.append(
+                f"  [{item.left_side}->{item.right_side}] "
+                f"{_diagnostic_checkpoint(item)}: {item.status}"
+            )
+            if item.status != "exact":
+                lines.append(f"    {_metrics_summary(item.tensor_metrics)}")
+            if item.note:
+                lines.append(f"    note: {item.note}")
+
+        candidate_repeat: dict[tuple[Any, ...], DiagnosticComparison] = {}
+        candidate_replay: dict[tuple[Any, ...], DiagnosticComparison] = {}
+        cross_replay: dict[tuple[Any, ...], DiagnosticComparison] = {}
+        for item in replay_diagnostics:
+            key = _cross_run_diagnostic_key(item.left)
+            if (
+                item.category == "within_run_production_vs_repeat"
+                and item.left_side == "candidate"
+            ):
+                candidate_repeat[key] = item
+            elif (
+                item.category == "within_run_production_vs_t1_replay"
+                and item.left_side == "candidate"
+            ):
+                candidate_replay[key] = item
+            elif item.category == (
+                "cross_run_reference_production_vs_candidate_t1_replay"
+            ):
+                cross_replay[key] = item
+        conclusion_keys = sorted(
+            set(candidate_repeat) | set(candidate_replay) | set(cross_replay),
+            key=lambda key: tuple(
+                "" if value is None else str(value) for value in key
+            ),
+        )
+        for key in conclusion_keys:
+            repeat = candidate_repeat.get(key)
+            replay = candidate_replay.get(key)
+            cross = cross_replay.get(key)
+            prefix = f"  AUTO pos={key[0]} tok={key[1]} L{key[2]}: "
+            if repeat is not None and repeat.status != "exact":
+                lines.append(
+                    prefix
+                    + "same-shape T>1 repeat changed; prioritize indexer "
+                    "non-determinism, stream ordering, or cache visibility."
+                )
+            elif (
+                repeat is not None
+                and repeat.status == "exact"
+                and replay is not None
+                and replay.status != "exact"
+                and cross is not None
+                and cross.status == "exact"
+            ):
+                lines.append(
+                    prefix
+                    + "T>1 production is repeatable, T=1 replay differs from it, "
+                    "and replay matches no-MTP: this isolates a T>1 versus T=1 "
+                    "LightningIndexer shape-path difference."
+                )
+            elif (
+                repeat is not None
+                and repeat.status == "exact"
+                and replay is not None
+                and replay.status != "exact"
+                and cross is not None
+                and cross.status != "exact"
+            ):
+                lines.append(
+                    prefix
+                    + "T=1 replay does not recover the no-MTP result; inspect "
+                    "the saved logical history K/scale before blaming only the "
+                    "T>1 kernel shape."
+                )
+            elif (
+                replay is not None
+                and replay.status == "exact"
+                and cross is not None
+                and cross.status != "exact"
+            ):
+                lines.append(
+                    prefix
+                    + "candidate T>1 and T=1 agree with each other but differ "
+                    "from no-MTP; historical cache/input state is the priority."
+                )
+            elif all(
+                item is None or item.status == "exact"
+                for item in (repeat, replay, cross)
+            ):
+                lines.append(
+                    prefix
+                    + "all available production/repeat/replay comparisons are exact."
+                )
+
+    history_diagnostics = [
+        item
+        for item in diagnostics
+        if item.category.startswith("cross_run_history_")
+    ]
+    if history_diagnostics:
+        lines.append("")
+        lines.append("LOGICAL INDEXER HISTORY K/SCALE CROSS-RUN CHECK")
+        for item in history_diagnostics:
+            lines.append(
+                f"  {_diagnostic_checkpoint(item)}: {item.status}"
+            )
+            if item.status != "exact":
+                lines.append(f"    {_metrics_summary(item.tensor_metrics)}")
+                lines.append(
+                    f"    {_logical_difference_summary(item.logical_difference)}"
+                )
 
     paired = [
         comparison
@@ -1296,6 +1914,7 @@ def write_json_report(
     reference: ParsedLog,
     candidate: ParsedLog,
     comparisons: list[Comparison],
+    diagnostics: list[DiagnosticComparison],
 ) -> None:
     payload = {
         "reference": {
@@ -1319,6 +1938,26 @@ def write_json_report(
                 ),
             }
             for item in comparisons
+        ],
+        "diagnostics": [
+            {
+                "category": item.category,
+                "left_side": item.left_side,
+                "right_side": item.right_side,
+                "status": item.status,
+                "note": item.note,
+                "left": _event_for_json(item.left),
+                "right": _event_for_json(item.right),
+                "tensor_metrics": (
+                    asdict(item.tensor_metrics) if item.tensor_metrics else None
+                ),
+                "logical_difference": (
+                    asdict(item.logical_difference)
+                    if item.logical_difference
+                    else None
+                ),
+            }
+            for item in diagnostics
         ],
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1526,17 +2165,48 @@ def main(argv: Optional[list[str]] = None) -> int:
         for summary in mixed_streams:
             print(f"  {summary}", file=sys.stderr)
         return 3
-    comparisons, duplicate_reference, duplicate_candidate = align_events(
+    diagnostics = build_diagnostic_comparisons(
         reference.stage_events, candidate.stage_events
+    )
+    # Repeat/replay stages intentionally exist only in a diagnostic run.  Keep
+    # them out of normal cross-run alignment so they do not create misleading
+    # missing-reference rows in otherwise conclusive reports.
+    regular_reference_events = [
+        event
+        for event in reference.stage_events
+        if not _is_shadow_only_stage(event.stage)
+    ]
+    regular_candidate_events = [
+        event
+        for event in candidate.stage_events
+        if not _is_shadow_only_stage(event.stage)
+    ]
+    comparisons, duplicate_reference, duplicate_candidate = align_events(
+        regular_reference_events, regular_candidate_events
     )
 
     tensor_compared = 0
     tensor_unavailable = 0
+    diagnostic_tensor_compared = 0
+    diagnostic_tensor_unavailable = 0
+    reference_resolver = DumpResolver(args.reference_dump_dir)
+    candidate_resolver = DumpResolver(args.candidate_dump_dir)
     if not args.skip_tensors:
         tensor_compared, tensor_unavailable = attach_tensor_metrics(
             comparisons,
-            reference_resolver=DumpResolver(args.reference_dump_dir),
-            candidate_resolver=DumpResolver(args.candidate_dump_dir),
+            reference_resolver=reference_resolver,
+            candidate_resolver=candidate_resolver,
+            atol=args.atol,
+            rtol=args.rtol,
+            top_elements=args.top_elements,
+        )
+        (
+            diagnostic_tensor_compared,
+            diagnostic_tensor_unavailable,
+        ) = attach_diagnostic_tensor_metrics(
+            diagnostics,
+            reference_resolver=reference_resolver,
+            candidate_resolver=candidate_resolver,
             atol=args.atol,
             rtol=args.rtol,
             top_elements=args.top_elements,
@@ -1546,10 +2216,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         reference,
         candidate,
         comparisons,
+        diagnostics,
         duplicate_reference=duplicate_reference,
         duplicate_candidate=duplicate_candidate,
         tensor_compared=tensor_compared,
         tensor_unavailable=tensor_unavailable,
+        diagnostic_tensor_compared=diagnostic_tensor_compared,
+        diagnostic_tensor_unavailable=diagnostic_tensor_unavailable,
         context=args.context,
         top=args.top,
         atol=args.atol,
@@ -1561,7 +2234,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         args.report.write_text(report, encoding="utf-8")
         print(f"compact report written to: {args.report}", file=sys.stderr)
     if args.json_report is not None:
-        write_json_report(args.json_report, reference, candidate, comparisons)
+        write_json_report(
+            args.json_report,
+            reference,
+            candidate,
+            comparisons,
+            diagnostics,
+        )
         print(f"JSON report written to: {args.json_report}", file=sys.stderr)
 
     if not reference.stage_events or not candidate.stage_events:

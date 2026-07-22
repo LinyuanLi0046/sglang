@@ -1,9 +1,10 @@
 """Opt-in diagnostics for deterministic NEXTN/normal-decode divergence.
 
 The helpers in this module are intentionally dormant unless
-``SGLANG_NPU_MTP_GREEDY_TRACE=1``.  Trace mode synchronizes small tensors to the
-host and performs a TP all-gather, so it is for short, single-request repros
-only, not performance measurements.
+``SGLANG_NPU_MTP_GREEDY_TRACE=1``.  Trace mode synchronizes selected tensors to
+the host and performs a TP all-gather; full-tensor mode can also dump a bounded
+logical indexer-cache prefix.  It is for short, single-request repros only, not
+performance measurements.
 """
 
 from __future__ import annotations
@@ -414,6 +415,31 @@ def npu_mtp_stage_trace_forward_selected(
     return bool(selected_rows)
 
 
+def npu_mtp_stage_trace_selected_rows(
+    *,
+    positions: torch.Tensor,
+    forward_batch: "ForwardBatch",
+    layer_id: int,
+    writer_only: bool = True,
+) -> list[int]:
+    """Return traced rows, optionally only on the stage-trace writer rank.
+
+    Shadow operators request rows on every TP rank to preserve rank symmetry;
+    ragged host dumps keep the default and run only on the writer.
+    """
+
+    if not npu_mtp_stage_trace_forward_selected(
+        positions=positions,
+        forward_batch=forward_batch,
+        layer_id=layer_id,
+    ):
+        return []
+    if writer_only and _trace_group().rank_in_group != 0:
+        return []
+    selected_rows, _, _ = _selected_stage_rows(positions, forward_batch)
+    return list(selected_rows)
+
+
 def _stage_tensor_fingerprint(
     tensor: torch.Tensor,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
@@ -503,6 +529,131 @@ def _maybe_dump_stage_tensor(
     return path
 
 
+def _trace_npu_mtp_stage_selected_tensor(
+    *,
+    stage: str,
+    selected_tensor: torch.Tensor,
+    row: int,
+    position_values: list[int],
+    input_id_values: Optional[list[int]],
+    forward_batch: "ForwardBatch",
+    layer_id: int,
+    group: Any,
+    token_dim: Optional[int],
+    extra: Optional[dict[str, Any]],
+) -> None:
+    """Write one tensor that has already been associated with a traced row."""
+
+    mode = forward_batch.forward_mode
+    input_position = int(position_values[row])
+    input_token = (
+        int(input_id_values[row]) if input_id_values is not None else None
+    )
+    cpu_tensor, fingerprint = _stage_tensor_fingerprint(selected_tensor)
+    count_key = (
+        int(group.rank),
+        str(mode),
+        int(layer_id),
+        stage,
+        input_position,
+        input_token,
+    )
+    occurrence = _STAGE_TRACE_COUNTS.get(count_key, 0)
+    _STAGE_TRACE_COUNTS[count_key] = occurrence + 1
+    metadata = {
+        **_rank_fields(group),
+        "forward_mode": str(mode),
+        "layer_id": int(layer_id),
+        "stage": stage,
+        "input_position": input_position,
+        "pred_position": input_position + 1,
+        "input_token": input_token,
+        "row_in_forward": int(row),
+        "tokens_in_forward": len(position_values),
+        "token_dim": token_dim,
+        "occurrence": occurrence,
+        "fingerprint": fingerprint,
+        **(extra or {}),
+    }
+    if "topk" in stage and not selected_tensor.is_floating_point():
+        flattened_indices = cpu_tensor.reshape(-1)
+        metadata["topk_summary"] = {
+            "unique_count": int(torch.unique(flattened_indices).numel()),
+            "negative_count": int((flattened_indices < 0).sum().item()),
+            "future_count": int(
+                (flattened_indices > input_position).sum().item()
+            ),
+        }
+    dump_path = _maybe_dump_stage_tensor(
+        cpu_tensor=cpu_tensor,
+        metadata=metadata,
+        occurrence=occurrence,
+    )
+    if dump_path is not None:
+        metadata["tensor_dump"] = dump_path
+    _emit("npu_stage", metadata)
+
+
+def trace_npu_mtp_stage_row_tensor(
+    *,
+    stage: str,
+    tensor: Any,
+    row_in_forward: int,
+    positions: torch.Tensor,
+    forward_batch: "ForwardBatch",
+    layer_id: int,
+    extra: Optional[dict[str, Any]] = None,
+) -> None:
+    """Trace a ragged tensor that already belongs to one selected token row.
+
+    Unlike :func:`trace_npu_mtp_stage_tensor`, ``tensor`` has no outer token
+    dimension.  This is used for logical KV prefixes whose lengths differ for
+    each row of a multi-token TARGET_VERIFY forward.
+    """
+
+    if isinstance(tensor, (tuple, list)):
+        for index, component in enumerate(tensor):
+            trace_npu_mtp_stage_row_tensor(
+                stage=f"{stage}.{index}",
+                tensor=component,
+                row_in_forward=row_in_forward,
+                positions=positions,
+                forward_batch=forward_batch,
+                layer_id=layer_id,
+                extra=extra,
+            )
+        return
+    if tensor is None or not isinstance(tensor, torch.Tensor):
+        return
+
+    selected_rows = npu_mtp_stage_trace_selected_rows(
+        positions=positions,
+        forward_batch=forward_batch,
+        layer_id=layer_id,
+    )
+    row = int(row_in_forward)
+    if row not in selected_rows:
+        return
+    _, position_values, input_id_values = _selected_stage_rows(
+        positions, forward_batch
+    )
+    if row < 0 or row >= len(position_values):
+        return
+    group = _trace_group()
+    _trace_npu_mtp_stage_selected_tensor(
+        stage=stage,
+        selected_tensor=tensor,
+        row=row,
+        position_values=position_values,
+        input_id_values=input_id_values,
+        forward_batch=forward_batch,
+        layer_id=layer_id,
+        group=group,
+        token_dim=None,
+        extra={"preselected_row_tensor": True, **(extra or {})},
+    )
+
+
 def trace_npu_mtp_stage_tensor(
     *,
     stage: str,
@@ -583,54 +734,18 @@ def trace_npu_mtp_stage_tensor(
         return
 
     for row in selected_rows:
-        input_position = int(position_values[row])
-        input_token = (
-            int(input_id_values[row]) if input_id_values is not None else None
+        _trace_npu_mtp_stage_selected_tensor(
+            stage=stage,
+            selected_tensor=tensor.select(normalized_token_dim, row),
+            row=row,
+            position_values=position_values,
+            input_id_values=input_id_values,
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            group=group,
+            token_dim=int(token_dim),
+            extra=extra,
         )
-        selected_tensor = tensor.select(normalized_token_dim, row)
-        cpu_tensor, fingerprint = _stage_tensor_fingerprint(selected_tensor)
-        count_key = (
-            int(group.rank),
-            str(mode),
-            int(layer_id),
-            stage,
-            input_position,
-            input_token,
-        )
-        occurrence = _STAGE_TRACE_COUNTS.get(count_key, 0)
-        _STAGE_TRACE_COUNTS[count_key] = occurrence + 1
-        metadata = {
-            **_rank_fields(group),
-            "forward_mode": str(mode),
-            "layer_id": int(layer_id),
-            "stage": stage,
-            "input_position": input_position,
-            "pred_position": input_position + 1,
-            "input_token": input_token,
-            "row_in_forward": int(row),
-            "tokens_in_forward": len(position_values),
-            "token_dim": int(token_dim),
-            "occurrence": occurrence,
-            "fingerprint": fingerprint,
-            **(extra or {}),
-        }
-        if "topk" in stage and not selected_tensor.is_floating_point():
-            flattened_indices = cpu_tensor.reshape(-1)
-            metadata["topk_summary"] = {
-                "unique_count": int(torch.unique(flattened_indices).numel()),
-                "negative_count": int((flattened_indices < 0).sum().item()),
-                "future_count": int(
-                    (flattened_indices > input_position).sum().item()
-                ),
-            }
-        dump_path = _maybe_dump_stage_tensor(
-            cpu_tensor=cpu_tensor,
-            metadata=metadata,
-            occurrence=occurrence,
-        )
-        if dump_path is not None:
-            metadata["tensor_dump"] = dump_path
-        _emit("npu_stage", metadata)
 
 
 def _safe_name(value: Any) -> str:

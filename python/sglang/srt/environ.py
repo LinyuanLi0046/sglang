@@ -549,6 +549,10 @@ class Envs:
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
+    # Maximum S1 per pseudo batch for the NPU DSA target-verify indexer.
+    # 0 disables the workaround, 1 is the strict T1 path, and 2 is the faster
+    # non-split-M path. Both enabled modes keep a single operator launch.
+    SGLANG_NPU_DSA_INDEXER_MAX_S1 = EnvInt(0)
     # Keep the GLM DSA NextN draft KV cache in BF16 when the target KV cache
     # uses FP8. This is intentionally a draft-only override; the target keeps
     # the FP8 layout selected by --kv-cache-dtype.

@@ -115,12 +115,85 @@ if TYPE_CHECKING:
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 NPU_MTP_TRACE_HISTORY_MAX_BYTES = 64 * 1024 * 1024
+NPU_DSA_INDEXER_GROUPED_METADATA_CACHE = "_npu_dsa_indexer_grouped_metadata"
 GRAPH_WEIGHTS_PROJ_LORA_ERROR = (
     "DSA indexer weights_proj LoRA is incompatible with "
     "piecewise/breakable CUDA graph; remove the explicit "
     "prefill cuda-graph backend override or drop "
     "indexer.weights_proj from the LoRA target modules."
 )
+
+
+def _build_npu_dsa_indexer_grouped_metadata(
+    actual_seq_lengths_q: torch.Tensor,
+    actual_seq_lengths_kv: torch.Tensor,
+    block_table: torch.Tensor,
+    num_query_tokens: int,
+    max_s1: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split each TND target-verify request into bounded-S1 pseudo batches.
+
+    For an original request with query length ``q_len`` and final key length
+    ``kv_len``, a segment starting at ``s`` with length ``g`` gets key length
+    ``kv_len - q_len + s + g``. Right-down causal masking then gives every row
+    exactly the same visible keys as the original request. Keeping ``g <= 2``
+    avoids LightningIndexer's ``actMBaseSize > 128`` split-M path for GLM's
+    64 query heads.
+
+    Query/weight tensors stay in their original request-major order, and the
+    operator still runs once.  Consequently its output needs no reordering.
+    """
+    if max_s1 not in (1, 2):
+        raise ValueError(f"NPU DSA indexer max S1 must be 1 or 2, got {max_s1}")
+
+    device = block_table.device
+    batch_size = actual_seq_lengths_q.numel()
+    seq_kv = actual_seq_lengths_kv.reshape(-1).to(
+        device=device, dtype=torch.int32
+    )
+    if batch_size == 0:
+        raise RuntimeError(
+            "NPU DSA indexer grouped pseudo batch requires a non-empty batch"
+        )
+    if seq_kv.numel() != batch_size or block_table.shape[0] != batch_size:
+        raise RuntimeError(
+            "NPU DSA indexer grouped pseudo batch requires matching ASLQ, ASLK, "
+            f"and block-table batch dimensions, got {batch_size}, "
+            f"{seq_kv.numel()}, and {block_table.shape[0]}"
+        )
+    if num_query_tokens % batch_size != 0:
+        raise RuntimeError(
+            "NPU DSA target verification requires a uniform query count per "
+            f"request, got {num_query_tokens} tokens for {batch_size} requests"
+        )
+
+    query_len = num_query_tokens // batch_size
+    segments_per_request = (query_len + max_s1 - 1) // max_s1
+    segment_starts_one_request = torch.arange(
+        0, query_len, max_s1, dtype=torch.int32, device=device
+    )
+    segment_lens_one_request = torch.clamp(
+        query_len - segment_starts_one_request, max=max_s1
+    )
+    request_ids = torch.arange(
+        batch_size, dtype=torch.int64, device=device
+    ).repeat_interleave(segments_per_request)
+    segment_starts = segment_starts_one_request.repeat(batch_size)
+    segment_lens = segment_lens_one_request.repeat(batch_size)
+
+    grouped_seq_q = torch.cumsum(segment_lens, dim=0, dtype=torch.int32)
+    selected_seq_kv = seq_kv.index_select(0, request_ids)
+    grouped_seq_kv = (
+        selected_seq_kv - query_len + segment_starts + segment_lens
+    )
+    # Graph padding keeps fixed query segments for inactive request slots while
+    # their key length is zero. Preserve zero instead of producing a negative
+    # length that the operator could reinterpret as an unsigned value.
+    grouped_seq_kv = torch.where(
+        selected_seq_kv > 0, grouped_seq_kv, selected_seq_kv
+    )
+    grouped_block_table = block_table.index_select(0, request_ids)
+    return grouped_seq_q, grouped_seq_kv, grouped_block_table
 
 
 def _is_in_piecewise_or_breakable_cuda_graph() -> bool:
@@ -344,6 +417,14 @@ class Indexer(MultiPlatformOp):
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
         self.alt_stream = alt_stream
+        self.npu_dsa_indexer_max_s1 = (
+            envs.SGLANG_NPU_DSA_INDEXER_MAX_S1.get() if _is_npu else 0
+        )
+        if self.npu_dsa_indexer_max_s1 not in (0, 1, 2):
+            raise ValueError(
+                "SGLANG_NPU_DSA_INDEXER_MAX_S1 must be 0, 1, or 2, got "
+                f"{self.npu_dsa_indexer_max_s1}"
+            )
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
@@ -2465,6 +2546,47 @@ class Indexer(MultiPlatformOp):
                     extra=trace_extra,
                 )
 
+            li_actual_seq_lengths_q = actual_seq_lengths_q
+            li_actual_seq_lengths_kv = actual_seq_lengths_kv
+            li_block_table = block_table
+            if (
+                self.npu_dsa_indexer_max_s1 > 0
+                and forward_batch.forward_mode.is_target_verify()
+                and indexer_query.shape[0]
+                > actual_seq_lengths_q.numel() * self.npu_dsa_indexer_max_s1
+            ):
+                forward_metadata = get_attn_backend().forward_metadata
+                grouped_metadata = getattr(
+                    forward_metadata,
+                    NPU_DSA_INDEXER_GROUPED_METADATA_CACHE,
+                    None,
+                )
+                if grouped_metadata is None:
+                    grouped_metadata = _build_npu_dsa_indexer_grouped_metadata(
+                        actual_seq_lengths_q=actual_seq_lengths_q,
+                        actual_seq_lengths_kv=actual_seq_lengths_kv,
+                        block_table=block_table,
+                        num_query_tokens=indexer_query.shape[0],
+                        max_s1=self.npu_dsa_indexer_max_s1,
+                    )
+                    setattr(
+                        forward_metadata,
+                        NPU_DSA_INDEXER_GROUPED_METADATA_CACHE,
+                        grouped_metadata,
+                    )
+                (
+                    li_actual_seq_lengths_q,
+                    li_actual_seq_lengths_kv,
+                    li_block_table,
+                ) = grouped_metadata
+                if trace_selected_forward:
+                    trace_extra["li_grouped_pseudo_batch_max_s1"] = int(
+                        self.npu_dsa_indexer_max_s1
+                    )
+                    trace_extra["li_grouped_pseudo_batch_size"] = int(
+                        li_actual_seq_lengths_q.numel()
+                    )
+
             if is_use_quant_lightning_indexer:
                 topk_indices = torch_npu.npu_quant_lightning_indexer(
                     query=indexer_query,
@@ -2472,11 +2594,13 @@ class Indexer(MultiPlatformOp):
                     weights=indexer_weights,
                     query_dequant_scale=indexer_query_scale,
                     key_dequant_scale=past_key_states_scale,
-                    actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
-                    actual_seq_lengths_key=actual_seq_lengths_kv.to(k.device).to(
+                    actual_seq_lengths_query=li_actual_seq_lengths_q.to(
                         torch.int32
                     ),
-                    block_table=block_table,
+                    actual_seq_lengths_key=li_actual_seq_lengths_kv.to(
+                        k.device
+                    ).to(torch.int32),
+                    block_table=li_block_table,
                     layout_query="TND",
                     layout_key="PA_BSND",
                     sparse_count=self.index_topk,
@@ -2491,9 +2615,9 @@ class Indexer(MultiPlatformOp):
                             indexer_query=indexer_query,
                             past_key_states=past_key_states,
                             indexer_weights=indexer_weights,
-                            actual_seq_lengths_q=actual_seq_lengths_q,
-                            actual_seq_lengths_kv=actual_seq_lengths_kv,
-                            block_table=block_table,
+                            actual_seq_lengths_q=li_actual_seq_lengths_q,
+                            actual_seq_lengths_kv=li_actual_seq_lengths_kv,
+                            block_table=li_block_table,
                             positions=positions,
                             forward_batch=forward_batch,
                             layer_id=layer_id,
@@ -2514,11 +2638,13 @@ class Indexer(MultiPlatformOp):
                     query=indexer_query,
                     key=past_key_states,
                     weights=indexer_weights,
-                    actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
-                    actual_seq_lengths_key=actual_seq_lengths_kv.to(k.device).to(
+                    actual_seq_lengths_query=li_actual_seq_lengths_q.to(
                         torch.int32
                     ),
-                    block_table=block_table,
+                    actual_seq_lengths_key=li_actual_seq_lengths_kv.to(
+                        k.device
+                    ).to(torch.int32),
+                    block_table=li_block_table,
                     layout_query="TND",
                     layout_key="PA_BSND",
                     sparse_count=self.index_topk,
@@ -2531,9 +2657,9 @@ class Indexer(MultiPlatformOp):
                             indexer_query=indexer_query,
                             past_key_states=past_key_states,
                             indexer_weights=indexer_weights,
-                            actual_seq_lengths_q=actual_seq_lengths_q,
-                            actual_seq_lengths_kv=actual_seq_lengths_kv,
-                            block_table=block_table,
+                            actual_seq_lengths_q=li_actual_seq_lengths_q,
+                            actual_seq_lengths_kv=li_actual_seq_lengths_kv,
+                            block_table=li_block_table,
                             positions=positions,
                             forward_batch=forward_batch,
                             layer_id=layer_id,

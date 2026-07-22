@@ -283,6 +283,17 @@ class Envs:
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
+    # Short-case diagnostics for greedy NEXTN verification on NPU.  All tensor
+    # copies, TP consensus collectives, and optional full-logit dumps are gated
+    # by the master switch and are absent from the normal hot path.
+    SGLANG_NPU_MTP_GREEDY_TRACE = EnvBool(False)
+    SGLANG_NPU_MTP_GREEDY_TRACE_RID = EnvStr("")
+    SGLANG_NPU_MTP_GREEDY_TRACE_START_TOKEN = EnvInt(0)
+    SGLANG_NPU_MTP_GREEDY_TRACE_MAX_TOKENS = EnvInt(512)
+    SGLANG_NPU_MTP_GREEDY_TRACE_TOPN = EnvInt(8)
+    SGLANG_NPU_MTP_GREEDY_TRACE_LABEL = EnvStr("")
+    SGLANG_NPU_MTP_GREEDY_TRACE_DUMP_POSITIONS = EnvStr("")
+    SGLANG_NPU_MTP_GREEDY_TRACE_DUMP_DIR = EnvStr("/tmp/sglang_mtp_trace")
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)

@@ -2555,13 +2555,19 @@ class Indexer(MultiPlatformOp):
                 and indexer_query.shape[0]
                 > actual_seq_lengths_q.numel() * self.npu_dsa_indexer_max_s1
             ):
-                forward_metadata = get_attn_backend().forward_metadata
+                attn_backend = get_attn_backend()
+                forward_metadata = attn_backend.forward_metadata
                 grouped_metadata = getattr(
                     forward_metadata,
                     NPU_DSA_INDEXER_GROUPED_METADATA_CACHE,
                     None,
                 )
                 if grouped_metadata is None:
+                    if getattr(attn_backend, "graph_mode", False):
+                        raise RuntimeError(
+                            "NPU DSA indexer grouped graph metadata was not "
+                            "preallocated by the attention backend"
+                        )
                     grouped_metadata = _build_npu_dsa_indexer_grouped_metadata(
                         actual_seq_lengths_q=actual_seq_lengths_q,
                         actual_seq_lengths_kv=actual_seq_lengths_kv,

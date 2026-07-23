@@ -77,8 +77,11 @@ if _is_cuda:
 if _use_aiter:
     from aiter.ops.cache import indexer_k_quant_and_cache
 
-if is_npu():
+if _is_npu:
     import torch_npu
+    import triton
+    import triton.language as tl
+    from sglang.srt.hardware_backend.npu.kernels import NUM_VECTOR_CORES
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
 from sglang.srt.distributed import (
@@ -283,8 +286,88 @@ class BaseIndexerMetadata(ABC):
         """
 
 
+if _is_npu:
+
+    @triton.jit(do_not_specialize=["num_rows"])
+    def _npu_hadamard_128_kernel(
+        input_ptr,
+        output_ptr,
+        num_rows,
+        BLOCK_ROWS: tl.constexpr,
+    ):
+        """Apply a normalized H128 to contiguous rows without materializing H."""
+        pid = tl.program_id(0)
+        num_programs = tl.num_programs(0)
+        row_in_tile = tl.arange(0, BLOCK_ROWS)
+        col = tl.arange(0, 128)
+        row_in_tile_2d = tl.expand_dims(row_in_tile, 1)
+        col_2d = tl.expand_dims(col, 0)
+        num_row_tiles = tl.cdiv(num_rows, BLOCK_ROWS)
+
+        for row_tile in tl.range(pid, num_row_tiles, num_programs):
+            row = row_tile * BLOCK_ROWS + row_in_tile_2d
+            offsets = row * 128 + col_2d
+            mask = tl.broadcast_to(row < num_rows, (BLOCK_ROWS, 128))
+            values = tl.load(input_ptr + offsets, mask=mask, other=0.0)
+            # Match the former NPU path: round the activation to BF16 first,
+            # then perform all seven butterfly stages in FP32.
+            values = values.to(tl.bfloat16).to(tl.float32)
+
+            # One stage maps adjacent pairs to [all sums | all differences].
+            # Repeating the same order seven times is the standard Sylvester
+            # Walsh-Hadamard transform H128.
+            for _ in tl.static_range(0, 7):
+                pairs = tl.reshape(values, (BLOCK_ROWS, 64, 2))
+                even, odd = tl.split(pairs)
+                joined = tl.join(even + odd, even - odd)
+                front_back = tl.trans(joined, (0, 2, 1))
+                values = tl.reshape(front_back, (BLOCK_ROWS, 128))
+
+            values *= 0.08838834764831845  # 1 / sqrt(128)
+            tl.store(output_ptr + offsets, values, mask=mask)
+
+
+def _rotate_activation_npu(x: torch.Tensor) -> torch.Tensor:
+    """Apply the normalized H128 with the in-file Triton Ascend kernel."""
+    if x.device.type != "npu":
+        raise RuntimeError("NPU Hadamard rotation requires an NPU tensor.")
+    if x.size(-1) != 128:
+        raise ValueError(
+            f"NPU DSA Hadamard rotation requires last dimension 128, got {x.size(-1)}."
+        )
+    if not x.is_contiguous():
+        raise ValueError("NPU DSA Hadamard rotation requires a contiguous tensor.")
+
+    output = torch.empty_like(x, dtype=torch.bfloat16)
+    num_rows = x.numel() // 128
+    if num_rows == 0:
+        return output
+
+    # Keep decode/small-batch rows independently scheduled. Only batch rows
+    # after there are enough tiles to keep every VectorCore occupied.
+    block_rows = 8 if num_rows >= NUM_VECTOR_CORES * 8 else 1
+    grid = (min(triton.cdiv(num_rows, block_rows), NUM_VECTOR_CORES),)
+    _npu_hadamard_128_kernel[grid](
+        x,
+        output,
+        num_rows,
+        BLOCK_ROWS=block_rows,
+    )
+    return output
+
+
+def _quantize_npu_indexer_activation(
+    x: torch.Tensor,
+    dst_type: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    rotated = _rotate_activation_npu(x)
+    return torch_npu.npu_dynamic_quant(rotated, dst_type=dst_type)
+
+
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     # from sgl_kernel import hadamard_transform
+    if _is_npu:
+        return _rotate_activation_npu(x)
     if _is_hip:
         from fast_hadamard_transform import hadamard_transform
     else:
@@ -1720,6 +1803,22 @@ class Indexer(MultiPlatformOp):
                 device=x.device,
             )
 
+        use_npu_prefill_cp = (
+            is_prefill
+            and self.dsa_enable_prefill_cp
+            and forward_batch.attn_cp_metadata is not None
+        )
+        is_use_quant_lightning_indexer = (
+            get_token_to_kv_pool().dtype == torch.float8_e4m3fn
+        )
+        # TODO: Add paired Q/K Hadamard, dynamic quantization, and
+        # npu_quant_lightning_indexer support for NPU prefill CP.
+        if is_use_quant_lightning_indexer and use_npu_prefill_cp:
+            raise NotImplementedError(
+                "NPU FP8 Indexer does not support DSA prefill context "
+                "parallelism yet."
+            )
+
         if self.rotary_emb.is_neox_style:
             if not hasattr(forward_batch, "npu_indexer_sin_cos_cache"):
                 cos_sin = self.rotary_emb.cos_sin_cache[positions]
@@ -1846,11 +1945,7 @@ class Indexer(MultiPlatformOp):
             q = torch.cat([q_pe, q_nope], dim=-1)
             k = torch.cat([k_pe, k_nope], dim=-1)
 
-        if (
-            is_prefill
-            and self.dsa_enable_prefill_cp
-            and forward_batch.attn_cp_metadata is not None
-        ):
+        if use_npu_prefill_cp:
             k = cp_all_gather_rerange_output(
                 k.contiguous().view(-1, self.head_dim),
                 self.cp_size,
@@ -1858,10 +1953,11 @@ class Indexer(MultiPlatformOp):
                 torch.npu.current_stream(),
             )
 
-        is_use_quant_lightning_indexer = get_token_to_kv_pool().dtype == torch.float8_e4m3fn
         if is_use_quant_lightning_indexer:
-            k, k_scale = torch_npu.npu_dynamic_quant(
-                k, dst_type=get_token_to_kv_pool().dtype
+            # The matching Q rotation below preserves the pre-quant dot product.
+            k, k_scale = _quantize_npu_indexer_activation(
+                k,
+                get_token_to_kv_pool().dtype,
             )
             get_token_to_kv_pool().set_index_k_scale_buffer(
                 layer_id, forward_batch.out_cache_loc, k_scale
@@ -1884,10 +1980,7 @@ class Indexer(MultiPlatformOp):
                 actual_seq_lengths_kv.numel() * query_tokens_per_req,
             )
         if is_prefill:
-            if (
-                self.dsa_enable_prefill_cp
-                and forward_batch.attn_cp_metadata is not None
-            ):
+            if use_npu_prefill_cp:
                 get_attn_backend().forward_metadata.actual_seq_lengths_q = (
                     forward_batch.attn_cp_metadata.actual_seq_q_prev_tensor,
                     forward_batch.attn_cp_metadata.actual_seq_q_next_tensor,
@@ -1962,11 +2055,7 @@ class Indexer(MultiPlatformOp):
             weights = scattered_to_tp_attn_full(weights, forward_batch)
         block_table = get_attn_backend().forward_metadata.block_tables
 
-        if (
-            is_prefill
-            and self.dsa_enable_prefill_cp
-            and forward_batch.attn_cp_metadata is not None
-        ):
+        if use_npu_prefill_cp:
             block_table = block_table[: actual_seq_lengths_q[0].numel()]
             topk_indices = self.do_npu_cp_balance_indexer(
                 q.view(-1, self.n_heads, self.head_dim),
@@ -1991,9 +2080,9 @@ class Indexer(MultiPlatformOp):
                 indexer_weights = indexer_weights[:indexer_bs]
 
             if is_use_quant_lightning_indexer:
-                indexer_query, indexer_query_scale = torch_npu.npu_dynamic_quant(
+                indexer_query, indexer_query_scale = _quantize_npu_indexer_activation(
                     indexer_query,
-                    dst_type=get_token_to_kv_pool().dtype
+                    get_token_to_kv_pool().dtype,
                 )
 
                 topk_indices = torch_npu.npu_quant_lightning_indexer(

@@ -477,9 +477,145 @@ def eagle_sample(
     num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
     # Sample tokens
-    if sampling_info.is_all_greedy or _is_npu or _is_hip:
+    if sampling_info.is_all_greedy or _is_hip:
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
+        predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
+            predicts=predict,  # mutable
+            accept_index=accept_index,  # mutable
+            accept_token_num=num_correct_drafts,  # mutable
+            candidates=candidates,
+            retrieve_index=verify_input.retrieve_index,
+            retrieve_next_token=verify_input.retrieve_next_token,
+            retrieve_next_sibling=verify_input.retrieve_next_sibling,
+            target_predict=target_predict,
+            topk=verify_input.tree_topk,
+        )
+    elif _is_npu:
+        server_args = get_global_server_args()
+        num_draft_tokens = verify_input.draft_token_num
+        expected_rows = bs * num_draft_tokens
+
+        if verify_input.tree_topk != 1:
+            raise NotImplementedError(
+                "NPU non-greedy speculative sampling currently supports only "
+                f"topk=1, got tree_topk={verify_input.tree_topk}."
+            )
+        if server_args.speculative_use_rejection_sampling:
+            raise NotImplementedError(
+                "NPU non-greedy speculative sampling currently supports only "
+                "target-only sampling; disable --speculative-use-rejection-sampling."
+            )
+        if (
+            server_args.speculative_accept_threshold_single != 1.0
+            or server_args.speculative_accept_threshold_acc != 1.0
+        ):
+            raise ValueError(
+                "NPU sampled-target verification requires "
+                "--speculative-accept-threshold-single=1.0 and "
+                "--speculative-accept-threshold-acc=1.0."
+            )
+        expected_tree_shape = (bs, num_draft_tokens)
+        if next_token_logits.ndim != 2 or next_token_logits.shape[0] != expected_rows:
+            raise ValueError(
+                "NPU sampled-target verification logits shape mismatch: expected "
+                f"[{expected_rows}, vocab], got {tuple(next_token_logits.shape)}."
+            )
+        if (
+            verify_input.max_tree_depth != num_draft_tokens
+            or tuple(verify_input.retrieve_index.shape) != expected_tree_shape
+        ):
+            raise ValueError(
+                "NPU sampled-target verification requires an untruncated linear "
+                f"chain of shape {expected_tree_shape}; got max_tree_depth="
+                f"{verify_input.max_tree_depth} and retrieve_index.shape="
+                f"{tuple(verify_input.retrieve_index.shape)}."
+            )
+
+        from sglang.srt.layers.sampler import (
+            sampling_from_probs_torch,
+            top_k_top_p_min_p_sampling_from_logits_ascend,
+            top_k_top_p_min_p_sampling_from_probs_torch,
+        )
+
+        expanded_temperature = torch.repeat_interleave(
+            sampling_info.temperatures, num_draft_tokens, dim=0
+        )
+        # Preserve next_token_logits for the logprob path below eagle_sample.
+        sampling_logits = next_token_logits.clone()
+        sampling_logits.div_(expanded_temperature)
+
+        expanded_sampling_seed = (
+            None
+            if sampling_info.sampling_seed is None
+            else torch.repeat_interleave(
+                sampling_info.sampling_seed, num_draft_tokens, dim=0
+            )
+        )
+        needs_filtering = (
+            sampling_info.need_top_k_sampling
+            or sampling_info.need_top_p_sampling
+            or sampling_info.need_min_p_sampling
+        )
+        if not needs_filtering:
+            target_predict = sampling_from_probs_torch(
+                F.softmax(sampling_logits, dim=-1),
+                sampling_seed=expanded_sampling_seed,
+                positions=verify_input.positions,
+            )
+        else:
+            # Keep these as new tensors. The Ascend full-vocabulary fallback
+            # rewrites TOP_K_ALL in-place to the vocabulary size.
+            expanded_top_ks = torch.repeat_interleave(
+                sampling_info.top_ks, num_draft_tokens, dim=0
+            )
+            expanded_top_ps = torch.repeat_interleave(
+                sampling_info.top_ps, num_draft_tokens, dim=0
+            )
+            expanded_min_ps = torch.repeat_interleave(
+                sampling_info.min_ps, num_draft_tokens, dim=0
+            )
+            if server_args.sampling_backend == "ascend":
+                target_predict = top_k_top_p_min_p_sampling_from_logits_ascend(
+                    sampling_logits,
+                    expanded_top_ks,
+                    expanded_top_ps,
+                    expanded_min_ps,
+                    sampling_info.need_min_p_sampling,
+                    expanded_sampling_seed,
+                    verify_input.positions,
+                )
+            elif server_args.sampling_backend == "pytorch":
+                target_predict = top_k_top_p_min_p_sampling_from_probs_torch(
+                    F.softmax(sampling_logits, dim=-1),
+                    expanded_top_ks,
+                    expanded_top_ps,
+                    expanded_min_ps,
+                    sampling_info.need_min_p_sampling,
+                    expanded_sampling_seed,
+                    verify_input.positions,
+                )
+            else:
+                raise NotImplementedError(
+                    "NPU non-greedy speculative sampling supports only the "
+                    "'ascend' and 'pytorch' sampling backends, got "
+                    f"{server_args.sampling_backend!r}."
+                )
+
+        # For a deterministic top-k=1 draft proposal d and the default
+        # acceptance thresholds, sampling X~p and accepting iff X==d is exactly
+        # target-only speculative sampling: on rejection X already follows the
+        # residual distribution p(. | X != d). Reuse the optimized greedy tree
+        # verifier instead of materializing full target probability tensors.
+        target_predict = target_predict.to(candidates.dtype).reshape(
+            bs, num_draft_tokens
+        )
+        tp_group = (
+            get_attention_tp_group() if is_dp_attention_enabled() else get_tp_group()
+        )
+        if tp_group.world_size > 1:
+            tp_group.broadcast(target_predict, src=0)
+
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
             predicts=predict,  # mutable
             accept_index=accept_index,  # mutable

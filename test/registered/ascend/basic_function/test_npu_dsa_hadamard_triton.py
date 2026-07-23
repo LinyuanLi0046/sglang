@@ -22,7 +22,7 @@ else:
     _IS_ASCEND_950 = False
 
 
-def _normalized_hadamard_128() -> torch.Tensor:
+def _hadamard_128() -> torch.Tensor:
     matrix = torch.ones((1, 1), dtype=torch.float32)
     while matrix.shape[0] < 128:
         matrix = torch.cat(
@@ -32,7 +32,11 @@ def _normalized_hadamard_128() -> torch.Tensor:
             ),
             dim=0,
         )
-    return matrix * (128**-0.5)
+    return matrix
+
+
+def _normalized_hadamard_128() -> torch.Tensor:
+    return _hadamard_128() * (128**-0.5)
 
 
 @unittest.skipUnless(_HAS_NPU, "Ascend NPU is required")
@@ -138,15 +142,17 @@ class TestDSAIndexerHadamardGemmQuant(unittest.TestCase):
     def setUpClass(cls):
         from sglang.srt.layers.attention.dsa.dsa_indexer import (
             _quantize_npu_indexer_activation,
+            rotate_activation,
         )
 
         cls.fused_quant = staticmethod(_quantize_npu_indexer_activation)
-        cls.hadamard = _normalized_hadamard_128().to(
+        cls.previous_rotate = staticmethod(rotate_activation)
+        cls.hadamard = _hadamard_128().to(
             device="npu",
             dtype=torch.bfloat16,
         )
 
-    def _check_against_vllm_sequence(self, shape):
+    def _check_against_previous_sequence(self, shape):
         torch.manual_seed(3)
         x = torch.randn(shape, dtype=torch.bfloat16, device="npu")
         actual_q, actual_scale = self.fused_quant(
@@ -155,7 +161,7 @@ class TestDSAIndexerHadamardGemmQuant(unittest.TestCase):
             torch.float8_e4m3fn,
         )
 
-        rotated = x.reshape(-1, 128) @ self.hadamard
+        rotated = self.previous_rotate(x)
         expected_q, expected_scale = torch_npu.npu_dynamic_quant(
             rotated,
             dst_type=torch.float8_e4m3fn,
@@ -190,10 +196,10 @@ class TestDSAIndexerHadamardGemmQuant(unittest.TestCase):
         )
 
     def test_k_and_q_shapes_cover_all_block_sizes(self):
-        self._check_against_vllm_sequence((1, 128))
-        self._check_against_vllm_sequence((3, 1, 128))
-        self._check_against_vllm_sequence((1, 32, 128))
-        self._check_against_vllm_sequence((3, 32, 128))
+        self._check_against_previous_sequence((1, 128))
+        self._check_against_previous_sequence((3, 1, 128))
+        self._check_against_previous_sequence((1, 32, 128))
+        self._check_against_previous_sequence((3, 32, 128))
 
     def test_zero_row_and_per_row_scales(self):
         x = torch.zeros((4, 128), dtype=torch.bfloat16, device="npu")
@@ -216,7 +222,7 @@ class TestDSAIndexerHadamardGemmQuant(unittest.TestCase):
         self.assertTrue(torch.count_nonzero(quantized[0].float()).item() == 0)
         self.assertGreater(scales[2].item(), scales[1].item())
 
-        rotated = x @ self.hadamard
+        rotated = self.previous_rotate(x)
         expected_q, expected_scales = torch_npu.npu_dynamic_quant(
             rotated,
             dst_type=torch.float8_e4m3fn,

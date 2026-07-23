@@ -120,19 +120,17 @@ GRAPH_WEIGHTS_PROJ_LORA_ERROR = (
 )
 
 
-def _create_normalized_hadamard_128_cpu() -> torch.Tensor:
-    """Build vLLM-compatible normalized Sylvester H128 once on the CPU."""
+def _create_hadamard_128_cpu() -> torch.Tensor:
+    """Build an unnormalized BF16 Sylvester H128 once on the CPU."""
     matrix = [[1.0]]
     while len(matrix) < 128:
         top = [row + row for row in matrix]
         bottom = [row + [-value for value in row] for row in matrix]
         matrix = top + bottom
-    return (
-        torch.tensor(matrix, dtype=torch.bfloat16) / (128**0.5)
-    ).contiguous()
+    return torch.tensor(matrix, dtype=torch.bfloat16).contiguous()
 
 
-_NORMALIZED_HADAMARD_128_CPU = _create_normalized_hadamard_128_cpu()
+_HADAMARD_128_CPU = _create_hadamard_128_cpu()
 
 
 def _is_in_piecewise_or_breakable_cuda_graph() -> bool:
@@ -377,6 +375,7 @@ if _is_npu:
         num_rows,
         BLOCK_ROWS: tl.constexpr,
         HEAD_DIM: tl.constexpr,
+        HADAMARD_SCALE: tl.constexpr,
         FP8_MAX: tl.constexpr,
     ):
         """Compute BF16 X @ H128 and per-row FP8 dynamic quant in one kernel."""
@@ -412,7 +411,9 @@ if _is_npu:
                 other=0.0,
             )
 
-            rotated = tl.dot(values, hadamard)
+            # Match the previous butterfly path: accumulate against exact
+            # BF16 +/-1 coefficients, then normalize once in FP32.
+            rotated = tl.dot(values, hadamard) * HADAMARD_SCALE
             # vLLM materializes the BF16 GEMM result before calling
             # npu_dynamic_quant. Preserve that rounding boundary locally
             # without writing the intermediate tensor to global memory.
@@ -529,6 +530,7 @@ def _quantize_npu_indexer_activation(
         num_rows,
         BLOCK_ROWS=block_rows,
         HEAD_DIM=128,
+        HADAMARD_SCALE=0.08838834764831845,
         FP8_MAX=448.0,
     )
     return quantized, scales
@@ -591,7 +593,7 @@ class Indexer(MultiPlatformOp):
         self.register_buffer(
             "_npu_hadamard_128",
             (
-                _NORMALIZED_HADAMARD_128_CPU.to(
+                _HADAMARD_128_CPU.to(
                     device=get_global_server_args().device
                 )
                 if _is_npu and self.head_dim == 128

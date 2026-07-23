@@ -298,30 +298,52 @@ if _is_npu:
         """Apply a normalized H128 to contiguous rows without materializing H."""
         pid = tl.program_id(0)
         num_programs = tl.num_programs(0)
-        row_in_tile = tl.arange(0, BLOCK_ROWS)
-        col = tl.arange(0, 128)
-        row_in_tile_2d = tl.expand_dims(row_in_tile, 1)
-        col_2d = tl.expand_dims(col, 0)
+        tile_elements = BLOCK_ROWS * 128
+        lane = tl.arange(0, tile_elements)
+        num_elements = num_rows * 128
         num_row_tiles = tl.cdiv(num_rows, BLOCK_ROWS)
 
         for row_tile in tl.range(pid, num_row_tiles, num_programs):
-            row = row_tile * BLOCK_ROWS + row_in_tile_2d
-            offsets = row * 128 + col_2d
-            mask = tl.broadcast_to(row < num_rows, (BLOCK_ROWS, 128))
+            offsets = row_tile * tile_elements + lane
+            mask = offsets < num_elements
             values = tl.load(input_ptr + offsets, mask=mask, other=0.0)
             # Match the former NPU path: round the activation to BF16 first,
             # then perform all seven butterfly stages in FP32.
             values = values.to(tl.bfloat16).to(tl.float32)
 
-            # One stage maps adjacent pairs to [all sums | all differences].
-            # Repeating the same order seven times is the standard Sylvester
-            # Walsh-Hadamard transform H128.
-            for _ in tl.static_range(0, 7):
-                pairs = tl.reshape(values, (BLOCK_ROWS, 64, 2))
-                even, odd = tl.split(pairs)
-                joined = tl.join(even + odd, even - odd)
-                front_back = tl.trans(joined, (0, 2, 1))
-                values = tl.reshape(front_back, (BLOCK_ROWS, 128))
+            # Keep the local tensor layout fixed as one flat, contiguous tile.
+            # XOR strides up to 64 cannot cross a 128-element row boundary.
+            # Repeated split/join/trans/reshape chains can trigger an A5
+            # ConvertLinalgRToBinary failure, especially for BLOCK_ROWS == 1.
+            # For each butterfly stage, gather the XOR partner from UB. A low
+            # bit computes self + partner; a high bit computes partner - self.
+            partner = tl.gather(values, lane ^ 1, axis=0)
+            sign = (1 - 2 * (lane & 1)).to(tl.float32)
+            values = partner + sign * values
+
+            partner = tl.gather(values, lane ^ 2, axis=0)
+            sign = (1 - 2 * ((lane >> 1) & 1)).to(tl.float32)
+            values = partner + sign * values
+
+            partner = tl.gather(values, lane ^ 4, axis=0)
+            sign = (1 - 2 * ((lane >> 2) & 1)).to(tl.float32)
+            values = partner + sign * values
+
+            partner = tl.gather(values, lane ^ 8, axis=0)
+            sign = (1 - 2 * ((lane >> 3) & 1)).to(tl.float32)
+            values = partner + sign * values
+
+            partner = tl.gather(values, lane ^ 16, axis=0)
+            sign = (1 - 2 * ((lane >> 4) & 1)).to(tl.float32)
+            values = partner + sign * values
+
+            partner = tl.gather(values, lane ^ 32, axis=0)
+            sign = (1 - 2 * ((lane >> 5) & 1)).to(tl.float32)
+            values = partner + sign * values
+
+            partner = tl.gather(values, lane ^ 64, axis=0)
+            sign = (1 - 2 * ((lane >> 6) & 1)).to(tl.float32)
+            values = partner + sign * values
 
             values *= 0.08838834764831845  # 1 / sqrt(128)
             tl.store(output_ptr + offsets, values, mask=mask)

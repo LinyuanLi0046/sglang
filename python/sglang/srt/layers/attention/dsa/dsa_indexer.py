@@ -81,7 +81,10 @@ if _is_npu:
     import torch_npu
     import triton
     import triton.language as tl
-    from sglang.srt.hardware_backend.npu.kernels import NUM_VECTOR_CORES
+    from sglang.srt.hardware_backend.npu.kernels import (
+        NUM_CUBE_CORES,
+        NUM_VECTOR_CORES,
+    )
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
 from sglang.srt.distributed import (
@@ -115,6 +118,21 @@ GRAPH_WEIGHTS_PROJ_LORA_ERROR = (
     "prefill cuda-graph backend override or drop "
     "indexer.weights_proj from the LoRA target modules."
 )
+
+
+def _create_normalized_hadamard_128_cpu() -> torch.Tensor:
+    """Build vLLM-compatible normalized Sylvester H128 once on the CPU."""
+    matrix = [[1.0]]
+    while len(matrix) < 128:
+        top = [row + row for row in matrix]
+        bottom = [row + [-value for value in row] for row in matrix]
+        matrix = top + bottom
+    return (
+        torch.tensor(matrix, dtype=torch.bfloat16) / (128**0.5)
+    ).contiguous()
+
+
+_NORMALIZED_HADAMARD_128_CPU = _create_normalized_hadamard_128_cpu()
 
 
 def _is_in_piecewise_or_breakable_cuda_graph() -> bool:
@@ -350,6 +368,77 @@ if _is_npu:
             values *= 0.08838834764831845  # 1 / sqrt(128)
             tl.store(output_ptr + offsets, values, mask=mask)
 
+    @triton.jit(do_not_specialize=["num_rows"])
+    def _npu_hadamard_128_gemm_quant_fp8_kernel(
+        input_ptr,
+        hadamard_ptr,
+        quantized_ptr,
+        scale_ptr,
+        num_rows,
+        BLOCK_ROWS: tl.constexpr,
+        HEAD_DIM: tl.constexpr,
+        FP8_MAX: tl.constexpr,
+    ):
+        """Compute BF16 X @ H128 and per-row FP8 dynamic quant in one kernel."""
+        pid = tl.program_id(0)
+        num_programs = tl.num_programs(0)
+        num_row_tiles = tl.cdiv(num_rows, BLOCK_ROWS)
+        tiles_per_program = num_row_tiles // num_programs
+        extra_tiles = num_row_tiles - tiles_per_program * num_programs
+        tiles_before = tl.minimum(pid, extra_tiles)
+        first_row_tile = pid * tiles_per_program + tiles_before
+        next_tiles_before = tl.minimum(pid + 1, extra_tiles)
+        row_tile_count = tiles_per_program + next_tiles_before - tiles_before
+        last_row_tile = first_row_tile + row_tile_count
+
+        row_lane = tl.arange(0, BLOCK_ROWS).to(tl.int32)
+        dim_lane = tl.arange(0, HEAD_DIM).to(tl.int32)
+
+        # H128 is shared by every row tile. Keeping this load outside the
+        # persistent loop lets each CubeCore reuse the same 32 KiB BF16 tile.
+        hadamard_offsets = (
+            dim_lane[:, None] * HEAD_DIM + dim_lane[None, :]
+        )
+        hadamard = tl.load(hadamard_ptr + hadamard_offsets)
+
+        # Give each CubeCore a balanced, contiguous interval of row tiles.
+        for row_tile in tl.range(first_row_tile, last_row_tile):
+            rows = row_tile * BLOCK_ROWS + row_lane
+            row_mask = rows < num_rows
+            input_offsets = rows[:, None] * HEAD_DIM + dim_lane[None, :]
+            values = tl.load(
+                input_ptr + input_offsets,
+                mask=row_mask[:, None],
+                other=0.0,
+            )
+
+            rotated = tl.dot(values, hadamard)
+            # vLLM materializes the BF16 GEMM result before calling
+            # npu_dynamic_quant. Preserve that rounding boundary locally
+            # without writing the intermediate tensor to global memory.
+            rotated = rotated.to(
+                tl.bfloat16,
+                fp_downcast_rounding="rtne",
+            ).to(tl.float32)
+
+            abs_max = tl.max(tl.abs(rotated), axis=1)
+            scales = abs_max * (1.0 / FP8_MAX)
+            nonzero = abs_max > 0.0
+            safe_scales = tl.where(nonzero, scales, 1.0)
+            scaled = rotated / safe_scales[:, None]
+            scaled = tl.where(nonzero[:, None], scaled, 0.0)
+            quantized = tl.clamp(scaled, -FP8_MAX, FP8_MAX).to(
+                quantized_ptr.dtype.element_ty,
+                fp_downcast_rounding="rtne",
+            )
+
+            tl.store(
+                quantized_ptr + input_offsets,
+                quantized,
+                mask=row_mask[:, None],
+            )
+            tl.store(scale_ptr + rows, scales, mask=row_mask)
+
 
 def _rotate_activation_npu(x: torch.Tensor) -> torch.Tensor:
     """Apply the normalized H128 with the in-file Triton Ascend kernel."""
@@ -383,10 +472,66 @@ def _rotate_activation_npu(x: torch.Tensor) -> torch.Tensor:
 
 def _quantize_npu_indexer_activation(
     x: torch.Tensor,
+    hadamard: torch.Tensor,
     dst_type: torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    rotated = _rotate_activation_npu(x)
-    return torch_npu.npu_dynamic_quant(rotated, dst_type=dst_type)
+    """Fuse normalized H128 GEMM and per-row E4M3FN dynamic quant on A5."""
+    if x.device.type != "npu":
+        raise RuntimeError("NPU fused Hadamard quantization requires an NPU tensor.")
+    if x.dtype != torch.bfloat16:
+        raise TypeError(
+            "NPU fused Hadamard quantization requires BF16 input, "
+            f"got {x.dtype}."
+        )
+    if x.size(-1) != 128:
+        raise ValueError(
+            "NPU fused Hadamard quantization requires last dimension 128, "
+            f"got {x.size(-1)}."
+        )
+    if not x.is_contiguous():
+        raise ValueError(
+            "NPU fused Hadamard quantization requires a contiguous tensor."
+        )
+    if dst_type != torch.float8_e4m3fn:
+        raise ValueError(
+            "NPU fused Hadamard quantization only supports "
+            f"torch.float8_e4m3fn, got {dst_type}."
+        )
+    if (
+        hadamard.device != x.device
+        or hadamard.dtype != torch.bfloat16
+        or hadamard.shape != (128, 128)
+        or not hadamard.is_contiguous()
+    ):
+        raise ValueError(
+            "Hadamard matrix must be a contiguous BF16 [128, 128] tensor "
+            "on the input NPU."
+        )
+
+    quantized = torch.empty_like(x, dtype=dst_type)
+    scales = torch.empty(x.shape[:-1], dtype=torch.float32, device=x.device)
+    num_rows = x.numel() // 128
+    if num_rows == 0:
+        return quantized, scales
+
+    if num_rows <= 16:
+        block_rows = 16
+    elif num_rows <= 32:
+        block_rows = 32
+    else:
+        block_rows = 64
+    grid = (min(triton.cdiv(num_rows, block_rows), NUM_CUBE_CORES),)
+    _npu_hadamard_128_gemm_quant_fp8_kernel[grid](
+        x,
+        hadamard,
+        quantized,
+        scales,
+        num_rows,
+        BLOCK_ROWS=block_rows,
+        HEAD_DIM=128,
+        FP8_MAX=448.0,
+    )
+    return quantized, scales
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
@@ -443,6 +588,17 @@ class Indexer(MultiPlatformOp):
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
         self.alt_stream = alt_stream
+        self.register_buffer(
+            "_npu_hadamard_128",
+            (
+                _NORMALIZED_HADAMARD_128_CPU.to(
+                    device=get_global_server_args().device
+                )
+                if _is_npu and self.head_dim == 128
+                else None
+            ),
+            persistent=False,
+        )
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
@@ -1982,6 +2138,7 @@ class Indexer(MultiPlatformOp):
             # The matching Q rotation below preserves the pre-quant dot product.
             k, k_scale = _quantize_npu_indexer_activation(
                 k,
+                self._npu_hadamard_128,
                 get_token_to_kv_pool().dtype,
             )
             get_token_to_kv_pool().set_index_k_scale_buffer(
@@ -2107,6 +2264,7 @@ class Indexer(MultiPlatformOp):
             if is_use_quant_lightning_indexer:
                 indexer_query, indexer_query_scale = _quantize_npu_indexer_activation(
                     indexer_query,
+                    self._npu_hadamard_128,
                     get_token_to_kv_pool().dtype,
                 )
 

@@ -35,104 +35,6 @@ def _hadamard_128() -> torch.Tensor:
     return matrix
 
 
-def _normalized_hadamard_128() -> torch.Tensor:
-    return _hadamard_128() * (128**-0.5)
-
-
-@unittest.skipUnless(_HAS_NPU, "Ascend NPU is required")
-class TestDSAIndexerHadamard(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        from sglang.srt.layers.attention.dsa.dsa_indexer import (
-            NUM_VECTOR_CORES,
-            rotate_activation,
-        )
-
-        cls.num_vector_cores = NUM_VECTOR_CORES
-        cls.rotate_activation = staticmethod(rotate_activation)
-        cls.reference_matrix = _normalized_hadamard_128()
-
-    def _check_against_reference(self, shape):
-        torch.manual_seed(0)
-        x = torch.randn(shape, dtype=torch.bfloat16, device="npu")
-        actual = self.rotate_activation(x)
-        expected = (
-            x.cpu()
-            .to(torch.float32)
-            .reshape(-1, 128)
-            .matmul(self.reference_matrix)
-            .reshape(shape)
-        )
-
-        self.assertEqual(actual.shape, x.shape)
-        self.assertEqual(actual.dtype, torch.bfloat16)
-        torch.testing.assert_close(
-            actual.cpu().to(torch.float32),
-            expected,
-            rtol=1e-2,
-            atol=5e-2,
-        )
-
-    def test_small_decode_shapes(self):
-        self._check_against_reference((1, 128))
-        self._check_against_reference((2, 32, 128))
-
-    def test_large_prefill_shape_and_tail(self):
-        rows = self.num_vector_cores * 8 + 3
-        self._check_against_reference((rows, 128))
-
-    def test_basis_vector_preserves_sylvester_order(self):
-        x = torch.zeros((1, 128), dtype=torch.bfloat16, device="npu")
-        x[0, 1] = 1
-        actual = self.rotate_activation(x).cpu().to(torch.float32)
-        expected = self.reference_matrix[1:2]
-        torch.testing.assert_close(actual, expected, rtol=0, atol=5e-4)
-
-    def test_qk_dot_product_is_preserved(self):
-        torch.manual_seed(1)
-        q = torch.randn((4, 32, 128), dtype=torch.bfloat16, device="npu")
-        k = torch.randn((4, 128), dtype=torch.bfloat16, device="npu")
-        q_rotated = self.rotate_activation(q).cpu().to(torch.float32)
-        k_rotated = self.rotate_activation(k).cpu().to(torch.float32)
-
-        before = (
-            q.cpu().to(torch.float32)
-            * k.cpu().to(torch.float32).unsqueeze(1)
-        ).sum(dim=-1)
-        after = (q_rotated * k_rotated.unsqueeze(1)).sum(dim=-1)
-        torch.testing.assert_close(after, before, rtol=2e-2, atol=2e-1)
-
-    def test_transform_is_approximately_involutory(self):
-        torch.manual_seed(2)
-        x = torch.randn((17, 128), dtype=torch.bfloat16, device="npu")
-        restored = self.rotate_activation(self.rotate_activation(x))
-        torch.testing.assert_close(
-            restored.cpu().to(torch.float32),
-            x.cpu().to(torch.float32),
-            rtol=2e-2,
-            atol=1e-1,
-        )
-
-    def test_empty_input(self):
-        x = torch.empty((0, 128), dtype=torch.bfloat16, device="npu")
-        actual = self.rotate_activation(x)
-        self.assertEqual(actual.shape, x.shape)
-        self.assertEqual(actual.dtype, torch.bfloat16)
-
-    def test_rejects_unsupported_shape_and_layout(self):
-        with self.assertRaisesRegex(ValueError, "last dimension 128"):
-            self.rotate_activation(
-                torch.empty((1, 64), dtype=torch.bfloat16, device="npu")
-            )
-
-        noncontiguous = torch.empty(
-            (128, 2), dtype=torch.bfloat16, device="npu"
-        ).transpose(0, 1)
-        self.assertFalse(noncontiguous.is_contiguous())
-        with self.assertRaisesRegex(ValueError, "contiguous tensor"):
-            self.rotate_activation(noncontiguous)
-
-
 @unittest.skipUnless(
     _IS_ASCEND_950,
     "The fused E4M3FN Hadamard GEMM quantizer requires Ascend 950",
@@ -142,17 +44,30 @@ class TestDSAIndexerHadamardGemmQuant(unittest.TestCase):
     def setUpClass(cls):
         from sglang.srt.layers.attention.dsa.dsa_indexer import (
             _quantize_npu_indexer_activation,
-            rotate_activation,
         )
 
         cls.fused_quant = staticmethod(_quantize_npu_indexer_activation)
-        cls.previous_rotate = staticmethod(rotate_activation)
-        cls.hadamard = _hadamard_128().to(
+        cls.reference_hadamard = _hadamard_128()
+        cls.hadamard = cls.reference_hadamard.to(
             device="npu",
             dtype=torch.bfloat16,
         )
 
-    def _check_against_previous_sequence(self, shape):
+    def _reference_rotate(self, x):
+        return (
+            (
+                x.cpu()
+                .to(torch.float32)
+                .reshape(-1, 128)
+                .matmul(self.reference_hadamard)
+                * (128**-0.5)
+            )
+            .to(torch.bfloat16)
+            .reshape(x.shape)
+            .to(x.device)
+        )
+
+    def _check_against_reference(self, shape):
         torch.manual_seed(3)
         x = torch.randn(shape, dtype=torch.bfloat16, device="npu")
         actual_q, actual_scale = self.fused_quant(
@@ -161,7 +76,7 @@ class TestDSAIndexerHadamardGemmQuant(unittest.TestCase):
             torch.float8_e4m3fn,
         )
 
-        rotated = self.previous_rotate(x)
+        rotated = self._reference_rotate(x)
         expected_q, expected_scale = torch_npu.npu_dynamic_quant(
             rotated,
             dst_type=torch.float8_e4m3fn,
@@ -196,10 +111,10 @@ class TestDSAIndexerHadamardGemmQuant(unittest.TestCase):
         )
 
     def test_k_and_q_shapes_cover_all_block_sizes(self):
-        self._check_against_previous_sequence((1, 128))
-        self._check_against_previous_sequence((3, 1, 128))
-        self._check_against_previous_sequence((1, 32, 128))
-        self._check_against_previous_sequence((3, 32, 128))
+        self._check_against_reference((1, 128))
+        self._check_against_reference((3, 1, 128))
+        self._check_against_reference((1, 32, 128))
+        self._check_against_reference((3, 32, 128))
 
     def test_zero_row_and_per_row_scales(self):
         x = torch.zeros((4, 128), dtype=torch.bfloat16, device="npu")
@@ -222,7 +137,7 @@ class TestDSAIndexerHadamardGemmQuant(unittest.TestCase):
         self.assertTrue(torch.count_nonzero(quantized[0].float()).item() == 0)
         self.assertGreater(scales[2].item(), scales[1].item())
 
-        rotated = self.previous_rotate(x)
+        rotated = self._reference_rotate(x)
         expected_q, expected_scales = torch_npu.npu_dynamic_quant(
             rotated,
             dst_type=torch.float8_e4m3fn,

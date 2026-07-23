@@ -81,10 +81,7 @@ if _is_npu:
     import torch_npu
     import triton
     import triton.language as tl
-    from sglang.srt.hardware_backend.npu.kernels import (
-        NUM_CUBE_CORES,
-        NUM_VECTOR_CORES,
-    )
+    from sglang.srt.hardware_backend.npu.kernels import NUM_CUBE_CORES
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
 from sglang.srt.distributed import (
@@ -305,68 +302,6 @@ class BaseIndexerMetadata(ABC):
 if _is_npu:
 
     @triton.jit(do_not_specialize=["num_rows"])
-    def _npu_hadamard_128_kernel(
-        input_ptr,
-        output_ptr,
-        num_rows,
-        BLOCK_ROWS: tl.constexpr,
-        TILE_ELEMENTS: tl.constexpr,
-    ):
-        """Apply a normalized H128 to contiguous rows without materializing H."""
-        pid = tl.program_id(0)
-        num_programs = tl.num_programs(0)
-        # This Triton frontend requires tl.arange bounds to be direct
-        # constexpr kernel parameters; a derived local loses constexpr typing.
-        lane = tl.arange(0, TILE_ELEMENTS)
-        num_elements = num_rows * 128
-        num_row_tiles = tl.cdiv(num_rows, BLOCK_ROWS)
-
-        for row_tile in tl.range(pid, num_row_tiles, num_programs):
-            offsets = row_tile * TILE_ELEMENTS + lane
-            mask = offsets < num_elements
-            values = tl.load(input_ptr + offsets, mask=mask, other=0.0)
-            # Match the former NPU path: round the activation to BF16 first,
-            # then perform all seven butterfly stages in FP32.
-            values = values.to(tl.bfloat16).to(tl.float32)
-
-            # Keep the local tensor layout fixed as one flat, contiguous tile.
-            # XOR strides up to 64 cannot cross a 128-element row boundary.
-            # Repeated split/join/trans/reshape chains can trigger an A5
-            # ConvertLinalgRToBinary failure, especially for BLOCK_ROWS == 1.
-            # For each butterfly stage, gather the XOR partner from UB. A low
-            # bit computes self + partner; a high bit computes partner - self.
-            partner = tl.gather(values, lane ^ 1, axis=0)
-            sign = (1 - 2 * (lane & 1)).to(tl.float32)
-            values = partner + sign * values
-
-            partner = tl.gather(values, lane ^ 2, axis=0)
-            sign = (1 - 2 * ((lane >> 1) & 1)).to(tl.float32)
-            values = partner + sign * values
-
-            partner = tl.gather(values, lane ^ 4, axis=0)
-            sign = (1 - 2 * ((lane >> 2) & 1)).to(tl.float32)
-            values = partner + sign * values
-
-            partner = tl.gather(values, lane ^ 8, axis=0)
-            sign = (1 - 2 * ((lane >> 3) & 1)).to(tl.float32)
-            values = partner + sign * values
-
-            partner = tl.gather(values, lane ^ 16, axis=0)
-            sign = (1 - 2 * ((lane >> 4) & 1)).to(tl.float32)
-            values = partner + sign * values
-
-            partner = tl.gather(values, lane ^ 32, axis=0)
-            sign = (1 - 2 * ((lane >> 5) & 1)).to(tl.float32)
-            values = partner + sign * values
-
-            partner = tl.gather(values, lane ^ 64, axis=0)
-            sign = (1 - 2 * ((lane >> 6) & 1)).to(tl.float32)
-            values = partner + sign * values
-
-            values *= 0.08838834764831845  # 1 / sqrt(128)
-            tl.store(output_ptr + offsets, values, mask=mask)
-
-    @triton.jit(do_not_specialize=["num_rows"])
     def _npu_hadamard_128_gemm_quant_fp8_kernel(
         input_ptr,
         hadamard_ptr,
@@ -410,13 +345,7 @@ if _is_npu:
                 mask=row_mask[:, None],
                 other=0.0,
             )
-
-            # Match the previous butterfly path: accumulate against exact
-            # BF16 +/-1 coefficients, then normalize once in FP32.
             rotated = tl.dot(values, hadamard) * HADAMARD_SCALE
-            # vLLM materializes the BF16 GEMM result before calling
-            # npu_dynamic_quant. Preserve that rounding boundary locally
-            # without writing the intermediate tensor to global memory.
             rotated = rotated.to(
                 tl.bfloat16,
                 fp_downcast_rounding="rtne",
@@ -439,36 +368,6 @@ if _is_npu:
                 mask=row_mask[:, None],
             )
             tl.store(scale_ptr + rows, scales, mask=row_mask)
-
-
-def _rotate_activation_npu(x: torch.Tensor) -> torch.Tensor:
-    """Apply the normalized H128 with the in-file Triton Ascend kernel."""
-    if x.device.type != "npu":
-        raise RuntimeError("NPU Hadamard rotation requires an NPU tensor.")
-    if x.size(-1) != 128:
-        raise ValueError(
-            f"NPU DSA Hadamard rotation requires last dimension 128, got {x.size(-1)}."
-        )
-    if not x.is_contiguous():
-        raise ValueError("NPU DSA Hadamard rotation requires a contiguous tensor.")
-
-    output = torch.empty_like(x, dtype=torch.bfloat16)
-    num_rows = x.numel() // 128
-    if num_rows == 0:
-        return output
-
-    # Keep decode/small-batch rows independently scheduled. Only batch rows
-    # after there are enough tiles to keep every VectorCore occupied.
-    block_rows = 8 if num_rows >= NUM_VECTOR_CORES * 8 else 1
-    grid = (min(triton.cdiv(num_rows, block_rows), NUM_VECTOR_CORES),)
-    _npu_hadamard_128_kernel[grid](
-        x,
-        output,
-        num_rows,
-        BLOCK_ROWS=block_rows,
-        TILE_ELEMENTS=block_rows * 128,
-    )
-    return output
 
 
 def _quantize_npu_indexer_activation(
@@ -539,7 +438,10 @@ def _quantize_npu_indexer_activation(
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     # from sgl_kernel import hadamard_transform
     if _is_npu:
-        return _rotate_activation_npu(x)
+        raise RuntimeError(
+            "Standalone NPU Hadamard rotation was removed; the NPU DSA FP8 "
+            "path uses the fused Hadamard GEMM quantizer."
+        )
     if _is_hip:
         from fast_hadamard_transform import hadamard_transform
     else:

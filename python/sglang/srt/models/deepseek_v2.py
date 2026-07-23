@@ -177,11 +177,6 @@ from sglang.srt.models.deepseek_common.utils import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.speculative.greedy_trace import (
-    npu_mtp_stage_trace_forward_selected,
-    npu_mtp_stage_trace_enabled,
-    trace_npu_mtp_stage_tensor,
-)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     BumpAllocator,
@@ -230,7 +225,6 @@ logger = logging.getLogger(__name__)
 _enable_pcg_dsv2_dual_stream = (
     _is_cuda and envs.SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM.get()
 )
-_enable_npu_mtp_stage_trace = _is_npu and npu_mtp_stage_trace_enabled()
 
 
 class DeepseekV2MLP(nn.Module):
@@ -2220,14 +2214,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
     ) -> torch.Tensor:
         hidden_states_orig = hidden_states
-        trace_main_model = _enable_npu_mtp_stage_trace and not self.is_nextn
-        trace_selected_forward = trace_main_model and (
-            npu_mtp_stage_trace_forward_selected(
-                positions=positions,
-                forward_batch=forward_batch,
-                layer_id=self.layer_id,
-            )
-        )
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
                 hidden_states,
@@ -2237,27 +2223,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                 quant_format=getattr(self, "_gfx95_quant_format", ""),
             )
         )
-        if trace_selected_forward:
-            trace_extra = {
-                "is_nextn": bool(self.is_nextn),
-                "is_layer_sparse": bool(self.is_layer_sparse),
-            }
-            trace_npu_mtp_stage_tensor(
-                stage="layer.attn_input",
-                tensor=hidden_states,
-                positions=positions,
-                forward_batch=forward_batch,
-                layer_id=self.layer_id,
-                extra=trace_extra,
-            )
-            trace_npu_mtp_stage_tensor(
-                stage="layer.residual_before_attn",
-                tensor=residual,
-                positions=positions,
-                forward_batch=forward_batch,
-                layer_id=self.layer_id,
-                extra=trace_extra,
-            )
 
         hidden_states = self.self_attn(
             positions=positions,
@@ -2272,37 +2237,11 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, topk_indices = hidden_states
         else:
             topk_indices = None
-        if trace_selected_forward:
-            trace_npu_mtp_stage_tensor(
-                stage="layer.attn_output",
-                tensor=hidden_states,
-                positions=positions,
-                forward_batch=forward_batch,
-                layer_id=self.layer_id,
-                extra=trace_extra,
-            )
         get_attn_tp_context().clear_attn_inputs()
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        if trace_selected_forward:
-            trace_npu_mtp_stage_tensor(
-                stage="layer.mlp_input",
-                tensor=hidden_states,
-                positions=positions,
-                forward_batch=forward_batch,
-                layer_id=self.layer_id,
-                extra=trace_extra,
-            )
-            trace_npu_mtp_stage_tensor(
-                stage="layer.residual_before_mlp",
-                tensor=residual,
-                positions=positions,
-                forward_batch=forward_batch,
-                layer_id=self.layer_id,
-                extra=trace_extra,
-            )
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -2337,15 +2276,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                 use_reduce_scatter,
                 gemm_output_zero_allocator,
             )
-        if trace_selected_forward:
-            trace_npu_mtp_stage_tensor(
-                stage="layer.mlp_output",
-                tensor=hidden_states,
-                positions=positions,
-                forward_batch=forward_batch,
-                layer_id=self.layer_id,
-                extra=trace_extra,
-            )
 
         if (
             not (self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp)
@@ -2356,30 +2286,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         if not should_allreduce_fusion:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
-            )
-
-        if trace_selected_forward:
-            trace_npu_mtp_stage_tensor(
-                stage="layer.output_hidden",
-                tensor=hidden_states,
-                positions=positions,
-                forward_batch=forward_batch,
-                layer_id=self.layer_id,
-                extra={
-                    **trace_extra,
-                    "should_allreduce_fusion": bool(should_allreduce_fusion),
-                },
-            )
-            trace_npu_mtp_stage_tensor(
-                stage="layer.output_residual",
-                tensor=residual,
-                positions=positions,
-                forward_batch=forward_batch,
-                layer_id=self.layer_id,
-                extra={
-                    **trace_extra,
-                    "should_allreduce_fusion": bool(should_allreduce_fusion),
-                },
             )
 
         return hidden_states, residual, topk_indices

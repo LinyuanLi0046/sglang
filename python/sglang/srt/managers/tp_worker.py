@@ -43,10 +43,6 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.greedy_trace import (
-    capture_raw_logits,
-    trace_normal_greedy_sample,
-)
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
@@ -525,12 +521,6 @@ class TpModelWorker(BaseTpWorker):
                 # Skip sampling; spec_v2 worker fires its own publish post-verify.
                 return batch_result
 
-            raw_logits_trace = capture_raw_logits(
-                batch,
-                logits_output.next_token_logits,
-                possible_tokens_per_req=1,
-            )
-
             if (
                 self.enable_overlap
                 and not self.enable_spec
@@ -541,20 +531,6 @@ class TpModelWorker(BaseTpWorker):
                     batch_result.next_token_ids = self.model_runner.sample(
                         logits_output, forward_batch
                     )
-                    trace_normal_greedy_sample(
-                        batch=batch,
-                        forward_batch=forward_batch,
-                        can_run_cuda_graph=can_run_cuda_graph,
-                        graph_runner=(
-                            self.model_runner.decode_cuda_graph_runner
-                            if can_run_cuda_graph
-                            and forward_batch.forward_mode.is_decode()
-                            else None
-                        ),
-                        logits=logits_output.next_token_logits,
-                        chosen_token_ids=batch_result.next_token_ids,
-                        raw_snapshot=raw_logits_trace,
-                    )
                     return batch_result
 
                 batch_result.delay_sample_func = sample_batch_func
@@ -564,20 +540,6 @@ class TpModelWorker(BaseTpWorker):
                 # For normal requests, sample the next token ids.
                 batch_result.next_token_ids = self.model_runner.sample(
                     logits_output, forward_batch
-                )
-                trace_normal_greedy_sample(
-                    batch=batch,
-                    forward_batch=forward_batch,
-                    can_run_cuda_graph=can_run_cuda_graph,
-                    graph_runner=(
-                        self.model_runner.decode_cuda_graph_runner
-                        if can_run_cuda_graph
-                        and forward_batch.forward_mode.is_decode()
-                        else None
-                    ),
-                    logits=logits_output.next_token_logits,
-                    chosen_token_ids=batch_result.next_token_ids,
-                    raw_snapshot=raw_logits_trace,
                 )
             else:
                 # For prefill-only requests, create dummy token IDs on CPU

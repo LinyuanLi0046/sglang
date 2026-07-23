@@ -15,7 +15,6 @@ from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.dsa.dsa_indexer import (
     BaseIndexerMetadata,
     Indexer,
-    _build_npu_dsa_indexer_grouped_metadata,
     rotate_activation,
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
@@ -57,80 +56,6 @@ DEFAULT_CONFIG = {
     "layer_id": 0,
     "page_size": 64,
 }
-
-
-class TestNpuDsaIndexerGroupedMetadata(unittest.TestCase):
-    def test_strict_t1_multiple_requests(self):
-        actual_seq_lengths_q = torch.tensor([3, 6], dtype=torch.int32)
-        actual_seq_lengths_kv = torch.tensor([100, 200], dtype=torch.int32)
-        block_table = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32)
-
-        t1_seq_q, t1_seq_kv, t1_block_table = (
-            _build_npu_dsa_indexer_grouped_metadata(
-                actual_seq_lengths_q=actual_seq_lengths_q,
-                actual_seq_lengths_kv=actual_seq_lengths_kv,
-                block_table=block_table,
-                num_query_tokens=6,
-                max_s1=1,
-            )
-        )
-
-        torch.testing.assert_close(
-            t1_seq_q, torch.tensor([1, 2, 3, 4, 5, 6], dtype=torch.int32)
-        )
-        torch.testing.assert_close(
-            t1_seq_kv,
-            torch.tensor([98, 99, 100, 198, 199, 200], dtype=torch.int32),
-        )
-        torch.testing.assert_close(
-            t1_block_table,
-            torch.tensor(
-                [
-                    [10, 11],
-                    [10, 11],
-                    [10, 11],
-                    [20, 21],
-                    [20, 21],
-                    [20, 21],
-                ],
-                dtype=torch.int32,
-            ),
-        )
-
-    def test_max_s1_two(self):
-        grouped_seq_q, grouped_seq_kv, grouped_block_table = (
-            _build_npu_dsa_indexer_grouped_metadata(
-                actual_seq_lengths_q=torch.tensor([3, 6], dtype=torch.int32),
-                actual_seq_lengths_kv=torch.tensor([100, 200], dtype=torch.int32),
-                block_table=torch.tensor([[10], [20]], dtype=torch.int32),
-                num_query_tokens=6,
-                max_s1=2,
-            )
-        )
-
-        torch.testing.assert_close(
-            grouped_seq_q, torch.tensor([2, 3, 5, 6], dtype=torch.int32)
-        )
-        torch.testing.assert_close(
-            grouped_seq_kv, torch.tensor([99, 100, 199, 200], dtype=torch.int32)
-        )
-        torch.testing.assert_close(
-            grouped_block_table,
-            torch.tensor([[10], [10], [20], [20]], dtype=torch.int32),
-        )
-
-    def test_zero_key_length_for_graph_padding_stays_zero(self):
-        _, t1_seq_kv, _ = _build_npu_dsa_indexer_grouped_metadata(
-            actual_seq_lengths_q=torch.tensor([2, 4], dtype=torch.int32),
-            actual_seq_lengths_kv=torch.tensor([10, 0], dtype=torch.int32),
-            block_table=torch.tensor([[10], [0]], dtype=torch.int32),
-            num_query_tokens=4,
-            max_s1=1,
-        )
-
-        torch.testing.assert_close(
-            t1_seq_kv, torch.tensor([9, 10, 0, 0], dtype=torch.int32)
-        )
 
 
 class MockIndexerMetadata(BaseIndexerMetadata):

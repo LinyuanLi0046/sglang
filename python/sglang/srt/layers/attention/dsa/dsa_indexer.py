@@ -99,101 +99,19 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.speculative.greedy_trace import (
-    npu_mtp_stage_trace_forward_selected,
-    npu_mtp_stage_trace_enabled,
-    npu_mtp_stage_trace_selected_rows,
-    trace_npu_mtp_stage_row_tensor,
-    trace_npu_mtp_stage_tensor,
-)
 
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
-_enable_npu_mtp_stage_trace = _is_npu and npu_mtp_stage_trace_enabled()
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
-NPU_MTP_TRACE_HISTORY_MAX_BYTES = 64 * 1024 * 1024
-NPU_DSA_INDEXER_GROUPED_METADATA_CACHE = "_npu_dsa_indexer_grouped_metadata"
 GRAPH_WEIGHTS_PROJ_LORA_ERROR = (
     "DSA indexer weights_proj LoRA is incompatible with "
     "piecewise/breakable CUDA graph; remove the explicit "
     "prefill cuda-graph backend override or drop "
     "indexer.weights_proj from the LoRA target modules."
 )
-
-
-def _build_npu_dsa_indexer_grouped_metadata(
-    actual_seq_lengths_q: torch.Tensor,
-    actual_seq_lengths_kv: torch.Tensor,
-    block_table: torch.Tensor,
-    num_query_tokens: int,
-    max_s1: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Split each TND target-verify request into bounded-S1 pseudo batches.
-
-    For an original request with query length ``q_len`` and final key length
-    ``kv_len``, a segment starting at ``s`` with length ``g`` gets key length
-    ``kv_len - q_len + s + g``. Right-down causal masking then gives every row
-    exactly the same visible keys as the original request. Keeping ``g <= 2``
-    avoids LightningIndexer's ``actMBaseSize > 128`` split-M path for GLM's
-    64 query heads.
-
-    Query/weight tensors stay in their original request-major order, and the
-    operator still runs once.  Consequently its output needs no reordering.
-    """
-    if max_s1 not in (1, 2):
-        raise ValueError(f"NPU DSA indexer max S1 must be 1 or 2, got {max_s1}")
-
-    device = block_table.device
-    batch_size = actual_seq_lengths_q.numel()
-    seq_kv = actual_seq_lengths_kv.reshape(-1).to(
-        device=device, dtype=torch.int32
-    )
-    if batch_size == 0:
-        raise RuntimeError(
-            "NPU DSA indexer grouped pseudo batch requires a non-empty batch"
-        )
-    if seq_kv.numel() != batch_size or block_table.shape[0] != batch_size:
-        raise RuntimeError(
-            "NPU DSA indexer grouped pseudo batch requires matching ASLQ, ASLK, "
-            f"and block-table batch dimensions, got {batch_size}, "
-            f"{seq_kv.numel()}, and {block_table.shape[0]}"
-        )
-    if num_query_tokens % batch_size != 0:
-        raise RuntimeError(
-            "NPU DSA target verification requires a uniform query count per "
-            f"request, got {num_query_tokens} tokens for {batch_size} requests"
-        )
-
-    query_len = num_query_tokens // batch_size
-    segments_per_request = (query_len + max_s1 - 1) // max_s1
-    segment_starts_one_request = torch.arange(
-        0, query_len, max_s1, dtype=torch.int32, device=device
-    )
-    segment_lens_one_request = torch.clamp(
-        query_len - segment_starts_one_request, max=max_s1
-    )
-    request_ids = torch.arange(
-        batch_size, dtype=torch.int64, device=device
-    ).repeat_interleave(segments_per_request)
-    segment_starts = segment_starts_one_request.repeat(batch_size)
-    segment_lens = segment_lens_one_request.repeat(batch_size)
-
-    grouped_seq_q = torch.cumsum(segment_lens, dim=0, dtype=torch.int32)
-    selected_seq_kv = seq_kv.index_select(0, request_ids)
-    grouped_seq_kv = (
-        selected_seq_kv - query_len + segment_starts + segment_lens
-    )
-    # Graph padding keeps fixed query segments for inactive request slots while
-    # their key length is zero. Preserve zero instead of producing a negative
-    # length that the operator could reinterpret as an unsigned value.
-    grouped_seq_kv = torch.where(
-        selected_seq_kv > 0, grouped_seq_kv, selected_seq_kv
-    )
-    grouped_block_table = block_table.index_select(0, request_ids)
-    return grouped_seq_q, grouped_seq_kv, grouped_block_table
 
 
 def _is_in_piecewise_or_breakable_cuda_graph() -> bool:
@@ -417,14 +335,6 @@ class Indexer(MultiPlatformOp):
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
         self.alt_stream = alt_stream
-        self.npu_dsa_indexer_max_s1 = (
-            envs.SGLANG_NPU_DSA_INDEXER_MAX_S1.get() if _is_npu else 0
-        )
-        if self.npu_dsa_indexer_max_s1 not in (0, 1, 2):
-            raise ValueError(
-                "SGLANG_NPU_DSA_INDEXER_MAX_S1 must be 0, 1, or 2, got "
-                f"{self.npu_dsa_indexer_max_s1}"
-            )
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
@@ -1778,365 +1688,6 @@ class Indexer(MultiPlatformOp):
         topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
         return maybe_capture_indexer_topk(layer_id, topk_result)
 
-    def _trace_npu_indexer_deep_diagnostics(
-        self,
-        *,
-        production_topk: torch.Tensor,
-        indexer_query: torch.Tensor,
-        past_key_states: torch.Tensor,
-        indexer_weights: torch.Tensor,
-        actual_seq_lengths_q: torch.Tensor,
-        actual_seq_lengths_kv: torch.Tensor,
-        block_table: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        layer_id: int,
-        is_quant: bool,
-        indexer_query_scale: Optional[torch.Tensor],
-        past_key_states_scale: Optional[torch.Tensor],
-        trace_extra: Dict[str, Any],
-    ) -> None:
-        """Run read-only indexer shadow calls for a selected eager trace row.
-
-        This is deliberately gated by full stage-tensor dumping.  It compares
-        an identical-shape repeat with per-row T=1 calls against the same cache,
-        and saves the selected row's logical K history.  Shadow operators run
-        on every TP rank to avoid rank skew; only the trace writer copies data
-        to the host.  None of their results participate in the model forward.
-        """
-
-        if not envs.SGLANG_NPU_MTP_STAGE_TRACE_SAVE_TENSORS.get():
-            return
-        selected_rows = npu_mtp_stage_trace_selected_rows(
-            positions=positions,
-            forward_batch=forward_batch,
-            layer_id=layer_id,
-            writer_only=False,
-        )
-        if not selected_rows:
-            return
-        writer_rows = npu_mtp_stage_trace_selected_rows(
-            positions=positions,
-            forward_batch=forward_batch,
-            layer_id=layer_id,
-        )
-
-        diagnostic_extra = {
-            **trace_extra,
-            "deep_indexer_diagnostic": True,
-            "diagnostic_query_tokens": int(indexer_query.shape[0]),
-            "diagnostic_selected_rows": [int(row) for row in selected_rows],
-        }
-        def run_indexer(
-            query: torch.Tensor,
-            weights: torch.Tensor,
-            seq_q: torch.Tensor,
-            seq_kv: torch.Tensor,
-            request_block_table: torch.Tensor,
-            query_scale: Optional[torch.Tensor],
-        ) -> torch.Tensor:
-            if is_quant:
-                if query_scale is None or past_key_states_scale is None:
-                    raise ValueError(
-                        "QuantLightningIndexer replay requires Q/K scales"
-                    )
-                return torch_npu.npu_quant_lightning_indexer(
-                    query=query,
-                    key=past_key_states,
-                    weights=weights,
-                    query_dequant_scale=query_scale,
-                    key_dequant_scale=past_key_states_scale,
-                    actual_seq_lengths_query=seq_q,
-                    actual_seq_lengths_key=seq_kv,
-                    block_table=request_block_table,
-                    layout_query="TND",
-                    layout_key="PA_BSND",
-                    sparse_count=self.index_topk,
-                    sparse_mode=3,
-                    query_quant_mode=0,
-                    key_quant_mode=0,
-                )
-            return torch_npu.npu_lightning_indexer(
-                query=query,
-                key=past_key_states,
-                weights=weights,
-                actual_seq_lengths_query=seq_q,
-                actual_seq_lengths_key=seq_kv,
-                block_table=request_block_table,
-                layout_query="TND",
-                layout_key="PA_BSND",
-                sparse_count=self.index_topk,
-                sparse_mode=3,
-            )[0]
-
-        q_cumulative = (
-            actual_seq_lengths_q.detach()
-            .reshape(-1)
-            .to(torch.int64)
-            .cpu()
-            .tolist()
-        )
-        kv_lengths = (
-            actual_seq_lengths_kv.detach()
-            .reshape(-1)
-            .to(torch.int64)
-            .cpu()
-            .tolist()
-        )
-        total_query_tokens = int(indexer_query.shape[0])
-        if not q_cumulative or int(q_cumulative[-1]) != total_query_tokens:
-            raise ValueError(
-                "Invalid cumulative Q lengths for indexer replay: "
-                f"q={q_cumulative}, query_tokens={total_query_tokens}"
-            )
-        if len(q_cumulative) != len(kv_lengths):
-            raise ValueError(
-                "Q/KV request count differs for indexer replay: "
-                f"{len(q_cumulative)} != {len(kv_lengths)}"
-            )
-        if block_table.ndim != 2 or block_table.shape[0] < len(q_cumulative):
-            raise ValueError(
-                "Block table cannot cover indexer replay requests: "
-                f"shape={tuple(block_table.shape)}, requests={len(q_cumulative)}"
-            )
-
-        row_plan: Dict[int, Tuple[int, int, int, int, int]] = {}
-        q_start = 0
-        for request_index, q_end_raw in enumerate(q_cumulative):
-            q_end = int(q_end_raw)
-            q_len = q_end - q_start
-            kv_final = int(kv_lengths[request_index])
-            if q_len <= 0:
-                raise ValueError(
-                    f"Non-positive Q length for request {request_index}: {q_len}"
-                )
-            for local_row in range(q_len):
-                row = q_start + local_row
-                kv_effective = kv_final - q_len + local_row + 1
-                if kv_effective <= 0 or kv_effective > kv_final:
-                    raise ValueError(
-                        "Invalid effective KV length for indexer replay: "
-                        f"request={request_index}, row={row}, "
-                        f"q_len={q_len}, kv_final={kv_final}, "
-                        f"kv_effective={kv_effective}"
-                    )
-                row_plan[row] = (
-                    request_index,
-                    local_row,
-                    q_len,
-                    kv_final,
-                    kv_effective,
-                )
-            q_start = q_end
-
-        if len(row_plan) != total_query_tokens:
-            raise ValueError(
-                "Indexer replay plan did not cover every query row: "
-                f"{len(row_plan)} != {total_query_tokens}"
-            )
-        if production_topk.shape[0] != total_query_tokens:
-            raise ValueError(
-                "Production top-k rows differ from indexer query rows: "
-                f"{production_topk.shape[0]} != {total_query_tokens}"
-            )
-        position_values = (
-            positions.detach().reshape(-1).to(torch.int64).cpu().tolist()
-        )
-        if len(position_values) != total_query_tokens:
-            raise ValueError(
-                "Position rows differ from indexer query rows: "
-                f"{len(position_values)} != {total_query_tokens}"
-            )
-        for row in selected_rows:
-            if row not in row_plan:
-                raise ValueError(f"Selected row {row} is absent from replay plan")
-            kv_effective = row_plan[row][-1]
-            if int(position_values[row]) + 1 != kv_effective:
-                raise ValueError(
-                    "Selected row is not equivalent under right-down causal "
-                    "T1 replay: "
-                    f"row={row}, position={position_values[row]}, "
-                    f"kv_effective={kv_effective}"
-                )
-
-        seq_q_for_op = actual_seq_lengths_q.to(torch.int32).contiguous()
-        seq_kv_for_op = actual_seq_lengths_kv.to(
-            device=indexer_query.device, dtype=torch.int32
-        ).contiguous()
-        repeat_topk = run_indexer(
-            indexer_query,
-            indexer_weights,
-            seq_q_for_op,
-            seq_kv_for_op,
-            block_table,
-            indexer_query_scale,
-        )
-        trace_npu_mtp_stage_tensor(
-            stage="indexer.topk_production",
-            tensor=production_topk,
-            positions=positions,
-            forward_batch=forward_batch,
-            layer_id=layer_id,
-            extra=diagnostic_extra,
-        )
-        trace_npu_mtp_stage_tensor(
-            stage="indexer.topk_repeat_same_shape",
-            tensor=repeat_topk,
-            positions=positions,
-            forward_batch=forward_batch,
-            layer_id=layer_id,
-            extra=diagnostic_extra,
-        )
-
-        replay_topk = production_topk.clone()
-        for row in selected_rows:
-            if row not in row_plan:
-                raise ValueError(f"Selected row {row} is absent from replay plan")
-            request_index, _, _, _, kv_effective = row_plan[row]
-            row_query_scale = (
-                indexer_query_scale[row : row + 1].contiguous()
-                if indexer_query_scale is not None
-                else None
-            )
-            row_topk = run_indexer(
-                indexer_query[row : row + 1].contiguous(),
-                indexer_weights[row : row + 1].contiguous(),
-                torch.ones(
-                    (1,), dtype=torch.int32, device=indexer_query.device
-                ),
-                torch.tensor(
-                    [kv_effective],
-                    dtype=torch.int32,
-                    device=indexer_query.device,
-                ),
-                block_table[request_index : request_index + 1].contiguous(),
-                row_query_scale,
-            )
-            replay_topk[row : row + 1].copy_(row_topk)
-        trace_npu_mtp_stage_tensor(
-            stage="indexer.topk_t1_replay",
-            tensor=replay_topk,
-            positions=positions,
-            forward_batch=forward_batch,
-            layer_id=layer_id,
-            extra=diagnostic_extra,
-        )
-
-        if past_key_states.ndim < 3:
-            raise ValueError(
-                f"Unexpected paged indexer K shape: {tuple(past_key_states.shape)}"
-            )
-        page_size = int(past_key_states.shape[1])
-        if page_size <= 0:
-            raise ValueError(f"Invalid indexer cache page size: {page_size}")
-        flat_key_states = past_key_states.reshape(
-            -1, *past_key_states.shape[2:]
-        )
-        flat_key_scales = (
-            past_key_states_scale.reshape(
-                -1, *past_key_states_scale.shape[2:]
-            )
-            if past_key_states_scale is not None
-            else None
-        )
-
-        for row in writer_rows:
-            if row not in row_plan:
-                raise ValueError(f"Selected row {row} is absent from replay plan")
-            request_index, local_row, q_len, kv_final, kv_effective = row_plan[row]
-            page_count = (kv_effective + page_size - 1) // page_size
-            if page_count > block_table.shape[1]:
-                raise ValueError(
-                    "Block table is too short for logical K history: "
-                    f"pages={page_count}, width={block_table.shape[1]}"
-                )
-            canonical_history_bytes = (
-                kv_effective * int(past_key_states[0, 0].numel()) * 4
-            )
-            if canonical_history_bytes > NPU_MTP_TRACE_HISTORY_MAX_BYTES:
-                logger.warning(
-                    "NPU MTP indexer history trace skipped at layer %s row %s: "
-                    "%s canonical bytes exceeds %s",
-                    layer_id,
-                    row,
-                    canonical_history_bytes,
-                    NPU_MTP_TRACE_HISTORY_MAX_BYTES,
-                )
-                continue
-
-            logical_positions = torch.arange(
-                kv_effective,
-                dtype=torch.int64,
-                device=block_table.device,
-            )
-            request_blocks = block_table[request_index]
-            physical_pages = request_blocks.index_select(
-                0, logical_positions // page_size
-            ).to(torch.int64)
-            physical_locs = (
-                physical_pages * page_size + logical_positions % page_size
-            )
-            physical_locs_cpu = physical_locs.detach().cpu()
-            if physical_locs_cpu.numel() and (
-                int(physical_locs_cpu.min().item()) < 0
-                or int(physical_locs_cpu.max().item()) >= flat_key_states.shape[0]
-            ):
-                raise ValueError(
-                    "Logical indexer history maps outside the K cache: "
-                    f"min={int(physical_locs_cpu.min().item())}, "
-                    f"max={int(physical_locs_cpu.max().item())}, "
-                    f"slots={flat_key_states.shape[0]}"
-                )
-            key_gather_locs = physical_locs.to(flat_key_states.device)
-            logical_key_history = flat_key_states.index_select(
-                0, key_gather_locs
-            )
-            row_extra = {
-                **diagnostic_extra,
-                "diagnostic_request_index": int(request_index),
-                "diagnostic_local_query_row": int(local_row),
-                "diagnostic_request_q_len": int(q_len),
-                "diagnostic_kv_final": int(kv_final),
-                "diagnostic_kv_effective": int(kv_effective),
-                "diagnostic_page_size": int(page_size),
-                "diagnostic_page_count": int(page_count),
-                "position_matches_kv_effective": bool(
-                    row < len(position_values)
-                    and int(position_values[row]) + 1 == kv_effective
-                ),
-            }
-            trace_npu_mtp_stage_row_tensor(
-                stage="indexer.history_physical_locs",
-                tensor=physical_locs,
-                row_in_forward=row,
-                positions=positions,
-                forward_batch=forward_batch,
-                layer_id=layer_id,
-                extra=row_extra,
-            )
-            trace_npu_mtp_stage_row_tensor(
-                stage="indexer.history_k_logical",
-                tensor=logical_key_history,
-                row_in_forward=row,
-                positions=positions,
-                forward_batch=forward_batch,
-                layer_id=layer_id,
-                extra=row_extra,
-            )
-            if flat_key_scales is not None:
-                logical_scale_history = flat_key_scales.index_select(
-                    0, physical_locs.to(flat_key_scales.device)
-                )
-                trace_npu_mtp_stage_row_tensor(
-                    stage="indexer.history_k_scale_logical",
-                    tensor=logical_scale_history,
-                    row_in_forward=row,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    layer_id=layer_id,
-                    extra=row_extra,
-                )
-
     def forward_npu(
         self,
         x: torch.Tensor,
@@ -2147,21 +1698,6 @@ class Indexer(MultiPlatformOp):
         layer_scatter_modes=None,
         dynamic_scale: torch.Tensor = None,
     ) -> torch.Tensor:
-        trace_main_model = _enable_npu_mtp_stage_trace and (
-            getattr(
-                forward_batch,
-                "_npu_mtp_stage_trace_target_layer_id",
-                None,
-            )
-            == layer_id
-        )
-        trace_selected_forward = trace_main_model and (
-            npu_mtp_stage_trace_forward_selected(
-                positions=positions,
-                forward_batch=forward_batch,
-                layer_id=layer_id,
-            )
-        )
         if get_attn_backend().forward_metadata.seq_lens_cpu_int is None:
             actual_seq_lengths_kv = get_attn_backend().forward_metadata.seq_lens
         else:
@@ -2322,11 +1858,7 @@ class Indexer(MultiPlatformOp):
                 torch.npu.current_stream(),
             )
 
-        is_use_quant_lightning_indexer = (
-            get_token_to_kv_pool().dtype == torch.float8_e4m3fn
-        )
-        k_before_quant = k if trace_selected_forward else None
-        k_scale = None
+        is_use_quant_lightning_indexer = get_token_to_kv_pool().dtype == torch.float8_e4m3fn
         if is_use_quant_lightning_indexer:
             k, k_scale = torch_npu.npu_dynamic_quant(
                 k, dst_type=get_token_to_kv_pool().dtype
@@ -2430,60 +1962,6 @@ class Indexer(MultiPlatformOp):
             weights = scattered_to_tp_attn_full(weights, forward_batch)
         block_table = get_attn_backend().forward_metadata.block_tables
 
-        if trace_selected_forward:
-            trace_extra = {
-                "quant_lightning_indexer": bool(is_use_quant_lightning_indexer),
-                "indexer_bs": int(indexer_bs),
-                "projected_bs": int(bs),
-                "actual_seq_lengths_query": (
-                    actual_seq_lengths_q.detach()
-                    .reshape(-1)
-                    .to(torch.int64)
-                    .cpu()
-                    .tolist()
-                ),
-                "actual_seq_lengths_kv": (
-                    actual_seq_lengths_kv.detach()
-                    .reshape(-1)
-                    .to(torch.int64)
-                    .cpu()
-                    .tolist()
-                ),
-                "block_table_shape": list(block_table.shape),
-            }
-            current_cache_locs = forward_batch.out_cache_loc[: k.shape[0]].to(
-                torch.int64
-            )
-            cached_current_k = torch.index_select(
-                past_key_states.view(-1, 1, self.head_dim),
-                0,
-                current_cache_locs,
-            )
-            cached_current_scale = None
-            if is_use_quant_lightning_indexer:
-                cached_current_scale = torch.index_select(
-                    past_key_states_scale.view(-1, 1),
-                    0,
-                    current_cache_locs,
-                )
-            for stage, tensor in (
-                ("indexer.q_post_rope", q),
-                ("indexer.k_pre_quant", k_before_quant),
-                ("indexer.k_to_cache", k),
-                ("indexer.k_cache_readback", cached_current_k),
-                ("indexer.k_scale", k_scale),
-                ("indexer.k_scale_cache_readback", cached_current_scale),
-                ("indexer.weights", weights),
-            ):
-                trace_npu_mtp_stage_tensor(
-                    stage=stage,
-                    tensor=tensor,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    layer_id=layer_id,
-                    extra=trace_extra,
-                )
-
         if (
             is_prefill
             and self.dsa_enable_prefill_cp
@@ -2518,95 +1996,17 @@ class Indexer(MultiPlatformOp):
                     dst_type=get_token_to_kv_pool().dtype
                 )
 
-                if trace_selected_forward:
-                    trace_npu_mtp_stage_tensor(
-                        stage="indexer.query_scale_to_op",
-                        tensor=indexer_query_scale,
-                        positions=positions,
-                        forward_batch=forward_batch,
-                        layer_id=layer_id,
-                        extra=trace_extra,
-                    )
-
-            if trace_selected_forward:
-                trace_npu_mtp_stage_tensor(
-                    stage="indexer.query_to_op",
-                    tensor=indexer_query,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    layer_id=layer_id,
-                    extra=trace_extra,
-                )
-                trace_npu_mtp_stage_tensor(
-                    stage="indexer.weights_to_op",
-                    tensor=indexer_weights,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    layer_id=layer_id,
-                    extra=trace_extra,
-                )
-
-            li_actual_seq_lengths_q = actual_seq_lengths_q
-            li_actual_seq_lengths_kv = actual_seq_lengths_kv
-            li_block_table = block_table
-            if (
-                self.npu_dsa_indexer_max_s1 > 0
-                and forward_batch.forward_mode.is_target_verify()
-                and indexer_query.shape[0]
-                > actual_seq_lengths_q.numel() * self.npu_dsa_indexer_max_s1
-            ):
-                attn_backend = get_attn_backend()
-                forward_metadata = attn_backend.forward_metadata
-                grouped_metadata = getattr(
-                    forward_metadata,
-                    NPU_DSA_INDEXER_GROUPED_METADATA_CACHE,
-                    None,
-                )
-                if grouped_metadata is None:
-                    if getattr(attn_backend, "graph_mode", False):
-                        raise RuntimeError(
-                            "NPU DSA indexer grouped graph metadata was not "
-                            "preallocated by the attention backend"
-                        )
-                    grouped_metadata = _build_npu_dsa_indexer_grouped_metadata(
-                        actual_seq_lengths_q=actual_seq_lengths_q,
-                        actual_seq_lengths_kv=actual_seq_lengths_kv,
-                        block_table=block_table,
-                        num_query_tokens=indexer_query.shape[0],
-                        max_s1=self.npu_dsa_indexer_max_s1,
-                    )
-                    setattr(
-                        forward_metadata,
-                        NPU_DSA_INDEXER_GROUPED_METADATA_CACHE,
-                        grouped_metadata,
-                    )
-                (
-                    li_actual_seq_lengths_q,
-                    li_actual_seq_lengths_kv,
-                    li_block_table,
-                ) = grouped_metadata
-                if trace_selected_forward:
-                    trace_extra["li_grouped_pseudo_batch_max_s1"] = int(
-                        self.npu_dsa_indexer_max_s1
-                    )
-                    trace_extra["li_grouped_pseudo_batch_size"] = int(
-                        li_actual_seq_lengths_q.numel()
-                    )
-
-            if is_use_quant_lightning_indexer:
                 topk_indices = torch_npu.npu_quant_lightning_indexer(
                     query=indexer_query,
                     key=past_key_states,
                     weights=indexer_weights,
                     query_dequant_scale=indexer_query_scale,
                     key_dequant_scale=past_key_states_scale,
-                    actual_seq_lengths_query=li_actual_seq_lengths_q.to(
+                    actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
+                    actual_seq_lengths_key=actual_seq_lengths_kv.to(k.device).to(
                         torch.int32
                     ),
-                    actual_seq_lengths_key=li_actual_seq_lengths_kv.to(
-                        k.device
-                    ).to(torch.int32),
-                    block_table=li_block_table,
+                    block_table=block_table,
                     layout_query="TND",
                     layout_key="PA_BSND",
                     sparse_count=self.index_topk,
@@ -2614,72 +2014,22 @@ class Indexer(MultiPlatformOp):
                     query_quant_mode=0,
                     key_quant_mode=0,
                 )
-                if trace_selected_forward:
-                    try:
-                        self._trace_npu_indexer_deep_diagnostics(
-                            production_topk=topk_indices,
-                            indexer_query=indexer_query,
-                            past_key_states=past_key_states,
-                            indexer_weights=indexer_weights,
-                            actual_seq_lengths_q=li_actual_seq_lengths_q,
-                            actual_seq_lengths_kv=li_actual_seq_lengths_kv,
-                            block_table=li_block_table,
-                            positions=positions,
-                            forward_batch=forward_batch,
-                            layer_id=layer_id,
-                            is_quant=True,
-                            indexer_query_scale=indexer_query_scale,
-                            past_key_states_scale=past_key_states_scale,
-                            trace_extra=trace_extra,
-                        )
-                    except Exception:
-                        logger.exception(
-                            "NPU MTP deep QuantLightningIndexer diagnostic "
-                            "failed at layer %s; retaining production output",
-                            layer_id,
-                        )
                 return topk_indices
             else:
                 topk_indices = torch_npu.npu_lightning_indexer(
                     query=indexer_query,
                     key=past_key_states,
                     weights=indexer_weights,
-                    actual_seq_lengths_query=li_actual_seq_lengths_q.to(
+                    actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
+                    actual_seq_lengths_key=actual_seq_lengths_kv.to(k.device).to(
                         torch.int32
                     ),
-                    actual_seq_lengths_key=li_actual_seq_lengths_kv.to(
-                        k.device
-                    ).to(torch.int32),
-                    block_table=li_block_table,
+                    block_table=block_table,
                     layout_query="TND",
                     layout_key="PA_BSND",
                     sparse_count=self.index_topk,
                     sparse_mode=3,
                 )
-                if trace_selected_forward:
-                    try:
-                        self._trace_npu_indexer_deep_diagnostics(
-                            production_topk=topk_indices[0],
-                            indexer_query=indexer_query,
-                            past_key_states=past_key_states,
-                            indexer_weights=indexer_weights,
-                            actual_seq_lengths_q=li_actual_seq_lengths_q,
-                            actual_seq_lengths_kv=li_actual_seq_lengths_kv,
-                            block_table=li_block_table,
-                            positions=positions,
-                            forward_batch=forward_batch,
-                            layer_id=layer_id,
-                            is_quant=False,
-                            indexer_query_scale=None,
-                            past_key_states_scale=None,
-                            trace_extra=trace_extra,
-                        )
-                    except Exception:
-                        logger.exception(
-                            "NPU MTP deep LightningIndexer diagnostic failed "
-                            "at layer %s; retaining production output",
-                            layer_id,
-                        )
                 return topk_indices[0]
 
     def do_npu_cp_balance_indexer(

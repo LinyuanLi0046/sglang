@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch_npu
@@ -12,7 +12,6 @@ from sgl_kernel_npu.attention.sinks_attention import (
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
 )
@@ -78,13 +77,6 @@ class ForwardMetadata:
     seq_lens: Optional[torch.Tensor] = None
     actual_seq_lengths_q: Optional[torch.Tensor] = None
     actual_seq_lengths_kv: Optional[torch.Tensor] = None
-
-    # Stable-address pseudo-batch inputs used by the NPU DSA indexer during
-    # target-verify graph capture/replay.  The backing buffers are shared by
-    # all graph buckets and refreshed out of graph before every replay.
-    _npu_dsa_indexer_grouped_metadata: Optional[
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-    ] = None
 
     # swa attention mask for graph mode decode
     swa_mask: Optional[torch.Tensor] = None
@@ -342,19 +334,6 @@ class AscendAttnBackend(AttentionBackend):
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
-        )
-        self.npu_dsa_indexer_max_s1 = envs.SGLANG_NPU_DSA_INDEXER_MAX_S1.get()
-        if self.npu_dsa_indexer_max_s1 not in (0, 1, 2):
-            raise ValueError(
-                "SGLANG_NPU_DSA_INDEXER_MAX_S1 must be 0, 1, or 2, got "
-                f"{self.npu_dsa_indexer_max_s1}"
-            )
-        # Avoid widening the ModelRunner interface at all when the workaround
-        # is disabled (some backend unit-test stubs do not expose this field).
-        self.is_draft_worker = (
-            model_runner.is_draft_worker
-            if self.npu_dsa_indexer_max_s1 > 0
-            else False
         )
         self.ascend_attn_mask_builder = AscendAttnMaskBuilder(
             model_runner, self.device, self.use_fia, self.use_mla
@@ -734,8 +713,6 @@ class AscendAttnBackend(AttentionBackend):
                 device=self.device,
             ),
         }
-        if self.npu_dsa_indexer_max_s1 > 0:
-            self._init_npu_dsa_indexer_grouped_graph_buffers(max_bs)
         if self.is_hybrid_swa:
             self.graph_metadata["block_tables_swa"] = torch.empty(
                 (max_bs, total_context_len // self.page_size),
@@ -806,25 +783,6 @@ class AscendAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=seq_lens.device,
             )
-        if self._use_npu_dsa_indexer_grouped_graph_metadata(forward_mode):
-            segments_per_request = self.graph_metadata[
-                "npu_dsa_indexer_grouped_segments_per_request"
-            ]
-            grouped_batch_size = bs * segments_per_request
-            metadata._npu_dsa_indexer_grouped_metadata = (
-                self.graph_metadata["npu_dsa_indexer_grouped_seq_q"][
-                    :grouped_batch_size
-                ],
-                self.graph_metadata["npu_dsa_indexer_grouped_seq_kv"][
-                    :bs
-                ].reshape(grouped_batch_size),
-                self.graph_metadata["npu_dsa_indexer_grouped_block_tables"][
-                    :bs
-                ].reshape(
-                    grouped_batch_size,
-                    self.graph_metadata["block_tables"].shape[1],
-                ),
-            )
         if forward_mode.is_dllm_extend():
             extend_seq_lens_cpu_int = torch.tensor(
                 [self.dllm_block_size for i in range(bs)],
@@ -861,104 +819,6 @@ class AscendAttnBackend(AttentionBackend):
             )
         self.graph_metadata[bs] = metadata
         return metadata
-
-    def _use_npu_dsa_indexer_grouped_graph_metadata(
-        self, forward_mode: ForwardMode
-    ) -> bool:
-        return (
-            self.npu_dsa_indexer_max_s1 > 0
-            and not self.is_draft_worker
-            and self.speculative_num_draft_tokens is not None
-            and self.speculative_num_draft_tokens > self.npu_dsa_indexer_max_s1
-            and forward_mode.is_target_verify()
-        )
-
-    def _init_npu_dsa_indexer_grouped_graph_buffers(self, max_bs: int) -> None:
-        """Allocate one shared pseudo-batch metadata buffer for all graph buckets.
-
-        Building the grouped block table lazily in the model forward keeps one
-        large copy alive for every captured batch size.  It also makes the LI
-        graph depend on tensors produced by an eager warmup.  Allocate the
-        largest required buffers once instead; per-bucket metadata only keeps
-        stable views into these buffers.
-        """
-        if (
-            self.npu_dsa_indexer_max_s1 == 0
-            or self.is_draft_worker
-            or self.speculative_num_draft_tokens is None
-            or self.speculative_num_draft_tokens <= self.npu_dsa_indexer_max_s1
-        ):
-            return
-
-        query_len = self.speculative_num_draft_tokens
-        max_s1 = self.npu_dsa_indexer_max_s1
-        segment_starts = list(range(0, query_len, max_s1))
-        segment_lens = [min(max_s1, query_len - start) for start in segment_starts]
-        segments_per_request = len(segment_lens)
-
-        grouped_seq_q = []
-        cumulative_q = 0
-        for _ in range(max_bs):
-            for segment_len in segment_lens:
-                cumulative_q += segment_len
-                grouped_seq_q.append(cumulative_q)
-
-        self.graph_metadata[
-            "npu_dsa_indexer_grouped_segments_per_request"
-        ] = segments_per_request
-        self.graph_metadata["npu_dsa_indexer_grouped_seq_q"] = torch.tensor(
-            grouped_seq_q, dtype=torch.int32, device=self.device
-        )
-        self.graph_metadata["npu_dsa_indexer_grouped_seq_kv"] = torch.empty(
-            (max_bs, segments_per_request),
-            dtype=torch.int32,
-            device=self.device,
-        )
-        self.graph_metadata["npu_dsa_indexer_grouped_kv_offsets"] = torch.tensor(
-            [
-                start + segment_len - query_len
-                for start, segment_len in zip(segment_starts, segment_lens)
-            ],
-            dtype=torch.int32,
-            device=self.device,
-        )
-        self.graph_metadata["npu_dsa_indexer_grouped_block_tables"] = torch.zeros(
-            (
-                max_bs,
-                segments_per_request,
-                self.graph_metadata["block_tables"].shape[1],
-            ),
-            dtype=self.graph_metadata["block_tables"].dtype,
-            device=self.device,
-        )
-
-    def _update_npu_dsa_indexer_grouped_graph_metadata(
-        self, metadata: ForwardMetadata, bs: int, max_seq_pages: int
-    ) -> None:
-        """Refresh dynamic pseudo-batch inputs before capture warmup or replay."""
-        grouped_metadata = metadata._npu_dsa_indexer_grouped_metadata
-        if grouped_metadata is None:
-            return
-
-        _, grouped_seq_kv, grouped_block_tables = grouped_metadata
-        segments_per_request = self.graph_metadata[
-            "npu_dsa_indexer_grouped_segments_per_request"
-        ]
-        seq_kv = metadata.seq_lens[:bs].reshape(bs, 1)
-        kv_offsets = self.graph_metadata[
-            "npu_dsa_indexer_grouped_kv_offsets"
-        ].reshape(1, segments_per_request)
-        grouped_seq_kv = grouped_seq_kv.reshape(bs, segments_per_request)
-        # TARGET_VERIFY seq_lens already includes all query tokens, so adding
-        # the non-positive segment offsets cannot produce a negative length.
-        torch.add(seq_kv, kv_offsets, out=grouped_seq_kv)
-        grouped_block_tables.reshape(
-            bs, segments_per_request, metadata.block_tables.shape[1]
-        )[:, :, :max_seq_pages].copy_(
-            metadata.block_tables[:bs, :max_seq_pages]
-            .unsqueeze(1)
-            .expand(-1, segments_per_request, -1)
-        )
 
     def _apply_cuda_graph_metadata(
         self,
@@ -1024,10 +884,6 @@ class AscendAttnBackend(AttentionBackend):
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             seq_lens = seq_lens + self.speculative_step_offset_npu
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
-        if self.npu_dsa_indexer_max_s1 > 0:
-            self._update_npu_dsa_indexer_grouped_graph_metadata(
-                metadata, bs, max_seq_pages
-            )
 
         self.forward_metadata = metadata
 

@@ -69,10 +69,6 @@ from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
 )
-from sglang.srt.speculative.greedy_trace import (
-    capture_raw_logits,
-    trace_mtp_greedy_verify,
-)
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     _eagle_prefill_tail_tokens,
@@ -1761,32 +1757,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Sample
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
         maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
-        raw_logits_trace = capture_raw_logits(
-            batch,
-            logits_output.next_token_logits,
-            possible_tokens_per_req=verify_input.draft_token_num,
-        )
         (
             predict,
             accept_lens,
             accept_index,
         ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
-        trace_mtp_greedy_verify(
-            batch=batch,
-            forward_batch=verify_forward_batch,
-            can_run_cuda_graph=can_run_cuda_graph,
-            graph_runner=(
-                self.target_worker.model_runner.decode_cuda_graph_runner
-                if can_run_cuda_graph
-                else None
-            ),
-            verify_input=verify_input,
-            logits=logits_output.next_token_logits,
-            predict=predict,
-            accept_lens=accept_lens,
-            accept_index=accept_index,
-            raw_snapshot=raw_logits_trace,
-        )
         new_seq_lens = batch.seq_lens + accept_lens
 
         # Update mamba state for hybrid GDN models after verification

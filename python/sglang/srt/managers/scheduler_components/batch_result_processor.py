@@ -26,7 +26,6 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.speculative.greedy_trace import trace_scheduler_commit
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
@@ -229,12 +228,6 @@ class SchedulerBatchResultProcessor:
                     req.time_stats.set_prefill_finished_time()
 
                     # req output_ids are set here
-                    trace_scheduler_commit(
-                        req=req,
-                        tokens=[next_token_id],
-                        phase="prefill",
-                        is_spec=not batch.spec_algorithm.is_none(),
-                    )
                     req.output_ids.append(next_token_id)
 
                     self._maybe_update_reasoning_tokens(req, next_token_id)
@@ -687,12 +680,6 @@ class SchedulerBatchResultProcessor:
             next_token_id = next_token_ids[i]
             is_spec = not batch.spec_algorithm.is_none()
 
-            trace_scheduler_commit(
-                req=req,
-                tokens=next_token_id,
-                phase="decode",
-                is_spec=is_spec,
-            )
             req.output_ids.extend(next_token_id)
             new_accept_len = len(next_token_id)
 

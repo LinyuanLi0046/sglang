@@ -17,11 +17,6 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
-from sglang.srt.speculative.greedy_trace import (
-    npu_mtp_stage_trace_forward_selected,
-    npu_mtp_stage_trace_enabled,
-    trace_npu_mtp_stage_tensor,
-)
 from sglang.srt.utils import is_npu_before_atlas_a5
 
 if TYPE_CHECKING:
@@ -30,7 +25,6 @@ if TYPE_CHECKING:
     from sglang.srt.utils import BumpAllocator
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 _is_npu_before_atlas_a5 = is_npu_before_atlas_a5()
-_enable_npu_mtp_stage_trace = npu_mtp_stage_trace_enabled()
 
 
 def _use_explicit_npu_interleaved_rope(m: "DeepseekV2AttentionMLA") -> bool:
@@ -494,14 +488,6 @@ def forward_dsa_prepare_npu(
     layer_scatter_modes,
     prev_topk_indices: torch.Tensor = None,
 ):
-    trace_main_model = _enable_npu_mtp_stage_trace and not m.is_nextn
-    trace_selected_forward = trace_main_model and (
-        npu_mtp_stage_trace_forward_selected(
-            positions=positions,
-            forward_batch=forward_batch,
-            layer_id=m.layer_id,
-        )
-    )
     dynamic_scale = None
     mla_preprocess_used = (
         is_mla_preprocess_enabled()
@@ -593,22 +579,6 @@ def forward_dsa_prepare_npu(
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
-        if trace_selected_forward:
-            trace_extra = {"mla_preprocess_used": False}
-            for stage, tensor in (
-                ("dsa.q_nope_pre_absorb", q_nope),
-                ("dsa.q_pe_pre_rope", q_pe),
-                ("dsa.k_pe_pre_rope", k_pe),
-            ):
-                trace_npu_mtp_stage_tensor(
-                    stage=stage,
-                    tensor=tensor,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    layer_id=m.layer_id,
-                    extra=trace_extra,
-                )
-
         if is_mla_preprocess_enabled() and not m.rotary_emb.is_neox_style:
             q_pe, k_pe = _apply_dsa_interleave_half_rope(
                 m, positions, q_pe, k_pe, forward_batch
@@ -627,49 +597,17 @@ def forward_dsa_prepare_npu(
             )
 
     if not m.skip_topk or (m.is_nextn and prev_topk_indices is None):
-        if trace_selected_forward:
-            forward_batch._npu_mtp_stage_trace_target_layer_id = m.layer_id
-        try:
-            topk_indices = m.indexer(
-                hidden_states,
-                q_lora,
-                positions,
-                forward_batch,
-                m.layer_id,
-                layer_scatter_modes,
-                dynamic_scale,
-            )
-        finally:
-            if trace_selected_forward:
-                del forward_batch._npu_mtp_stage_trace_target_layer_id
+        topk_indices = m.indexer(
+            hidden_states,
+            q_lora,
+            positions,
+            forward_batch,
+            m.layer_id,
+            layer_scatter_modes,
+            dynamic_scale,
+        )
     else:
         topk_indices = prev_topk_indices
-
-    if trace_selected_forward:
-        trace_extra = {
-            "mla_preprocess_used": bool(mla_preprocess_used),
-            "topk_reused": bool(
-                m.skip_topk and not (m.is_nextn and prev_topk_indices is None)
-            ),
-        }
-        for stage, tensor in (
-            ("dsa.attn_input", hidden_states),
-            ("dsa.q_lora", q_lora),
-            ("dsa.q_nope_absorbed", q_nope_out),
-            ("dsa.q_pe", q_pe),
-            ("dsa.k_nope", k_nope),
-            ("dsa.k_pe", k_pe),
-            ("dsa.indexer_topk", topk_indices),
-            ("dsa.dynamic_scale", dynamic_scale),
-        ):
-            trace_npu_mtp_stage_tensor(
-                stage=stage,
-                tensor=tensor,
-                positions=positions,
-                forward_batch=forward_batch,
-                layer_id=m.layer_id,
-                extra=trace_extra,
-            )
 
     return (
         q_pe,
@@ -696,14 +634,6 @@ def forward_dsa_core_npu(
     zero_allocator: "BumpAllocator",
     positions: torch.Tensor,
 ) -> torch.Tensor:
-    trace_main_model = _enable_npu_mtp_stage_trace and not m.is_nextn
-    trace_selected_forward = trace_main_model and (
-        npu_mtp_stage_trace_forward_selected(
-            positions=positions,
-            forward_batch=forward_batch,
-            layer_id=m.layer_id,
-        )
-    )
     attn_output = m.attn_mqa(
         q_nope_out.contiguous(),
         k_nope.contiguous(),
@@ -714,15 +644,6 @@ def forward_dsa_core_npu(
         k_rope=k_pe.contiguous(),
         topk_indices=topk_indices,
     )
-    if trace_selected_forward:
-        trace_npu_mtp_stage_tensor(
-            stage="dsa.sfa_latent_output",
-            tensor=attn_output,
-            positions=positions,
-            forward_batch=forward_batch,
-            layer_id=m.layer_id,
-            extra={"mla_preprocess_used": bool(mla_preprocess_used)},
-        )
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 
     attn_bmm_output = torch.empty(
@@ -751,28 +672,9 @@ def forward_dsa_core_npu(
         else:
             batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
 
-    if trace_selected_forward:
-        trace_npu_mtp_stage_tensor(
-            stage="dsa.value_projection_output",
-            tensor=attn_bmm_output,
-            positions=positions,
-            forward_batch=forward_batch,
-            layer_id=m.layer_id,
-            extra={"mla_preprocess_used": bool(mla_preprocess_used)},
-        )
-
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
 
     output, _ = m.o_proj(attn_bmm_output)
-    if trace_selected_forward:
-        trace_npu_mtp_stage_tensor(
-            stage="dsa.o_proj_output",
-            tensor=output,
-            positions=positions,
-            forward_batch=forward_batch,
-            layer_id=m.layer_id,
-            extra={"mla_preprocess_used": bool(mla_preprocess_used)},
-        )
     if not m.next_skip_topk:
         return output, None
     else:

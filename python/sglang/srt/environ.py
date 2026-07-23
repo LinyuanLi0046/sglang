@@ -283,27 +283,6 @@ class Envs:
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
-    # Short-case diagnostics for greedy NEXTN verification on NPU.  All tensor
-    # copies, TP consensus collectives, and optional full-logit dumps are gated
-    # by the master switch and are absent from the normal hot path.
-    SGLANG_NPU_MTP_GREEDY_TRACE = EnvBool(False)
-    SGLANG_NPU_MTP_GREEDY_TRACE_RID = EnvStr("")
-    SGLANG_NPU_MTP_GREEDY_TRACE_START_TOKEN = EnvInt(0)
-    SGLANG_NPU_MTP_GREEDY_TRACE_MAX_TOKENS = EnvInt(512)
-    SGLANG_NPU_MTP_GREEDY_TRACE_TOPN = EnvInt(8)
-    SGLANG_NPU_MTP_GREEDY_TRACE_LABEL = EnvStr("")
-    SGLANG_NPU_MTP_GREEDY_TRACE_DUMP_POSITIONS = EnvStr("")
-    SGLANG_NPU_MTP_GREEDY_TRACE_DUMP_DIR = EnvStr("/tmp/sglang_mtp_trace")
-    # Eager-only, layer/stage diagnostics for comparing normal DECODE with
-    # multi-token TARGET_VERIFY.  Positions are predicted-token positions,
-    # matching SGLANG_NPU_MTP_GREEDY_TRACE_DUMP_POSITIONS; an empty layer list
-    # means all layers.  Full tensor rows are optional because compact SHA256
-    # fingerprints are always emitted for selected rows.  On NPU, saving full
-    # tensors also enables read-only LightningIndexer repeat/T1/cache-prefix
-    # diagnostics for the selected layer and position.
-    SGLANG_NPU_MTP_STAGE_TRACE_POSITIONS = EnvStr("")
-    SGLANG_NPU_MTP_STAGE_TRACE_LAYERS = EnvStr("")
-    SGLANG_NPU_MTP_STAGE_TRACE_SAVE_TENSORS = EnvBool(False)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
@@ -549,10 +528,6 @@ class Envs:
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
-    # Maximum S1 per pseudo batch for the NPU DSA target-verify indexer.
-    # 0 disables the workaround, 1 is the strict T1 path, and 2 is the faster
-    # non-split-M path. Both enabled modes keep a single operator launch.
-    SGLANG_NPU_DSA_INDEXER_MAX_S1 = EnvInt(0)
     # Keep the GLM DSA NextN draft KV cache in BF16 when the target KV cache
     # uses FP8. This is intentionally a draft-only override; the target keeps
     # the FP8 layout selected by --kv-cache-dtype.

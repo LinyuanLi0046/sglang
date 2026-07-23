@@ -294,17 +294,19 @@ if _is_npu:
         output_ptr,
         num_rows,
         BLOCK_ROWS: tl.constexpr,
+        TILE_ELEMENTS: tl.constexpr,
     ):
         """Apply a normalized H128 to contiguous rows without materializing H."""
         pid = tl.program_id(0)
         num_programs = tl.num_programs(0)
-        tile_elements = BLOCK_ROWS * 128
-        lane = tl.arange(0, tile_elements)
+        # This Triton frontend requires tl.arange bounds to be direct
+        # constexpr kernel parameters; a derived local loses constexpr typing.
+        lane = tl.arange(0, TILE_ELEMENTS)
         num_elements = num_rows * 128
         num_row_tiles = tl.cdiv(num_rows, BLOCK_ROWS)
 
         for row_tile in tl.range(pid, num_row_tiles, num_programs):
-            offsets = row_tile * tile_elements + lane
+            offsets = row_tile * TILE_ELEMENTS + lane
             mask = offsets < num_elements
             values = tl.load(input_ptr + offsets, mask=mask, other=0.0)
             # Match the former NPU path: round the activation to BF16 first,
@@ -374,6 +376,7 @@ def _rotate_activation_npu(x: torch.Tensor) -> torch.Tensor:
         output,
         num_rows,
         BLOCK_ROWS=block_rows,
+        TILE_ELEMENTS=block_rows * 128,
     )
     return output
 

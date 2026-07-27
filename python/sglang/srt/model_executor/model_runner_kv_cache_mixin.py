@@ -7,9 +7,11 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.configs.model_config import (
+    can_use_compact_npu_dsa_indexer_cache,
     get_dsa_index_head_dim,
     is_deepseek_dsa,
     is_deepseek_v4,
+    resolve_dsa_indexer_layer_ids,
 )
 from sglang.srt.distributed.parallel_state import (
     get_world_group,
@@ -606,6 +608,35 @@ class ModelRunnerKVCacheMixin:
                     NPUMLATokenToKVPool,
                 )
 
+                indexer_layer_ids = None
+                if (
+                    is_dsa_model
+                    and can_use_compact_npu_dsa_indexer_cache(self.server_args)
+                ):
+                    is_nextn = self.is_draft_worker and bool(
+                        getattr(
+                            self.model_config, "num_nextn_predict_layers", None
+                        )
+                    )
+                    indexer_layer_ids = resolve_dsa_indexer_layer_ids(
+                        self.model_config.hf_config,
+                        self.start_layer,
+                        self.end_layer,
+                        is_nextn=is_nextn,
+                    )
+                    logger.info(
+                        "NPU DSA Indexer KV cache uses %d physical layer(s) "
+                        "for %d local transformer layer(s): %s",
+                        len(indexer_layer_ids),
+                        self.num_effective_layers,
+                        indexer_layer_ids,
+                    )
+                elif is_dsa_model:
+                    logger.info(
+                        "NPU DSA Indexer KV cache keeps the legacy all-layer "
+                        "layout for PD disaggregation or HiCache compatibility."
+                    )
+
                 self.token_to_kv_pool = NPUMLATokenToKVPool(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
@@ -621,6 +652,7 @@ class ModelRunnerKVCacheMixin:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
+                    indexer_layer_ids=indexer_layer_ids,
                 )
             else:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (

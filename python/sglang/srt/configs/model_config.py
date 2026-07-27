@@ -200,6 +200,47 @@ def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
     return max(layer_id - 1, 0) % freq != 0
 
 
+def resolve_dsa_indexer_layer_ids(
+    config: PretrainedConfig,
+    start_layer: int,
+    end_layer: int,
+    is_nextn: bool = False,
+) -> tuple[int, ...]:
+    """Return the global layer ids that instantiate a DSA Indexer.
+
+    Target layers marked ``skip_topk`` reuse the preceding Indexer's top-k
+    result and therefore need no Indexer KV cache. NextN layers are different:
+    ``DeepseekV2AttentionMLA`` explicitly instantiates an Indexer for them even
+    when their logical layer id would otherwise be marked ``skip_topk``.
+    """
+    assert is_deepseek_dsa(config)
+    assert 0 <= start_layer <= end_layer, (
+        f"Invalid DSA layer range: [{start_layer}, {end_layer})"
+    )
+
+    if is_nextn:
+        return tuple(range(start_layer, end_layer))
+
+    return tuple(
+        layer_id
+        for layer_id in range(start_layer, end_layer)
+        if not dsa_layer_skips_topk(config, layer_id)
+    )
+
+
+def can_use_compact_npu_dsa_indexer_cache(server_args) -> bool:
+    """Whether NPU DSA can use a non-uniform per-layer Indexer layout.
+
+    The current Ascend PD and HiCache transfer paths assume that every cache
+    component has one tensor per local transformer layer. Keep their legacy
+    layout until those protocols carry explicit logical-layer metadata.
+    """
+    return (
+        getattr(server_args, "disaggregation_mode", "null") == "null"
+        and not getattr(server_args, "enable_hierarchical_cache", False)
+    )
+
+
 def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config)
     return config.index_n_heads

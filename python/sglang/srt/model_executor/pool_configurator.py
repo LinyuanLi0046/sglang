@@ -20,9 +20,11 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.configs.model_config import (
+    can_use_compact_npu_dsa_indexer_cache,
     get_dsa_index_head_dim,
     is_deepseek_dsa,
     is_deepseek_v4,
+    resolve_dsa_indexer_layer_ids,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -76,6 +78,39 @@ def use_npu_glm_nextn_bf16_kv_cache(server_args, model_config) -> bool:
         and server_args.kv_cache_dtype == "fp8_e4m3"
         and getattr(model_config.hf_text_config, "model_type", None)
         == "glm_moe_dsa"
+    )
+
+
+def _get_npu_dsa_indexer_size_per_token(
+    model_config, kv_cache_dtype: torch.dtype
+) -> int:
+    """Return the bytes used by one NPU DSA Indexer layer for one token."""
+    index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
+    size = index_head_dim * torch._utils._element_size(kv_cache_dtype)
+    if kv_cache_dtype == torch.float8_e4m3fn:
+        # FP8 Indexer K uses one per-token FP32 scale. BF16/FP16 Indexer K
+        # is stored directly and therefore has no scale buffer.
+        size += torch.float32.itemsize
+    return size
+
+
+def _get_npu_dsa_indexer_layer_count(mr: ModelRunner, num_layers: int) -> int:
+    """Return the number of Indexer cache layers allocated by the NPU pool."""
+    if not can_use_compact_npu_dsa_indexer_cache(mr.server_args):
+        # PD and HiCache still require the legacy uniform per-layer buffer
+        # layout. Keep their budget aligned with the actual pool allocation.
+        return num_layers
+
+    is_nextn = mr.is_draft_worker and bool(
+        getattr(mr.model_config, "num_nextn_predict_layers", None)
+    )
+    return len(
+        resolve_dsa_indexer_layer_ids(
+            mr.model_config.hf_config,
+            mr.start_layer,
+            mr.end_layer,
+            is_nextn=is_nextn,
+        )
     )
 
 
@@ -153,31 +188,50 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             ):
                 if (
                     mr.spec_algorithm.is_eagle()
-                    and use_npu_glm_nextn_bf16_kv_cache(
-                        mr.server_args, mr.model_config
-                    )
+                    and is_npu()
+                    and is_deepseek_dsa(mr.model_config.hf_config)
                 ):
-                    # NPUMLATokenToKVPool stores a BF16 DSA draft layer as
-                    # ckv[512] + kr[64]. Its indexer cache also follows the
-                    # pool dtype and keeps one FP32 scale slot per token.
+                    # NPU DSA NextN layers instantiate their own Indexer even
+                    # when the corresponding target layer reuses a prior
+                    # layer's top-k. Account for the draft main KV and Indexer
+                    # caches explicitly instead of scaling the compact target
+                    # cache by a target-layer average.
                     model_config = mr.model_config
-                    draft_layer_size = (
-                        (
-                            model_config.kv_lora_rank
-                            + model_config.qk_rope_head_dim
-                        )
-                        * torch.bfloat16.itemsize
+                    draft_num_layers = int(eagle_draft_num_layers)
+                    use_bf16_draft_kv = use_npu_glm_nextn_bf16_kv_cache(
+                        mr.server_args, model_config
                     )
-                    if is_deepseek_dsa(model_config.hf_config):
-                        index_head_dim = get_dsa_index_head_dim(
-                            model_config.hf_config
+                    draft_kv_cache_dtype = (
+                        torch.bfloat16 if use_bf16_draft_kv else mr.kv_cache_dtype
+                    )
+                    if use_bf16_draft_kv:
+                        draft_main_size_per_layer = (
+                            (
+                                model_config.kv_lora_rank
+                                + model_config.qk_rope_head_dim
+                            )
+                            * torch.bfloat16.itemsize
                         )
-                        draft_layer_size += (
-                            index_head_dim * torch.bfloat16.itemsize
-                            + torch.float32.itemsize
+                    else:
+                        draft_main_size_per_layer = (
+                            mr.calculate_mla_kv_cache_dim()
+                            * torch._utils._element_size(draft_kv_cache_dtype)
                         )
-                    self._cell_size += int(eagle_draft_num_layers) * int(
-                        draft_layer_size
+
+                    draft_indexer_layers = len(
+                        resolve_dsa_indexer_layer_ids(
+                            model_config.hf_config,
+                            0,
+                            draft_num_layers,
+                            is_nextn=True,
+                        )
+                    )
+                    self._cell_size += (
+                        draft_num_layers * draft_main_size_per_layer
+                        + draft_indexer_layers
+                        * _get_npu_dsa_indexer_size_per_token(
+                            model_config, draft_kv_cache_dtype
+                        )
                     )
                 else:
                     self._cell_size = int(
@@ -230,15 +284,28 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
-                index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
-                indexer_size_per_token = (
-                    index_head_dim
-                    + index_head_dim // DSATokenToKVPool.quant_block_size * 4
-                )
-                element_size = torch._utils._element_size(
-                    DSATokenToKVPool.index_k_with_scale_buffer_dtype
-                )
-                cell_size += indexer_size_per_token * num_layers * element_size
+                if is_npu():
+                    indexer_size_per_token = _get_npu_dsa_indexer_size_per_token(
+                        model_config, kv_cache_dtype
+                    )
+                    num_indexer_layers = _get_npu_dsa_indexer_layer_count(
+                        mr, num_layers
+                    )
+                    cell_size += indexer_size_per_token * num_indexer_layers
+                else:
+                    index_head_dim = get_dsa_index_head_dim(
+                        model_config.hf_config
+                    )
+                    indexer_size_per_token = (
+                        index_head_dim
+                        + index_head_dim // DSATokenToKVPool.quant_block_size * 4
+                    )
+                    element_size = torch._utils._element_size(
+                        DSATokenToKVPool.index_k_with_scale_buffer_dtype
+                    )
+                    cell_size += (
+                        indexer_size_per_token * num_layers * element_size
+                    )
         else:
             cell_size = (
                 model_config.get_num_kv_heads(tp_size)

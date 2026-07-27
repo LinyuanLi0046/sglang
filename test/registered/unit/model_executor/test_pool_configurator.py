@@ -10,6 +10,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -125,6 +127,50 @@ def _make_model_runner(
     spec.is_none.return_value = True
     mr.spec_algorithm = spec
 
+    return mr
+
+
+def _make_npu_dsa_mla_runner(
+    *,
+    start_layer=0,
+    end_layer=8,
+    real_indexer_layer_ids=(0, 4),
+    kv_cache_dtype=torch.float8_e4m3fn,
+    mla_kv_cache_dim=656,
+):
+    """Create a GLM DSA runner for NPU cache-budget unit tests."""
+    mr = _make_model_runner(
+        num_layers=end_layer - start_layer,
+        use_mla_backend=True,
+    )
+    mr.start_layer = start_layer
+    mr.end_layer = end_layer
+    mr.num_effective_layers = end_layer - start_layer
+    mr.kv_cache_dtype = kv_cache_dtype
+    mr.calculate_mla_kv_cache_dim.return_value = mla_kv_cache_dim
+    mr.eagle_draft_num_layers = None
+
+    pattern = [
+        "F" if layer_id in real_indexer_layer_ids else "S"
+        for layer_id in range(end_layer)
+    ]
+    mr.model_config.hf_config = SimpleNamespace(
+        architectures=["GlmMoeDsaForCausalLM"],
+        index_topk=2048,
+        index_head_dim=128,
+        index_topk_pattern=pattern,
+    )
+    mr.model_config.hf_text_config = SimpleNamespace(model_type="glm_moe_dsa")
+    mr.model_config.index_head_dim = 128
+    mr.model_config.kv_lora_rank = 512
+    mr.model_config.qk_rope_head_dim = 64
+
+    mr.server_args.kv_cache_dtype = (
+        "fp8_e4m3"
+        if kv_cache_dtype == torch.float8_e4m3fn
+        else "bfloat16"
+    )
+    mr.server_args.enable_hierarchical_cache = False
     return mr
 
 
@@ -530,6 +576,146 @@ class TestEagleConfigurator(unittest.TestCase):
         total_layers = num_layers + eagle_draft_num_layers
         used = config.max_total_num_tokens * full_pt * total_layers
         self.assertLessEqual(used, available)
+
+
+class TestNPUDSACompactIndexerBudget(unittest.TestCase):
+    """NPU DSA budget must mirror compact target and explicit NextN pools."""
+
+    @staticmethod
+    def _make_configurator(mr, *, is_npu=True):
+        with (
+            patch(
+                "sglang.srt.model_executor.pool_configurator.is_npu",
+                return_value=is_npu,
+            ),
+            patch(
+                "sglang.srt.model_executor.pool_configurator.get_attention_tp_size",
+                return_value=1,
+            ),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                DefaultPoolConfigurator,
+            )
+
+            return DefaultPoolConfigurator(mr)
+
+    def test_target_uses_real_indexer_layers_in_current_pp_stage(self):
+        mr = _make_npu_dsa_mla_runner(
+            start_layer=3,
+            end_layer=9,
+            real_indexer_layer_ids=(0, 4, 7),
+        )
+
+        cfg = self._make_configurator(mr)
+
+        # Six main FP8 C8 layers plus only the two real Indexers in [3, 9).
+        self.assertEqual(cfg._cell_size, 6 * 656 + 2 * (128 + 4))
+
+    def test_nextn_resolver_keeps_its_indexer_even_for_skip_layer(self):
+        from sglang.srt.configs.model_config import (
+            resolve_dsa_indexer_layer_ids,
+        )
+
+        config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"],
+            index_topk=2048,
+            index_topk_pattern="S",
+        )
+        self.assertEqual(
+            resolve_dsa_indexer_layer_ids(config, 0, 1, is_nextn=False), ()
+        )
+        self.assertEqual(
+            resolve_dsa_indexer_layer_ids(config, 0, 1, is_nextn=True), (0,)
+        )
+
+    def test_glm52_resolver_has_21_real_indexer_layers(self):
+        from sglang.srt.configs.model_config import (
+            resolve_dsa_indexer_layer_ids,
+        )
+
+        config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"],
+            index_topk=2048,
+            index_topk_freq=4,
+            index_skip_topk_offset=3,
+        )
+        layer_ids = resolve_dsa_indexer_layer_ids(config, 0, 78)
+        self.assertEqual(layer_ids[:4], (0, 1, 2, 6))
+        self.assertEqual(layer_ids[-1], 74)
+        self.assertEqual(len(layer_ids), 21)
+        self.assertEqual(
+            resolve_dsa_indexer_layer_ids(config, 20, 40),
+            (22, 26, 30, 34, 38),
+        )
+
+    def test_pd_and_hicache_keep_legacy_all_layer_budget(self):
+        for mode, enable_hicache in (("prefill", False), ("null", True)):
+            with self.subTest(
+                disaggregation_mode=mode,
+                enable_hierarchical_cache=enable_hicache,
+            ):
+                mr = _make_npu_dsa_mla_runner(
+                    start_layer=3,
+                    end_layer=9,
+                    real_indexer_layer_ids=(0, 4, 7),
+                )
+                mr.server_args.disaggregation_mode = mode
+                mr.server_args.enable_hierarchical_cache = enable_hicache
+
+                cfg = self._make_configurator(mr)
+
+                self.assertEqual(cfg._cell_size, 6 * 656 + 6 * (128 + 4))
+
+    def test_bf16_target_indexer_has_no_scale_buffer(self):
+        mr = _make_npu_dsa_mla_runner(
+            start_layer=3,
+            end_layer=9,
+            real_indexer_layer_ids=(0, 4, 7),
+            kv_cache_dtype=torch.bfloat16,
+            mla_kv_cache_dim=576,
+        )
+
+        cfg = self._make_configurator(mr)
+
+        self.assertEqual(cfg._cell_size, 6 * 576 * 2 + 2 * 128 * 2)
+
+    def test_fp8_nextn_draft_adds_one_main_and_one_indexer_layer(self):
+        mr = _make_npu_dsa_mla_runner()
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.eagle_draft_num_layers = 1
+
+        cfg = self._make_configurator(mr)
+
+        target = 8 * 656 + 2 * (128 + 4)
+        draft = 656 + (128 + 4)
+        self.assertEqual(cfg._cell_size, target + draft)
+
+    def test_bf16_nextn_override_adds_no_indexer_scale(self):
+        from sglang.srt.environ import envs
+
+        mr = _make_npu_dsa_mla_runner()
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.eagle_draft_num_layers = 1
+
+        with envs.SGLANG_NPU_GLM_NEXTN_BF16_KV_CACHE.override(True):
+            cfg = self._make_configurator(mr)
+
+        target = 8 * 656 + 2 * (128 + 4)
+        draft = 576 * 2 + 128 * 2
+        self.assertEqual(cfg._cell_size, target + draft)
+
+    def test_non_npu_dsa_budget_keeps_all_indexer_layers(self):
+        mr = _make_npu_dsa_mla_runner(
+            start_layer=3,
+            end_layer=9,
+            real_indexer_layer_ids=(0, 4, 7),
+        )
+
+        cfg = self._make_configurator(mr, is_npu=False)
+
+        self.assertEqual(cfg._cell_size, 6 * 656 + 6 * (128 + 4))
 
 
 class TestFactory(unittest.TestCase):

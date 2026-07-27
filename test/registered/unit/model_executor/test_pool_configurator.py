@@ -70,6 +70,7 @@ def _make_model_runner(
     """Create a mock ModelRunner with the fields configurators need."""
     mr = MagicMock()
 
+    mr.device = "cpu"
     mr.use_mla_backend = use_mla_backend
     mr.is_draft_worker = False
     mr.num_effective_layers = num_layers
@@ -103,6 +104,7 @@ def _make_model_runner(
     mr.kv_cache_dtype = "fake_bf16"
 
     sa = SimpleNamespace()
+    sa.device = "cpu"
     sa.swa_full_tokens_ratio = swa_full_tokens_ratio
     sa.page_size = page_size
     sa.disable_radix_cache = disable_radix_cache
@@ -143,6 +145,8 @@ def _make_npu_dsa_mla_runner(
         num_layers=end_layer - start_layer,
         use_mla_backend=True,
     )
+    mr.device = "npu"
+    mr.server_args.device = "npu"
     mr.start_layer = start_layer
     mr.end_layer = end_layer
     mr.num_effective_layers = end_layer - start_layer
@@ -582,16 +586,10 @@ class TestNPUDSACompactIndexerBudget(unittest.TestCase):
     """NPU DSA budget must mirror compact target and explicit NextN pools."""
 
     @staticmethod
-    def _make_configurator(mr, *, is_npu=True):
-        with (
-            patch(
-                "sglang.srt.model_executor.pool_configurator.is_npu",
-                return_value=is_npu,
-            ),
-            patch(
-                "sglang.srt.model_executor.pool_configurator.get_attention_tp_size",
-                return_value=1,
-            ),
+    def _make_configurator(mr):
+        with patch(
+            "sglang.srt.model_executor.pool_configurator.get_attention_tp_size",
+            return_value=1,
         ):
             from sglang.srt.model_executor.pool_configurator import (
                 DefaultPoolConfigurator,
@@ -610,6 +608,19 @@ class TestNPUDSACompactIndexerBudget(unittest.TestCase):
 
         # Six main FP8 C8 layers plus only the two real Indexers in [3, 9).
         self.assertEqual(cfg._cell_size, 6 * 656 + 2 * (128 + 4))
+
+    def test_npu_compact_budget_ignores_stale_is_npu_cache(self):
+        mr = _make_npu_dsa_mla_runner()
+
+        # Hardware probing can be cached before torch_npu registers torch.npu.
+        # The explicit runner device must remain the source of truth for sizing.
+        with patch(
+            "sglang.srt.utils.common.is_npu",
+            return_value=False,
+        ):
+            cfg = self._make_configurator(mr)
+
+        self.assertEqual(cfg._cell_size, 8 * 656 + 2 * (128 + 4))
 
     def test_nextn_resolver_keeps_its_indexer_even_for_skip_layer(self):
         from sglang.srt.configs.model_config import (
@@ -712,8 +723,10 @@ class TestNPUDSACompactIndexerBudget(unittest.TestCase):
             end_layer=9,
             real_indexer_layer_ids=(0, 4, 7),
         )
+        mr.device = "cuda"
+        mr.server_args.device = "cuda"
 
-        cfg = self._make_configurator(mr, is_npu=False)
+        cfg = self._make_configurator(mr)
 
         self.assertEqual(cfg._cell_size, 6 * 656 + 6 * (128 + 4))
 

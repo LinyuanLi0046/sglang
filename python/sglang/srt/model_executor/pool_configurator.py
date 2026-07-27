@@ -34,7 +34,6 @@ from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.utils.common import (
     ceil_align,
     is_float4_e2m1fn_x2,
-    is_npu,
     spec_decode_alloc_len_per_request,
 )
 
@@ -72,8 +71,10 @@ logger = logging.getLogger(__name__)
 
 def use_npu_glm_nextn_bf16_kv_cache(server_args, model_config) -> bool:
     """Whether GLM DSA NextN should override only its draft KV cache to BF16."""
+    # Use the normalized device argument instead of is_npu(): the latter is
+    # cached and may be queried before torch_npu registers torch.npu.
     return (
-        is_npu()
+        server_args.device == "npu"
         and envs.SGLANG_NPU_GLM_NEXTN_BF16_KV_CACHE.get()
         and server_args.kv_cache_dtype == "fp8_e4m3"
         and getattr(model_config.hf_text_config, "model_type", None)
@@ -186,9 +187,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(eagle_draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
+                # Keep sizing tied to the runner's actual device instead of
+                # the potentially stale global is_npu() probe.
                 if (
                     mr.spec_algorithm.is_eagle()
-                    and is_npu()
+                    and mr.device == "npu"
                     and is_deepseek_dsa(mr.model_config.hf_config)
                 ):
                     # NPU DSA NextN layers instantiate their own Indexer even
@@ -284,7 +287,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
-                if is_npu():
+                if mr.device == "npu":
                     indexer_size_per_token = _get_npu_dsa_indexer_size_per_token(
                         model_config, kv_cache_dtype
                     )

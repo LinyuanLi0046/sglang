@@ -489,10 +489,7 @@ def forward_dsa_prepare_npu(
     prev_topk_indices: torch.Tensor = None,
 ):
     dynamic_scale = None
-    mla_preprocess_used = (
-        is_mla_preprocess_enabled()
-        and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-    )
+    mla_preprocess_used = is_mla_preprocess_enabled()
     if mla_preprocess_used:
         (
             q_pe,

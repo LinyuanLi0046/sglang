@@ -133,6 +133,28 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             torch.float
         ) if hasattr(self.q_b_proj, 'weight_scale') else None
 
+    def _uses_legacy_mlapo(self) -> bool:
+        # Before Atlas A5, ModelSlim QKV-A projections use the legacy MLAPO
+        # implementation even when kv_b_proj is excluded from quantization.
+        return (
+            _is_npu_before_atlas_a5
+            and hasattr(self.qkv_a_proj.quant_method, "quantization_config")
+            and self.qkv_a_proj.quant_method.quantization_config.get_name()
+            == "modelslim"
+        )
+
+    def uses_mlaprolog(self) -> bool:
+        # Keep this as the single source of truth for both dispatching the
+        # preprocess operator and interpreting its query_norm output.
+        if self._uses_legacy_mlapo():
+            return False
+
+        configured_for_mlaprolog = hasattr(self.quant_config, "ignore") and any(
+            re.fullmatch(r".*kv_b_proj", layer)
+            for layer in self.quant_config.ignore
+        )
+        return configured_for_mlaprolog or not _is_npu_before_atlas_a5
+
     def _get_quant_scale_ckv(self, device: torch.device) -> torch.Tensor:
         fak_descale_reciprocal = self.runtime_refs.get("fak_descale_reciprocal")
         if fak_descale_reciprocal is not None:
@@ -760,22 +782,11 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         )
 
     def forward(self, positions, hidden_states, forward_batch, zero_allocator):
-        # assert self.quant_config and self.quant_config.get_name() == "modelslim"
-        # route by `qkv_a_proj` quant type as MTP layers can be unquantized
-        _is_w8a8 = (
-            hasattr(self.qkv_a_proj.quant_method, "quantization_config")
-            and self.qkv_a_proj.quant_method.quantization_config.get_name()
-            == "modelslim"
-        )
-        # with the mlaprolog enabled, the kv_b_proj layers are unquantized
-        _is_mlaprolog = hasattr(self.quant_config, "ignore") and any(
-            re.fullmatch(r".*kv_b_proj", l) for l in self.quant_config.ignore
-        )
-        if _is_w8a8 and _is_npu_before_atlas_a5:
+        if self._uses_legacy_mlapo():
             return self.forward_mlapo(
                 positions, hidden_states, forward_batch, zero_allocator
             )
-        elif _is_mlaprolog or not _is_npu_before_atlas_a5:
+        elif self.uses_mlaprolog():
             return self.forward_mlaprolog(positions, hidden_states, forward_batch)
         else:
             return self.forward_absorb_prepare_npu_rms_norm_cache(

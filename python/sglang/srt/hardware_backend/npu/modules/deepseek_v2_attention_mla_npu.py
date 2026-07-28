@@ -704,11 +704,9 @@ def npu_mla_preprocess(
             m.v_head_dim,
             m.quant_config,
         )
-    # mlaprolog does not require additional calculation of q_lora
-    _is_mlaprolog = hasattr(m.quant_config, "ignore") and any(
-        re.fullmatch(r".*kv_b_proj", l) for l in m.quant_config.ignore
-    )
-    if _is_mlaprolog:
+    # MLAProlog returns query_norm directly, so it does not require an
+    # additional QKV-A projection and RMSNorm to produce q_lora.
+    if m.mla_preprocess.uses_mlaprolog():
         (
             q_pe,
             k_pe,
@@ -723,8 +721,14 @@ def npu_mla_preprocess(
         ) = m.mla_preprocess.forward(
             positions, hidden_states, forward_batch, zero_allocator
         )
-        if q_lora.dtype == torch.float8_e4m3fn:
-            if dynamic_scale is None:
+        if (
+            q_lora is None
+            or q_lora.dim() == 0
+            or q_lora.shape[-1] != m.q_lora_rank
+        ):
+            raise RuntimeError("MLAProlog returned an invalid query_norm")
+        if q_lora.dtype == torch.float8_e4m3fn and q_lora.numel() > 0:
+            if dynamic_scale is None or dynamic_scale.numel() == 0:
                 raise RuntimeError(
                     "MLAProlog returned MXFP8 query_norm without dequant scale"
                 )
@@ -755,7 +759,7 @@ def npu_mla_preprocess(
                 [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
             )
             q_lora = m.q_a_layernorm(q)
-            torch.npu.current_stream().wait_event(m.alt_stream)
+            torch.npu.current_stream().wait_stream(m.alt_stream)
         else:
             (
                 q_pe,

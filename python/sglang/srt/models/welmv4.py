@@ -1663,17 +1663,29 @@ class Qwen2MoeModel(nn.Module):
             raise ValueError(
                 "A WeLMv4 layer cannot be both a KV-mirror source and consumer."
             )
+        num_nextn_predict_layers = int(
+            getattr(config, "num_nextn_predict_layers", 0) or 0
+        )
+        if num_nextn_predict_layers < 0:
+            raise ValueError("WeLMv4 num_nextn_predict_layers must be non-negative.")
+        # KV-mirror IDs use one logical namespace.  Target layers occupy
+        # [0, num_hidden_layers), followed by optional NextN/MTP layers.  A
+        # target-only server therefore legitimately sees (and later ignores)
+        # pairs whose consumer is the first MTP layer, e.g. 0 -> 48 for a
+        # 48-layer target model.
+        num_logical_layers = config.num_hidden_layers + num_nextn_predict_layers
         for mirror_layer, imitated_layer in zip(
             kv_mirror_layers, kv_mirror_imitated_layers
         ):
             if not (
-                0 <= imitated_layer < mirror_layer < config.num_hidden_layers
+                0 <= imitated_layer < mirror_layer < num_logical_layers
             ):
                 raise ValueError(
                     "Each WeLMv4 KV-mirror pair must satisfy "
                     f"0 <= source ({imitated_layer}) < consumer "
-                    f"({mirror_layer}) < num_hidden_layers "
-                    f"({config.num_hidden_layers})."
+                    f"({mirror_layer}) < num_logical_layers "
+                    f"({num_logical_layers} = {config.num_hidden_layers} target + "
+                    f"{num_nextn_predict_layers} NextN/MTP)."
                 )
         # The legacy CUDA path optionally keeps the (potentially very large)
         # base/OE embedding tables in mapped pinned host memory.  Keep this
@@ -2488,26 +2500,27 @@ class WeLMV4MoeForCausalLM(nn.Module):
             self.model.config, "kv_mirror_imitated_layers", []
         )
         if is_nextn:
-            kv_mirror_layer_ids = [
+            local_layer_ids = {
                 decoder.self_attn.kv_mirror_layer_idx
                 for decoder in self.model.decoder_layers
-            ]
-            kv_mirror_imitated_layers = total_kv_mirror_imitated_layers[
-                : len(kv_mirror_layer_ids)
-            ]
+            }
         else:
-            kv_mirror_layer_ids = [
+            local_layer_ids = {
                 decoder_layer.self_attn.kv_mirror_layer_idx
                 for decoder_layer in self.model.layers
-            ]
-            kv_mirror_layer_ids = [
-                layer_id
-                for layer_id in total_kv_mirror_layers
-                if layer_id in kv_mirror_layer_ids
-            ]  # keep the order of total_kv_mirror_layers
-            kv_mirror_imitated_layers = total_kv_mirror_imitated_layers[
-                -len(kv_mirror_layer_ids) :
-            ]
+            }
+        # Preserve pair alignment while selecting consumers owned by this
+        # model.  In particular, list[-0:] would return the entire source list
+        # when a target-only model filters out all MTP consumers.
+        active_pairs = [
+            (mirror_layer, imitated_layer)
+            for mirror_layer, imitated_layer in zip(
+                total_kv_mirror_layers, total_kv_mirror_imitated_layers
+            )
+            if mirror_layer in local_layer_ids
+        ]
+        kv_mirror_layer_ids = [pair[0] for pair in active_pairs]
+        kv_mirror_imitated_layers = [pair[1] for pair in active_pairs]
         LayerManager.post_init(
             kv_mirror_layer_ids, kv_mirror_imitated_layers, is_nextn=is_nextn
         )

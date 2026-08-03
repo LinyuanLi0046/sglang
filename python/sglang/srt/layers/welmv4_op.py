@@ -7,9 +7,21 @@ from torch import nn
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.layers.rotary_embedding import FusedSetKVBufferArg, RotaryEmbedding
+from sglang.srt.utils import is_npu
 
 
 def _get_num_sms(multiplier: int = 1) -> int:
+    if is_npu():
+        device = torch.npu.current_device()
+        device_properties = (
+            triton.runtime.driver.active.utils.get_device_properties(device)
+        )
+        num_cores = device_properties.get(
+            "num_vectorcore", device_properties.get("num_aicore", -1)
+        )
+        assert num_cores > 0, "Failed to detect NPU core count."
+        return num_cores * multiplier
+
     return (
         torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
         * multiplier
@@ -464,6 +476,9 @@ class WelmV4FusedRMSNorm(CustomOp):
         else:
             return output, out_residual
 
+    def forward_npu(self, *args, **kwargs):
+        return self.forward_cuda(*args, **kwargs)
+
 
 @triton.jit
 def mmq_style_shared_experts_add_residual_rms_norm_kernel(
@@ -771,6 +786,9 @@ class WelmV4InplaceRotaryEmbedding(RotaryEmbedding):
             triton.next_power_of_2(key.shape[-2]),
         )
         return query, key
+
+    def forward_npu(self, *args, **kwargs):
+        return self.forward_cuda(*args, **kwargs)
 
     def extra_repr(self) -> str:
         s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"

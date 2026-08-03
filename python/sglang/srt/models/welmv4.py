@@ -280,7 +280,7 @@ class LayerManager:
                 imitated_layer_attn.qkv_proj_bias = None
                 mirror_layer_attn.qkv_proj_bias = None
 
-        torch.cuda.empty_cache()
+        torch.get_device_module().empty_cache()
 
 
 class Qwen2MoeMLP(nn.Module):
@@ -1116,11 +1116,11 @@ class Qwen2MoeAttention(nn.Module):
                 and forward_batch.forward_mode.is_extend_without_speculative()
                 and self.kv_mirror_layer_idx in self.kv_mirror_layers
             ):
-                self.rotary_emb.forward_cuda(
+                q, k = self.rotary_emb(
                     positions, q, k, last_index=forward_batch.custom_last_index
                 )
             else:
-                self.rotary_emb.forward_cuda(positions, q, k)
+                q, k = self.rotary_emb(positions, q, k)
             q = q.view(q_shape)
             k = k.view(k_shape)
         else:
@@ -1844,7 +1844,9 @@ class WeLMV4MoeForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        alt_stream = torch.cuda.Stream(device=torch.cuda.current_device())
+        alt_stream = (
+            torch.cuda.Stream(device=torch.cuda.current_device()) if _is_cuda else None
+        )
         self.model = Qwen2MoeModel(
             config,
             quant_config,
@@ -2198,8 +2200,9 @@ class WeLMV4MoeForCausalLM(nn.Module):
         self.model.oe_embed = embed[1]
         self.model.oe_gate_up_proj = embed[2]
         self.lm_head = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        device_module = torch.get_device_module()
+        device_module.empty_cache()
+        device_module.synchronize()
 
     def post_init_after_load_weights(self, is_nextn=False):
         total_kv_mirror_layers = getattr(self.model.config, "kv_mirror_layers", [])

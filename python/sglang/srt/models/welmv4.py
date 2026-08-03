@@ -1636,7 +1636,10 @@ class Qwen2MoeModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.padding_idx = config.pad_token_id
+        # Some WeLMv4 remote configs do not define pad_token_id.  Padding is
+        # handled by SGLang's request metadata, so keep this optional just as
+        # the mainline Qwen2 implementation does.
+        self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
 

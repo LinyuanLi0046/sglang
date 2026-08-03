@@ -5125,13 +5125,11 @@ class ServerArgs:
                 )
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
             if is_npu() and self.cuda_graph_config.decode.backend != Backend.DISABLED:
-                logger.warning(
-                    "Decode NPU Graph is disabled for WeLMv4 until its custom "
-                    "Triton kernels and native expert-bias TopK fallback are "
-                    "validated under NPUGraph capture. Ascend eager inference "
-                    "remains enabled."
+                logger.info(
+                    "Decode NPU Graph is enabled for WeLMv4 and uses FIA v2 "
+                    "with dynamic actual_seq_kvlen updates. Torch Compile and "
+                    "Prefill NPU Graph remain disabled."
                 )
-                self.cuda_graph_config.decode.backend = Backend.DISABLED
             if self.disaggregation_mode != "null":
                 raise ValueError(
                     "WeLMv4 does not yet support prefill/decode disaggregation: "

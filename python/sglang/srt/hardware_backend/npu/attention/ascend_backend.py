@@ -335,6 +335,15 @@ class AscendAttnBackend(AttentionBackend):
         self.graph_mode = False
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        # A WeLMv4 decode graph can contain a mixture of full-attention,
+        # sliding-window, and attention-sink layers.  Keep every layer on FIA
+        # v2 during graph capture so NPUGraph replay has one dynamic CPU
+        # sequence-length binding (actual_seq_kvlen) for the whole graph.
+        # This graph-only choice is independent of ASCEND_USE_FIA; eager
+        # attention continues to honor that environment variable.
+        self.force_fia_v2_decode_graph = "WeLMV4MoeForCausalLM" in (
+            model_runner.model_config.hf_config.architectures or []
+        )
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.ascend_attn_mask_builder = AscendAttnMaskBuilder(
@@ -2260,7 +2269,8 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
         if (
-            sinks is not None
+            self.force_fia_v2_decode_graph
+            or sinks is not None
             or self.is_hybrid_swa
             or (self._has_layerwise_sliding_window(layer) and self.use_fia)
         ):
@@ -2269,7 +2279,7 @@ class AscendAttnBackend(AttentionBackend):
                 block_tables = self.forward_metadata.block_tables_swa
             else:
                 block_tables = self.forward_metadata.block_tables
-            if self.use_fia:
+            if self.use_fia or self.force_fia_v2_decode_graph:
                 k_cache = (
                     self.token_to_kv_pool.get_key_buffer(layer.layer_id)
                     .view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)

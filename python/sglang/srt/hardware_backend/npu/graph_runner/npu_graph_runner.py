@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Run the model with NPU graph and torch.compile.
+"""Run the model with NPU graph and optional torch.compile.
 
 NPUGraphRunner is a thin subclass of DecodeCudaGraphRunner: the
 factory returns NPUCudaGraphBackend for NPU devices, so all
@@ -85,7 +85,7 @@ def patch_model_npu(
 
 
 class NPUGraphRunner(DecodeCudaGraphRunner):
-    """A NPUGraphRunner runs the forward pass of a model with NPU graph and torch.compile."""
+    """Run model forwards with NPUGraph; torch.compile is optional."""
 
     def __init__(
         self,
@@ -113,7 +113,12 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         self.if_use_v2 = any(
             arch
-            in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM", "Step3p5ForCausalLM")
+            in (
+                "MiMoV2ForCausalLM",
+                "MiMoV2FlashForCausalLM",
+                "Step3p5ForCausalLM",
+                "WeLMV4MoeForCausalLM",
+            )
             for arch in (model_runner.model_config.hf_config.architectures or [])
         )
 

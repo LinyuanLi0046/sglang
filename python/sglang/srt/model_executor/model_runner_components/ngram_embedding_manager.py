@@ -12,6 +12,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import ForwardMode
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -51,17 +52,20 @@ class NgramEmbeddingManager:
                 device=device,
             )
             chunked_prefill_size = server_args.chunked_prefill_size
-            assert (
-                chunked_prefill_size is not None and chunked_prefill_size > 0
-            ), "Ngram embedding requires chunked prefill to be enabled (chunked_prefill_size > 0)"
-            for module in model.modules():
-                if isinstance(module, NgramEmbedding):
-                    module.init_buffers(
-                        max_running_requests, chunked_prefill_size, device
-                    )
-            hf_config = model_config.hf_config
-            ngram_embedding_n = hf_config.ngram_embedding_n
-            ngram_embedding_k = hf_config.ngram_embedding_k
+            ngram_modules = [
+                module for module in model.modules() if isinstance(module, NgramEmbedding)
+            ]
+            # LongCat's NgramEmbedding owns per-forward scratch buffers sized
+            # from chunked prefill. WeLMv4 computes its hashes directly from
+            # the shared token table and therefore does not need those buffers.
+            if ngram_modules:
+                assert (
+                    chunked_prefill_size is not None and chunked_prefill_size > 0
+                ), "Ngram embedding requires chunked prefill to be enabled (chunked_prefill_size > 0)"
+            for module in ngram_modules:
+                module.init_buffers(max_running_requests, chunked_prefill_size, device)
+            ngram_embedding_n = model_config.ngram_embedding_n
+            ngram_embedding_k = model_config.ngram_embedding_k
         return cls(
             enabled=use_ngram_embedding,
             table=token_table,
@@ -118,7 +122,7 @@ class NgramEmbeddingManager:
                 request_lengths.append(len(tokens))
             dtype = self.table.dtype
             device = self.table.device
-            update_token_table(
+            _update_token_table(
                 ne_token_table=self.table,
                 tokens=torch.tensor(all_tokens, dtype=dtype, device=device),
                 row_indices=batch.req_pool_indices,
@@ -165,7 +169,7 @@ def update_ngram_token_table_after_sampling(
         indices = (~skip_token_table_update).nonzero(as_tuple=True)[0]
         if indices.numel() == 0:
             return False
-        update_token_table(
+        _update_token_table(
             ne_token_table=ngram_embedding_info.token_table,
             tokens=next_token_ids[indices].to(torch.int32),
             row_indices=req_pool_indices[indices],
@@ -182,7 +186,7 @@ def update_ngram_token_table_after_sampling(
     # batch_size so padded rows don't pollute the token table (and shapes match).
     ngram_embedding_info.out_column_starts[:batch_size] = seq_lens[:batch_size]
     ngram_embedding_info.out_req_lens[:batch_size] = 1
-    update_token_table(
+    _update_token_table(
         ne_token_table=ngram_embedding_info.token_table,
         tokens=next_token_ids[:batch_size].to(torch.int32),
         row_indices=req_pool_indices[:batch_size],
@@ -191,3 +195,60 @@ def update_ngram_token_table_after_sampling(
         ignore_tokens=None,
     )
     return True
+
+
+def _update_token_table(
+    *,
+    ne_token_table: torch.Tensor,
+    tokens: torch.Tensor,
+    row_indices: torch.Tensor,
+    column_starts: torch.Tensor,
+    req_lens: torch.Tensor,
+    ignore_tokens: Optional[torch.Tensor],
+) -> None:
+    """Update the request token table with a device-native NPU fallback.
+
+    The upstream fast path is a CUDA JIT extension. Ascend cannot load that
+    extension, while the operation itself is only a ragged indexed copy. Keep
+    CUDA on the optimized kernel and express the NPU path with ordinary torch
+    indexing so torch-npu can lower it to native device operators.
+    """
+    if not is_npu():
+        update_token_table(
+            ne_token_table=ne_token_table,
+            tokens=tokens,
+            row_indices=row_indices,
+            column_starts=column_starts,
+            req_lens=req_lens,
+            ignore_tokens=ignore_tokens,
+        )
+        return
+
+    num_tokens = tokens.numel()
+    if num_tokens == 0:
+        return
+    req_lens = req_lens.to(dtype=torch.long)
+    rows = torch.repeat_interleave(
+        row_indices.to(dtype=torch.long), req_lens, output_size=num_tokens
+    )
+    request_starts = torch.cumsum(req_lens, dim=0) - req_lens
+    flat_starts = torch.repeat_interleave(
+        request_starts, req_lens, output_size=num_tokens
+    )
+    offsets = torch.arange(num_tokens, device=tokens.device) - flat_starts
+    columns = torch.repeat_interleave(
+        column_starts.to(dtype=torch.long), req_lens, output_size=num_tokens
+    ) + offsets
+    values = tokens.to(dtype=ne_token_table.dtype)
+    if ignore_tokens is not None and ignore_tokens.numel() > 0:
+        # ``torch.isin`` has varied across torch-npu releases.  The ignored
+        # token set is tiny, so express it with basic equality/reduction ops
+        # that are available on all supported Ascend stacks.
+        ignored = (
+            values.unsqueeze(-1)
+            == ignore_tokens.to(device=values.device, dtype=values.dtype).reshape(
+                1, -1
+            )
+        ).any(dim=-1)
+        values = torch.where(ignored, -values, values)
+    ne_token_table[rows, columns] = values

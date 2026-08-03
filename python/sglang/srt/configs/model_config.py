@@ -462,7 +462,22 @@ class ModelConfig:
         self.is_local_attention_model = is_local_attention_model(
             self.hf_config.architectures
         )
-        self.use_ngram_embedding = getattr(self.hf_config, "use_ngram_embedding", False)
+        # LongCat declares ``use_ngram_embedding`` explicitly. WeLMv4 uses a
+        # different config schema (``oe_grams`` / ``oe_vocab_sizes``), but it
+        # needs the same request-scoped token history table. Normalize both
+        # schemas here so the scheduler, eager runner, and CUDA graph runners
+        # share one n-gram lifecycle.
+        oe_grams = tuple(getattr(self.hf_config, "oe_grams", ()) or ())
+        self.use_ngram_embedding = bool(
+            getattr(self.hf_config, "use_ngram_embedding", False) or oe_grams
+        )
+        self.ngram_embedding_n = (
+            getattr(self.hf_config, "ngram_embedding_n", None)
+            or max(oe_grams, default=0)
+        )
+        self.ngram_embedding_k = (
+            getattr(self.hf_config, "ngram_embedding_k", None) or len(oe_grams)
+        )
         # A multimodal arch is piecewise-incompatible until its LM prefill is validated.
         self.is_piecewise_cuda_graph_disabled_model = (
             is_piecewise_cuda_graph_disabled_model(self.hf_config.architectures)
@@ -755,6 +770,12 @@ class ModelConfig:
             return getattr(
                 self.hf_text_config, "add_swa_attention_sink_bias", False
             ) or getattr(self.hf_text_config, "add_full_attention_sink_bias", False)
+
+        if "WeLMV4MoeForCausalLM" in archs:
+            sink_flags = (
+                getattr(self.hf_text_config, "enable_attn_sink_layerwise", []) or []
+            )
+            return any(sink_flags)
         return False
 
     def _derive_context_length(self, context_length: int):
@@ -1832,6 +1853,7 @@ piecewise_cuda_graph_disabled_model_archs = [
     "DeepseekV4ForCausalLM",
     "DeepseekV4ForCausalLMNextN",
     "DeepseekV4ForCausalLMDSpark",
+    "WeLMV4MoeForCausalLM",
     "Qwen3NextForCausalLM",
     "BailingMoeV2_5ForCausalLM",
     "LLaDAModelLM",

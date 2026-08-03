@@ -237,6 +237,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         enable_tp: bool = True,
         use_attn_tp_group: bool = False,
         use_presharded_weights: bool = False,
+        host_tensor: bool = False,
     ):
         super().__init__()
         self.quant_config = quant_config
@@ -339,6 +340,7 @@ class VocabParallelEmbedding(torch.nn.Module):
             self.num_embeddings_padded,
             params_dtype=params_dtype,
             weight_loader=self.weight_loader,
+            host_tensor=host_tensor,
         )
 
     @classmethod

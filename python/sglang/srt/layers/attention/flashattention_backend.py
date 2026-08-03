@@ -1317,6 +1317,20 @@ class FlashAttentionBackend(AttentionBackend):
             cache_seqlens = swa_spec_metadata.cache_seqlens_int32
             max_seqlen_q = swa_spec_metadata.max_seq_len_q
             cu_seqlens_k = swa_spec_metadata.cu_seqlens_k
+        elif hasattr(forward_batch, "custom_last_index"):
+            # WeLMv4 mirror layers reuse the full K/V sequence produced by an
+            # earlier layer, but issue only the last query of each request.
+            # FlashAttention's varlen metadata must therefore describe bs
+            # independent one-token Q sequences against the original KV rows.
+            page_table = metadata.page_table
+            cu_seqlens_q = torch.arange(
+                forward_batch.batch_size + 1,
+                dtype=torch.int32,
+                device=q.device,
+            )
+            cache_seqlens = metadata.cache_seqlens_int32
+            max_seqlen_q = 1
+            cu_seqlens_k = metadata.cu_seqlens_k
         else:
             page_table = metadata.page_table
             if is_swa_layer and self.use_sliding_window_kv_pool:

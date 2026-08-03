@@ -603,6 +603,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
 
+    # WeLMv4 can reuse K/V activations from an earlier layer and keep only the
+    # last prefill query per request. This is a model-level optimization flag;
+    # the default full-query path is mathematically equivalent.
+    enable_kv_mirror: bool = False
+
     # For dumper: int-hashed request / bootstrap-room IDs (derived from rids)
     rids_int: Optional[torch.Tensor] = None
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
@@ -801,6 +806,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
+            enable_kv_mirror=getattr(model_runner.server_args, "enable_kv_mirror", False),
         )
 
         ret._maybe_init_non_generation_fields(batch)

@@ -389,6 +389,14 @@ class AscendAttnBackend(AttentionBackend):
         )
 
     @staticmethod
+    def _has_layerwise_sliding_window(layer: RadixAttention) -> bool:
+        """Whether this layer requests a window, independent of SWA KV pools."""
+        return (
+            layer.sliding_window_size is not None
+            and layer.sliding_window_size > -1
+        )
+
+    @staticmethod
     def _can_use_tnd(layer: RadixAttention) -> bool:
         """Check if TND layout is supported."""
         d = layer.qk_head_dim
@@ -1233,7 +1241,9 @@ class AscendAttnBackend(AttentionBackend):
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
-            if sinks is not None or (self._is_swa_layer(layer) and self.use_fia):
+            if sinks is not None or (
+                self._has_layerwise_sliding_window(layer) and self.use_fia
+            ):
                 # Use SWA block tables if hybrid SWA is enabled for this layer
                 if self._is_swa_layer(layer):
                     block_tables = self.forward_metadata.block_tables_swa
@@ -1334,10 +1344,21 @@ class AscendAttnBackend(AttentionBackend):
                                 actual_seq_qlen=[q_len],
                                 actual_seq_kvlen=[total_kv_len],
                                 atten_mask=self.fia_mask.unsqueeze(0),
-                                sparse_mode=4,
+                                sparse_mode=(
+                                    4 if layer.sliding_window_size != -1 else 3
+                                ),
                                 softmax_scale=layer.scaling,
-                                pre_tokens=layer.sliding_window_size,
-                                next_tokens=0,
+                                pre_tokens=(
+                                    layer.sliding_window_size
+                                    if layer.sliding_window_size != -1
+                                    else FULL_ATTENTION_WINDOW
+                                ),
+                                next_tokens=(
+                                    0
+                                    if layer.sliding_window_size != -1
+                                    else FULL_ATTENTION_WINDOW
+                                ),
+                                learnable_sink=sinks,
                             )
                             attn_out[q_len_offset : q_len_offset + q_len] = result[0]
                             q_len_offset += q_len
@@ -2238,7 +2259,11 @@ class AscendAttnBackend(AttentionBackend):
                     v,
                 )
 
-        if sinks is not None or self.is_hybrid_swa:
+        if (
+            sinks is not None
+            or self.is_hybrid_swa
+            or (self._has_layerwise_sliding_window(layer) and self.use_fia)
+        ):
             # Use SWA block tables if hybrid SWA is enabled for this layer
             if self._is_swa_layer(layer):
                 block_tables = self.forward_metadata.block_tables_swa
@@ -2293,7 +2318,9 @@ class AscendAttnBackend(AttentionBackend):
                         else FULL_ATTENTION_WINDOW
                     ),
                     next_tokens=(
-                        0 if layer.sliding_window_size == -1 else FULL_ATTENTION_WINDOW
+                        0
+                        if layer.sliding_window_size != -1
+                        else FULL_ATTENTION_WINDOW
                     ),
                     atten_mask=self.fia_mask.to(torch.int8),
                     sparse_mode=sparse_mode,
@@ -2544,7 +2571,9 @@ class AscendAttnBackend(AttentionBackend):
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
-            if sinks is not None or (self._is_swa_layer(layer) and self.use_fia):
+            if sinks is not None or (
+                self._has_layerwise_sliding_window(layer) and self.use_fia
+            ):
                 # Use SWA block tables if hybrid SWA is enabled for this layer
                 if self._is_swa_layer(layer):
                     block_tables = self.forward_metadata.block_tables_swa
@@ -2559,15 +2588,12 @@ class AscendAttnBackend(AttentionBackend):
                         )
                     block_size = self.page_size
 
-                    if sinks is not None:
-                        mask = self.fia_mask
-                    else:
-                        max_model_len = block_tables.shape[-1] * block_size
-                        mask = self.ascend_attn_mask_builder.get_swa_mask(
-                            self.forward_metadata.seq_lens,
-                            max_model_len,
-                            layer.sliding_window_size,
-                        )
+                    # FIA sparse_mode=4 expects its fixed compressed causal
+                    # mask.  The runtime window comes from pre_tokens while
+                    # the full block table keeps every cached page addressable.
+                    # A per-request [B,1,1,S] SWA mask is not a valid mode-4
+                    # mask and can produce a tiling error or wrong visibility.
+                    mask = self.fia_mask
 
                     attn_out, _ = torch_npu.npu_fused_infer_attention_score_v2(
                         q.view(

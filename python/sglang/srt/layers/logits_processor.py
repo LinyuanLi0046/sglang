@@ -246,6 +246,10 @@ class LogitsMetadata:
     # EagleDraftExtendInput.select_index).
     draft_extend_select_index: Optional[torch.Tensor] = None
 
+    # WeLMv4 KV-mirror prefill has already contracted hidden states to one row
+    # per request before entering the logits processor.
+    enable_kv_mirror: bool = False
+
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
         if (
@@ -272,6 +276,18 @@ class LogitsMetadata:
             extend_return_logprob = extend_return_top_logprob = (
                 extend_token_ids_logprob
             ) = extend_logprob_pruned_lens_cpu = False
+
+        if (
+            forward_batch.enable_kv_mirror
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            # KV-mirror pruning keeps only the final query/hidden row for each
+            # request. Intermediate prompt rows no longer exist, so input
+            # logprobs cannot be reconstructed on this optimized pass.
+            extend_return_logprob = False
+            extend_return_top_logprob = False
+            extend_token_ids_logprob = False
+            extend_logprob_pruned_lens_cpu = False
 
         if forward_batch.forward_mode.is_draft_extend_v2():
             draft_extend_select_index = forward_batch.spec_info.select_index
@@ -302,6 +318,7 @@ class LogitsMetadata:
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
             draft_extend_select_index=draft_extend_select_index,
+            enable_kv_mirror=forward_batch.enable_kv_mirror,
         )
 
     def compute_dp_attention_metadata(self):
@@ -500,6 +517,10 @@ class LogitsProcessor(nn.Module):
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
             or logits_metadata.forward_mode.is_draft_extend_v2()
+            or (
+                logits_metadata.enable_kv_mirror
+                and logits_metadata.forward_mode.is_extend_without_speculative()
+            )
         ):
             if logits_metadata.draft_extend_select_index is not None:
                 # Only next_token_logits narrows to [bs, vocab]; the

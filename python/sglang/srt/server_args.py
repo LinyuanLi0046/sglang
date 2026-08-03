@@ -3385,6 +3385,16 @@ class ServerArgs:
         ),
         NS("observability"),
     ] = None
+    enable_over_encoding: A[
+        bool,
+        "Compatibility flag for WeLMv4. Over-encoding math is enabled from the model config automatically; the rebased runtime uses ordinary device tensors on both CUDA and NPU.",
+        NS("model"),
+    ] = False
+    enable_kv_mirror: A[
+        bool,
+        "Compatibility flag for WeLMv4 KV-mirror prefill query pruning. The rebased runtime currently keeps the equivalent full-query path.",
+        NS("model"),
+    ] = False
     msprobe_dump_config: A[
         Optional[str],
         "The path of the JSON configuration file for msProbe. If specified, enables msProbe dump.",
@@ -5038,6 +5048,123 @@ class ServerArgs:
 
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
+
+        if model_arch == "WeLMV4MoeForCausalLM":
+            sink_flags = (
+                getattr(hf_config, "enable_attn_sink_layerwise", []) or []
+            )
+            explicitly_requested_attn_backends = {
+                backend
+                for backend in (
+                    self.attention_backend,
+                    self.prefill_attention_backend,
+                    self.decode_attention_backend,
+                )
+                if backend is not None
+            }
+            if any(sink_flags) and "flashinfer" in explicitly_requested_attn_backends:
+                raise ValueError(
+                    "WeLMv4 attention sinks are not supported by FlashInfer. "
+                    "Use the automatic backend selection, FA3, Triton, "
+                    "TRT-LLM MHA, or Ascend as appropriate for the device."
+                )
+
+            # The model keeps imitated-layer KV activations in process-local
+            # forward state, so mixed chunks and two-batch overlap would
+            # interleave two independent requests through the same state.
+            self.enable_mixed_chunk = False
+            self.enable_two_batch_overlap = False
+            if self.enable_pdmux:
+                raise ValueError(
+                    "WeLMv4 does not support --enable-pdmux: split-prefill can "
+                    "interleave decode work while KV-mirror activations are held "
+                    "in process-local layer state. Disable PDMux."
+                )
+            if self.ep_size != 1 or self.moe_a2a_backend != "none":
+                raise ValueError(
+                    "The rebased WeLMv4 path currently supports tensor-parallel "
+                    "MoE only. Use --ep-size 1 --moe-a2a-backend none; its custom "
+                    "routing/clamp path has not been aligned with A2A dispatch."
+                )
+            if self.ep_num_redundant_experts != 0 or self.enable_eplb:
+                raise ValueError(
+                    "WeLMv4 redundant experts/EPLB are not supported by this "
+                    "rebase. Use --ep-num-redundant-experts 0 and disable EPLB."
+                )
+            if self.pp_size != 1:
+                raise ValueError(
+                    "WeLMv4 KV-mirror activations are process-local and this "
+                    "rebase does not transfer them across pipeline stages. "
+                    "Use --pp-size 1; tensor parallel and attention DP remain supported."
+                )
+            if self.speculative_algorithm is not None:
+                raise ValueError(
+                    "Speculative decoding is not supported by the rebased "
+                    "WeLMv4 path because draft/verify ngram history has not "
+                    "been ported. Disable speculative decoding."
+                )
+            if self.enable_torch_compile:
+                logger.warning(
+                    "Torch Compile is disabled for WeLMv4 on the rebased "
+                    "runtime because its custom RMSNorm/RoPE/MoE clamp path "
+                    "has not been validated under the latest compiler stack."
+                )
+                self.enable_torch_compile = False
+            if self.cuda_graph_config.decode.backend == Backend.TC_PIECEWISE:
+                logger.warning(
+                    "WeLMv4 decode TC-piecewise is replaced with a full CUDA "
+                    "Graph so the custom MoE clamp path stays in its validated "
+                    "CUDA implementation."
+                )
+                self.cuda_graph_config.decode.backend = Backend.FULL
+            if self.cuda_graph_config.prefill.backend != Backend.DISABLED:
+                logger.warning(
+                    "Prefill CUDA Graph is disabled for WeLMv4 because the "
+                    "latest prefill graph buffers do not yet carry its request "
+                    "ngram token-table metadata. Decode CUDA Graph remains enabled."
+                )
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            if is_npu() and self.cuda_graph_config.decode.backend != Backend.DISABLED:
+                logger.warning(
+                    "Decode NPU Graph is disabled for WeLMv4 until its custom "
+                    "Triton kernels and native expert-bias TopK fallback are "
+                    "validated under NPUGraph capture. Ascend eager inference "
+                    "remains enabled."
+                )
+                self.cuda_graph_config.decode.backend = Backend.DISABLED
+            if self.disaggregation_mode != "null":
+                raise ValueError(
+                    "WeLMv4 does not yet support prefill/decode disaggregation: "
+                    "the request-scoped ngram token table is not transferred "
+                    "with the KV cache. Use --disaggregation-mode null."
+                )
+            if self.enable_over_encoding:
+                if not is_cuda():
+                    logger.warning(
+                        "--enable-over-encoding controls the optional CUDA "
+                        "host-backed embedding allocator and is ignored on %s. "
+                        "The WeLMv4 ngram embedding math remains enabled from "
+                        "oe_grams.",
+                        self.device,
+                    )
+                    self.enable_over_encoding = False
+                else:
+                    logger.warning(
+                        "--enable-over-encoding places WeLMv4 base/OE embedding "
+                        "tables in mapped pinned host memory. Install the optional "
+                        "allocator with `pip install --no-build-isolation "
+                        "./3rdparty/over_encoding_ops`; "
+                        "this saves device memory at the cost of PCIe/NVLink reads."
+                    )
+            if self.enable_kv_mirror:
+                logger.warning(
+                    "--enable-kv-mirror is accepted for compatibility but its "
+                    "prefill query-pruning optimization is disabled on the "
+                    "rebased runtime. WeLMv4 still performs the same cross-layer "
+                    "K/V reuse with full queries, which is mathematically "
+                    "equivalent and works on both CUDA and NPU backends."
+                )
+                self.enable_kv_mirror = False
 
         if self.enable_dsa_cache_layer_split and not is_deepseek_dsa(hf_config):
             raise ValueError(

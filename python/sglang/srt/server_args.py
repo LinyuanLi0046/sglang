@@ -5171,19 +5171,28 @@ class ServerArgs:
                         "disabled, so prefill query pruning has no work to do."
                     )
                     self.enable_kv_mirror = False
-                elif target_mirror_layers != [int(hf_config.num_hidden_layers) - 1]:
-                    raise ValueError(
-                        "The rebased --enable-kv-mirror path currently requires "
-                        "exactly one target-model consumer and it must be the "
-                        "final target layer, but got target consumers "
-                        f"{target_mirror_layers}. This keeps the post-mirror "
-                        "hidden/residual contraction and KV-cache writes valid."
-                    )
                 else:
+                    first_target_mirror_layer = min(target_mirror_layers)
+                    expected_target_mirror_layers = set(
+                        range(
+                            first_target_mirror_layer,
+                            int(hf_config.num_hidden_layers),
+                        )
+                    )
+                    if set(target_mirror_layers) != expected_target_mirror_layers:
+                        raise ValueError(
+                            "The rebased --enable-kv-mirror path requires target "
+                            "consumers to form a contiguous suffix ending at the "
+                            "final target layer. Got target consumers "
+                            f"{target_mirror_layers}, but expected all layers "
+                            f"from {first_target_mirror_layer} through "
+                            f"{int(hf_config.num_hidden_layers) - 1}."
+                        )
                     logger.info(
                         "WeLMv4 KV-mirror prefill query pruning is enabled for "
-                        "target layer %d.",
-                        target_mirror_layers[0],
+                        "the target-layer suffix %d..%d.",
+                        first_target_mirror_layer,
+                        int(hf_config.num_hidden_layers) - 1,
                     )
 
         if self.enable_dsa_cache_layer_split and not is_deepseek_dsa(hf_config):

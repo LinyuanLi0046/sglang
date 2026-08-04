@@ -1260,7 +1260,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
         self.kv_mirror_imitated_layers = getattr(
             config, "kv_mirror_imitated_layers", []
         )
-        self.last_target_kv_mirror_layer = max(
+        # Query pruning begins at the first mirror consumer encountered by the
+        # ascending decoder loop.  Valid target consumers form a contiguous
+        # suffix, so every later layer also obtains full K/V from its source.
+        self.first_target_kv_mirror_layer = min(
             (
                 int(layer_id)
                 for layer_id in self.kv_mirror_layers
@@ -1437,7 +1440,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         if (
             forward_batch.enable_kv_mirror
             and forward_batch.forward_mode.is_extend_without_speculative()
-            and self.layer_id == self.last_target_kv_mirror_layer
+            and self.layer_id == self.first_target_kv_mirror_layer
         ):
             residual = residual[forward_batch.custom_last_index]
             if is_dp_attention_enabled():

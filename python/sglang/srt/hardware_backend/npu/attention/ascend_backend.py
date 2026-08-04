@@ -1153,6 +1153,104 @@ class AscendAttnBackend(AttentionBackend):
 
         return attn_out
 
+    def _forward_extend_kv_mirror(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        sinks: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Run WeLMv4's last-query prefill against the source layer's full K/V.
+
+        A mirror consumer receives one query row per request, while ``k_cache``
+        still contains every prefix and extend token.  Ordinary prefill metadata
+        describes ``extend_seq_lens`` query rows and therefore cannot be reused:
+        FIA must see cumulative Q lengths ``[1, 2, ..., batch_size]`` together
+        with the original, full KV lengths.
+        """
+        num_queries = q.shape[0]
+        if num_queries != forward_batch.batch_size:
+            raise RuntimeError(
+                "WeLMv4 KV-mirror prefill expects one query per request, but got "
+                f"{num_queries} query rows for batch size {forward_batch.batch_size}."
+            )
+
+        block_tables = (
+            self.forward_metadata.block_tables_swa
+            if self._is_swa_layer(layer)
+            else self.forward_metadata.block_tables
+        )
+        actual_seq_kvlen = self.forward_metadata.seq_lens_cpu_int[:num_queries]
+        sliding_window = layer.sliding_window_size
+        is_sliding_window = sliding_window is not None and sliding_window != -1
+        pre_tokens = sliding_window if is_sliding_window else FULL_ATTENTION_WINDOW
+        next_tokens = 0 if is_sliding_window else FULL_ATTENTION_WINDOW
+        sparse_mode = 4 if is_sliding_window else 3
+
+        q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        key = k_cache.view(
+            -1,
+            self.page_size,
+            layer.tp_k_head_num * layer.qk_head_dim,
+        )
+        value = v_cache.view(
+            -1,
+            self.page_size,
+            layer.tp_v_head_num * layer.v_head_dim,
+        )
+
+        if self._can_use_tnd(layer):
+            attn_out, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                query=q,
+                key=key,
+                value=value,
+                pre_tokens=pre_tokens,
+                next_tokens=next_tokens,
+                atten_mask=self.fia_mask,
+                block_table=block_tables,
+                input_layout="TND",
+                block_size=self.page_size,
+                num_query_heads=layer.tp_q_head_num,
+                num_key_value_heads=layer.tp_k_head_num,
+                actual_seq_qlen=list(range(1, num_queries + 1)),
+                actual_seq_kvlen=actual_seq_kvlen,
+                softmax_scale=layer.scaling,
+                sparse_mode=sparse_mode,
+                learnable_sink=sinks,
+            )
+        else:
+            # Keep a generic BSND fallback for checkpoints whose head dimensions
+            # are outside FIA's TND whitelist.  Each call still has Q length 1.
+            attn_out = torch.empty(
+                (num_queries, layer.tp_q_head_num, layer.v_head_dim),
+                device=q.device,
+                dtype=q.dtype,
+            )
+            for seq_idx, total_kv_len in enumerate(actual_seq_kvlen.tolist()):
+                result, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                    query=q[None, seq_idx : seq_idx + 1],
+                    key=key,
+                    value=value,
+                    num_query_heads=layer.tp_q_head_num,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    input_layout="BSND",
+                    block_table=block_tables[seq_idx : seq_idx + 1],
+                    block_size=self.page_size,
+                    actual_seq_qlen=[1],
+                    actual_seq_kvlen=[int(total_kv_len)],
+                    atten_mask=self.fia_mask.unsqueeze(0),
+                    sparse_mode=sparse_mode,
+                    softmax_scale=layer.scaling,
+                    pre_tokens=pre_tokens,
+                    next_tokens=next_tokens,
+                    learnable_sink=sinks,
+                )
+                attn_out[seq_idx] = result[0, 0]
+
+        return attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
     def forward_extend(
         self,
         q,
@@ -1249,6 +1347,25 @@ class AscendAttnBackend(AttentionBackend):
 
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+            if (
+                forward_batch.enable_kv_mirror
+                and forward_batch.forward_mode.is_extend_without_speculative()
+                and hasattr(forward_batch, "custom_last_index")
+            ):
+                if is_cp_mode:
+                    raise NotImplementedError(
+                        "WeLMv4 KV-mirror prefill query pruning is not yet "
+                        "supported together with context-parallel prefill on Ascend."
+                    )
+                return self._forward_extend_kv_mirror(
+                    q=q,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    layer=layer,
+                    forward_batch=forward_batch,
+                    sinks=sinks,
+                )
 
             if sinks is not None or (
                 self._has_layerwise_sliding_window(layer) and self.use_fia

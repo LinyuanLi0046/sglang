@@ -3392,7 +3392,7 @@ class ServerArgs:
     ] = False
     enable_kv_mirror: A[
         bool,
-        "Compatibility flag for WeLMv4 KV-mirror prefill query pruning. The rebased runtime currently keeps the equivalent full-query path.",
+        "Enable WeLMv4 KV-mirror prefill query pruning. Mirror consumers reuse the source layer's full K/V sequence and compute only the last query of each request.",
         NS("model"),
     ] = False
     msprobe_dump_config: A[
@@ -5155,14 +5155,36 @@ class ServerArgs:
                         "this saves device memory at the cost of PCIe/NVLink reads."
                     )
             if self.enable_kv_mirror:
-                logger.warning(
-                    "--enable-kv-mirror is accepted for compatibility but its "
-                    "prefill query-pruning optimization is disabled on the "
-                    "rebased runtime. WeLMv4 still performs the same cross-layer "
-                    "K/V reuse with full queries, which is mathematically "
-                    "equivalent and works on both CUDA and NPU backends."
-                )
-                self.enable_kv_mirror = False
+                target_mirror_layers = [
+                    int(layer_id)
+                    for layer_id in (
+                        getattr(hf_config, "kv_mirror_layers", []) or []
+                    )
+                    if 0 <= int(layer_id) < int(hf_config.num_hidden_layers)
+                ]
+                if not target_mirror_layers:
+                    logger.warning(
+                        "--enable-kv-mirror was requested, but this WeLMv4 "
+                        "checkpoint has no KV-mirror consumer in the target "
+                        "model. The configured consumers belong only to "
+                        "NextN/MTP layers, while speculative decoding is "
+                        "disabled, so prefill query pruning has no work to do."
+                    )
+                    self.enable_kv_mirror = False
+                elif target_mirror_layers != [int(hf_config.num_hidden_layers) - 1]:
+                    raise ValueError(
+                        "The rebased --enable-kv-mirror path currently requires "
+                        "exactly one target-model consumer and it must be the "
+                        "final target layer, but got target consumers "
+                        f"{target_mirror_layers}. This keeps the post-mirror "
+                        "hidden/residual contraction and KV-cache writes valid."
+                    )
+                else:
+                    logger.info(
+                        "WeLMv4 KV-mirror prefill query pruning is enabled for "
+                        "target layer %d.",
+                        target_mirror_layers[0],
+                    )
 
         if self.enable_dsa_cache_layer_split and not is_deepseek_dsa(hf_config):
             raise ValueError(

@@ -1260,6 +1260,14 @@ class Qwen2MoeDecoderLayer(nn.Module):
         self.kv_mirror_imitated_layers = getattr(
             config, "kv_mirror_imitated_layers", []
         )
+        self.last_target_kv_mirror_layer = max(
+            (
+                int(layer_id)
+                for layer_id in self.kv_mirror_layers
+                if 0 <= int(layer_id) < int(config.num_hidden_layers)
+            ),
+            default=None,
+        )
         self.sliding_window_size_layerwise = getattr(
             config, "sliding_window_size_layerwise", []
         )
@@ -1429,7 +1437,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         if (
             forward_batch.enable_kv_mirror
             and forward_batch.forward_mode.is_extend_without_speculative()
-            and self.layer_id == self.kv_mirror_layers[-1]
+            and self.layer_id == self.last_target_kv_mirror_layer
         ):
             residual = residual[forward_batch.custom_last_index]
             if is_dp_attention_enabled():

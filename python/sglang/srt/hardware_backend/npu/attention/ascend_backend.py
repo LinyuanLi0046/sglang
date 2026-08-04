@@ -775,7 +775,12 @@ class AscendAttnBackend(AttentionBackend):
         return torch.cat([topk_indices, padding], dim=0)
 
     def get_cuda_graph_seq_len_fill_value(self):
-        return 0
+        # WeLMv4 decode graphs force every attention layer onto FIA v2.  A
+        # zero-filled dummy batch makes FIA capture its zero-KV/need-init
+        # tiling, then the first real replay has to replace it with a normal
+        # attention tiling.  Keep the capture dummy and replay padding rows on
+        # reserved KV slot 0 so both paths use a non-empty tiling.
+        return 1 if getattr(self, "force_fia_v2_decode_graph", False) else 0
 
     def _generate_alibi_bias(
         self,

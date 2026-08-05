@@ -100,6 +100,9 @@ class NgramEmbeddingManager:
         if batch is None or not self.enabled:
             return batch
         batch.ne_token_table = self.table
+        # This mask is valid only for the current forward pass. Rebuild it
+        # below when the current batch contains an unfinished chunked request.
+        batch.ne_skip_token_table_update = None
         if batch.forward_mode == ForwardMode.EXTEND:
             all_tokens = []
             column_starts = []

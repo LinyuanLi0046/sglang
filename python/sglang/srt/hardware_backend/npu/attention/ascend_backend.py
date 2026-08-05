@@ -1204,6 +1204,7 @@ class AscendAttnBackend(AttentionBackend):
         if self._use_welm_sink_triton(sinks):
             # KV-mirror prefill has one query per request, so it has the same
             # shape contract as the paged Triton decode kernel.
+            q = q.contiguous()
             k_cache = k_cache.view(
                 -1,
                 self.page_size,
@@ -1541,6 +1542,7 @@ class AscendAttnBackend(AttentionBackend):
                         )
 
                 else:
+                    q = q.contiguous()
                     k_cache = k_cache.view(
                         -1,
                         self.page_size,
@@ -2526,6 +2528,7 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
                 v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+                q = q.contiguous()
                 k_cache = k_cache.view(
                     -1,
                     self.page_size,
@@ -2824,6 +2827,7 @@ class AscendAttnBackend(AttentionBackend):
                     )
                     attn_out = attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
                 else:
+                    q = q.contiguous()
                     k_cache = k_cache.view(
                         -1,
                         self.page_size,

@@ -52,6 +52,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -513,6 +514,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 reduce_results=False,
                 prefix=add_prefix("shared_expert", prefix),
                 swiglu_clamp_limit=shared_clamp_limit,
+                **(
+                    dict(tp_rank=0, tp_size=1)
+                    if get_moe_a2a_backend().is_deepep()
+                    else {}
+                ),
             )
         else:
             self.shared_expert = None
@@ -541,28 +547,34 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             _welm_dump_tensor(f"{dump_prefix}.router.input", hidden_states)
             _welm_dump_tensor(f"{dump_prefix}.router.input_fp32", hidden_states_fp32)
         shared_output = None
-        if self.shared_expert is not None:
-            shared_output = self.shared_expert(hidden_states)
-            if self.shared_expert_gate is not None:
-                shared_output = (
-                    F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
-                )
-        router_logits = mmq_style_router_linear(hidden_states, self.gate.weight)
-        if dump_this_layer:
-            _welm_dump_tensor(f"{dump_prefix}.router.logits", router_logits)
-            router_scores = (
-                torch.softmax(router_logits, dim=-1).type_as(router_logits)
-                if self.router_score_func == "softmax"
-                else torch.sigmoid(router_logits).type_as(router_logits)
+        if get_moe_a2a_backend().is_deepep() and hidden_states.shape[0] == 0:
+            topk_output = self.topk.empty_topk_output(
+                hidden_states.device, layer_id=self.layer_id
             )
-            _welm_dump_tensor(f"{dump_prefix}.router.scores", router_scores)
-        # Ascend's fused TopK fast path currently ignores custom routing
-        # callbacks. WeLM needs its sigmoid/expert-bias callback, so use the
-        # shared PyTorch implementation on NPU. CUDA keeps the fused dispatch.
-        if _is_npu and self.custom_routing_function is not None:
-            topk_output = self.topk.forward_native(hidden_states, router_logits)
         else:
-            topk_output = self.topk(hidden_states, router_logits)
+            if self.shared_expert is not None:
+                shared_output = self.shared_expert(hidden_states)
+                if self.shared_expert_gate is not None:
+                    shared_output = (
+                        F.sigmoid(self.shared_expert_gate(hidden_states))
+                        * shared_output
+                    )
+            router_logits = mmq_style_router_linear(hidden_states, self.gate.weight)
+            if dump_this_layer:
+                _welm_dump_tensor(f"{dump_prefix}.router.logits", router_logits)
+                router_scores = (
+                    torch.softmax(router_logits, dim=-1).type_as(router_logits)
+                    if self.router_score_func == "softmax"
+                    else torch.sigmoid(router_logits).type_as(router_logits)
+                )
+                _welm_dump_tensor(f"{dump_prefix}.router.scores", router_scores)
+            # Ascend's fused TopK fast path currently ignores custom routing
+            # callbacks. WeLM needs its sigmoid/expert-bias callback, so use the
+            # shared PyTorch implementation on NPU. CUDA keeps the fused dispatch.
+            if _is_npu and self.custom_routing_function is not None:
+                topk_output = self.topk.forward_native(hidden_states, router_logits)
+            else:
+                topk_output = self.topk(hidden_states, router_logits)
         if dump_this_layer and hasattr(topk_output, "topk_weights"):
             _welm_dump_tensor(f"{dump_prefix}.router.topk_scores", topk_output.topk_weights)
             _welm_dump_tensor(f"{dump_prefix}.router.topk_ids", topk_output.topk_ids)
@@ -593,7 +605,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             final_hidden_states = final_hidden_states + shared_output
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.output", final_hidden_states)
-        if self.tp_size > 1 and not use_reduce_scatter:
+        if (
+            self.tp_size > 1
+            and not use_reduce_scatter
+            and not get_moe_a2a_backend().is_deepep()
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         final_hidden_states = final_hidden_states.view(num_tokens, hidden_dim)

@@ -5080,12 +5080,6 @@ class ServerArgs:
                     "interleave decode work while KV-mirror activations are held "
                     "in process-local layer state. Disable PDMux."
                 )
-            if self.ep_size != 1 or self.moe_a2a_backend != "none":
-                raise ValueError(
-                    "The rebased WeLMv4 path currently supports tensor-parallel "
-                    "MoE only. Use --ep-size 1 --moe-a2a-backend none; its custom "
-                    "routing/clamp path has not been aligned with A2A dispatch."
-                )
             if self.ep_num_redundant_experts != 0 or self.enable_eplb:
                 raise ValueError(
                     "WeLMv4 redundant experts/EPLB are not supported by this "

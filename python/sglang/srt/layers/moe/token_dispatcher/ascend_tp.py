@@ -98,7 +98,14 @@ class AscendTPDispatcher(BaseDispatcher):
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> AscendTPDispatchOutput:
         topk_weights, topk_ids, _ = topk_output
-        topk_weights = topk_weights.to(hidden_states.dtype)
+        # BF16 finalize routing supports FP32 scales and accumulates in FP32.
+        # Preserve router precision instead of truncating the weights to BF16.
+        if not (
+            self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.BF16
+            and hidden_states.dtype == torch.bfloat16
+            and topk_weights.dtype == torch.float32
+        ):
+            topk_weights = topk_weights.to(hidden_states.dtype)
         topk_ids = topk_ids.to(torch.int32)
         top_k = topk_weights.shape[-1]
 

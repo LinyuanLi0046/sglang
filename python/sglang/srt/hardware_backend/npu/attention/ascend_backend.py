@@ -419,9 +419,10 @@ class AscendAttnBackend(AttentionBackend):
         if window_left is None or window_left < 0:
             return -1
 
-        # WeLMv4 stores the HF span minus one. Add two here to match the CUDA
-        # sink path's inclusive left boundary (W previous tokens plus query).
-        return window_left + 2 if self.is_welm_v4 else window_left
+        # WeLMv4 stores the number of tokens to the left (HF value minus one),
+        # while sinks_attention.py subtracts this value directly from kv_len
+        # and therefore expects the total visible span including the query.
+        return window_left + 1 if self.is_welm_v4 else window_left
 
     @staticmethod
     def _can_use_tnd(layer: RadixAttention) -> bool:

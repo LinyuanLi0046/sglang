@@ -1204,6 +1204,18 @@ class AscendAttnBackend(AttentionBackend):
         if self._use_welm_sink_triton(sinks):
             # KV-mirror prefill has one query per request, so it has the same
             # shape contract as the paged Triton decode kernel.
+            k_cache = k_cache.view(
+                -1,
+                self.page_size,
+                layer.tp_k_head_num,
+                layer.qk_head_dim,
+            )
+            v_cache = v_cache.view(
+                -1,
+                self.page_size,
+                layer.tp_v_head_num,
+                layer.v_head_dim,
+            )
             return attention_sinks_triton(
                 q,
                 k_cache,
@@ -1529,6 +1541,18 @@ class AscendAttnBackend(AttentionBackend):
                         )
 
                 else:
+                    k_cache = k_cache.view(
+                        -1,
+                        self.page_size,
+                        layer.tp_k_head_num,
+                        layer.qk_head_dim,
+                    )
+                    v_cache = v_cache.view(
+                        -1,
+                        self.page_size,
+                        layer.tp_v_head_num,
+                        layer.v_head_dim,
+                    )
                     attn_out = attention_sinks_prefill_triton(
                         q,
                         k_cache,
@@ -2502,6 +2526,18 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
                 v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+                k_cache = k_cache.view(
+                    -1,
+                    self.page_size,
+                    layer.tp_k_head_num,
+                    layer.qk_head_dim,
+                )
+                v_cache = v_cache.view(
+                    -1,
+                    self.page_size,
+                    layer.tp_v_head_num,
+                    layer.v_head_dim,
+                )
                 attn_out = attention_sinks_triton(
                     q,
                     k_cache,
@@ -2788,6 +2824,18 @@ class AscendAttnBackend(AttentionBackend):
                     )
                     attn_out = attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
                 else:
+                    k_cache = k_cache.view(
+                        -1,
+                        self.page_size,
+                        layer.tp_k_head_num,
+                        layer.qk_head_dim,
+                    )
+                    v_cache = v_cache.view(
+                        -1,
+                        self.page_size,
+                        layer.tp_v_head_num,
+                        layer.v_head_dim,
+                    )
                     attn_out = attention_sinks_triton(
                         q,
                         k_cache,

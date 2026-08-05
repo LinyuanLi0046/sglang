@@ -335,15 +335,14 @@ class AscendAttnBackend(AttentionBackend):
         self.graph_mode = False
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        architectures = model_runner.model_config.hf_config.architectures or []
+        self.is_welm_v4 = "WeLMV4MoeForCausalLM" in architectures
         # A WeLMv4 decode graph can contain a mixture of full-attention,
-        # sliding-window, and attention-sink layers.  Keep every layer on FIA
-        # v2 during graph capture so NPUGraph replay has one dynamic CPU
-        # sequence-length binding (actual_seq_kvlen) for the whole graph.
-        # This graph-only choice is independent of ASCEND_USE_FIA; eager
-        # attention continues to honor that environment variable.
-        self.force_fia_v2_decode_graph = "WeLMV4MoeForCausalLM" in (
-            model_runner.model_config.hf_config.architectures or []
-        )
+        # sliding-window, and attention-sink layers. Keep non-sink layers on
+        # FIA v2 during graph capture so they share one dynamic CPU sequence-
+        # length binding (actual_seq_kvlen). Sink layers are dispatched to the
+        # NPU Triton kernel below based on their non-None ``sinks`` argument.
+        self.force_fia_v2_decode_graph = self.is_welm_v4
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.ascend_attn_mask_builder = AscendAttnMaskBuilder(
@@ -404,6 +403,26 @@ class AscendAttnBackend(AttentionBackend):
             layer.sliding_window_size is not None
             and layer.sliding_window_size > -1
         )
+
+    def _use_welm_sink_triton(self, sinks: Optional[torch.Tensor]) -> bool:
+        """Route WeLMv4 layers enabled by config to the NPU Triton kernel.
+
+        ``welmv4.py`` materializes ``enable_attn_sink_layerwise[layer_id]`` as
+        either a per-head sink tensor or ``None``, so this test is exactly the
+        layerwise config decision without indexing the config again here.
+        """
+        return self.is_welm_v4 and sinks is not None
+
+    def _get_sink_triton_window_size(self, layer: RadixAttention) -> int:
+        """Convert WeLMv4's left-window value to the Triton kernel's span."""
+        window_left = layer.sliding_window_size
+        if window_left is None or window_left < 0:
+            return -1
+
+        # WeLMv4 stores the number of tokens to the left (HF value minus one),
+        # while sinks_attention.py subtracts this value directly from kv_len
+        # and therefore expects the total visible span including the query.
+        return window_left + 1 if self.is_welm_v4 else window_left
 
     @staticmethod
     def _can_use_tnd(layer: RadixAttention) -> bool:
@@ -1182,6 +1201,22 @@ class AscendAttnBackend(AttentionBackend):
             if self._is_swa_layer(layer)
             else self.forward_metadata.block_tables
         )
+        if self._use_welm_sink_triton(sinks):
+            # KV-mirror prefill has one query per request, so it has the same
+            # shape contract as the paged Triton decode kernel.
+            return attention_sinks_triton(
+                q,
+                k_cache,
+                v_cache,
+                sinks,
+                block_tables,
+                self.forward_metadata.seq_lens[:num_queries],
+                layer.scaling,
+                self._get_sink_triton_window_size(layer),
+                layer.tp_q_head_num,
+                layer.tp_k_head_num,
+            )
+
         actual_seq_kvlen = self.forward_metadata.seq_lens_cpu_int[:num_queries]
         sliding_window = layer.sliding_window_size
         is_sliding_window = sliding_window is not None and sliding_window != -1
@@ -1375,7 +1410,7 @@ class AscendAttnBackend(AttentionBackend):
                     block_tables = self.forward_metadata.block_tables_swa
                 else:
                     block_tables = self.forward_metadata.block_tables
-                if self.use_fia:
+                if self.use_fia and not self._use_welm_sink_triton(sinks):
                     if self._can_use_tnd(layer):
                         num_token_padding = q.shape[0]
                         if num_token_padding > forward_batch.num_token_non_padded_cpu:
@@ -1503,7 +1538,7 @@ class AscendAttnBackend(AttentionBackend):
                         block_tables,
                         self.forward_metadata.seq_lens,
                         layer.scaling,
-                        layer.sliding_window_size,
+                        self._get_sink_triton_window_size(layer),
                         layer.tp_q_head_num,
                         layer.tp_k_head_num,
                     )
@@ -2396,7 +2431,9 @@ class AscendAttnBackend(AttentionBackend):
                 block_tables = self.forward_metadata.block_tables_swa
             else:
                 block_tables = self.forward_metadata.block_tables
-            if self.use_fia or self.force_fia_v2_decode_graph:
+            if (
+                self.use_fia or self.force_fia_v2_decode_graph
+            ) and not self._use_welm_sink_triton(sinks):
                 k_cache = (
                     self.token_to_kv_pool.get_key_buffer(layer.layer_id)
                     .view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)
@@ -2473,7 +2510,7 @@ class AscendAttnBackend(AttentionBackend):
                     block_tables,
                     self.forward_metadata.seq_lens,
                     layer.scaling,
-                    layer.sliding_window_size,
+                    self._get_sink_triton_window_size(layer),
                     layer.tp_q_head_num,
                     layer.tp_k_head_num,
                 )
@@ -2706,7 +2743,7 @@ class AscendAttnBackend(AttentionBackend):
                     block_tables = self.forward_metadata.block_tables_swa
                 else:
                     block_tables = self.forward_metadata.block_tables
-                if self.use_fia:
+                if self.use_fia and not self._use_welm_sink_triton(sinks):
                     if self.forward_metadata.seq_lens_cpu_int is None:
                         actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
                     else:
@@ -2759,7 +2796,7 @@ class AscendAttnBackend(AttentionBackend):
                         block_tables,
                         self.forward_metadata.seq_lens,
                         layer.scaling,
-                        layer.sliding_window_size,
+                        self._get_sink_triton_window_size(layer),
                         layer.tp_q_head_num,
                         layer.tp_k_head_num,
                     )

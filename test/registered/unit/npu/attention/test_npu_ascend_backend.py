@@ -110,6 +110,45 @@ class TestReshapeKvForFiaNz(unittest.TestCase):
         self.assertEqual(result.data_ptr(), tensor.data_ptr())
 
 
+class TestWelMLayerwiseSinkTritonRouting(unittest.TestCase):
+    def setUp(self):
+        self.backend = AscendAttnBackend.__new__(AscendAttnBackend)
+
+    def test_welm_sink_tensor_uses_triton(self):
+        self.backend.is_welm_v4 = True
+        self.assertTrue(self.backend._use_welm_sink_triton(torch.ones(6)))
+        self.assertFalse(self.backend._use_welm_sink_triton(None))
+
+    def test_other_models_keep_existing_dispatch(self):
+        self.backend.is_welm_v4 = False
+        self.assertFalse(self.backend._use_welm_sink_triton(torch.ones(6)))
+
+    def test_welm_window_adds_current_token(self):
+        self.backend.is_welm_v4 = True
+        layer = SimpleNamespace(sliding_window_size=16383)
+        self.assertEqual(self.backend._get_sink_triton_window_size(layer), 16384)
+
+    def test_full_attention_window_stays_disabled(self):
+        self.backend.is_welm_v4 = True
+        self.assertEqual(
+            self.backend._get_sink_triton_window_size(
+                SimpleNamespace(sliding_window_size=-1)
+            ),
+            -1,
+        )
+        self.assertEqual(
+            self.backend._get_sink_triton_window_size(
+                SimpleNamespace(sliding_window_size=None)
+            ),
+            -1,
+        )
+
+    def test_other_models_keep_existing_window_value(self):
+        self.backend.is_welm_v4 = False
+        layer = SimpleNamespace(sliding_window_size=4096)
+        self.assertEqual(self.backend._get_sink_triton_window_size(layer), 4096)
+
+
 class TestForwardMetadata(unittest.TestCase):
     def test_is_dataclass(self):
         self.assertTrue(is_dataclass(ForwardMetadata))

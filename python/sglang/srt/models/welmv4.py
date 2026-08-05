@@ -164,6 +164,24 @@ def _welm_dump_tensor(name: str, tensor: torch.Tensor) -> None:
     torch.save(tensor.detach().cpu(), _WELM_DUMP_PROCESS_DIR / f"{name}.pt")
 
 
+def _welm_dump_module_weights(prefix: str, module: nn.Module) -> None:
+    """Dump the parameter shards that are resident on this worker.
+
+    SGLang parallel layers replace a checkpoint parameter with the shard owned
+    by the current TP/EP rank during weight loading.  Iterating the live module
+    (instead of the checkpoint) therefore records the exact tensors consumed
+    by this worker.
+
+    Buffers are deliberately excluded: RoPE caches and other buffers are
+    runtime state rather than learned weights.  WeLM's KV-mirror QKV tensors
+    are an exception because they are unregistered tensors assembled after
+    loading; those are dumped explicitly in the decoder layer below.
+    """
+    for name, parameter in module.named_parameters(recurse=True):
+        parameter_name = f"{prefix}.{name}" if name else prefix
+        _welm_dump_tensor(parameter_name, parameter)
+
+
 def _welm_start_dump_pass() -> None:
     global _WELM_DUMP_BASE_DIR, _WELM_DUMP_PASS_ID, _WELM_DUMP_PROCESS_DIR
     if not _welm_dump_enabled():
@@ -1407,6 +1425,26 @@ class Qwen2MoeDecoderLayer(nn.Module):
         dump_this_layer = _welm_should_dump_layer(self.layer_id)
         if dump_this_layer:
             _welm_dump_tensor(f"model.layers.{self.layer_id}.__input__.0", hidden_states)
+            _welm_dump_module_weights(
+                f"model.layers.{self.layer_id}.__weights__", self
+            )
+
+            # LayerManager.post_init() constructs these tensors for KV-mirror
+            # source/consumer layers.  They are plain Tensor attributes (not
+            # Parameters), and Qwen2MoeAttention.forward() passes them directly
+            # to F.linear, so named_parameters() above cannot see them.
+            if hasattr(self.self_attn, "qkv_proj_weight"):
+                _welm_dump_tensor(
+                    f"model.layers.{self.layer_id}.__weights__."
+                    "self_attn.qkv_proj_weight",
+                    self.self_attn.qkv_proj_weight,
+                )
+                if self.self_attn.qkv_proj_bias is not None:
+                    _welm_dump_tensor(
+                        f"model.layers.{self.layer_id}.__weights__."
+                        "self_attn.qkv_proj_bias",
+                        self.self_attn.qkv_proj_bias,
+                    )
         residual_after_layernorm = (
             self.ppln and self.layer_id not in self.prenorm_layer_idx
         )
@@ -1849,6 +1887,10 @@ class Qwen2MoeModel(nn.Module):
 
         dump_oe = _welm_dump_enabled()
         if dump_oe:
+            _welm_dump_module_weights("model.oe.__weights__.embed", oe_embed_modules)
+            _welm_dump_module_weights(
+                "model.oe.__weights__.up_proj", oe_up_proj_module
+            )
             _welm_dump_tensor("model.oe.input_ids", input_ids)
             _welm_dump_tensor("model.oe.base_hidden_states", base_hidden_states)
 
@@ -2003,6 +2045,10 @@ class Qwen2MoeModel(nn.Module):
         _welm_start_dump_pass()
         if self.pp_group.is_first_rank:
             if input_embeds is None:
+                if _welm_dump_enabled():
+                    _welm_dump_module_weights(
+                        "model.embed_tokens.__weights__", self.embed_tokens
+                    )
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
@@ -2058,6 +2104,8 @@ class Qwen2MoeModel(nn.Module):
         else:
             pre_norm_hidden_states = None
             if hidden_states.shape[0] != 0:
+                if _welm_dump_enabled():
+                    _welm_dump_module_weights("model.norm.__weights__", self.norm)
                 if residual is None:
                     pre_norm_hidden_states = hidden_states
                     hidden_states, _ = self.norm(hidden_states)
@@ -2234,6 +2282,8 @@ class WeLMV4MoeForCausalLM(nn.Module):
                         forward_batch.extend_num_tokens // scale
                     )
 
+            if _welm_dump_enabled():
+                _welm_dump_module_weights("lm_head.__weights__", self.lm_head)
             return self.logits_processor(
                 input_ids,
                 hidden_states,
@@ -2256,7 +2306,12 @@ class WeLMV4MoeForCausalLM(nn.Module):
         start, end = split_interval
         # embed
         if start == 0:
+            _welm_start_dump_pass()
             if input_embeds is None:
+                if _welm_dump_enabled():
+                    _welm_dump_module_weights(
+                        "model.embed_tokens.__weights__", self.model.embed_tokens
+                    )
                 forward_batch.hidden_states = self.model.embed_tokens(input_ids)
             else:
                 forward_batch.hidden_states = input_embeds
@@ -2287,6 +2342,8 @@ class WeLMV4MoeForCausalLM(nn.Module):
 
         if end == self.model.config.num_hidden_layers:
             # norm
+            if _welm_dump_enabled():
+                _welm_dump_module_weights("model.norm.__weights__", self.model.norm)
             hidden_states, _ = self.model.norm(
                 forward_batch.hidden_states, forward_batch.residual
             )
@@ -2322,6 +2379,8 @@ class WeLMV4MoeForCausalLM(nn.Module):
                     )
 
             # logits process
+            if _welm_dump_enabled():
+                _welm_dump_module_weights("lm_head.__weights__", self.lm_head)
             result = self.logits_processor(
                 input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
             )

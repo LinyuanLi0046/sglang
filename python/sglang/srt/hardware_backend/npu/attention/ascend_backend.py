@@ -337,6 +337,9 @@ class AscendAttnBackend(AttentionBackend):
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         architectures = model_runner.model_config.hf_config.architectures or []
         self.is_welm_v4 = "WeLMV4MoeForCausalLM" in architectures
+        self.enable_welm_fia_sink_lse = get_bool_env_var(
+            "ASCEND_USE_FIA_SINK_LSE", "False"
+        )
         # A WeLMv4 decode graph can contain a mixture of full-attention,
         # sliding-window, and attention-sink layers. Keep non-sink layers on
         # FIA v2 during graph capture so they share one dynamic CPU sequence-
@@ -411,7 +414,42 @@ class AscendAttnBackend(AttentionBackend):
         either a per-head sink tensor or ``None``, so this test is exactly the
         layerwise config decision without indexing the config again here.
         """
-        return self.is_welm_v4 and sinks is not None
+        return (
+            self.is_welm_v4
+            and sinks is not None
+            and not self.enable_welm_fia_sink_lse
+        )
+
+    def _use_welm_fia_sink_lse(self, sinks: Optional[torch.Tensor]) -> bool:
+        """Use FIA without native sinks and restore sink semantics from LSE."""
+        return (
+            self.is_welm_v4
+            and sinks is not None
+            and self.enable_welm_fia_sink_lse
+        )
+
+    @staticmethod
+    def _apply_welm_sink_lse(
+        attn_out: torch.Tensor,
+        softmax_lse: torch.Tensor,
+        sinks: torch.Tensor,
+        input_layout: str,
+    ) -> torch.Tensor:
+        """Apply WeLMv4's zero-value attention sink using FIA's softmax LSE."""
+        if input_layout == "TND":
+            lse = softmax_lse.reshape(attn_out.shape[0], attn_out.shape[1], 1)
+            sink = sinks.float().reshape(1, -1, 1)
+        elif input_layout == "BSND":
+            # FIA returns LSE in BNSD layout for every non-TND input layout.
+            lse = softmax_lse.transpose(1, 2)
+            sink = sinks.float().reshape(1, 1, -1, 1)
+        else:
+            raise ValueError(
+                f"Unsupported FIA input layout for sink LSE: {input_layout}"
+            )
+
+        sink_scale = torch.sigmoid(lse.float() - sink)
+        return (attn_out.float() * sink_scale).to(attn_out.dtype)
 
     def _get_sink_triton_window_size(self, layer: RadixAttention) -> int:
         """Convert WeLMv4's left-window value to the Triton kernel's span."""
@@ -1248,9 +1286,10 @@ class AscendAttnBackend(AttentionBackend):
             self.page_size,
             layer.tp_v_head_num * layer.v_head_dim,
         )
+        use_sink_lse = self._use_welm_fia_sink_lse(sinks)
 
         if self._can_use_tnd(layer):
-            attn_out, _ = torch_npu.npu_fused_infer_attention_score_v2(
+            attn_out, softmax_lse = torch_npu.npu_fused_infer_attention_score_v2(
                 query=q,
                 key=key,
                 value=value,
@@ -1266,8 +1305,13 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_kvlen=actual_seq_kvlen,
                 softmax_scale=layer.scaling,
                 sparse_mode=sparse_mode,
-                learnable_sink=sinks,
+                learnable_sink=None if use_sink_lse else sinks,
+                return_softmax_lse=use_sink_lse,
             )
+            if use_sink_lse:
+                attn_out = self._apply_welm_sink_lse(
+                    attn_out, softmax_lse, sinks, "TND"
+                )
         else:
             # Keep a generic BSND fallback for checkpoints whose head dimensions
             # are outside FIA's TND whitelist.  Each call still has Q length 1.
@@ -1277,7 +1321,7 @@ class AscendAttnBackend(AttentionBackend):
                 dtype=q.dtype,
             )
             for seq_idx, total_kv_len in enumerate(actual_seq_kvlen.tolist()):
-                result, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                result, softmax_lse = torch_npu.npu_fused_infer_attention_score_v2(
                     query=q[None, seq_idx : seq_idx + 1],
                     key=key,
                     value=value,
@@ -1293,8 +1337,13 @@ class AscendAttnBackend(AttentionBackend):
                     softmax_scale=layer.scaling,
                     pre_tokens=pre_tokens,
                     next_tokens=next_tokens,
-                    learnable_sink=sinks,
+                    learnable_sink=None if use_sink_lse else sinks,
+                    return_softmax_lse=use_sink_lse,
                 )
+                if use_sink_lse:
+                    result = self._apply_welm_sink_lse(
+                        result, softmax_lse, sinks, "BSND"
+                    )
                 attn_out[seq_idx] = result[0, 0]
 
         return attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -1424,6 +1473,7 @@ class AscendAttnBackend(AttentionBackend):
                 else:
                     block_tables = self.forward_metadata.block_tables
                 if self.use_fia and not self._use_welm_sink_triton(sinks):
+                    use_sink_lse = self._use_welm_fia_sink_lse(sinks)
                     if self._can_use_tnd(layer):
                         num_token_padding = q.shape[0]
                         if num_token_padding > forward_batch.num_token_non_padded_cpu:
@@ -1433,7 +1483,7 @@ class AscendAttnBackend(AttentionBackend):
                             ]
                         q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                         block_size = self.page_size
-                        attn_out, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                        attn_out, softmax_lse = torch_npu.npu_fused_infer_attention_score_v2(
                             query=q,
                             key=k_cache.view(
                                 -1,
@@ -1465,8 +1515,13 @@ class AscendAttnBackend(AttentionBackend):
                             actual_seq_kvlen=self.forward_metadata.seq_lens_cpu_int,
                             softmax_scale=layer.scaling,
                             sparse_mode=4 if layer.sliding_window_size != -1 else 3,
-                            learnable_sink=sinks,
+                            learnable_sink=None if use_sink_lse else sinks,
+                            return_softmax_lse=use_sink_lse,
                         )
+                        if use_sink_lse:
+                            attn_out = self._apply_welm_sink_lse(
+                                attn_out, softmax_lse, sinks, "TND"
+                            )
                         attn_out = attn_out.view(
                             -1, layer.tp_q_head_num * layer.v_head_dim
                         )
@@ -1498,7 +1553,7 @@ class AscendAttnBackend(AttentionBackend):
                             if q_len == 0:
                                 continue
                             total_kv_len = seq_lens_cpu[seq_idx]
-                            result, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                            result, softmax_lse = torch_npu.npu_fused_infer_attention_score_v2(
                                 query=q[None, q_len_offset : q_len_offset + q_len],
                                 key=k_cache.view(
                                     -1,
@@ -1532,8 +1587,13 @@ class AscendAttnBackend(AttentionBackend):
                                     if layer.sliding_window_size != -1
                                     else FULL_ATTENTION_WINDOW
                                 ),
-                                learnable_sink=sinks,
+                                learnable_sink=None if use_sink_lse else sinks,
+                                return_softmax_lse=use_sink_lse,
                             )
+                            if use_sink_lse:
+                                result = self._apply_welm_sink_lse(
+                                    result, softmax_lse, sinks, "BSND"
+                                )
                             attn_out[q_len_offset : q_len_offset + q_len] = result[0]
                             q_len_offset += q_len
 
@@ -2495,7 +2555,8 @@ class AscendAttnBackend(AttentionBackend):
                 else:
                     sparse_mode = 3
 
-                attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                use_sink_lse = self._use_welm_fia_sink_lse(sinks)
+                attn_output, softmax_lse = torch_npu.npu_fused_infer_attention_score_v2(
                     query,
                     k_cache,
                     v_cache,
@@ -2519,8 +2580,13 @@ class AscendAttnBackend(AttentionBackend):
                     block_size=self.page_size,
                     actual_seq_qlen=actual_seq_lengths,
                     actual_seq_kvlen=actual_seq_lengths_kv,
-                    learnable_sink=sinks,
+                    learnable_sink=None if use_sink_lse else sinks,
+                    return_softmax_lse=use_sink_lse,
                 )
+                if use_sink_lse:
+                    attn_output = self._apply_welm_sink_lse(
+                        attn_output, softmax_lse, sinks, "TND"
+                    )
                 attn_output = attn_output.view(
                     -1, layer.tp_q_head_num * layer.v_head_dim
                 )
@@ -2783,6 +2849,7 @@ class AscendAttnBackend(AttentionBackend):
                 else:
                     block_tables = self.forward_metadata.block_tables
                 if self.use_fia and not self._use_welm_sink_triton(sinks):
+                    use_sink_lse = self._use_welm_fia_sink_lse(sinks)
                     if self.forward_metadata.seq_lens_cpu_int is None:
                         actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
                     else:
@@ -2798,7 +2865,7 @@ class AscendAttnBackend(AttentionBackend):
                     # mask and can produce a tiling error or wrong visibility.
                     mask = self.fia_mask
 
-                    attn_out, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                    attn_out, softmax_lse = torch_npu.npu_fused_infer_attention_score_v2(
                         q.view(
                             forward_batch.batch_size,
                             -1,
@@ -2823,8 +2890,13 @@ class AscendAttnBackend(AttentionBackend):
                         actual_seq_kvlen=actual_seq_len_kv,
                         pre_tokens=layer.sliding_window_size,
                         next_tokens=0,
-                        learnable_sink=sinks,
+                        learnable_sink=None if use_sink_lse else sinks,
+                        return_softmax_lse=use_sink_lse,
                     )
+                    if use_sink_lse:
+                        attn_out = self._apply_welm_sink_lse(
+                            attn_out, softmax_lse, sinks, "BSND"
+                        )
                     attn_out = attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
                 else:
                     q = q.contiguous()

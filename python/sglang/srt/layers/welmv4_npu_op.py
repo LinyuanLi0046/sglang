@@ -87,7 +87,7 @@ def mmq_style_router_linear_npu(x: torch.Tensor, weight: torch.Tensor) -> torch.
     N = weight.shape[0]
 
     x = x.contiguous()
-    weight = weight.contiguous()
+    weight = weight.to(dtype=x.dtype).contiguous()
 
     c = torch.empty((M, N), dtype=torch.float32, device=x.device)
 

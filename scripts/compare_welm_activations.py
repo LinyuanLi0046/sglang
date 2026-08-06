@@ -553,6 +553,22 @@ def select_pass_pair(
         warnings.append(
             "Selected passes have different input/position/sequence-length metadata."
         )
+    if (
+        cuda_selected.stage == "prefill"
+        and npu_selected.stage == "prefill"
+        and cuda_selected.position_max is not None
+        and cuda_selected.position_max == npu_selected.position_max
+        and cuda_selected.position_min is not None
+        and npu_selected.position_min is not None
+        and cuda_selected.position_min != npu_selected.position_min
+    ):
+        warnings.append(
+            "The prefill position ranges end at the same logical token but start "
+            "at different tokens. This usually means the two servers reused "
+            "different-length Radix-cache prefixes; tensor dim 0 is the uncached "
+            "suffix length, not the full prompt length. Flush/disable the prefix "
+            "cache before a controlled activation comparison."
+        )
     return cuda_selected, npu_selected, warnings
 
 
@@ -1155,11 +1171,15 @@ def main() -> int:
     print(f"CUDA process: {cuda_process_dir}")
     print(
         f"CUDA pass:    {cuda_pass.path} (stage={cuda_pass.stage}, "
+        f"positions=[{cuda_pass.position_min},{cuda_pass.position_max}], "
+        f"extend_seq_lens={cuda_pass.extend_seq_lens}, "
         f"fp={cuda_pass.fingerprint[:12]})"
     )
     print(f"NPU process:  {npu_process_dir}")
     print(
         f"NPU pass:     {npu_pass.path} (stage={npu_pass.stage}, "
+        f"positions=[{npu_pass.position_min},{npu_pass.position_max}], "
+        f"extend_seq_lens={npu_pass.extend_seq_lens}, "
         f"fp={npu_pass.fingerprint[:12]})"
     )
     print(

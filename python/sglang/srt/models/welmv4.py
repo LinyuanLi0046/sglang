@@ -72,6 +72,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.layers.welmv4_op import (
     WelmV4FusedRMSNorm,
     WelmV4InplaceRotaryEmbedding,
+    inplace_sigmoid_mul,
     mmq_style_expert_bias_topk,
     mmq_style_k_rms_norm,
     mmq_style_norm_after_attn,
@@ -1229,10 +1230,7 @@ class Qwen2MoeAttention(nn.Module):
                     f"model.layers.{self.layer_idx}.attn.router.0", gate.squeeze(-1)
                 )
             attn_output = attn_output.view(attn_shape[0], self.num_heads, -1)
-            # inplace_sigmoid_mul(gate, attn_output)
-            attn_output = (
-                torch.sigmoid(gate.float()) * attn_output.float()
-            ).to(attn_output.dtype)
+            inplace_sigmoid_mul(gate, attn_output)
             attn_output = attn_output.view(attn_shape)
             if dump_this_layer:
                 _welm_dump_tensor(f"{dump_prefix}.gated_attn_output", attn_output)

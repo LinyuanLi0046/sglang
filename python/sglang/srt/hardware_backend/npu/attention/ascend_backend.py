@@ -407,25 +407,57 @@ class AscendAttnBackend(AttentionBackend):
             and layer.sliding_window_size > -1
         )
 
-    def _use_welm_sink_triton(self, sinks: Optional[torch.Tensor]) -> bool:
-        """Route WeLMv4 layers enabled by config to the NPU Triton kernel.
+    def _is_welm_full_attention_layer(self, layer: RadixAttention) -> bool:
+        """Whether a WeLMv4 window covers the complete runtime context."""
+        if not self.is_welm_v4:
+            return False
+
+        window_left = layer.sliding_window_size
+        return (
+            window_left is None
+            or window_left < 0
+            or window_left + 1 >= self.max_context_len
+        )
+
+    def _has_effective_sliding_window(self, layer: RadixAttention) -> bool:
+        """Whether attention must actually be restricted at runtime."""
+        return self._has_layerwise_sliding_window(
+            layer
+        ) and not self._is_welm_full_attention_layer(layer)
+
+    def _use_welm_sink_triton(
+        self, layer: RadixAttention, sinks: Optional[torch.Tensor]
+    ) -> bool:
+        """Route WeLMv4 SWA sink layers to the NPU Triton kernel.
 
         ``welmv4.py`` materializes ``enable_attn_sink_layerwise[layer_id]`` as
         either a per-head sink tensor or ``None``, so this test is exactly the
-        layerwise config decision without indexing the config again here.
+        layerwise config decision without indexing the config again here.  A
+        window that covers the runtime context is full attention and always
+        uses FIA plus exact LSE sink compensation instead.
         """
         return (
             self.is_welm_v4
             and sinks is not None
+            and not self._is_welm_full_attention_layer(layer)
             and not self.enable_welm_fia_sink_lse
         )
 
-    def _use_welm_fia_sink_lse(self, sinks: Optional[torch.Tensor]) -> bool:
-        """Use FIA without native sinks and restore sink semantics from LSE."""
+    def _use_welm_fia_sink_lse(
+        self, layer: RadixAttention, sinks: Optional[torch.Tensor]
+    ) -> bool:
+        """Use FIA without native sinks and restore sink semantics from LSE.
+
+        Full-attention sink layers always use this path.  For actual SWA
+        layers, ``ASCEND_USE_FIA_SINK_LSE`` selects it instead of Triton.
+        """
         return (
             self.is_welm_v4
             and sinks is not None
-            and self.enable_welm_fia_sink_lse
+            and (
+                self._is_welm_full_attention_layer(layer)
+                or self.enable_welm_fia_sink_lse
+            )
         )
 
     @staticmethod
@@ -1239,7 +1271,7 @@ class AscendAttnBackend(AttentionBackend):
             if self._is_swa_layer(layer)
             else self.forward_metadata.block_tables
         )
-        if self._use_welm_sink_triton(sinks):
+        if self._use_welm_sink_triton(layer, sinks):
             # KV-mirror prefill has one query per request, so it has the same
             # shape contract as the paged Triton decode kernel.
             q = q.contiguous()
@@ -1270,7 +1302,7 @@ class AscendAttnBackend(AttentionBackend):
 
         actual_seq_kvlen = self.forward_metadata.seq_lens_cpu_int[:num_queries]
         sliding_window = layer.sliding_window_size
-        is_sliding_window = sliding_window is not None and sliding_window != -1
+        is_sliding_window = self._has_effective_sliding_window(layer)
         pre_tokens = sliding_window if is_sliding_window else FULL_ATTENTION_WINDOW
         next_tokens = 0 if is_sliding_window else FULL_ATTENTION_WINDOW
         sparse_mode = 4 if is_sliding_window else 3
@@ -1286,7 +1318,7 @@ class AscendAttnBackend(AttentionBackend):
             self.page_size,
             layer.tp_v_head_num * layer.v_head_dim,
         )
-        use_sink_lse = self._use_welm_fia_sink_lse(sinks)
+        use_sink_lse = self._use_welm_fia_sink_lse(layer, sinks)
 
         if self._can_use_tnd(layer):
             attn_out, softmax_lse = torch_npu.npu_fused_infer_attention_score_v2(
@@ -1465,15 +1497,18 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
             if sinks is not None or (
-                self._has_layerwise_sliding_window(layer) and self.use_fia
+                self._has_effective_sliding_window(layer) and self.use_fia
             ):
                 # Use SWA block tables if hybrid SWA is enabled for this layer
                 if self._is_swa_layer(layer):
                     block_tables = self.forward_metadata.block_tables_swa
                 else:
                     block_tables = self.forward_metadata.block_tables
-                if self.use_fia and not self._use_welm_sink_triton(sinks):
-                    use_sink_lse = self._use_welm_fia_sink_lse(sinks)
+                use_sink_lse = self._use_welm_fia_sink_lse(layer, sinks)
+                if (self.use_fia or use_sink_lse) and not self._use_welm_sink_triton(
+                    layer, sinks
+                ):
+                    is_sliding_window = self._has_effective_sliding_window(layer)
                     if self._can_use_tnd(layer):
                         num_token_padding = q.shape[0]
                         if num_token_padding > forward_batch.num_token_non_padded_cpu:
@@ -1497,12 +1532,12 @@ class AscendAttnBackend(AttentionBackend):
                             ),
                             pre_tokens=(
                                 layer.sliding_window_size
-                                if layer.sliding_window_size != -1
+                                if is_sliding_window
                                 else FULL_ATTENTION_WINDOW
                             ),
                             next_tokens=(
                                 0
-                                if layer.sliding_window_size != -1
+                                if is_sliding_window
                                 else FULL_ATTENTION_WINDOW
                             ),
                             atten_mask=self.fia_mask,
@@ -1514,7 +1549,7 @@ class AscendAttnBackend(AttentionBackend):
                             actual_seq_qlen=self.forward_metadata.seq_lens_list_cumsum,
                             actual_seq_kvlen=self.forward_metadata.seq_lens_cpu_int,
                             softmax_scale=layer.scaling,
-                            sparse_mode=4 if layer.sliding_window_size != -1 else 3,
+                            sparse_mode=4 if is_sliding_window else 3,
                             learnable_sink=None if use_sink_lse else sinks,
                             return_softmax_lse=use_sink_lse,
                         )
@@ -1573,18 +1608,16 @@ class AscendAttnBackend(AttentionBackend):
                                 actual_seq_qlen=[q_len],
                                 actual_seq_kvlen=[total_kv_len],
                                 atten_mask=self.fia_mask.unsqueeze(0),
-                                sparse_mode=(
-                                    4 if layer.sliding_window_size != -1 else 3
-                                ),
+                                sparse_mode=4 if is_sliding_window else 3,
                                 softmax_scale=layer.scaling,
                                 pre_tokens=(
                                     layer.sliding_window_size
-                                    if layer.sliding_window_size != -1
+                                    if is_sliding_window
                                     else FULL_ATTENTION_WINDOW
                                 ),
                                 next_tokens=(
                                     0
-                                    if layer.sliding_window_size != -1
+                                    if is_sliding_window
                                     else FULL_ATTENTION_WINDOW
                                 ),
                                 learnable_sink=None if use_sink_lse else sinks,
@@ -2510,7 +2543,7 @@ class AscendAttnBackend(AttentionBackend):
             self.force_fia_v2_decode_graph
             or sinks is not None
             or self.is_hybrid_swa
-            or (self._has_layerwise_sliding_window(layer) and self.use_fia)
+            or (self._has_effective_sliding_window(layer) and self.use_fia)
         ):
             # Use SWA block tables if hybrid SWA is enabled for this layer
             if self._is_swa_layer(layer):
@@ -2519,7 +2552,7 @@ class AscendAttnBackend(AttentionBackend):
                 block_tables = self.forward_metadata.block_tables
             if (
                 self.use_fia or self.force_fia_v2_decode_graph
-            ) and not self._use_welm_sink_triton(sinks):
+            ) and not self._use_welm_sink_triton(layer, sinks):
                 k_cache = (
                     self.token_to_kv_pool.get_key_buffer(layer.layer_id)
                     .view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)
@@ -2550,12 +2583,13 @@ class AscendAttnBackend(AttentionBackend):
                     .cumsum(dim=0)
                     .tolist()
                 )
-                if layer.sliding_window_size != -1:
+                is_sliding_window = self._has_effective_sliding_window(layer)
+                if is_sliding_window:
                     sparse_mode = 4
                 else:
                     sparse_mode = 3
 
-                use_sink_lse = self._use_welm_fia_sink_lse(sinks)
+                use_sink_lse = self._use_welm_fia_sink_lse(layer, sinks)
                 attn_output, softmax_lse = torch_npu.npu_fused_infer_attention_score_v2(
                     query,
                     k_cache,
@@ -2565,12 +2599,12 @@ class AscendAttnBackend(AttentionBackend):
                     input_layout="TND",
                     pre_tokens=(
                         layer.sliding_window_size
-                        if layer.sliding_window_size != -1
+                        if is_sliding_window
                         else FULL_ATTENTION_WINDOW
                     ),
                     next_tokens=(
                         0
-                        if layer.sliding_window_size != -1
+                        if is_sliding_window
                         else FULL_ATTENTION_WINDOW
                     ),
                     atten_mask=self.fia_mask.to(torch.int8),
@@ -2841,15 +2875,18 @@ class AscendAttnBackend(AttentionBackend):
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
             if sinks is not None or (
-                self._has_layerwise_sliding_window(layer) and self.use_fia
+                self._has_effective_sliding_window(layer) and self.use_fia
             ):
                 # Use SWA block tables if hybrid SWA is enabled for this layer
                 if self._is_swa_layer(layer):
                     block_tables = self.forward_metadata.block_tables_swa
                 else:
                     block_tables = self.forward_metadata.block_tables
-                if self.use_fia and not self._use_welm_sink_triton(sinks):
-                    use_sink_lse = self._use_welm_fia_sink_lse(sinks)
+                use_sink_lse = self._use_welm_fia_sink_lse(layer, sinks)
+                if (self.use_fia or use_sink_lse) and not self._use_welm_sink_triton(
+                    layer, sinks
+                ):
+                    is_sliding_window = self._has_effective_sliding_window(layer)
                     if self.forward_metadata.seq_lens_cpu_int is None:
                         actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
                     else:
@@ -2882,14 +2919,18 @@ class AscendAttnBackend(AttentionBackend):
                         num_key_value_heads=layer.tp_k_head_num,
                         input_layout="BSND",
                         block_size=block_size,
-                        atten_mask=(mask if layer.sliding_window_size != -1 else None),
-                        sparse_mode=4 if layer.sliding_window_size != -1 else 0,
+                        atten_mask=(mask if is_sliding_window else None),
+                        sparse_mode=4 if is_sliding_window else 0,
                         softmax_scale=layer.scaling,
                         block_table=block_tables,
                         actual_seq_qlen=[1] * len(self.forward_metadata.seq_lens),
                         actual_seq_kvlen=actual_seq_len_kv,
-                        pre_tokens=layer.sliding_window_size,
-                        next_tokens=0,
+                        pre_tokens=(
+                            layer.sliding_window_size
+                            if is_sliding_window
+                            else FULL_ATTENTION_WINDOW
+                        ),
+                        next_tokens=(0 if is_sliding_window else FULL_ATTENTION_WINDOW),
                         learnable_sink=None if use_sink_lse else sinks,
                         return_softmax_lse=use_sink_lse,
                     )

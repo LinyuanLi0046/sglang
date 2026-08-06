@@ -990,10 +990,12 @@ class Qwen2MoeAttention(nn.Module):
         )
         if len(sliding_window_size_layerwise) > layer_idx:
             raw_sliding_window_size = sliding_window_size_layerwise[layer_idx]
+            # HF window sizes include the current token, while SGLang
+            # attention backends take the number of tokens to the left.
             self.sliding_window_size = (
-                int(raw_sliding_window_size)
+                raw_sliding_window_size - 1
                 if raw_sliding_window_size is not None
-                and int(raw_sliding_window_size) > 0
+                and raw_sliding_window_size > 0
                 else -1
             )
         else:

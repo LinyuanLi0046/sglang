@@ -1222,9 +1222,11 @@ class Qwen2MoeAttention(nn.Module):
             _welm_dump_tensor(f"{dump_prefix}.attn_output", attn_output)
         if self.gated_self_attention_headwise:
             attn_shape = attn_output.shape
-            gate = self.gate_proj(hidden_states)[0].unsqueeze(
-                -1
-            )  # (bs * seq_len, num_heads, 1)
+            gate = F.linear(
+                hidden_states.float(),
+                self.gate_proj.weight.float(),
+            ).to(hidden_states.dtype)
+            gate = gate.unsqueeze(-1)  # (bs * seq_len, num_heads, 1)
             if dump_this_layer:
                 _welm_dump_tensor(
                     f"model.layers.{self.layer_idx}.attn.router.0", gate.squeeze(-1)

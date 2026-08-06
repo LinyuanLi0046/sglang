@@ -861,8 +861,28 @@ class WelmV4InplaceRotaryEmbedding(RotaryEmbedding):
         )
         return query, key
 
-    def forward_npu(self, *args, **kwargs):
-        return self.forward_cuda(*args, **kwargs)
+    def forward_npu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+        last_index: Optional[torch.Tensor] = None,
+    ):
+        from sglang.srt.layers.welmv4_npu_op import welmv4_inplace_rope_npu
+
+        query = query.view(query.shape[0], -1, self.head_size)
+        key = key.view(key.shape[0], -1, self.head_size)
+        return welmv4_inplace_rope_npu(
+            query,
+            key,
+            positions,
+            self.cos_sin_cache,
+            last_index=last_index,
+            head_dim=self.head_size,
+            rope_dim=self.rotary_dim,
+        )
 
     def extra_repr(self) -> str:
         s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"

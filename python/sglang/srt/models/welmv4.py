@@ -86,6 +86,9 @@ from sglang.srt.runtime_context import get_parallel
 # from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_npu, make_layers
 
+if is_npu():
+    from sglang.srt.layers.welmv4_npu_op import mmq_style_router_linear_npu
+
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
@@ -579,7 +582,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         F.sigmoid(self.shared_expert_gate(hidden_states))
                         * shared_output
                     )
-            router_logits = mmq_style_router_linear(hidden_states, self.gate.weight)
+            if _is_npu:
+                router_logits = mmq_style_router_linear_npu(
+                    hidden_states, self.gate.weight
+                )
+            else:
+                router_logits = mmq_style_router_linear(
+                    hidden_states, self.gate.weight
+                )
             if dump_this_layer:
                 _welm_dump_tensor(f"{dump_prefix}.router.logits", router_logits)
                 router_scores = (

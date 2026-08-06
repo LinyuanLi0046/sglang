@@ -48,6 +48,12 @@ _FAST_LLAMA_TOKENIZER = "hf-internal-testing/llama-tokenizer"
 
 # Class name used by transformers v5 when no tokenizer mapping exists for a model_type.
 _TOKENIZERS_BACKEND = "TokenizersBackend"
+_RESTORE_RAW_BACKEND_COMPONENT_TOKENIZER_CLASSES = {
+    "Qwen2Tokenizer",
+    "Qwen2TokenizerFast",
+    "WeLMV3Tokenizer",
+    "WeLMV3TokenizerFast",
+}
 
 
 def _load_tokenizer_by_declared_class(tokenizer_name, *args, **kwargs):
@@ -255,13 +261,15 @@ def _resolve_tokenizers_backend(tokenizer_name, *args, **common_kwargs):
 
 
 def _fix_v5_tokenizer_components(tokenizer, model_name_or_path, revision=None):
-    """Fix pre_tokenizer/decoder when a v5 tokenizer class overwrites them.
+    """Fix backend components when a v5 tokenizer class overwrites them.
 
     In transformers v5, some tokenizer classes (e.g. LlamaTokenizer) have a
     custom __init__ that rebuilds the pre_tokenizer and decoder from scratch
     with class-specific components, discarding the originals from tokenizer.json.
     This breaks models that specify LlamaTokenizerFast but actually use a
     different tokenizer architecture (e.g. DeepSeek-V3.2 uses ByteLevel).
+    Qwen2Tokenizer-backed WeLM checkpoints also need the raw BPE model restored
+    because the rebuilt backend can lose numeric merges.
 
     Detects the mismatch by comparing against the raw tokenizer.json and
     restores the original components when they differ.
@@ -286,6 +294,55 @@ def _fix_v5_tokenizer_components(tokenizer, model_name_or_path, revision=None):
             model_name_or_path,
             e,
         )
+        return
+
+    try:
+        config_file = _resolve_local_or_cached_file(
+            model_name_or_path, "tokenizer_config.json", revision
+        )
+        with open(config_file) as f:
+            tok_config = json.load(f)
+        tokenizer_class = tok_config.get("tokenizer_class", "")
+    except (FileNotFoundError, OSError, json.JSONDecodeError, ValueError):
+        tokenizer_class = ""
+
+    def _component_changed(loaded, expected):
+        if loaded is None or expected is None:
+            return loaded is not expected
+        return repr(loaded) != repr(expected)
+
+    if tokenizer_class in _RESTORE_RAW_BACKEND_COMPONENT_TOKENIZER_CLASSES:
+        restored = []
+        for attr in (
+            "model",
+            "normalizer",
+            "pre_tokenizer",
+            "post_processor",
+            "decoder",
+        ):
+            loaded_component = getattr(backend, attr, None)
+            raw_component = getattr(raw, attr, None)
+            if not _component_changed(loaded_component, raw_component):
+                continue
+            try:
+                setattr(backend, attr, raw_component)
+                restored.append(attr)
+            except Exception as e:
+                logger.debug(
+                    "_fix_v5_tokenizer_components: could not restore %s for %s: %s",
+                    attr,
+                    model_name_or_path,
+                    e,
+                )
+
+        if restored:
+            logger.info(
+                "Restored v5 %s tokenizer backend components for %s "
+                "from tokenizer.json: %s",
+                tokenizer_class,
+                model_name_or_path,
+                ", ".join(restored),
+            )
         return
 
     raw_pre = type(raw.pre_tokenizer).__name__ if raw.pre_tokenizer else None

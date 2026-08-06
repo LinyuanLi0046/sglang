@@ -177,6 +177,8 @@ def _welm_dump_module_weights(prefix: str, module: nn.Module) -> None:
     are an exception because they are unregistered tensors assembled after
     loading; those are dumped explicitly in the decoder layer below.
     """
+    if not get_bool_env_var("DUMP_WEIGHT", "false"):
+        return
     for name, parameter in module.named_parameters(recurse=True):
         parameter_name = f"{prefix}.{name}" if name else prefix
         _welm_dump_tensor(parameter_name, parameter)

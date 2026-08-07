@@ -26,6 +26,46 @@ import compare_welm_activations as base
 
 
 BEFORE_SUFFIX = "_npu_before_replay"
+VALID_REPLAY_POINTS = (
+    "embedding",
+    "qkv",
+    "attention_input",
+    "attn_output",
+    "gated_attn_output",
+    "o_proj_out",
+    "norm_inputs",
+    "norm_after_attn",
+)
+REPLAY_POINT_ALIASES = {
+    "attn": "attention_input",
+    "attention": "attention_input",
+    "post_rope": "attention_input",
+    "attention_output": "attn_output",
+    "gated_attention_output": "gated_attn_output",
+    "oproj": "o_proj_out",
+    "o_proj": "o_proj_out",
+    "norm_input": "norm_inputs",
+    "norm_after_attention": "norm_after_attn",
+}
+
+
+def parse_replay_points(value: str) -> Tuple[str, ...]:
+    points: List[str] = []
+    for item in value.split(","):
+        item = item.strip().lower()
+        if not item:
+            continue
+        point = REPLAY_POINT_ALIASES.get(item, item)
+        if point not in VALID_REPLAY_POINTS:
+            raise ValueError(
+                f"Unsupported replay point {item!r}; expected one of "
+                f"{', '.join(VALID_REPLAY_POINTS)}."
+            )
+        if point not in points:
+            points.append(point)
+    if not points:
+        raise ValueError("At least one replay point must be specified.")
+    return tuple(points)
 
 
 def layer_id(name: str) -> Optional[int]:
@@ -33,7 +73,7 @@ def layer_id(name: str) -> Optional[int]:
     return int(match.group(1)) if match else None
 
 
-def is_expected_injection_name(name: str, point: str) -> bool:
+def is_expected_injection_name_for_point(name: str, point: str) -> bool:
     if point == "embedding":
         return name == "model.layers.0.__input__.0"
     if point == "qkv":
@@ -74,6 +114,18 @@ def is_expected_injection_name(name: str, point: str) -> bool:
             )
         )
     raise ValueError(f"Unsupported replay point: {point}")
+
+
+def is_expected_injection_name(name: str, points: Sequence[str]) -> bool:
+    return any(is_expected_injection_name_for_point(name, point) for point in points)
+
+
+def matching_replay_points(name: str, points: Sequence[str]) -> Tuple[str, ...]:
+    return tuple(
+        point
+        for point in points
+        if is_expected_injection_name_for_point(name, point)
+    )
 
 
 def compare_tensor_pair(
@@ -205,36 +257,41 @@ def metric_text(result: Optional[base.ComparisonResult]) -> str:
 
 def classify_canonical_region(
     name: str,
-    point: str,
+    points: Sequence[str],
     injection_names: Sequence[str],
 ) -> str:
     injection_set = set(injection_names)
     if name in injection_set:
         return "injection_after"
 
-    if point == "embedding":
-        anchor = "model.layers.0.__input__.0"
-        if base.semantic_order(name) > base.semantic_order(anchor):
-            return "post_injection"
-        return "upstream"
-
     current_layer = layer_id(name)
-    if current_layer is None:
-        return "other"
-    same_layer_injections = [
-        item for item in injection_names if layer_id(item) == current_layer
+    name_order = replay_semantic_order(name, points, injection_names)
+    preceding_injections = [
+        item
+        for item in injection_names
+        if replay_semantic_order(item, points, injection_names) < name_order
     ]
-    if not same_layer_injections:
-        return "other"
-    anchor = max(same_layer_injections, key=base.semantic_order)
-    if base.semantic_order(name) > base.semantic_order(anchor):
-        return "post_injection_same_layer"
-    return "upstream_same_layer"
+    if preceding_injections:
+        anchor = max(
+            preceding_injections,
+            key=lambda item: replay_semantic_order(item, points, injection_names),
+        )
+        if anchor == "model.layers.0.__input__.0":
+            return "post_injection"
+        if current_layer is not None and layer_id(anchor) == current_layer:
+            return "post_injection_same_layer"
+        return "post_injection"
+
+    if current_layer is not None and any(
+        layer_id(item) == current_layer for item in injection_names
+    ):
+        return "upstream_same_layer"
+    return "other" if current_layer is None else "upstream"
 
 
 def replay_semantic_order(
     name: str,
-    point: str,
+    points: Sequence[str],
     injection_names: Sequence[str],
 ) -> Tuple[int, int, int, int, str]:
     """Place all tensors of one replay boundary at the real injection event.
@@ -247,8 +304,14 @@ def replay_semantic_order(
         return (*base_order[:3], 1, base_order[3])
 
     current_layer = layer_id(name)
-    same_layer = [item for item in injection_names if layer_id(item) == current_layer]
-    event_stage = max(base.semantic_order(item)[2] for item in same_layer)
+    matching_points = set(matching_replay_points(name, points))
+    same_event = [
+        item
+        for item in injection_names
+        if layer_id(item) == current_layer
+        and matching_points.intersection(matching_replay_points(item, points))
+    ]
+    event_stage = max(base.semantic_order(item)[2] for item in same_event)
     suffix_order = {
         "q_pre_rope": 0,
         "k_pre_rope": 1,
@@ -271,12 +334,36 @@ def replay_semantic_order(
     return (base_order[0], base_order[1], event_stage, 0, str(within_event))
 
 
+def active_replay_boundary(
+    name: str,
+    points: Sequence[str],
+    injection_names: Sequence[str],
+) -> str:
+    if name in set(injection_names):
+        return ",".join(matching_replay_points(name, points))
+
+    name_order = replay_semantic_order(name, points, injection_names)
+    preceding_injections = [
+        item
+        for item in injection_names
+        if replay_semantic_order(item, points, injection_names) < name_order
+    ]
+    if not preceding_injections:
+        return ""
+    anchor = max(
+        preceding_injections,
+        key=lambda item: replay_semantic_order(item, points, injection_names),
+    )
+    return ",".join(matching_replay_points(anchor, points))
+
+
 def enhanced_rows(
     canonical_results: Sequence[base.ComparisonResult],
     before_results: Dict[str, base.ComparisonResult],
-    point: str,
+    points: Sequence[str],
     injection_names: Sequence[str],
 ) -> List[Dict[str, object]]:
+    point_label = ",".join(points)
     rows: List[Dict[str, object]] = []
     output_order = 0
     for result in canonical_results:
@@ -285,7 +372,10 @@ def enhanced_rows(
             row = base.flatten_result(before)
             row["order"] = output_order
             row["comparison_kind"] = "injection_before"
-            row["replay_point"] = point
+            row["replay_point"] = point_label
+            row["replay_boundary"] = active_replay_boundary(
+                result.name, points, injection_names
+            )
             row["layer"] = layer_id(result.name)
             rows.append(row)
             output_order += 1
@@ -293,9 +383,12 @@ def enhanced_rows(
         row = base.flatten_result(result)
         row["order"] = output_order
         row["comparison_kind"] = classify_canonical_region(
-            result.name, point, injection_names
+            result.name, points, injection_names
         )
-        row["replay_point"] = point
+        row["replay_point"] = point_label
+        row["replay_boundary"] = active_replay_boundary(
+            result.name, points, injection_names
+        )
         row["layer"] = layer_id(result.name)
         rows.append(row)
         output_order += 1
@@ -310,11 +403,19 @@ def write_enhanced_csv(path: Path, rows: Sequence[Dict[str, object]]) -> None:
         "order",
         "comparison_kind",
         "replay_point",
+        "replay_boundary",
         "layer",
     ] + [
         key
         for key in rows[0]
-        if key not in ("order", "comparison_kind", "replay_point", "layer")
+        if key
+        not in (
+            "order",
+            "comparison_kind",
+            "replay_point",
+            "replay_boundary",
+            "layer",
+        )
     ]
     with path.open("w", newline="", encoding="utf-8") as output:
         writer = csv.DictWriter(output, fieldnames=fieldnames)
@@ -348,7 +449,7 @@ def first_issue(
 
 
 def print_replay_summary(
-    point: str,
+    points: Sequence[str],
     injection_names: Sequence[str],
     before_results: Dict[str, base.ComparisonResult],
     canonical_results: Sequence[base.ComparisonResult],
@@ -375,7 +476,7 @@ def print_replay_summary(
     post_results = [
         result
         for result in canonical_results
-        if classify_canonical_region(result.name, point, injection_names)
+        if classify_canonical_region(result.name, points, injection_names)
         in ("post_injection", "post_injection_same_layer")
     ]
     issue = first_issue(post_results)
@@ -404,6 +505,28 @@ def print_replay_summary(
             "First unmatched post-injection dump name (not used as the numeric "
             f"divergence): {structural_issue.name}"
         )
+
+    if len(points) > 1:
+        print("\nFirst comparable divergence after each replay boundary:")
+        injection_set = set(injection_names)
+        for point in points:
+            boundary_results = [
+                result
+                for result in canonical_results
+                if result.name not in injection_set
+                and point
+                in active_replay_boundary(
+                    result.name, points, injection_names
+                ).split(",")
+            ]
+            boundary_issue = first_issue(boundary_results)
+            if boundary_issue is None:
+                print(f"  {point}: none crossed configured thresholds")
+            else:
+                print(
+                    f"  {point}: {boundary_issue.name} "
+                    f"({metric_text(boundary_issue)})"
+                )
 
     replay_layers = sorted(
         {
@@ -435,19 +558,10 @@ def build_parser():
     parser.description = "Compare CUDA dumps with an NPU WeLM activation-replay run."
     parser.add_argument(
         "--replay-point",
-        choices=(
-            "embedding",
-            "qkv",
-            "attention_input",
-            "attn_output",
-            "gated_attn_output",
-            "o_proj_out",
-            "norm_inputs",
-            "norm_after_attn",
-        ),
+        metavar="POINT[,POINT...]",
         help=(
-            "Injection point used by SGLANG_WELM_REPLAY_POINT; required unless "
-            "--list-passes is used"
+            "Comma-separated injection points used by SGLANG_WELM_REPLAY_POINT; "
+            "required unless --list-passes is used"
         ),
     )
     return parser
@@ -473,6 +587,10 @@ def main() -> int:
 
         if args.replay_point is None:
             parser.error("--replay-point is required unless --list-passes is used")
+        try:
+            replay_points = parse_replay_points(args.replay_point)
+        except ValueError as exc:
+            parser.error(str(exc))
 
         cuda_process_dir, cuda_pass_dirs = base.select_process(
             cuda_processes, args.cuda_process, "CUDA"
@@ -521,7 +639,7 @@ def main() -> int:
         if not npu_name.endswith(BEFORE_SUFFIX):
             continue
         canonical_name = npu_name[: -len(BEFORE_SUFFIX)]
-        if is_expected_injection_name(canonical_name, args.replay_point):
+        if is_expected_injection_name(canonical_name, replay_points):
             if args.name_regex and not re.search(args.name_regex, canonical_name):
                 continue
             injection_pairs.append((canonical_name, npu_path))
@@ -531,6 +649,20 @@ def main() -> int:
             "No replay boundary tensors were found in the selected NPU pass. "
             "Check --replay-point, SGLANG_DUMP_ACTIVATIONS_LAYER_IDXS, and "
             "pass selection."
+        )
+    missing_points = [
+        point
+        for point in replay_points
+        if not any(
+            is_expected_injection_name_for_point(name, point)
+            for name, _ in injection_pairs
+        )
+    ]
+    if missing_points:
+        parser.error(
+            "No replay boundary tensors were found for configured point(s) "
+            f"{missing_points!r} in the selected NPU pass. Check the runtime "
+            "replay configuration and dump layer selection."
         )
 
     before_results: Dict[str, base.ComparisonResult] = {}
@@ -556,13 +688,13 @@ def main() -> int:
     injection_names = [name for name, _ in injection_pairs]
     canonical_results.sort(
         key=lambda result: replay_semantic_order(
-            result.name, args.replay_point, injection_names
+            result.name, replay_points, injection_names
         )
     )
     for order, result in enumerate(canonical_results):
         result.order = order
     print_replay_summary(
-        args.replay_point,
+        replay_points,
         injection_names,
         before_results,
         canonical_results,
@@ -572,7 +704,7 @@ def main() -> int:
     rows = enhanced_rows(
         canonical_results,
         before_results,
-        args.replay_point,
+        replay_points,
         injection_names,
     )
     if args.csv:

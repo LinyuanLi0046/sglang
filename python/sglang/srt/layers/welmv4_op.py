@@ -293,6 +293,15 @@ def _do_rms_norm(hidden, gamma, cols: int, eps: tl.constexpr):
 
 
 @triton.jit
+def _do_rms_norm_fp32(hidden, gamma, cols: int, eps: tl.constexpr):
+    """RMSNorm without the legacy cast through the weight dtype."""
+    hidden = hidden.to(tl.float32)
+    gamma = gamma.to(tl.float32)
+    inv_rms = tl.math.rsqrt(tl.sum(hidden * hidden, axis=-1) / cols + eps)
+    return hidden * inv_rms * gamma
+
+
+@triton.jit
 def _do_mmq_rms_norm(hidden, gamma, cols: int, eps: tl.constexpr):
     hidden = hidden.to(gamma.dtype)
     hidden = hidden.to(tl.float32)
@@ -316,6 +325,7 @@ def mmq_style_norm_after_attn_kernel(
     eps: float,
     NUM_SMS: tl.constexpr,  # pylint: disable=invalid-name
     BLOCK_SIZE: tl.constexpr,  # pylint: disable=invalid-name
+    FP32_ONORM_RESIDUAL: tl.constexpr,  # pylint: disable=invalid-name
 ):
     cols_offsets = tl.arange(0, BLOCK_SIZE)
     mask = cols_offsets < cols
@@ -326,10 +336,17 @@ def mmq_style_norm_after_attn_kernel(
     for row_id in tl.range(tl.program_id(0), rows, NUM_SMS, num_stages=2):
         offsets = (row_id * cols + cols_offsets).to(tl.int64)
         hs = tl.load(hidden_states_ptr + offsets, mask=mask, other=0.0)
-        onorm_out, _ = _do_mmq_rms_norm(hs, onorm_gamma, cols, eps)
-        hs = onorm_out.to(hs.dtype)
-        residual = tl.load(residual_ptr + offsets, mask=mask, other=0.0)
-        hs += residual
+        if FP32_ONORM_RESIDUAL:
+            hs = _do_rms_norm_fp32(hs, onorm_gamma, cols, eps)
+            residual = tl.load(
+                residual_ptr + offsets, mask=mask, other=0.0
+            ).to(tl.float32)
+            hs = hs + residual
+        else:
+            onorm_out, _ = _do_mmq_rms_norm(hs, onorm_gamma, cols, eps)
+            hs = onorm_out.to(hs.dtype)
+            residual = tl.load(residual_ptr + offsets, mask=mask, other=0.0)
+            hs += residual
         rnorm_out, _ = _do_mmq_rms_norm(hs, rnorm_gamma, cols, eps)
         tl.store(residual_out_ptr + offsets, hs, mask=mask)
         tl.store(fp32_out_ptr + offsets, rnorm_out, mask=mask)
@@ -342,15 +359,23 @@ def mmq_style_norm_after_attn(
     onorm_weight: torch.Tensor,
     rnorm_weight: torch.Tensor,
     eps: float,
+    fp32_onorm_residual: bool = False,
+    output_dtype: Optional[torch.dtype] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert hidden_states.dim() == 2
     assert residual.dim() == 2
     assert hidden_states.shape == residual.shape
+    if fp32_onorm_residual:
+        assert hidden_states.dtype == torch.float32
+        assert residual.dtype == torch.float32
+        assert output_dtype is not None
     hidden_states = hidden_states.contiguous()
     residual = residual.contiguous()
     onorm_weight = onorm_weight.contiguous()
     rnorm_weight = rnorm_weight.contiguous()
-    output = torch.empty_like(hidden_states)
+    output = torch.empty_like(
+        hidden_states, dtype=output_dtype or hidden_states.dtype
+    )
     residual_out = torch.empty_like(hidden_states, dtype=torch.float32)
     fp32_out = torch.empty_like(hidden_states, dtype=torch.float32)
     rows, cols = hidden_states.shape
@@ -369,6 +394,7 @@ def mmq_style_norm_after_attn(
         eps,
         num_sms,
         block_size,
+        FP32_ONORM_RESIDUAL=fp32_onorm_residual,
     )
     return output, residual_out, fp32_out
 
@@ -391,6 +417,7 @@ def rms_norm_kernel(  # pylint: disable=too-many-arguments,too-many-locals
     residual_after_layernorm: tl.constexpr,
     NUM_SMS: tl.constexpr,  # pylint: disable=invalid-name
     BLOCK_SIZE: tl.constexpr,  # pylint: disable=invalid-name
+    PRESERVE_FP32_INPUT: tl.constexpr,  # pylint: disable=invalid-name
 ):
     row_start = tl.program_id(0)
     cols_off = tl.arange(0, BLOCK_SIZE)
@@ -418,7 +445,10 @@ def rms_norm_kernel(  # pylint: disable=too-many-arguments,too-many-locals
                 mask=mask,
             )
 
-        out = _do_rms_norm(h, gamma_shm, cols, eps)
+        if PRESERVE_FP32_INPUT:
+            out = _do_rms_norm_fp32(h, gamma_shm, cols, eps)
+        else:
+            out = _do_rms_norm(h, gamma_shm, cols, eps)
         if out_copy_ptr is not None:
             tl.store(out_copy_ptr + output_offs, out, mask=mask)
 
@@ -446,6 +476,7 @@ class WelmV4FusedRMSNorm(MultiPlatformOp):
         residual_after_layernorm: bool = False,
         clone_fp32_out: bool = False,
         output_dtype: Optional[torch.dtype] = None,
+        preserve_fp32_input: bool = False,
     ):
         """Torch implementation matching the fused kernel's FP32 reduction."""
         hidden = x.float()
@@ -458,7 +489,11 @@ class WelmV4FusedRMSNorm(MultiPlatformOp):
         output = normalized_fp32.to(dtype=output_dtype or x.dtype)
 
         if residual_after_layernorm:
-            out_residual = output.to(dtype=x.dtype)
+            out_residual = (
+                output
+                if preserve_fp32_input and output_dtype is not None
+                else output.to(dtype=x.dtype)
+            )
         elif residual is not None:
             out_residual = hidden.to(dtype=residual.dtype)
         else:
@@ -475,13 +510,21 @@ class WelmV4FusedRMSNorm(MultiPlatformOp):
         residual_after_layernorm: bool = False,
         clone_fp32_out: bool = False,
         output_dtype: Optional[torch.dtype] = None,
+        preserve_fp32_input: bool = False,
     ):
         assert x.dim() in [2, 3]
         output = torch.empty_like(x, dtype=output_dtype or x.dtype)
         fp32_out = None
         out_residual = None
         if residual_after_layernorm:
-            out_residual = torch.empty_like(x)
+            out_residual = torch.empty_like(
+                x,
+                dtype=(
+                    output_dtype
+                    if preserve_fp32_input and output_dtype is not None
+                    else x.dtype
+                ),
+            )
         elif residual is not None:
             out_residual = torch.empty_like(residual)
         if clone_fp32_out:
@@ -520,6 +563,7 @@ class WelmV4FusedRMSNorm(MultiPlatformOp):
             residual_after_layernorm,
             num_sms,
             block_size,
+            PRESERVE_FP32_INPUT=preserve_fp32_input,
         )
         if out_residual is None:
             out_residual = x

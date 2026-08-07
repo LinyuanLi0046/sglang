@@ -106,6 +106,9 @@ _WELM_REPLAY_CONFIGURED_POINT = {
     "attn": "attention_input",
     "attention": "attention_input",
     "post_rope": "attention_input",
+    "attention_output": "attn_output",
+    "gated_attention_output": "gated_attn_output",
+    "norm_after_attention": "norm_after_attn",
 }.get(_WELM_REPLAY_CONFIGURED_POINT, _WELM_REPLAY_CONFIGURED_POINT)
 
 
@@ -261,11 +264,19 @@ def _welm_should_replay(
         return False
     if not forward_batch.rids or _WELM_REPLAY_PASS_ID < 0:
         return False
-    valid_points = {"embedding", "qkv", "attention_input"}
+    valid_points = {
+        "embedding",
+        "qkv",
+        "attention_input",
+        "attn_output",
+        "gated_attn_output",
+        "norm_after_attn",
+    }
     if configured_point not in valid_points:
         raise ValueError(
-            "SGLANG_WELM_REPLAY_POINT must be one of embedding, qkv, or "
-            f"attention_input, got {configured_point!r}."
+            "SGLANG_WELM_REPLAY_POINT must be one of embedding, qkv, "
+            "attention_input, attn_output, gated_attn_output, or "
+            f"norm_after_attn, got {configured_point!r}."
         )
     if configured_point != point:
         return False
@@ -1560,6 +1571,25 @@ class Qwen2MoeAttention(nn.Module):
         if self.attn_sink is not None:
             attn_kwargs["sinks"] = self.attn_sink
         attn_output = self.attn(q, k, v, forward_batch, **attn_kwargs)
+        replay_attn_output = (
+            _WELM_REPLAY_CONFIGURED_POINT == "attn_output"
+            and _welm_should_replay("attn_output", forward_batch, self.layer_idx)
+        )
+        if replay_attn_output:
+            _welm_validate_replay_positions(
+                positions, forward_batch, self.layer_idx
+            )
+            if dump_this_layer:
+                _welm_dump_tensor(
+                    f"{dump_prefix}.attn_output_npu_before_replay", attn_output
+                )
+            attn_output = _welm_load_replay_tensor(
+                f"{dump_prefix}.attn_output",
+                attn_output,
+                point="attn_output",
+                forward_batch=forward_batch,
+                layer_idx=self.layer_idx,
+            )
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.attn_output", attn_output)
         if self.gated_self_attention_headwise:
@@ -1574,6 +1604,28 @@ class Qwen2MoeAttention(nn.Module):
             attn_output = attn_output.view(attn_shape[0], self.num_heads, -1)
             inplace_sigmoid_mul(gate, attn_output)
             attn_output = attn_output.view(attn_shape)
+            replay_gated_attn_output = (
+                _WELM_REPLAY_CONFIGURED_POINT == "gated_attn_output"
+                and _welm_should_replay(
+                    "gated_attn_output", forward_batch, self.layer_idx
+                )
+            )
+            if replay_gated_attn_output:
+                _welm_validate_replay_positions(
+                    positions, forward_batch, self.layer_idx
+                )
+                if dump_this_layer:
+                    _welm_dump_tensor(
+                        f"{dump_prefix}.gated_attn_output_npu_before_replay",
+                        attn_output,
+                    )
+                attn_output = _welm_load_replay_tensor(
+                    f"{dump_prefix}.gated_attn_output",
+                    attn_output,
+                    point="gated_attn_output",
+                    forward_batch=forward_batch,
+                    layer_idx=self.layer_idx,
+                )
             if dump_this_layer:
                 _welm_dump_tensor(f"{dump_prefix}.gated_attn_output", attn_output)
 
@@ -1996,6 +2048,51 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     hidden_states_fp32,
                 ) = self.post_attention_layernorm(
                     hidden_states, residual, clone_fp32_out=True
+                )
+        replay_norm_after_attn = (
+            _WELM_REPLAY_CONFIGURED_POINT == "norm_after_attn"
+            and _welm_should_replay(
+                "norm_after_attn", forward_batch, self.layer_id
+            )
+        )
+        if replay_norm_after_attn:
+            _welm_validate_replay_positions(
+                positions, forward_batch, self.layer_id
+            )
+            norm_dump_prefix = f"model.layers.{self.layer_id}.norm_after_attn"
+            if dump_this_layer:
+                _welm_dump_tensor(
+                    f"{norm_dump_prefix}.output_npu_before_replay", hidden_states
+                )
+                _welm_dump_tensor(
+                    f"{norm_dump_prefix}.output_fp32_npu_before_replay",
+                    hidden_states_fp32,
+                )
+                if residual is not None:
+                    _welm_dump_tensor(
+                        f"{norm_dump_prefix}.residual_npu_before_replay", residual
+                    )
+            hidden_states = _welm_load_replay_tensor(
+                f"{norm_dump_prefix}.output",
+                hidden_states,
+                point="norm_after_attn",
+                forward_batch=forward_batch,
+                layer_idx=self.layer_id,
+            )
+            hidden_states_fp32 = _welm_load_replay_tensor(
+                f"{norm_dump_prefix}.output_fp32",
+                hidden_states_fp32,
+                point="norm_after_attn",
+                forward_batch=forward_batch,
+                layer_idx=self.layer_id,
+            )
+            if residual is not None:
+                residual = _welm_load_replay_tensor(
+                    f"{norm_dump_prefix}.residual",
+                    residual,
+                    point="norm_after_attn",
+                    forward_batch=forward_batch,
+                    layer_idx=self.layer_id,
                 )
         if dump_this_layer:
             _welm_dump_tensor(

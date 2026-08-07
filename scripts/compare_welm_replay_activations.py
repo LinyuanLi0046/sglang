@@ -52,6 +52,18 @@ def is_expected_injection_name(name: str, point: str) -> bool:
                 ".self_attn.v",
             )
         )
+    if point == "attn_output":
+        return name.endswith(".self_attn.attn_output")
+    if point == "gated_attn_output":
+        return name.endswith(".self_attn.gated_attn_output")
+    if point == "norm_after_attn":
+        return name.endswith(
+            (
+                ".norm_after_attn.output",
+                ".norm_after_attn.output_fp32",
+                ".norm_after_attn.residual",
+            )
+        )
     raise ValueError(f"Unsupported replay point: {point}")
 
 
@@ -235,6 +247,11 @@ def replay_semantic_order(
         "k_post_rope": 1,
         ".v": 2,
         "__input__.0": 0,
+        "gated_attn_output": 0,
+        "attn_output": 0,
+        "norm_after_attn.output": 0,
+        "norm_after_attn.output_fp32": 1,
+        "norm_after_attn.residual": 2,
     }
     within_event = next(
         (order for suffix, order in suffix_order.items() if name.endswith(suffix)),
@@ -407,7 +424,14 @@ def build_parser():
     parser.description = "Compare CUDA dumps with an NPU WeLM activation-replay run."
     parser.add_argument(
         "--replay-point",
-        choices=("embedding", "qkv", "attention_input"),
+        choices=(
+            "embedding",
+            "qkv",
+            "attention_input",
+            "attn_output",
+            "gated_attn_output",
+            "norm_after_attn",
+        ),
         help=(
             "Injection point used by SGLANG_WELM_REPLAY_POINT; required unless "
             "--list-passes is used"

@@ -15,7 +15,7 @@ from typing import Any, Mapping, Optional
 import torch
 
 
-_PREFILL_MIN_M = 65536
+_PREFILL_MIN_M = 16383
 _LOGGED_KEYS: set[tuple[str, int, str]] = set()
 _PREFILL_RECORDED_KEYS: set[tuple[str, int]] = set()
 _LOG_LOCK = threading.Lock()
@@ -89,7 +89,7 @@ def log_welmv4_kernel_shapes_once(
 ) -> None:
     """Append one shape record per kernel/layer/prefill-or-decode stage.
 
-    Prefill records are emitted only when ``m >= 65536``.  The output path can
+    Prefill records are emitted only when ``m >= 16383``.  The output path can
     be overridden with ``SGLANG_WELMV4_KERNEL_SHAPE_LOG``; an empty value
     disables logging.  By default only TP-rank 0 of each PP stage records;
     ``SGLANG_WELMV4_KERNEL_SHAPE_LOG_ALL_RANKS=1`` enables every rank.

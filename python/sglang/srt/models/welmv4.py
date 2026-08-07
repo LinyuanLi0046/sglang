@@ -108,6 +108,9 @@ _WELM_REPLAY_CONFIGURED_POINT = {
     "post_rope": "attention_input",
     "attention_output": "attn_output",
     "gated_attention_output": "gated_attn_output",
+    "oproj": "o_proj_out",
+    "o_proj": "o_proj_out",
+    "norm_input": "norm_inputs",
     "norm_after_attention": "norm_after_attn",
 }.get(_WELM_REPLAY_CONFIGURED_POINT, _WELM_REPLAY_CONFIGURED_POINT)
 
@@ -270,13 +273,15 @@ def _welm_should_replay(
         "attention_input",
         "attn_output",
         "gated_attn_output",
+        "o_proj_out",
+        "norm_inputs",
         "norm_after_attn",
     }
     if configured_point not in valid_points:
         raise ValueError(
             "SGLANG_WELM_REPLAY_POINT must be one of embedding, qkv, "
-            "attention_input, attn_output, gated_attn_output, or "
-            f"norm_after_attn, got {configured_point!r}."
+            "attention_input, attn_output, gated_attn_output, o_proj_out, "
+            f"norm_inputs, or norm_after_attn, got {configured_point!r}."
         )
     if configured_point != point:
         return False
@@ -1630,10 +1635,34 @@ class Qwen2MoeAttention(nn.Module):
                 _welm_dump_tensor(f"{dump_prefix}.gated_attn_output", attn_output)
 
         output, _ = self.o_proj(attn_output)
-        if dump_this_layer:
-            _welm_dump_tensor(
-                f"model.layers.{self.layer_idx}.attn.mixer.o_proj_out", output
+        replay_o_proj_point = (
+            _WELM_REPLAY_CONFIGURED_POINT
+            if _WELM_REPLAY_CONFIGURED_POINT in {"o_proj_out", "norm_inputs"}
+            else None
+        )
+        replay_o_proj_out = replay_o_proj_point is not None and _welm_should_replay(
+            replay_o_proj_point, forward_batch, self.layer_idx
+        )
+        o_proj_dump_name = (
+            f"model.layers.{self.layer_idx}.attn.mixer.o_proj_out"
+        )
+        if replay_o_proj_out:
+            _welm_validate_replay_positions(
+                positions, forward_batch, self.layer_idx
             )
+            if dump_this_layer:
+                _welm_dump_tensor(
+                    f"{o_proj_dump_name}_npu_before_replay", output
+                )
+            output = _welm_load_replay_tensor(
+                o_proj_dump_name,
+                output,
+                point=replay_o_proj_point,
+                forward_batch=forward_batch,
+                layer_idx=self.layer_idx,
+            )
+        if dump_this_layer:
+            _welm_dump_tensor(o_proj_dump_name, output)
         if self.o_norm is not None and not skip_o_norm:
             output, _ = self.o_norm(output)
             if dump_this_layer:
@@ -1964,6 +1993,38 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     forward_batch.dp_padding_mode.is_max_len(),
                     new_global_num_tokens,
                 )
+
+        replay_norm_inputs = (
+            _WELM_REPLAY_CONFIGURED_POINT == "norm_inputs"
+            and _welm_should_replay(
+                "norm_inputs", forward_batch, self.layer_id
+            )
+        )
+        if replay_norm_inputs:
+            if residual is None:
+                raise RuntimeError(
+                    "WeLM norm_inputs replay requires a pre-norm residual, "
+                    f"but layer {self.layer_id} received residual=None."
+                )
+            _welm_validate_replay_positions(
+                positions, forward_batch, self.layer_id
+            )
+            residual_dump_name = f"model.layers.{self.layer_id}.attn.mixer.1"
+            if dump_this_layer:
+                _welm_dump_tensor(
+                    f"{residual_dump_name}_npu_before_replay", residual
+                )
+            residual = _welm_load_replay_tensor(
+                residual_dump_name,
+                residual,
+                point="norm_inputs",
+                forward_batch=forward_batch,
+                layer_idx=self.layer_id,
+            )
+            if dump_this_layer:
+                # Overwrite the earlier pre-attention dump so the canonical
+                # file records the residual actually consumed by the norm.
+                _welm_dump_tensor(residual_dump_name, residual)
 
         if use_mmq_norm_after_attn:
             # With attention DP, RowParallelLinear deliberately leaves the

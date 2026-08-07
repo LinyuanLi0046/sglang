@@ -56,6 +56,15 @@ def is_expected_injection_name(name: str, point: str) -> bool:
         return name.endswith(".self_attn.attn_output")
     if point == "gated_attn_output":
         return name.endswith(".self_attn.gated_attn_output")
+    if point == "o_proj_out":
+        return name.endswith(".attn.mixer.o_proj_out")
+    if point == "norm_inputs":
+        return name.endswith(
+            (
+                ".attn.mixer.o_proj_out",
+                ".attn.mixer.1",
+            )
+        )
     if point == "norm_after_attn":
         return name.endswith(
             (
@@ -249,6 +258,8 @@ def replay_semantic_order(
         "__input__.0": 0,
         "gated_attn_output": 0,
         "attn_output": 0,
+        "o_proj_out": 0,
+        ".attn.mixer.1": 1,
         "norm_after_attn.output": 0,
         "norm_after_attn.output_fp32": 1,
         "norm_after_attn.residual": 2,
@@ -430,6 +441,8 @@ def build_parser():
             "attention_input",
             "attn_output",
             "gated_attn_output",
+            "o_proj_out",
+            "norm_inputs",
             "norm_after_attn",
         ),
         help=(

@@ -530,8 +530,8 @@ class WelmV4FusedRMSNorm(MultiPlatformOp):
             return output, out_residual
 
     def forward_npu(self, *args, **kwargs):
-        return self.forward_cuda(*args, **kwargs)
-
+        # return self.forward_cuda(*args, **kwargs)
+        return self.forward_native(*args, **kwargs)
 
 @triton.jit
 def mmq_style_shared_experts_add_residual_rms_norm_kernel(

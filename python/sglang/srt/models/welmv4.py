@@ -93,6 +93,9 @@ logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_WELM_NPU_FP32_OPROJ = _is_npu and get_bool_env_var(
+    "SGLANG_WELM_FP32_OPROJ", "false"
+)
 _WELM_DUMP_PROCESS_DIR = None
 _WELM_DUMP_BASE_DIR = None
 _WELM_DUMP_PASS_ID = -1
@@ -1324,6 +1327,34 @@ class Qwen2MoeAttention(nn.Module):
             reduce_results=not is_dp_attention_enabled(),
             prefix=add_prefix("o_proj", prefix),
         )
+        self.register_buffer(
+            "_welm_fp32_o_proj_weight", None, persistent=False
+        )
+        self.register_buffer("_welm_fp32_o_proj_bias", None, persistent=False)
+        if _WELM_NPU_FP32_OPROJ:
+            if is_dp_attention_enabled():
+                raise RuntimeError(
+                    "SGLANG_WELM_FP32_OPROJ only supports pure TP; "
+                    "attention DP leaves OProj reduction to a different path."
+                )
+            if self.o_proj.tp_size != get_tensor_model_parallel_world_size():
+                raise RuntimeError(
+                    "SGLANG_WELM_FP32_OPROJ requires OProj TP size to "
+                    "match the global tensor-parallel size."
+                )
+            if (
+                self.o_proj.quant_method.__class__.__name__
+                != "UnquantizedLinearMethod"
+            ):
+                raise RuntimeError(
+                    "SGLANG_WELM_FP32_OPROJ only supports unquantized "
+                    "OProj weights."
+                )
+            if self.layer_idx == 0:
+                logger.warning(
+                    "WeLM NPU FP32 OProj diagnostic path is enabled: local "
+                    "F.linear and TP AllReduce run in FP32 before casting back."
+                )
         if rope_scaling is None:
             rope_scaling = {"type": "linear", "factor": 1 / self.compress}
         else:
@@ -1637,7 +1668,34 @@ class Qwen2MoeAttention(nn.Module):
             if dump_this_layer:
                 _welm_dump_tensor(f"{dump_prefix}.gated_attn_output", attn_output)
 
-        output, _ = self.o_proj(attn_output)
+        if _WELM_NPU_FP32_OPROJ:
+            # Keep both the local row-parallel GEMM partial and its TP sum in
+            # FP32.  Casting only after the AllReduce separates OProj numeric
+            # error from the normal BF16 projection/reduction path.
+            if self._welm_fp32_o_proj_weight is None:
+                self._welm_fp32_o_proj_weight = (
+                    self.o_proj.weight.detach().float().contiguous()
+                )
+                if self.o_proj.bias is not None:
+                    self._welm_fp32_o_proj_bias = (
+                        self.o_proj.bias.detach().float().contiguous()
+                    )
+
+            o_proj_bias = (
+                self._welm_fp32_o_proj_bias
+                if self.o_proj.tp_rank == 0 and not self.o_proj.skip_bias_add
+                else None
+            )
+            output_fp32 = F.linear(
+                attn_output.float().contiguous(),
+                self._welm_fp32_o_proj_weight,
+                o_proj_bias,
+            )
+            if self.o_proj.tp_size > 1:
+                output_fp32 = tensor_model_parallel_all_reduce(output_fp32)
+            output = output_fp32.to(attn_output.dtype)
+        else:
+            output, _ = self.o_proj(attn_output)
         replay_o_proj_point = None
         if _welm_should_replay("norm_inputs", forward_batch, self.layer_idx):
             # ``norm_inputs`` remains the existing composite replay point: it

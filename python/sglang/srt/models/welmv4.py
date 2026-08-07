@@ -93,9 +93,6 @@ logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
-_WELM_NPU_FP32_OE = _is_npu and get_bool_env_var(
-    "SGLANG_WELM_FP32_OE", "false"
-)
 _WELM_NPU_FP32_OPROJ = _is_npu and get_bool_env_var(
     "SGLANG_WELM_FP32_OPROJ", "false"
 )
@@ -1355,8 +1352,8 @@ class Qwen2MoeAttention(nn.Module):
                 )
             if self.layer_idx == 0:
                 logger.warning(
-                    "WeLM NPU FP32 OProj path is enabled: OProj, TP AllReduce, "
-                    "o_norm, and the following residual addition stay in FP32."
+                    "WeLM NPU FP32 OProj diagnostic path is enabled: local "
+                    "F.linear and TP AllReduce run in FP32 before casting back."
                 )
         if rope_scaling is None:
             rope_scaling = {"type": "linear", "factor": 1 / self.compress}
@@ -1429,7 +1426,6 @@ class Qwen2MoeAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         skip_o_norm: bool = False,
-        preserve_fp32_o_proj: bool = False,
     ) -> torch.Tensor:
         dump_this_layer = _welm_should_dump_layer(self.layer_idx)
         dump_prefix = f"model.layers.{self.layer_idx}.self_attn"
@@ -1673,9 +1669,9 @@ class Qwen2MoeAttention(nn.Module):
                 _welm_dump_tensor(f"{dump_prefix}.gated_attn_output", attn_output)
 
         if _WELM_NPU_FP32_OPROJ:
-            # Keep the local row-parallel GEMM partial and its TP sum in FP32.
-            # The decoder requests an FP32 output when it will also keep
-            # o_norm and the following residual addition in FP32.
+            # Keep both the local row-parallel GEMM partial and its TP sum in
+            # FP32.  Casting only after the AllReduce separates OProj numeric
+            # error from the normal BF16 projection/reduction path.
             if self._welm_fp32_o_proj_weight is None:
                 self._welm_fp32_o_proj_weight = (
                     self.o_proj.weight.detach().float().contiguous()
@@ -1697,11 +1693,7 @@ class Qwen2MoeAttention(nn.Module):
             )
             if self.o_proj.tp_size > 1:
                 output_fp32 = tensor_model_parallel_all_reduce(output_fp32)
-            output = (
-                output_fp32
-                if preserve_fp32_o_proj
-                else output_fp32.to(attn_output.dtype)
-            )
+            output = output_fp32.to(attn_output.dtype)
         else:
             output, _ = self.o_proj(attn_output)
         replay_o_proj_point = None
@@ -1723,32 +1715,17 @@ class Qwen2MoeAttention(nn.Module):
                 _welm_dump_tensor(
                     f"{o_proj_dump_name}_npu_before_replay", output
                 )
-            replay_reference = output
-            if preserve_fp32_o_proj and output.dtype == torch.float32:
-                # The CUDA baseline dumps OProj at the normal attention
-                # activation dtype. Preserve strict replay validation there,
-                # then widen the injected tensor for the FP32 downstream path.
-                replay_reference = output.to(dtype=attn_output.dtype)
             output = _welm_load_replay_tensor(
                 o_proj_dump_name,
-                replay_reference,
+                output,
                 point=replay_o_proj_point,
                 forward_batch=forward_batch,
                 layer_idx=self.layer_idx,
             )
-            if preserve_fp32_o_proj:
-                output = output.float()
         if dump_this_layer:
             _welm_dump_tensor(o_proj_dump_name, output)
         if self.o_norm is not None and not skip_o_norm:
-            if preserve_fp32_o_proj:
-                output, _ = self.o_norm(
-                    output,
-                    output_dtype=torch.float32,
-                    preserve_fp32_input=True,
-                )
-            else:
-                output, _ = self.o_norm(output)
+            output, _ = self.o_norm(output)
             if dump_this_layer:
                 _welm_dump_tensor(
                     f"model.layers.{self.layer_idx}.attn.mixer.o_norm_out", output
@@ -1951,23 +1928,13 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 _welm_dump_tensor(
                     "model.layers.0.__input__.0_npu_before_replay", hidden_states
                 )
-            replay_reference = hidden_states
-            if _WELM_NPU_FP32_OE and hidden_states.dtype == torch.float32:
-                # CUDA's canonical embedding dump is the original activation
-                # dtype. Load it strictly in that dtype, then re-enter this
-                # experiment's FP32 input-norm island.
-                replay_reference = hidden_states.to(
-                    dtype=self.input_layernorm.weight.dtype
-                )
             hidden_states = _welm_load_replay_tensor(
                 "model.layers.0.__input__.0",
-                replay_reference,
+                hidden_states,
                 point="embedding",
                 forward_batch=forward_batch,
                 layer_idx=0,
             )
-            if _WELM_NPU_FP32_OE:
-                hidden_states = hidden_states.float()
         if dump_this_layer:
             _welm_dump_tensor(f"model.layers.{self.layer_id}.__input__.0", hidden_states)
             _welm_dump_module_weights(
@@ -2001,42 +1968,21 @@ class Qwen2MoeDecoderLayer(nn.Module):
             if residual_after_layernorm:
                 residual = hidden_states.to(torch.float32)
         elif residual_after_layernorm:
-            if _WELM_NPU_FP32_OE:
-                # Keep the pre-normalization value and RMSNorm arithmetic in
-                # FP32, while preserving the original BF16 attention input.
-                hidden_states, _, residual = self.input_layernorm(
-                    hidden_states,
-                    residual,
-                    residual_after_layernorm=residual_after_layernorm,
-                    clone_fp32_out=True,
-                    output_dtype=self.input_layernorm.weight.dtype,
-                    preserve_fp32_input=True,
-                )
-            else:
-                hidden_states, _, residual = self.input_layernorm(
-                    hidden_states,
-                    residual,
-                    residual_after_layernorm=residual_after_layernorm,
-                    clone_fp32_out=True,
-                    output_dtype=self.input_layernorm.weight.dtype
-                    if hidden_states.dtype == torch.float32
-                    else hidden_states.dtype,
-                )
+            hidden_states, _, residual = self.input_layernorm(
+                hidden_states,
+                residual,
+                residual_after_layernorm=residual_after_layernorm,
+                clone_fp32_out=True,
+                output_dtype=self.input_layernorm.weight.dtype
+                if hidden_states.dtype == torch.float32
+                else hidden_states.dtype,
+            )
         else:
-            if _WELM_NPU_FP32_OE:
-                hidden_states, residual = self.input_layernorm(
-                    hidden_states,
-                    residual,
-                    residual_after_layernorm=residual_after_layernorm,
-                    output_dtype=self.input_layernorm.weight.dtype,
-                    preserve_fp32_input=True,
-                )
-            else:
-                hidden_states, residual = self.input_layernorm(
-                    hidden_states,
-                    residual,
-                    residual_after_layernorm=residual_after_layernorm,
-                )
+            hidden_states, residual = self.input_layernorm(
+                hidden_states,
+                residual,
+                residual_after_layernorm=residual_after_layernorm,
+            )
         if dump_this_layer:
             _welm_dump_tensor(
                 f"model.layers.{self.layer_id}.input_layernorm.0", hidden_states
@@ -2047,7 +1993,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
         use_dp_o_norm_after_attn = (
             is_dp_attention_enabled() and self.self_attn.use_o_norm
         )
-        attention_input_dtype = hidden_states.dtype
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
@@ -2057,7 +2002,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 # decoder performs it after the explicit all-reduce on DP
                 # paths; the MMQ branch additionally fuses residual+rnorm.
                 skip_o_norm=use_mmq_norm_after_attn or use_dp_o_norm_after_attn,
-                preserve_fp32_o_proj=_WELM_NPU_FP32_OPROJ,
             )
         if (
             forward_batch.enable_kv_mirror
@@ -2149,20 +2093,12 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 hidden_states = attention_tensor_model_parallel_all_reduce(
                     hidden_states
                 )
-            fp32_oproj_path = (
-                _WELM_NPU_FP32_OPROJ
-                and hidden_states.dtype == torch.float32
-            )
             hidden_states, residual, hidden_states_fp32 = mmq_style_norm_after_attn(
                 hidden_states,
                 residual,
                 self.self_attn.o_norm.weight,
                 self.post_attention_layernorm.weight,
                 self.post_attention_layernorm.eps,
-                fp32_onorm_residual=fp32_oproj_path,
-                output_dtype=(
-                    attention_input_dtype if fp32_oproj_path else None
-                ),
             )
             if (
                 is_dp_attention_enabled()
@@ -2224,31 +2160,13 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 )
                 hidden_states_fp32 = hidden_states.to(torch.float32)
             else:
-                if (
-                    _WELM_NPU_FP32_OPROJ
-                    and hidden_states.dtype == torch.float32
-                ):
-                    # o_norm (when configured) has already run in FP32 in
-                    # Attention.forward. Add the FP32 residual here, but keep
-                    # postnorm's old BF16 output boundary for the router.
-                    (
-                        hidden_states,
-                        residual,
-                        hidden_states_fp32,
-                    ) = self.post_attention_layernorm(
-                        hidden_states,
-                        residual,
-                        clone_fp32_out=True,
-                        output_dtype=attention_input_dtype,
-                    )
-                else:
-                    (
-                        hidden_states,
-                        residual,
-                        hidden_states_fp32,
-                    ) = self.post_attention_layernorm(
-                        hidden_states, residual, clone_fp32_out=True
-                    )
+                (
+                    hidden_states,
+                    residual,
+                    hidden_states_fp32,
+                ) = self.post_attention_layernorm(
+                    hidden_states, residual, clone_fp32_out=True
+                )
         replay_norm_after_attn = _welm_should_replay(
             "norm_after_attn", forward_batch, self.layer_id
         )
@@ -2372,23 +2290,10 @@ class Qwen2MoeModel(nn.Module):
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
-        if _WELM_NPU_FP32_OE and is_dp_attention_enabled():
-            raise RuntimeError(
-                "SGLANG_WELM_FP32_OE currently supports pure TP only; "
-                "attention DP routes input RMSNorm through LayerCommunicator."
-            )
-        if _WELM_NPU_FP32_OE:
-            logger.warning(
-                "WeLM NPU FP32 OE path is enabled: OE projection/merge and "
-                "decoder input RMSNorm residual arithmetic stay in FP32."
-            )
 
         self.oe_dim = config.oe_dim
         self.oe_grams = config.oe_grams
         self.oe_vocab_sizes = config.oe_vocab_sizes
-        self.register_buffer(
-            "_welm_fp32_oe_up_proj_weight", None, persistent=False
-        )
         kv_mirror_layers = list(getattr(config, "kv_mirror_layers", []) or [])
         kv_mirror_imitated_layers = list(
             getattr(config, "kv_mirror_imitated_layers", []) or []
@@ -2548,18 +2453,6 @@ class Qwen2MoeModel(nn.Module):
         for layer_id in self.layers_to_capture:
             setattr(self.layers[layer_id], "_is_layer_to_capture", True)
 
-    def _prepare_fp32_oe_projection(
-        self, refresh: bool = False
-    ) -> Optional[torch.Tensor]:
-        """Materialize the optional FP32 OE projection before graph capture."""
-        if not _WELM_NPU_FP32_OE or not hasattr(self, "oe_gate_up_proj"):
-            return None
-        if refresh or self._welm_fp32_oe_up_proj_weight is None:
-            self._welm_fp32_oe_up_proj_weight = (
-                self.oe_gate_up_proj.weight.detach().float().contiguous()
-            )
-        return self._welm_fp32_oe_up_proj_weight
-
     def _compute_oe_embedding(
         self,
         input_ids,
@@ -2598,11 +2491,7 @@ class Qwen2MoeModel(nn.Module):
         # belong to a request and therefore must not index the request token
         # table (whose metadata is intentionally empty on that rank).
         if getattr(forward_batch, "_original_batch_size", None) == 0:
-            return (
-                base_hidden_states.float()
-                if _WELM_NPU_FP32_OE
-                else base_hidden_states
-            )
+            return base_hidden_states
 
         num_token_non_padded = getattr(
             forward_batch, "num_token_non_padded_cpu", None
@@ -2614,11 +2503,7 @@ class Qwen2MoeModel(nn.Module):
             else int(num_token_non_padded),
         )
         if history_num_tokens == 0:
-            return (
-                base_hidden_states.float()
-                if _WELM_NPU_FP32_OE
-                else base_hidden_states
-            )
+            return base_hidden_states
         oe_input_ids = input_ids[:history_num_tokens]
         req_lens = ngram_embedding_info.req_lens.to(dtype=torch.long)
         # Decode CUDA graphs round the batch size up and leave initialized
@@ -2686,40 +2571,13 @@ class Qwen2MoeModel(nn.Module):
                 )
             emb_ngram_tmp = oe_embed_modules[i](input_ids_ngram_hashed_tmp)
             if dump_oe:
-                # Keep the canonical tensor at the actual lookup/TP-reduce
-                # dtype so it remains directly comparable with CUDA dumps.
                 _welm_dump_tensor(f"model.oe.vocab{i}.embedding", emb_ngram_tmp)
-            if _WELM_NPU_FP32_OE:
-                # Keep the embedding tables/checkpoint in their original
-                # dtype; only the selected OE activations enter the FP32 island.
-                emb_ngram_tmp = emb_ngram_tmp.float()
             emb_ngram.append(emb_ngram_tmp)
-        if _WELM_NPU_FP32_OE:
-            oe_hidden_fp32 = torch.cat(emb_ngram, dim=-1).contiguous()
-            if oe_up_proj_module is self.oe_gate_up_proj:
-                oe_weight_fp32 = self._prepare_fp32_oe_projection()
-            else:
-                # scale_seq_times > 0 is rejected during model construction;
-                # retain a correct fallback for callers supplying a module.
-                oe_weight_fp32 = (
-                    oe_up_proj_module.weight.detach().float().contiguous()
-                )
-            assert oe_weight_fp32 is not None
-            emb_new = F.linear(oe_hidden_fp32, oe_weight_fp32)
-            hidden_states = (
-                base_hidden_states[:history_num_tokens].float() + emb_new
-            ) * 0.5
-        else:
-            emb_new, _ = oe_up_proj_module(torch.cat(emb_ngram, dim=-1))
-            hidden_states = (
-                base_hidden_states[:history_num_tokens] + emb_new
-            ) / 2.0
+        emb_new, _ = oe_up_proj_module(torch.cat(emb_ngram, dim=-1))
+        hidden_states = (base_hidden_states[:history_num_tokens] + emb_new) / 2.0
         if history_num_tokens < num_tokens:
-            tail_hidden_states = base_hidden_states[history_num_tokens:]
-            if _WELM_NPU_FP32_OE:
-                tail_hidden_states = tail_hidden_states.float()
             hidden_states = torch.cat(
-                (hidden_states, tail_hidden_states), dim=0
+                (hidden_states, base_hidden_states[history_num_tokens:]), dim=0
             )
         if dump_oe:
             _welm_dump_tensor("model.oe.projected", emb_new)
@@ -3302,7 +3160,6 @@ class WeLMV4MoeForCausalLM(nn.Module):
         self.model.embed_tokens = embed[0]
         self.model.oe_embed = embed[1]
         self.model.oe_gate_up_proj = embed[2]
-        self.model._prepare_fp32_oe_projection(refresh=True)
         self.lm_head = head
         device_module = torch.get_device_module()
         device_module.empty_cache()
@@ -3338,7 +3195,6 @@ class WeLMV4MoeForCausalLM(nn.Module):
         LayerManager.post_init(
             kv_mirror_layer_ids, kv_mirror_imitated_layers, is_nextn=is_nextn
         )
-        self.model._prepare_fp32_oe_projection(refresh=True)
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
         """Run KV-mirror fixups for loaders that bypass ``load_weights``."""

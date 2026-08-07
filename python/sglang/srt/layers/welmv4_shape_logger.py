@@ -17,6 +17,7 @@ import torch
 
 _PREFILL_MIN_M = 65536
 _LOGGED_KEYS: set[tuple[str, int, str]] = set()
+_PREFILL_RECORDED_KEYS: set[tuple[str, int]] = set()
 _LOG_LOCK = threading.Lock()
 
 
@@ -92,6 +93,8 @@ def log_welmv4_kernel_shapes_once(
     be overridden with ``SGLANG_WELMV4_KERNEL_SHAPE_LOG``; an empty value
     disables logging.  By default only TP-rank 0 of each PP stage records;
     ``SGLANG_WELMV4_KERNEL_SHAPE_LOG_ALL_RANKS=1`` enables every rank.
+    Decode is recorded only after the matching kernel/layer prefill record has
+    been written successfully, so startup/warmup decode calls are ignored.
     ``os.O_APPEND`` plus one ``os.write`` call keeps each JSON line intact when
     multiple model-worker processes share the file.
     """
@@ -118,8 +121,14 @@ def log_welmv4_kernel_shapes_once(
         return
 
     resolved_layer_id = -1 if layer_id is None else int(layer_id)
+    kernel_layer_key = (kernel, resolved_layer_id)
     key = (kernel, resolved_layer_id, resolved_stage)
     with _LOG_LOCK:
+        if (
+            resolved_stage == "decode"
+            and kernel_layer_key not in _PREFILL_RECORDED_KEYS
+        ):
+            return
         if key in _LOGGED_KEYS:
             return
         _LOGGED_KEYS.add(key)
@@ -149,6 +158,9 @@ def log_welmv4_kernel_shapes_once(
             os.write(fd, line)
         finally:
             os.close(fd)
+        if resolved_stage == "prefill":
+            with _LOG_LOCK:
+                _PREFILL_RECORDED_KEYS.add(kernel_layer_key)
     except Exception:
         # Debug instrumentation must not make inference fail because the log
         # directory is unavailable or a shared filesystem rejects the write.

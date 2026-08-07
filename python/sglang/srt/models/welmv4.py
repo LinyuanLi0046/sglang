@@ -383,6 +383,7 @@ def expert_bias_routing(
     expert_bias: torch.Tensor,
     renormalize: bool = False,
     score_func: str = "sigmoid",
+    layer_id: Optional[int] = None,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     if score_func == "softmax":
@@ -395,7 +396,9 @@ def expert_bias_routing(
         and scores.dtype == torch.float32
         and expert_bias.dtype == torch.float32
     ):
-        topk_scores, indices = mmq_style_expert_bias_topk(scores, expert_bias, topk)
+        topk_scores, indices = mmq_style_expert_bias_topk(
+            scores, expert_bias, topk, layer_id=layer_id
+        )
     else:
         scores_for_routing = scores + expert_bias
         _, indices = torch.topk(scores_for_routing, topk, dim=-1)
@@ -484,6 +487,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 expert_bias_routing,
                 expert_bias=self.expert_bias,
                 score_func=self.router_score_func,
+                layer_id=self.layer_id,
             )
             self.custom_routing_function = custom_routing_function
         else:
@@ -1075,6 +1079,8 @@ class Qwen2MoeAttention(nn.Module):
             compress=self.compress,
             rope_scaling=rope_scaling,
         )
+        self.rotary_emb.welm_layer_id = self.layer_idx
+        self.rotary_emb_orig.welm_layer_id = self.layer_idx
 
         self.attn = RadixAttention(
             self.num_heads,
@@ -1188,7 +1194,17 @@ class Qwen2MoeAttention(nn.Module):
         k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
         if self.k_norm is not None:
             k_by_head = mmq_style_k_rms_norm(
-                k_by_head.contiguous(), self.k_norm.weight, self.k_norm.eps
+                k_by_head.contiguous(),
+                self.k_norm.weight,
+                self.k_norm.eps,
+                layer_id=self.layer_idx,
+                stage=(
+                    "prefill"
+                    if forward_batch.forward_mode.is_extend()
+                    else "decode"
+                    if forward_batch.forward_mode.is_decode()
+                    else None
+                ),
             )
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.k_after_norm", k_by_head.view(k.shape))

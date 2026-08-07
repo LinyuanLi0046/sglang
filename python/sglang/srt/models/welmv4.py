@@ -99,10 +99,7 @@ _WELM_DUMP_PASS_ID = -1
 _WELM_REPLAY_PASS_ID = -1
 _WELM_REPLAY_LOGGED_KEYS = set()
 _WELM_REPLAY_VALIDATED_PASSES = set()
-_WELM_REPLAY_CONFIGURED_POINT = os.getenv(
-    "SGLANG_WELM_REPLAY_POINT", ""
-).strip().lower()
-_WELM_REPLAY_CONFIGURED_POINT = {
+_WELM_REPLAY_POINT_ALIASES = {
     "attn": "attention_input",
     "attention": "attention_input",
     "post_rope": "attention_input",
@@ -112,7 +109,15 @@ _WELM_REPLAY_CONFIGURED_POINT = {
     "o_proj": "o_proj_out",
     "norm_input": "norm_inputs",
     "norm_after_attention": "norm_after_attn",
-}.get(_WELM_REPLAY_CONFIGURED_POINT, _WELM_REPLAY_CONFIGURED_POINT)
+}
+_WELM_REPLAY_CONFIGURED_POINTS = frozenset(
+    _WELM_REPLAY_POINT_ALIASES.get(point, point)
+    for point in (
+        item.strip().lower()
+        for item in os.getenv("SGLANG_WELM_REPLAY_POINT", "").split(",")
+    )
+    if point
+)
 
 
 class WelmV4CommunicatorRMSNorm(nn.Module):
@@ -219,20 +224,25 @@ def _welm_start_dump_pass() -> None:
     _WELM_DUMP_PROCESS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _welm_replay_point() -> str:
-    """Return the optional CUDA-activation replay point.
+def _welm_replay_points() -> frozenset[str]:
+    """Return the optional CUDA-activation replay points.
 
     This is intentionally an eager-only debugging facility.  The caller is
     responsible for disabling graph capture/replay before enabling it.
     """
-    return _WELM_REPLAY_CONFIGURED_POINT
+    return _WELM_REPLAY_CONFIGURED_POINTS
+
+
+def _welm_replay_point() -> str:
+    """Return a normalized replay-point string for compatibility/debug logs."""
+    return ",".join(sorted(_welm_replay_points()))
 
 
 def _welm_start_replay_pass(forward_batch: ForwardBatch) -> None:
     global _WELM_REPLAY_PASS_ID
     # Model profiling/dummy forwards do not carry request IDs.  Do not consume
     # CUDA dump passes or attempt disk I/O until a real scheduled request runs.
-    if _welm_replay_point() and forward_batch.rids:
+    if _welm_replay_points() and forward_batch.rids:
         _WELM_REPLAY_PASS_ID += 1
 
 
@@ -262,8 +272,8 @@ def _welm_should_replay(
     forward_batch: ForwardBatch,
     layer_idx: Optional[int] = None,
 ) -> bool:
-    configured_point = _welm_replay_point()
-    if not configured_point:
+    configured_points = _welm_replay_points()
+    if not configured_points:
         return False
     if not forward_batch.rids or _WELM_REPLAY_PASS_ID < 0:
         return False
@@ -277,13 +287,15 @@ def _welm_should_replay(
         "norm_inputs",
         "norm_after_attn",
     }
-    if configured_point not in valid_points:
+    invalid_points = configured_points - valid_points
+    if invalid_points:
         raise ValueError(
-            "SGLANG_WELM_REPLAY_POINT must be one of embedding, qkv, "
+            "Each comma-separated SGLANG_WELM_REPLAY_POINT value must be one of "
+            "embedding, qkv, "
             "attention_input, attn_output, gated_attn_output, o_proj_out, "
-            f"norm_inputs, or norm_after_attn, got {configured_point!r}."
+            f"norm_inputs, or norm_after_attn, got {sorted(invalid_points)!r}."
         )
-    if configured_point != point:
+    if point not in configured_points:
         return False
 
     stages = {
@@ -1433,9 +1445,7 @@ class Qwen2MoeAttention(nn.Module):
             qkv, _ = self.qkv_proj(hidden_states)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        replay_qkv = _WELM_REPLAY_CONFIGURED_POINT == "qkv" and _welm_should_replay(
-            "qkv", forward_batch, self.layer_idx
-        )
+        replay_qkv = _welm_should_replay("qkv", forward_batch, self.layer_idx)
         if replay_qkv:
             _welm_validate_replay_positions(
                 positions, forward_batch, self.layer_idx
@@ -1528,11 +1538,8 @@ class Qwen2MoeAttention(nn.Module):
         else:
             q, k = self.rotary_emb(positions, q, k, layer_id=self.layer_idx)
 
-        replay_attention_input = (
-            _WELM_REPLAY_CONFIGURED_POINT == "attention_input"
-            and _welm_should_replay(
-                "attention_input", forward_batch, self.layer_idx
-            )
+        replay_attention_input = _welm_should_replay(
+            "attention_input", forward_batch, self.layer_idx
         )
         if replay_attention_input:
             _welm_validate_replay_positions(
@@ -1576,9 +1583,8 @@ class Qwen2MoeAttention(nn.Module):
         if self.attn_sink is not None:
             attn_kwargs["sinks"] = self.attn_sink
         attn_output = self.attn(q, k, v, forward_batch, **attn_kwargs)
-        replay_attn_output = (
-            _WELM_REPLAY_CONFIGURED_POINT == "attn_output"
-            and _welm_should_replay("attn_output", forward_batch, self.layer_idx)
+        replay_attn_output = _welm_should_replay(
+            "attn_output", forward_batch, self.layer_idx
         )
         if replay_attn_output:
             _welm_validate_replay_positions(
@@ -1609,11 +1615,8 @@ class Qwen2MoeAttention(nn.Module):
             attn_output = attn_output.view(attn_shape[0], self.num_heads, -1)
             inplace_sigmoid_mul(gate, attn_output)
             attn_output = attn_output.view(attn_shape)
-            replay_gated_attn_output = (
-                _WELM_REPLAY_CONFIGURED_POINT == "gated_attn_output"
-                and _welm_should_replay(
-                    "gated_attn_output", forward_batch, self.layer_idx
-                )
+            replay_gated_attn_output = _welm_should_replay(
+                "gated_attn_output", forward_batch, self.layer_idx
             )
             if replay_gated_attn_output:
                 _welm_validate_replay_positions(
@@ -1635,14 +1638,14 @@ class Qwen2MoeAttention(nn.Module):
                 _welm_dump_tensor(f"{dump_prefix}.gated_attn_output", attn_output)
 
         output, _ = self.o_proj(attn_output)
-        replay_o_proj_point = (
-            _WELM_REPLAY_CONFIGURED_POINT
-            if _WELM_REPLAY_CONFIGURED_POINT in {"o_proj_out", "norm_inputs"}
-            else None
-        )
-        replay_o_proj_out = replay_o_proj_point is not None and _welm_should_replay(
-            replay_o_proj_point, forward_batch, self.layer_idx
-        )
+        replay_o_proj_point = None
+        if _welm_should_replay("norm_inputs", forward_batch, self.layer_idx):
+            # ``norm_inputs`` remains the existing composite replay point: it
+            # replaces both o_proj_out here and the FP32 residual below.
+            replay_o_proj_point = "norm_inputs"
+        elif _welm_should_replay("o_proj_out", forward_batch, self.layer_idx):
+            replay_o_proj_point = "o_proj_out"
+        replay_o_proj_out = replay_o_proj_point is not None
         o_proj_dump_name = (
             f"model.layers.{self.layer_idx}.attn.mixer.o_proj_out"
         )
@@ -1860,7 +1863,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
         dump_this_layer = _welm_should_dump_layer(self.layer_id)
         if (
             self.layer_id == 0
-            and _WELM_REPLAY_CONFIGURED_POINT == "embedding"
             and _welm_should_replay("embedding", forward_batch)
         ):
             _welm_validate_replay_positions(positions, forward_batch, self.layer_id)
@@ -1994,11 +1996,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     new_global_num_tokens,
                 )
 
-        replay_norm_inputs = (
-            _WELM_REPLAY_CONFIGURED_POINT == "norm_inputs"
-            and _welm_should_replay(
-                "norm_inputs", forward_batch, self.layer_id
-            )
+        replay_norm_inputs = _welm_should_replay(
+            "norm_inputs", forward_batch, self.layer_id
         )
         if replay_norm_inputs:
             if residual is None:
@@ -2110,11 +2109,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 ) = self.post_attention_layernorm(
                     hidden_states, residual, clone_fp32_out=True
                 )
-        replay_norm_after_attn = (
-            _WELM_REPLAY_CONFIGURED_POINT == "norm_after_attn"
-            and _welm_should_replay(
-                "norm_after_attn", forward_batch, self.layer_id
-            )
+        replay_norm_after_attn = _welm_should_replay(
+            "norm_after_attn", forward_batch, self.layer_id
         )
         if replay_norm_after_attn:
             _welm_validate_replay_positions(

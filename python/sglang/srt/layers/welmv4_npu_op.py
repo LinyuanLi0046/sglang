@@ -4,7 +4,10 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.welmv4_shape_logger import log_welmv4_kernel_shapes_once
+from sglang.srt.layers.welmv4_shape_logger import (
+    WELMV4_KERNEL_SHAPE_LOG_ENABLED,
+    log_welmv4_kernel_shapes_once,
+)
 from sglang.srt.utils import is_npu
 
 
@@ -268,26 +271,27 @@ def welmv4_inplace_rope_npu(
         triton.next_power_of_2(num_q_heads),
         triton.next_power_of_2(num_k_heads),
     )
-    log_welmv4_kernel_shapes_once(
-        kernel="_welmv4_inplace_rope_kernel_npu",
-        layer_id=layer_id,
-        stage=stage,
-        m=N,
-        inputs={
-            "query": query,
-            "key": key,
-            "positions": positions,
-            "cos_sin_cache": cos_sin_cache,
-            "last_index": last_index,
-        },
-        outputs={"query": query, "key": key},
-        parameters={
-            "BS": BS,
-            "head_dim": head_dim,
-            "rope_dim": rope_dim,
-            "num_q_heads": num_q_heads,
-            "num_k_heads": num_k_heads,
-            "num_sms": num_sms,
-        },
-    )
+    if WELMV4_KERNEL_SHAPE_LOG_ENABLED:
+        log_welmv4_kernel_shapes_once(
+            kernel="_welmv4_inplace_rope_kernel_npu",
+            layer_id=layer_id,
+            stage=stage,
+            m=N,
+            inputs={
+                "query": query,
+                "key": key,
+                "positions": positions,
+                "cos_sin_cache": cos_sin_cache,
+                "last_index": last_index,
+            },
+            outputs={"query": query, "key": key},
+            parameters={
+                "BS": BS,
+                "head_dim": head_dim,
+                "rope_dim": rope_dim,
+                "num_q_heads": num_q_heads,
+                "num_k_heads": num_k_heads,
+                "num_sms": num_sms,
+            },
+        )
     return query, key

@@ -15,6 +15,9 @@ from typing import Any, Mapping, Optional
 import torch
 
 
+WELMV4_KERNEL_SHAPE_LOG_ENABLED = os.getenv(
+    "SGLANG_WELMV4_KERNEL_SHAPE_LOG_ENABLE", "0"
+).lower() in {"1", "true", "yes", "on"}
 _PREFILL_MIN_M = 16383
 _LOGGED_KEYS: set[tuple[str, int, str]] = set()
 _PREFILL_RECORDED_KEYS: set[tuple[str, int]] = set()
@@ -34,7 +37,7 @@ def _get_stage(m: int, stage: Optional[str]) -> str:
         # Shape logging must never affect model execution.
         pass
 
-    # Decode cannot realistically have 64K rows.  This fallback also keeps the
+    # Decode cannot realistically have 16K rows.  This fallback also keeps the
     # logger useful in standalone wrapper tests where no ForwardBatch exists.
     return "prefill" if m >= _PREFILL_MIN_M else "decode"
 
@@ -89,15 +92,20 @@ def log_welmv4_kernel_shapes_once(
 ) -> None:
     """Append one shape record per kernel/layer/prefill-or-decode stage.
 
-    Prefill records are emitted only when ``m >= 16383``.  The output path can
-    be overridden with ``SGLANG_WELMV4_KERNEL_SHAPE_LOG``; an empty value
-    disables logging.  By default only TP-rank 0 of each PP stage records;
+    Logging is disabled by default and enabled with
+    ``SGLANG_WELMV4_KERNEL_SHAPE_LOG_ENABLE=1``.  Prefill records are emitted
+    only when ``m >= 16383``.  The output path can be overridden with
+    ``SGLANG_WELMV4_KERNEL_SHAPE_LOG``.  By default only TP-rank 0 of each PP
+    stage records;
     ``SGLANG_WELMV4_KERNEL_SHAPE_LOG_ALL_RANKS=1`` enables every rank.
     Decode is recorded only after the matching kernel/layer prefill record has
     been written successfully, so startup/warmup decode calls are ignored.
     ``os.O_APPEND`` plus one ``os.write`` call keeps each JSON line intact when
     multiple model-worker processes share the file.
     """
+
+    if not WELMV4_KERNEL_SHAPE_LOG_ENABLED:
+        return
 
     log_path = os.getenv(
         "SGLANG_WELMV4_KERNEL_SHAPE_LOG", "welmv4_kernel_shapes.jsonl"

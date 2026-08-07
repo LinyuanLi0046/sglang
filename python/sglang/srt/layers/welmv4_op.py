@@ -9,7 +9,10 @@ from torch import nn
 
 from sglang.srt.layers.rotary_embedding import RotaryEmbedding
 from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.layers.welmv4_shape_logger import log_welmv4_kernel_shapes_once
+from sglang.srt.layers.welmv4_shape_logger import (
+    WELMV4_KERNEL_SHAPE_LOG_ENABLED,
+    log_welmv4_kernel_shapes_once,
+)
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
@@ -267,15 +270,16 @@ def mmq_style_expert_bias_topk(
         TOPK=topk,
         BLOCK_SIZE=triton.next_power_of_2(num_experts),
     )
-    log_welmv4_kernel_shapes_once(
-        kernel="mmq_style_expert_bias_topk_kernel",
-        layer_id=layer_id,
-        stage=stage,
-        m=num_tokens,
-        inputs={"scores": scores, "expert_bias": expert_bias},
-        outputs={"topk_weights": topk_weights, "topk_ids": topk_ids},
-        parameters={"topk": topk, "num_experts": num_experts},
-    )
+    if WELMV4_KERNEL_SHAPE_LOG_ENABLED:
+        log_welmv4_kernel_shapes_once(
+            kernel="mmq_style_expert_bias_topk_kernel",
+            layer_id=layer_id,
+            stage=stage,
+            m=num_tokens,
+            inputs={"scores": scores, "expert_bias": expert_bias},
+            outputs={"topk_weights": topk_weights, "topk_ids": topk_ids},
+            parameters={"topk": topk, "num_experts": num_experts},
+        )
     return topk_weights, topk_ids
 
 
@@ -657,20 +661,21 @@ def mmq_style_k_rms_norm(
         num_sms,
         triton.next_power_of_2(kv_heads),
     )
-    log_welmv4_kernel_shapes_once(
-        kernel="mmq_style_k_rms_norm_kernel",
-        layer_id=layer_id,
-        stage=stage,
-        m=tokens,
-        inputs={"x": x, "gamma": gamma},
-        outputs={"output": output},
-        parameters={
-            "eps": eps,
-            "kv_heads": kv_heads,
-            "head_dim": head_dim,
-            "num_sms": num_sms,
-        },
-    )
+    if WELMV4_KERNEL_SHAPE_LOG_ENABLED:
+        log_welmv4_kernel_shapes_once(
+            kernel="mmq_style_k_rms_norm_kernel",
+            layer_id=layer_id,
+            stage=stage,
+            m=tokens,
+            inputs={"x": x, "gamma": gamma},
+            outputs={"output": output},
+            parameters={
+                "eps": eps,
+                "kv_heads": kv_heads,
+                "head_dim": head_dim,
+                "num_sms": num_sms,
+            },
+        )
     return output
 
 

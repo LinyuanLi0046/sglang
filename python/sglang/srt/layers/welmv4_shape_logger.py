@@ -18,28 +18,16 @@ import torch
 WELMV4_KERNEL_SHAPE_LOG_ENABLED = os.getenv(
     "SGLANG_WELMV4_KERNEL_SHAPE_LOG_ENABLE", "0"
 ).lower() in {"1", "true", "yes", "on"}
-_PREFILL_MIN_M = 16383
+_PREFILL_MIN_M = 9000
 _LOGGED_KEYS: set[tuple[str, int, str]] = set()
 _PREFILL_RECORDED_KEYS: set[tuple[str, int]] = set()
 _LOG_LOCK = threading.Lock()
 
 
 def _get_stage(m: int, stage: Optional[str]) -> str:
-    if stage in ("prefill", "decode"):
-        return stage
-
-    try:
-        from sglang.srt.layers.dp_attention import get_is_extend_in_batch
-
-        if get_is_extend_in_batch():
-            return "prefill"
-    except Exception:
-        # Shape logging must never affect model execution.
-        pass
-
-    # Decode cannot realistically have 16K rows.  This fallback also keeps the
-    # logger useful in standalone wrapper tests where no ForwardBatch exists.
-    return "prefill" if m >= _PREFILL_MIN_M else "decode"
+    # Shape collection intentionally accepts only the single-token case as
+    # decode.  This excludes startup/warmup decode batches with M > 1.
+    return "decode" if m == 1 else "prefill"
 
 
 def _tensor_metadata(value: Any) -> Any:
@@ -94,7 +82,8 @@ def log_welmv4_kernel_shapes_once(
 
     Logging is disabled by default and enabled with
     ``SGLANG_WELMV4_KERNEL_SHAPE_LOG_ENABLE=1``.  Prefill records are emitted
-    only when ``m >= 16383``.  The output path can be overridden with
+    only when ``m >= 9000`` and only ``m == 1`` is treated as decode.  The
+    output path can be overridden with
     ``SGLANG_WELMV4_KERNEL_SHAPE_LOG``.  By default only TP-rank 0 of each PP
     stage records;
     ``SGLANG_WELMV4_KERNEL_SHAPE_LOG_ALL_RANKS=1`` enables every rank.

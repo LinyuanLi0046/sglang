@@ -96,6 +96,17 @@ _is_npu = is_npu()
 _WELM_DUMP_PROCESS_DIR = None
 _WELM_DUMP_BASE_DIR = None
 _WELM_DUMP_PASS_ID = -1
+_WELM_REPLAY_PASS_ID = -1
+_WELM_REPLAY_LOGGED_KEYS = set()
+_WELM_REPLAY_VALIDATED_PASSES = set()
+_WELM_REPLAY_CONFIGURED_POINT = os.getenv(
+    "SGLANG_WELM_REPLAY_POINT", ""
+).strip().lower()
+_WELM_REPLAY_CONFIGURED_POINT = {
+    "attn": "attention_input",
+    "attention": "attention_input",
+    "post_rope": "attention_input",
+}.get(_WELM_REPLAY_CONFIGURED_POINT, _WELM_REPLAY_CONFIGURED_POINT)
 
 
 class WelmV4CommunicatorRMSNorm(nn.Module):
@@ -200,6 +211,244 @@ def _welm_start_dump_pass() -> None:
     _WELM_DUMP_PROCESS_DIR = _WELM_DUMP_BASE_DIR / f"Pass{_WELM_DUMP_PASS_ID:05d}"
     os.environ["SGLANG_DUMP_ACTIVATIONS_PROCESS_DIR"] = str(_WELM_DUMP_PROCESS_DIR)
     _WELM_DUMP_PROCESS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _welm_replay_point() -> str:
+    """Return the optional CUDA-activation replay point.
+
+    This is intentionally an eager-only debugging facility.  The caller is
+    responsible for disabling graph capture/replay before enabling it.
+    """
+    return _WELM_REPLAY_CONFIGURED_POINT
+
+
+def _welm_start_replay_pass(forward_batch: ForwardBatch) -> None:
+    global _WELM_REPLAY_PASS_ID
+    # Model profiling/dummy forwards do not carry request IDs.  Do not consume
+    # CUDA dump passes or attempt disk I/O until a real scheduled request runs.
+    if _welm_replay_point() and forward_batch.rids:
+        _WELM_REPLAY_PASS_ID += 1
+
+
+def _welm_replay_stage(forward_batch: ForwardBatch) -> str:
+    if forward_batch.forward_mode.is_decode():
+        return "decode"
+    if forward_batch.forward_mode.is_extend():
+        return "prefill"
+    return "other"
+
+
+def _welm_replay_layer_ids() -> set[int]:
+    value = os.getenv("SGLANG_WELM_REPLAY_LAYER_IDXS")
+    if value is None:
+        value = os.getenv("SGLANG_DUMP_ACTIVATIONS_LAYER_IDXS", "0")
+    try:
+        return {int(item.strip()) for item in value.split(",") if item.strip()}
+    except ValueError as exc:
+        raise ValueError(
+            "SGLANG_WELM_REPLAY_LAYER_IDXS must be a comma-separated list "
+            f"of integers, got {value!r}."
+        ) from exc
+
+
+def _welm_should_replay(
+    point: str,
+    forward_batch: ForwardBatch,
+    layer_idx: Optional[int] = None,
+) -> bool:
+    configured_point = _welm_replay_point()
+    if not configured_point:
+        return False
+    if not forward_batch.rids or _WELM_REPLAY_PASS_ID < 0:
+        return False
+    valid_points = {"embedding", "qkv", "attention_input"}
+    if configured_point not in valid_points:
+        raise ValueError(
+            "SGLANG_WELM_REPLAY_POINT must be one of embedding, qkv, or "
+            f"attention_input, got {configured_point!r}."
+        )
+    if configured_point != point:
+        return False
+
+    stages = {
+        item.strip().lower()
+        for item in os.getenv(
+            "SGLANG_WELM_REPLAY_STAGES", "prefill,decode"
+        ).split(",")
+        if item.strip()
+    }
+    stage = _welm_replay_stage(forward_batch)
+    if stage not in stages:
+        return False
+    if layer_idx is not None and layer_idx not in _welm_replay_layer_ids():
+        return False
+    return True
+
+
+def _welm_replay_pass_dir() -> Path:
+    if _WELM_REPLAY_PASS_ID < 0:
+        raise RuntimeError(
+            "WeLM activation replay pass was not initialized before tensor load."
+        )
+
+    tp_rank = get_parallel().tp_rank
+    directory_template = os.getenv(f"SGLANG_WELM_REPLAY_DIR_TP{tp_rank}")
+    if not directory_template:
+        directory_template = os.getenv("SGLANG_WELM_REPLAY_DIR")
+    if not directory_template:
+        raise RuntimeError(
+            "WeLM activation replay is enabled but no source directory was "
+            "configured. Set SGLANG_WELM_REPLAY_DIR (it may contain "
+            "{tp_rank}, {pass_id}, or {pass_name}) or set the rank-specific "
+            f"SGLANG_WELM_REPLAY_DIR_TP{tp_rank}."
+        )
+
+    try:
+        pass_offset = int(os.getenv("SGLANG_WELM_REPLAY_PASS_OFFSET", "0"))
+    except ValueError as exc:
+        raise ValueError("SGLANG_WELM_REPLAY_PASS_OFFSET must be an integer.") from exc
+    source_pass_id = _WELM_REPLAY_PASS_ID + pass_offset
+    if source_pass_id < 0:
+        raise RuntimeError(
+            "The resolved CUDA replay pass is negative: "
+            f"npu_pass={_WELM_REPLAY_PASS_ID}, offset={pass_offset}."
+        )
+    pass_name = f"Pass{source_pass_id:05d}"
+
+    try:
+        formatted = directory_template.format(
+            tp_rank=tp_rank,
+            attn_tp_rank=get_parallel().attn_tp_rank,
+            pass_id=source_pass_id,
+            pass_name=pass_name,
+        )
+    except (KeyError, ValueError) as exc:
+        raise ValueError(
+            "Invalid placeholder in SGLANG_WELM_REPLAY_DIR: only {tp_rank}, "
+            "{attn_tp_rank}, {pass_id}, and {pass_name} are supported."
+        ) from exc
+
+    replay_dir = Path(os.path.expandvars(formatted)).expanduser()
+    template_has_pass = (
+        "{pass_id" in directory_template or "{pass_name" in directory_template
+    )
+    path_is_explicit_pass = (
+        replay_dir.name.startswith("Pass") and replay_dir.name[4:].isdigit()
+    )
+    if not template_has_pass and not path_is_explicit_pass:
+        replay_dir = replay_dir / pass_name
+    return replay_dir
+
+
+def _welm_load_replay_tensor(
+    tensor_name: str,
+    reference: torch.Tensor,
+    *,
+    point: str,
+    forward_batch: ForwardBatch,
+    layer_idx: Optional[int] = None,
+) -> torch.Tensor:
+    """Load one CPU CUDA dump tensor and move it to the reference device."""
+    source_path = _welm_replay_pass_dir() / f"{tensor_name}.pt"
+    if not source_path.is_file():
+        raise FileNotFoundError(
+            "Missing WeLM CUDA replay tensor for "
+            f"point={point}, stage={_welm_replay_stage(forward_batch)}, "
+            f"layer={layer_idx}, npu_pass={_WELM_REPLAY_PASS_ID}: {source_path}"
+        )
+    try:
+        source = torch.load(source_path, map_location="cpu", weights_only=True)
+    except TypeError:
+        # Compatibility with older PyTorch versions that do not expose
+        # weights_only on torch.load.
+        source = torch.load(source_path, map_location="cpu")
+    if not isinstance(source, torch.Tensor):
+        raise TypeError(f"Replay file does not contain a tensor: {source_path}")
+    if tuple(source.shape) != tuple(reference.shape):
+        raise RuntimeError(
+            "WeLM CUDA replay shape mismatch for "
+            f"{tensor_name}: source={tuple(source.shape)}, "
+            f"npu={tuple(reference.shape)}, stage={_welm_replay_stage(forward_batch)}, "
+            f"npu_pass={_WELM_REPLAY_PASS_ID}, file={source_path}. This normally "
+            "means the requests, tokenizer output, batching, or pass offset differ."
+        )
+    if source.dtype != reference.dtype:
+        raise RuntimeError(
+            "WeLM CUDA replay dtype mismatch for "
+            f"{tensor_name}: source={source.dtype}, npu={reference.dtype}, "
+            f"file={source_path}. Refusing an implicit cast because it would "
+            "invalidate the precision comparison."
+        )
+
+    result = source.to(device=reference.device).contiguous()
+    log_key = (point, _welm_replay_stage(forward_batch), layer_idx)
+    if log_key not in _WELM_REPLAY_LOGGED_KEYS:
+        _WELM_REPLAY_LOGGED_KEYS.add(log_key)
+        logger.info(
+            "WeLM CUDA activation replay enabled: point=%s stage=%s layer=%s "
+            "npu_pass=%d source=%s",
+            point,
+            _welm_replay_stage(forward_batch),
+            layer_idx,
+            _WELM_REPLAY_PASS_ID,
+            source_path,
+        )
+    return result
+
+
+def _welm_validate_replay_positions(
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+    layer_idx: int,
+) -> None:
+    """Reject a same-shape decode dump from the wrong token position/pass."""
+    if os.getenv("SGLANG_WELM_REPLAY_VALIDATE_POSITIONS", "1").lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        return
+    validation_key = (_WELM_REPLAY_PASS_ID, _welm_replay_stage(forward_batch))
+    if validation_key in _WELM_REPLAY_VALIDATED_PASSES:
+        return
+
+    tensor_name = f"model.layers.{layer_idx}.self_attn.positions"
+    source_path = _welm_replay_pass_dir() / f"{tensor_name}.pt"
+    if not source_path.is_file():
+        raise FileNotFoundError(
+            "Cannot validate WeLM replay positions because the CUDA dump is "
+            f"missing {source_path}. Set "
+            "SGLANG_WELM_REPLAY_VALIDATE_POSITIONS=0 only if pass alignment "
+            "has been verified separately."
+        )
+    try:
+        source_positions = torch.load(
+            source_path, map_location="cpu", weights_only=True
+        )
+    except TypeError:
+        source_positions = torch.load(source_path, map_location="cpu")
+    current_positions = positions.detach().to(device="cpu")
+    positions_match = (
+        isinstance(source_positions, torch.Tensor)
+        and tuple(source_positions.shape) == tuple(current_positions.shape)
+        and torch.equal(
+            source_positions.to(torch.int64), current_positions.to(torch.int64)
+        )
+    )
+    if not positions_match:
+        source_shape = (
+            tuple(source_positions.shape)
+            if isinstance(source_positions, torch.Tensor)
+            else type(source_positions).__name__
+        )
+        raise RuntimeError(
+            "WeLM CUDA replay positions do not match the current NPU batch: "
+            f"source_shape={source_shape}, npu_shape={tuple(current_positions.shape)}, "
+            f"stage={_welm_replay_stage(forward_batch)}, "
+            f"replay_step={_WELM_REPLAY_PASS_ID}, file={source_path}."
+        )
+    _WELM_REPLAY_VALIDATED_PASSES.add(validation_key)
 
 
 def hash_input_ids_vectorized(input_ids: torch.Tensor) -> torch.Tensor:
@@ -1079,9 +1328,6 @@ class Qwen2MoeAttention(nn.Module):
             compress=self.compress,
             rope_scaling=rope_scaling,
         )
-        self.rotary_emb.welm_layer_id = self.layer_idx
-        self.rotary_emb_orig.welm_layer_id = self.layer_idx
-
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -1170,6 +1416,39 @@ class Qwen2MoeAttention(nn.Module):
         else:
             qkv, _ = self.qkv_proj(hidden_states)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        replay_qkv = _WELM_REPLAY_CONFIGURED_POINT == "qkv" and _welm_should_replay(
+            "qkv", forward_batch, self.layer_idx
+        )
+        if replay_qkv:
+            _welm_validate_replay_positions(
+                positions, forward_batch, self.layer_idx
+            )
+            if dump_this_layer:
+                _welm_dump_tensor(f"{dump_prefix}.q_pre_rope_npu_before_replay", q)
+                _welm_dump_tensor(f"{dump_prefix}.k_pre_rope_npu_before_replay", k)
+                _welm_dump_tensor(f"{dump_prefix}.v_npu_before_replay", v)
+            q = _welm_load_replay_tensor(
+                f"{dump_prefix}.q_pre_rope",
+                q,
+                point="qkv",
+                forward_batch=forward_batch,
+                layer_idx=self.layer_idx,
+            )
+            k = _welm_load_replay_tensor(
+                f"{dump_prefix}.k_pre_rope",
+                k,
+                point="qkv",
+                forward_batch=forward_batch,
+                layer_idx=self.layer_idx,
+            )
+            v = _welm_load_replay_tensor(
+                f"{dump_prefix}.v",
+                v,
+                point="qkv",
+                forward_batch=forward_batch,
+                layer_idx=self.layer_idx,
+            )
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.positions", positions)
             if forward_batch.extend_seq_lens is not None:
@@ -1218,17 +1497,64 @@ class Qwen2MoeAttention(nn.Module):
                 and self.kv_mirror_layer_idx in self.kv_mirror_layers
             ):
                 q, k = self.rotary_emb(
-                    positions, q, k, last_index=forward_batch.custom_last_index
+                    positions,
+                    q,
+                    k,
+                    last_index=forward_batch.custom_last_index,
+                    layer_id=self.layer_idx,
                 )
             else:
-                q, k = self.rotary_emb(positions, q, k)
+                q, k = self.rotary_emb(
+                    positions, q, k, layer_id=self.layer_idx
+                )
             q = q.view(q_shape)
             k = k.view(k_shape)
         else:
-            q, k = self.rotary_emb(positions, q, k)
+            q, k = self.rotary_emb(positions, q, k, layer_id=self.layer_idx)
+
+        replay_attention_input = (
+            _WELM_REPLAY_CONFIGURED_POINT == "attention_input"
+            and _welm_should_replay(
+                "attention_input", forward_batch, self.layer_idx
+            )
+        )
+        if replay_attention_input:
+            _welm_validate_replay_positions(
+                positions, forward_batch, self.layer_idx
+            )
+            if dump_this_layer:
+                _welm_dump_tensor(f"{dump_prefix}.q_post_rope_npu_before_replay", q)
+                _welm_dump_tensor(f"{dump_prefix}.k_post_rope_npu_before_replay", k)
+                _welm_dump_tensor(f"{dump_prefix}.v_npu_before_replay", v)
+            q = _welm_load_replay_tensor(
+                f"{dump_prefix}.q_post_rope",
+                q,
+                point="attention_input",
+                forward_batch=forward_batch,
+                layer_idx=self.layer_idx,
+            )
+            k = _welm_load_replay_tensor(
+                f"{dump_prefix}.k_post_rope",
+                k,
+                point="attention_input",
+                forward_batch=forward_batch,
+                layer_idx=self.layer_idx,
+            )
+            v = _welm_load_replay_tensor(
+                f"{dump_prefix}.v",
+                v,
+                point="attention_input",
+                forward_batch=forward_batch,
+                layer_idx=self.layer_idx,
+            )
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.q_post_rope", q)
             _welm_dump_tensor(f"{dump_prefix}.k_post_rope", k)
+            if replay_attention_input:
+                # The regular V dump happens before RoPE.  Overwrite it here so
+                # the canonical file records the value actually consumed by
+                # attention in an attention-input replay run.
+                _welm_dump_tensor(f"{dump_prefix}.v", v)
 
         attn_kwargs = {}
         if self.attn_sink is not None:
@@ -1451,6 +1777,23 @@ class Qwen2MoeDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         dump_this_layer = _welm_should_dump_layer(self.layer_id)
+        if (
+            self.layer_id == 0
+            and _WELM_REPLAY_CONFIGURED_POINT == "embedding"
+            and _welm_should_replay("embedding", forward_batch)
+        ):
+            _welm_validate_replay_positions(positions, forward_batch, self.layer_id)
+            if dump_this_layer:
+                _welm_dump_tensor(
+                    "model.layers.0.__input__.0_npu_before_replay", hidden_states
+                )
+            hidden_states = _welm_load_replay_tensor(
+                "model.layers.0.__input__.0",
+                hidden_states,
+                point="embedding",
+                forward_batch=forward_batch,
+                layer_idx=0,
+            )
         if dump_this_layer:
             _welm_dump_tensor(f"model.layers.{self.layer_id}.__input__.0", hidden_states)
             _welm_dump_module_weights(
@@ -2070,6 +2413,7 @@ class Qwen2MoeModel(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        _welm_start_replay_pass(forward_batch)
         _welm_start_dump_pass()
         if self.pp_group.is_first_rank:
             if input_embeds is None:
@@ -2334,6 +2678,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
         start, end = split_interval
         # embed
         if start == 0:
+            _welm_start_replay_pass(forward_batch)
             _welm_start_dump_pass()
             if input_embeds is None:
                 if _welm_dump_enabled():

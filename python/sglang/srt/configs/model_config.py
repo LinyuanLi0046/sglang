@@ -48,6 +48,7 @@ MIMO_V2_MODEL_ARCHS = (
     "MiMoV2FlashForCausalLM",
 )
 MIMO_V2_MULTIMODAL_ARCHS = ("MiMoV2ForCausalLM",)
+WELMV4_MODEL_ARCHS = ("WeLMV4MoeForCausalLM",)
 
 
 def get_mimo_v2_fused_qkv_expected_tp_size(hf_config):
@@ -705,6 +706,20 @@ class ModelConfig:
             and not self.disable_hybrid_swa_memory
         )
 
+        # A WeLM checkpoint may encode a full-attention layer with a positive
+        # layerwise window equal to the runtime context limit.  Decide whether
+        # there is any real SWA layer before enabling the dual memory pool; a
+        # short runtime context can make every layer effectively full attention.
+        if self.is_hybrid_swa and any(
+            arch in WELMV4_MODEL_ARCHS for arch in self.hf_config.architectures
+        ):
+            swa_layer_ids, _ = get_hybrid_layer_ids(
+                self.hf_config.architectures,
+                self.hf_text_config,
+                context_len=self.context_len,
+            )
+            self.is_hybrid_swa = bool(swa_layer_ids)
+
         if self.is_hybrid_swa:
             logger.info(f"Hybrid swa model: {self.hf_config.architectures=}")
 
@@ -723,6 +738,7 @@ class ModelConfig:
                     get_hybrid_layer_ids(
                         self.hf_config.architectures,
                         self.hf_text_config,
+                        context_len=self.context_len,
                     )
                 )
 
@@ -2014,6 +2030,7 @@ def is_hybrid_swa_model(
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationMTP",
         "UnlimitedOCRForCausalLM",
+        *WELMV4_MODEL_ARCHS,
     }
     if any(arch in hybrid_swa_archs for arch in model_architectures):
         # Only treat Laguna as hybrid SWA when it actually has a sliding window.
@@ -2031,9 +2048,104 @@ def is_hybrid_swa_model(
     return False
 
 
+def _get_welmv4_full_window_limit(
+    hf_text_config: PretrainedConfig,
+    context_len: Optional[int],
+) -> Optional[int]:
+    """Return the smallest configured limit that makes a window effectively full."""
+
+    candidates = (
+        context_len,
+        getattr(hf_text_config, "sliding_window", None),
+        getattr(hf_text_config, "max_position_embeddings", None),
+    )
+    valid = [
+        int(value)
+        for value in candidates
+        if value is not None and int(value) > 0
+    ]
+    return min(valid) if valid else None
+
+
+def get_welmv4_layerwise_sliding_windows(
+    hf_text_config: PretrainedConfig,
+    context_len: Optional[int] = None,
+    *,
+    num_layers: Optional[int] = None,
+    layer_offset: int = 0,
+) -> List[int]:
+    """Normalize active WeLM layer windows to SGLang's left-history convention.
+
+    WeLM checkpoint values include the current token.  A positive value smaller
+    than the effective full-attention limit is a real SWA window and is returned
+    as ``raw_window - 1``.  Full-attention layers are returned as ``-1``.
+
+    ``layer_offset`` is intentionally explicit so a future NextN worker can read
+    configuration index ``target_layer_count + local_layer_id`` while retaining
+    local layer IDs for its own KV pool.  The current target model uses offset 0.
+    """
+
+    if num_layers is None:
+        num_layers = int(getattr(hf_text_config, "num_hidden_layers", 0) or 0)
+    if num_layers < 0:
+        raise ValueError("WeLMv4 num_layers must be non-negative.")
+    if layer_offset < 0:
+        raise ValueError("WeLMv4 layer_offset must be non-negative.")
+
+    raw_windows = (
+        getattr(hf_text_config, "sliding_window_size_layerwise", None) or []
+    )
+    if not raw_windows:
+        return [-1] * num_layers
+
+    required_windows = layer_offset + num_layers
+    if len(raw_windows) < required_windows:
+        raise ValueError(
+            "WeLMv4 sliding_window_size_layerwise does not cover all active "
+            f"layers: need at least {required_windows} entries for "
+            f"layer_offset={layer_offset}, num_layers={num_layers}, but got "
+            f"{len(raw_windows)}."
+        )
+
+    full_window_limit = _get_welmv4_full_window_limit(hf_text_config, context_len)
+    normalized = []
+    for config_layer_id in range(layer_offset, required_windows):
+        raw_window = raw_windows[config_layer_id]
+        if raw_window is None:
+            normalized.append(-1)
+            continue
+        try:
+            raw_window = int(raw_window)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "WeLMv4 sliding_window_size_layerwise entries must be integers "
+                f"or None, but index {config_layer_id} is {raw_window!r}."
+            ) from exc
+
+        is_swa = raw_window > 0 and (
+            full_window_limit is None or raw_window < full_window_limit
+        )
+
+        # RadixAttention currently canonicalizes a zero left-history window to
+        # full attention (``sliding_window_size or -1``).  Reject checkpoint
+        # span 1 when it is a real SWA window instead of classifying its KV
+        # ownership as SWA while the attention operator interprets it as Full.
+        if is_swa and raw_window == 1:
+            raise ValueError(
+                "WeLMv4 sliding_window_size_layerwise cannot contain 1: "
+                "SGLang cannot represent a sliding window with zero history. "
+                f"Invalid entry at index {config_layer_id}."
+            )
+
+        normalized.append(raw_window - 1 if is_swa else -1)
+
+    return normalized
+
+
 def get_hybrid_layer_ids(
     model_architectures: List[str],
     hf_text_config: PretrainedConfig,
+    context_len: Optional[int] = None,
 ):
     num_hidden_layers = hf_text_config.num_hidden_layers
     if "Llama4ForConditionalGeneration" in model_architectures:
@@ -2128,6 +2240,22 @@ def get_hybrid_layer_ids(
     elif "UnlimitedOCRForCausalLM" in model_architectures:
         swa_attention_layer_ids = list(range(num_hidden_layers))
         full_attention_layer_ids = []
+    elif any(arch in WELMV4_MODEL_ARCHS for arch in model_architectures):
+        normalized_windows = get_welmv4_layerwise_sliding_windows(
+            hf_text_config,
+            context_len=context_len,
+            num_layers=num_hidden_layers,
+        )
+        swa_attention_layer_ids = [
+            layer_id
+            for layer_id, window_left in enumerate(normalized_windows)
+            if window_left >= 0
+        ]
+        full_attention_layer_ids = [
+            layer_id
+            for layer_id, window_left in enumerate(normalized_windows)
+            if window_left < 0
+        ]
     elif getattr(hf_text_config, "hybrid_layer_pattern", None) is not None:
         # Generic fallback for custom hybrid SWA models that opt in via
         # hf_text_config.is_hybrid_swa and expose a hybrid_layer_pattern

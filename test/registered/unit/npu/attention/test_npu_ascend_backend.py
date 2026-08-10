@@ -29,6 +29,7 @@ for _ in (
     sys.modules.setdefault(_, MagicMock())
 
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
+    FULL_ATTENTION_WINDOW,
     AscendAttnBackend,
     AscendAttnMaskBuilder,
     AscendAttnMultiStepDraftBackend,
@@ -36,6 +37,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     _expand_dsa_sparse_indices,
     _reshape_kv_for_fia_nz,
 )
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
 
 class TestExpandDsaSparseIndices(unittest.TestCase):
@@ -125,8 +127,22 @@ class TestWelMLayerwiseSinkTritonRouting(unittest.TestCase):
 
     def test_welm_window_adds_current_token(self):
         self.backend.is_welm_v4 = True
-        layer = SimpleNamespace(sliding_window_size=16383)
-        self.assertEqual(self.backend._get_sink_triton_window_size(layer), 16384)
+        layer = SimpleNamespace(sliding_window_size=511)
+        self.assertEqual(self.backend._get_sink_triton_window_size(layer), 512)
+
+    def test_fia_full_window_uses_explicit_large_pre_tokens(self):
+        self.assertEqual(
+            self.backend._get_fia_pre_tokens(
+                SimpleNamespace(sliding_window_size=-1)
+            ),
+            FULL_ATTENTION_WINDOW,
+        )
+        self.assertEqual(
+            self.backend._get_fia_pre_tokens(
+                SimpleNamespace(sliding_window_size=511)
+            ),
+            511,
+        )
 
     def test_full_attention_window_stays_disabled(self):
         self.backend.is_welm_v4 = True
@@ -147,6 +163,47 @@ class TestWelMLayerwiseSinkTritonRouting(unittest.TestCase):
         self.backend.is_welm_v4 = False
         layer = SimpleNamespace(sliding_window_size=4096)
         self.assertEqual(self.backend._get_sink_triton_window_size(layer), 4096)
+
+    def test_split_pool_mapping_is_authoritative_for_swa_routing(self):
+        self.backend.is_hybrid_swa = True
+        self.backend.token_to_kv_pool = SWAKVPool.__new__(SWAKVPool)
+        self.backend.token_to_kv_pool.layers_mapping = {
+            0: (0, False),
+            1: (0, True),
+        }
+
+        # A positive marker must not route a Full-owned layer to SWA tables.
+        self.assertFalse(
+            self.backend._is_swa_layer(
+                SimpleNamespace(layer_id=0, sliding_window_size=1023)
+            )
+        )
+        self.assertTrue(
+            self.backend._is_swa_layer(
+                SimpleNamespace(layer_id=1, sliding_window_size=511)
+            )
+        )
+
+    def test_split_pool_missing_layer_mapping_fails_loudly(self):
+        self.backend.is_hybrid_swa = True
+        self.backend.token_to_kv_pool = SWAKVPool.__new__(SWAKVPool)
+        self.backend.token_to_kv_pool.layers_mapping = {}
+
+        with self.assertRaisesRegex(RuntimeError, "no layer mapping"):
+            self.backend._is_swa_layer(
+                SimpleNamespace(layer_id=7, sliding_window_size=511)
+            )
+
+    def test_non_hybrid_backend_never_uses_swa_mapping(self):
+        self.backend.is_hybrid_swa = False
+        self.backend.token_to_kv_pool = SWAKVPool.__new__(SWAKVPool)
+        self.backend.token_to_kv_pool.layers_mapping = {1: (0, True)}
+
+        self.assertFalse(
+            self.backend._is_swa_layer(
+                SimpleNamespace(layer_id=1, sliding_window_size=511)
+            )
+        )
 
 
 class TestForwardMetadata(unittest.TestCase):

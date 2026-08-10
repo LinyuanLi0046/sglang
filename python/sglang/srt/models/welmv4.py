@@ -26,6 +26,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
+from sglang.srt.configs.model_config import get_welmv4_layerwise_sliding_windows
 from sglang.srt.distributed import (
     attention_tensor_model_parallel_all_reduce,
     get_pp_group,
@@ -1207,7 +1208,7 @@ class Qwen2MoeAttention(nn.Module):
         prefix: str = "",
         kv_mirror_layers=[],
         kv_mirror_imitated_layers=[],
-        sliding_window_size_layerwise=[],
+        sliding_window_size: int = -1,
         enable_attn_sink_layerwise=[],
         layer_idx: Optional[int] = None,
         o_norm=False,
@@ -1272,18 +1273,7 @@ class Qwen2MoeAttention(nn.Module):
             self.kv_mirror_layers,
             self.kv_mirror_imitated_layers,
         )
-        if len(sliding_window_size_layerwise) > layer_idx:
-            raw_sliding_window_size = sliding_window_size_layerwise[layer_idx]
-            # HF window sizes include the current token, while SGLang
-            # attention backends take the number of tokens to the left.
-            self.sliding_window_size = (
-                raw_sliding_window_size - 1
-                if raw_sliding_window_size is not None
-                and raw_sliding_window_size > 0
-                else -1
-            )
-        else:
-            self.sliding_window_size = -1
+        self.sliding_window_size = int(sliding_window_size)
         logger.debug(
             "WeLMv4 layer %s: sliding_window_size=%s",
             layer_idx,
@@ -1801,9 +1791,12 @@ class Qwen2MoeDecoderLayer(nn.Module):
             ),
             default=None,
         )
-        self.sliding_window_size_layerwise = getattr(
-            config, "sliding_window_size_layerwise", []
-        )
+        self.sliding_window_size = get_welmv4_layerwise_sliding_windows(
+            config,
+            context_len=getattr(config, "context_len", None),
+            num_layers=1,
+            layer_offset=layer_id,
+        )[0]
         self.enable_attn_sink_layerwise = getattr(
             config, "enable_attn_sink_layerwise", []
         )
@@ -1838,7 +1831,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             kv_mirror_layers=self.kv_mirror_layers,
             kv_mirror_imitated_layers=self.kv_mirror_imitated_layers,
-            sliding_window_size_layerwise=self.sliding_window_size_layerwise,
+            sliding_window_size=self.sliding_window_size,
             enable_attn_sink_layerwise=self.enable_attn_sink_layerwise,
             layer_idx=layer_id,
             o_norm=o_norm and layer_id not in self.prenorm_layer_idx,
@@ -2786,21 +2779,20 @@ class WeLMV4MoeForCausalLM(nn.Module):
         self.capture_aux_hidden_states = False
 
     def get_attention_sliding_window_size(self) -> Optional[int]:
-        """Return the largest configured layerwise left window for metadata.
+        """Return the largest real SWA left-history window for cache metadata.
 
         A checkpoint that only has the generic ``sliding_window`` field with
         ``use_sliding_window=false`` intentionally returns ``None`` here.
-        Individual layers still carry their own normalized window values.
+        Full-attention marker values are excluded.  The current token is not
+        part of this value: eviction receives a pre-length that already excludes
+        it, while the WeLM Triton adapter adds it back to the kernel span.
         """
-        layerwise_windows = (
-            getattr(self.config, "sliding_window_size_layerwise", []) or []
+        normalized_windows = get_welmv4_layerwise_sliding_windows(
+            self.config,
+            context_len=getattr(self.config, "context_len", None),
         )
-        normalized_windows = [
-            int(window) - 1
-            for window in layerwise_windows
-            if window is not None and int(window) > 0
-        ]
-        return max(normalized_windows, default=None)
+        swa_windows = [window for window in normalized_windows if window >= 0]
+        return max(swa_windows, default=None)
 
     @torch.no_grad()
     def forward(

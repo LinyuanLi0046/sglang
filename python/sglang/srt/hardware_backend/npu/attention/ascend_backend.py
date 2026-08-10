@@ -393,9 +393,26 @@ class AscendAttnBackend(AttentionBackend):
         self.attn_cp_size = model_runner.ps.attn_cp_size
 
     def _is_swa_layer(self, layer: RadixAttention) -> bool:
+        if not self.is_hybrid_swa:
+            return False
+
+        # With a split SWA/Full pool, pool ownership is authoritative.  Using
+        # only the numerical attention window can pair a Full KV buffer with an
+        # SWA block table when a checkpoint represents full attention with a
+        # large positive marker value.
+        if isinstance(self.token_to_kv_pool, SWAKVPool):
+            mapping = self.token_to_kv_pool.layers_mapping.get(layer.layer_id)
+            if mapping is None:
+                raise RuntimeError(
+                    "Hybrid SWA KV pool has no layer mapping for attention "
+                    f"layer {layer.layer_id}."
+                )
+            return mapping[1]
+
+        # Specialized hybrid pools that do not expose layer ownership retain
+        # their existing numerical-window dispatch.
         return (
-            self.is_hybrid_swa
-            and layer.sliding_window_size is not None
+            layer.sliding_window_size is not None
             and layer.sliding_window_size > -1
         )
 
@@ -461,6 +478,16 @@ class AscendAttnBackend(AttentionBackend):
         # while sinks_attention.py subtracts this value directly from kv_len
         # and therefore expects the total visible span including the query.
         return window_left + 1 if self.is_welm_v4 else window_left
+
+    @staticmethod
+    def _get_fia_pre_tokens(layer: RadixAttention) -> int:
+        """Translate SGLang's Full sentinel to FIA's explicit large window."""
+        window_left = layer.sliding_window_size
+        return (
+            window_left
+            if window_left is not None and window_left >= 0
+            else FULL_ATTENTION_WINDOW
+        )
 
     @staticmethod
     def _can_use_tnd(layer: RadixAttention) -> bool:
@@ -2888,7 +2915,7 @@ class AscendAttnBackend(AttentionBackend):
                         block_table=block_tables,
                         actual_seq_qlen=[1] * len(self.forward_metadata.seq_lens),
                         actual_seq_kvlen=actual_seq_len_kv,
-                        pre_tokens=layer.sliding_window_size,
+                        pre_tokens=self._get_fia_pre_tokens(layer),
                         next_tokens=0,
                         learnable_sink=None if use_sink_lse else sinks,
                         return_softmax_lse=use_sink_lse,

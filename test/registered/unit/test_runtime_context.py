@@ -669,6 +669,38 @@ class TestEpBufferState(_IsolatedServerArgs):
         reset_context()
         self.assertIsNone(DeepEPBuffer._state().buffer)
 
+    def test_deepep_normal_alltoall_preserves_low_latency_strategy(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe import utils as moe_utils
+        from sglang.srt.layers.moe.token_dispatcher import deepep as deepep_module
+
+        class _FakeStrategy:
+            def __init__(self, name):
+                self.name = name
+
+        class _FakeBuffer:
+            def __init__(self):
+                self.normal_strategy = _FakeStrategy("default")
+                self.low_latency_strategy = _FakeStrategy("original-low-latency")
+
+            def _init_normal_strategy(self, strategy):
+                self.normal_strategy = _FakeStrategy(strategy)
+
+        buffer = _FakeBuffer()
+        original_low_latency_strategy = buffer.low_latency_strategy
+
+        with (
+            patch.object(deepep_module, "_is_npu", True),
+            patch.object(deepep_module, "_use_zbal", False),
+            envs.SGLANG_DEEPEP_NORMAL_USE_ALLTOALL.override(True),
+        ):
+            deepep_module.DeepEPBuffer._maybe_enable_normal_alltoall(
+                buffer, moe_utils.DeepEPMode.AUTO
+            )
+
+        self.assertEqual(buffer.normal_strategy.name, "alltoall")
+        self.assertIs(buffer.low_latency_strategy, original_low_latency_strategy)
+
 
 class TestForwardFlags(_IsolatedServerArgs):
     """ctx.forward: contextvar-backed per-forward flags; scoped() restores,

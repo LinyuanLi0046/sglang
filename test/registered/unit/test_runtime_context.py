@@ -674,32 +674,129 @@ class TestEpBufferState(_IsolatedServerArgs):
         from sglang.srt.layers.moe import utils as moe_utils
         from sglang.srt.layers.moe.token_dispatcher import deepep as deepep_module
 
+        class _FakeBackend:
+            def __init__(self, comm_name):
+                self.comm_name = comm_name
+
+            def get_hccl_comm_name(self, rank):
+                return f"{self.comm_name}-{rank}"
+
+        class _FakeGroup:
+            def __init__(self, comm_name):
+                self.backend = _FakeBackend(comm_name)
+
+            def size(self):
+                return 4
+
+            def rank(self):
+                return 1
+
+            def _get_backend(self, device):
+                return self.backend
+
         class _FakeStrategy:
-            def __init__(self, name):
+            def __init__(self, name, group):
                 self.name = name
+                self.group = group
 
         class _FakeBuffer:
-            def __init__(self):
-                self.normal_strategy = _FakeStrategy("default")
-                self.low_latency_strategy = _FakeStrategy("original-low-latency")
+            def __init__(self, group):
+                self.group = group
+                self.normal_strategy = _FakeStrategy("default", group)
+                self.low_latency_strategy = _FakeStrategy(
+                    "original-low-latency", group
+                )
 
             def _init_normal_strategy(self, strategy):
-                self.normal_strategy = _FakeStrategy(strategy)
+                self.normal_strategy = _FakeStrategy(strategy, self.group)
 
-        buffer = _FakeBuffer()
+        low_latency_group = _FakeGroup("low-latency")
+        normal_alltoall_group = _FakeGroup("normal-alltoall")
+        buffer = _FakeBuffer(low_latency_group)
         original_low_latency_strategy = buffer.low_latency_strategy
 
         with (
             patch.object(deepep_module, "_is_npu", True),
             patch.object(deepep_module, "_use_zbal", False),
+            patch.dict(os.environ, {"DEEP_USE_MODE": "default"}),
             envs.SGLANG_DEEPEP_NORMAL_USE_ALLTOALL.override(True),
         ):
             deepep_module.DeepEPBuffer._maybe_enable_normal_alltoall(
-                buffer, moe_utils.DeepEPMode.AUTO
+                buffer,
+                moe_utils.DeepEPMode.AUTO,
+                normal_alltoall_group,
             )
 
         self.assertEqual(buffer.normal_strategy.name, "alltoall")
+        self.assertIs(buffer.group, low_latency_group)
+        self.assertIs(buffer.normal_strategy.group, normal_alltoall_group)
         self.assertIs(buffer.low_latency_strategy, original_low_latency_strategy)
+        self.assertIs(buffer.low_latency_strategy.group, low_latency_group)
+
+    def test_deepep_normal_alltoall_rejects_shared_group(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe import utils as moe_utils
+        from sglang.srt.layers.moe.token_dispatcher import deepep as deepep_module
+
+        class _FakeGroup:
+            def size(self):
+                return 4
+
+            def rank(self):
+                return 1
+
+        class _FakeStrategy:
+            def __init__(self, group):
+                self.group = group
+
+        class _FakeBuffer:
+            def __init__(self, group):
+                self.group = group
+                self.normal_strategy = _FakeStrategy(group)
+                self.low_latency_strategy = _FakeStrategy(group)
+
+            def _init_normal_strategy(self, strategy):
+                self.normal_strategy = _FakeStrategy(self.group)
+
+        group = _FakeGroup()
+        buffer = _FakeBuffer(group)
+        with (
+            patch.object(deepep_module, "_is_npu", True),
+            patch.object(deepep_module, "_use_zbal", False),
+            patch.dict(os.environ, {"DEEP_USE_MODE": "default"}),
+            envs.SGLANG_DEEPEP_NORMAL_USE_ALLTOALL.override(True),
+            self.assertRaisesRegex(RuntimeError, "must not share"),
+        ):
+            deepep_module.DeepEPBuffer._maybe_enable_normal_alltoall(
+                buffer, moe_utils.DeepEPMode.AUTO, group
+            )
+
+    def test_deepep_normal_alltoall_rejects_global_alltoall_mode(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe import utils as moe_utils
+        from sglang.srt.layers.moe.token_dispatcher import deepep as deepep_module
+
+        class _FakeGroup:
+            def size(self):
+                return 4
+
+            def rank(self):
+                return 1
+
+        class _FakeBuffer:
+            def __init__(self):
+                self.group = _FakeGroup()
+
+        with (
+            patch.object(deepep_module, "_is_npu", True),
+            patch.object(deepep_module, "_use_zbal", False),
+            patch.dict(os.environ, {"DEEP_USE_MODE": "alltoall"}),
+            envs.SGLANG_DEEPEP_NORMAL_USE_ALLTOALL.override(True),
+            self.assertRaisesRegex(RuntimeError, "must not be combined"),
+        ):
+            deepep_module.DeepEPBuffer._maybe_enable_normal_alltoall(
+                _FakeBuffer(), moe_utils.DeepEPMode.AUTO, _FakeGroup()
+            )
 
 
 class TestForwardFlags(_IsolatedServerArgs):

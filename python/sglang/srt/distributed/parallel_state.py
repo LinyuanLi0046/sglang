@@ -1906,6 +1906,7 @@ def get_dcp_group() -> GroupCoordinator:
 
 _MOE_DP: Optional[GroupCoordinator] = None
 _MOE_EP: Optional[GroupCoordinator] = None
+_MOE_EP_NORMAL_A2A: Optional[GroupCoordinator] = None
 _MOE_TP: Optional[GroupCoordinator] = None
 
 
@@ -1917,6 +1918,13 @@ def get_moe_dp_group() -> GroupCoordinator:
 def get_moe_ep_group() -> GroupCoordinator:
     assert _MOE_EP is not None, "expert model parallel group is not initialized"
     return _MOE_EP
+
+
+def get_moe_ep_normal_a2a_group() -> GroupCoordinator:
+    assert _MOE_EP_NORMAL_A2A is not None, (
+        "DeepEP normal alltoall group is not initialized"
+    )
+    return _MOE_EP_NORMAL_A2A
 
 
 def get_moe_tp_group() -> GroupCoordinator:
@@ -2453,7 +2461,7 @@ def initialize_model_parallel(
     if moe_ep_size == tensor_model_parallel_size and not _is_npu:
         _MOE_EP = _TP
     else:
-        group_ranks = []
+        moe_ep_group_ranks = []
         for tp_group_idx in range(num_tensor_model_parallel_groups):
             for moe_dp_idx in range(moe_dp_size):
                 for moe_tp_idx in range(moe_tp_size):
@@ -2464,14 +2472,36 @@ def initialize_model_parallel(
                     )
                     en = st + moe_ep_size * moe_tp_size
                     ranks = list(range(st, en, moe_tp_size))
-                    group_ranks.append(ranks)
+                    moe_ep_group_ranks.append(ranks)
         _MOE_EP = init_model_parallel_group(
-            group_ranks,
+            moe_ep_group_ranks,
             get_world_group().local_rank,
             backend,
             use_pynccl=False,
             use_custom_allreduce=False,
             group_name="moe_ep",
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
+        )
+
+    # DeepEP's NPU normal-alltoall path and its low-latency runtime issue
+    # different collective sequences. They therefore need distinct HCCL
+    # communicators even though their EP rank membership is identical. Create
+    # the duplicate group here, where every world rank enters new_group in a
+    # deterministic order, rather than lazily during the first model forward.
+    global _MOE_EP_NORMAL_A2A
+    assert _MOE_EP_NORMAL_A2A is None, (
+        "DeepEP normal alltoall group is already initialized"
+    )
+    if _is_npu and envs.SGLANG_DEEPEP_NORMAL_USE_ALLTOALL.get():
+        _MOE_EP_NORMAL_A2A = init_model_parallel_group(
+            moe_ep_group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_pynccl=False,
+            use_custom_allreduce=False,
+            group_name="moe_ep_normal_a2a",
             recovered_rank=recovered_rank,
             rank_offset=rank_offset,
             max_world_size=max_world_size,
@@ -2766,6 +2796,11 @@ def destroy_model_parallel():
     if _DCP:
         _DCP.destroy()
     _DCP = None
+
+    global _MOE_EP_NORMAL_A2A
+    if _MOE_EP_NORMAL_A2A:
+        _MOE_EP_NORMAL_A2A.destroy()
+    _MOE_EP_NORMAL_A2A = None
 
     global _MOE_EP
     if _MOE_EP:

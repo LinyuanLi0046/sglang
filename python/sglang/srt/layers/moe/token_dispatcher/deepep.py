@@ -182,39 +182,6 @@ class DeepEPBuffer:
             buffers["deepep_ep_state"] = state
         return state
 
-    @staticmethod
-    def _maybe_enable_normal_alltoall(buffer, deepep_mode: DeepEPMode):
-        if (
-            not envs.SGLANG_DEEPEP_NORMAL_USE_ALLTOALL.get()
-            or not deepep_mode.enable_normal()
-        ):
-            return
-
-        if not _is_npu:
-            raise RuntimeError(
-                "SGLANG_DEEPEP_NORMAL_USE_ALLTOALL is only supported on NPU"
-            )
-        if _use_zbal:
-            raise RuntimeError(
-                "SGLANG_DEEPEP_NORMAL_USE_ALLTOALL requires the DeepEP Buffer; "
-                "disable ZBAL first"
-            )
-
-        init_normal_strategy = getattr(buffer, "_init_normal_strategy", None)
-        if init_normal_strategy is None:
-            raise RuntimeError(
-                "The installed deep_ep package does not support the normal "
-                "alltoall strategy"
-            )
-
-        # Only replace the normal strategy. The low-latency strategy selected by
-        # DeepEP remains untouched.
-        init_normal_strategy("alltoall")
-        logger.info(
-            "Enabled DeepEP alltoall strategy for normal mode; "
-            "low-latency strategy is unchanged"
-        )
-
     @classmethod
     def get_deepep_buffer(
         cls,
@@ -314,10 +281,8 @@ class DeepEPBuffer:
         if not is_cu12 and use_mnnvl_fabric:
             buffer_kwargs["use_fabric"] = True
 
-        buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
-        cls._maybe_enable_normal_alltoall(buffer, deepep_mode)
-        state.buffer = buffer
-        return buffer
+        state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
+        return state.buffer
 
     @classmethod
     def clean_buffer(cls):

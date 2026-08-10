@@ -6,7 +6,7 @@ import sys
 import unittest
 from dataclasses import fields, is_dataclass
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -115,6 +115,7 @@ class TestReshapeKvForFiaNz(unittest.TestCase):
 class TestWelMLayerwiseSinkTritonRouting(unittest.TestCase):
     def setUp(self):
         self.backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        self.backend.enable_welm_fia_sink_lse = False
 
     def test_welm_sink_tensor_uses_triton(self):
         self.backend.is_welm_v4 = True
@@ -205,6 +206,156 @@ class TestWelMLayerwiseSinkTritonRouting(unittest.TestCase):
             )
         )
 
+    def test_only_full_welm_sink_layers_use_dedicated_kernel(self):
+        self.backend.is_welm_v4 = True
+        self.backend.is_hybrid_swa = True
+        self.backend.token_to_kv_pool = SWAKVPool.__new__(SWAKVPool)
+        self.backend.token_to_kv_pool.layers_mapping = {
+            0: (0, False),
+            1: (0, True),
+        }
+
+        sinks = torch.ones(6)
+        self.assertTrue(
+            self.backend._is_welm_full_sink_layer(
+                SimpleNamespace(layer_id=0, sliding_window_size=-1), sinks
+            )
+        )
+        self.assertFalse(
+            self.backend._is_welm_full_sink_layer(
+                SimpleNamespace(layer_id=1, sliding_window_size=511), sinks
+            )
+        )
+        self.assertFalse(
+            self.backend._is_welm_full_sink_layer(
+                SimpleNamespace(layer_id=0, sliding_window_size=-1), None
+            )
+        )
+
+    def test_other_model_does_not_use_dedicated_full_sink_kernel(self):
+        self.backend.is_welm_v4 = False
+        self.backend.is_hybrid_swa = False
+        self.assertFalse(
+            self.backend._is_welm_full_sink_layer(
+                SimpleNamespace(layer_id=0, sliding_window_size=-1), torch.ones(6)
+            )
+        )
+
+    def test_swa_semantics_stay_windowed_without_hybrid_pool(self):
+        self.backend.is_welm_v4 = True
+        self.backend.is_hybrid_swa = False
+        self.assertFalse(
+            self.backend._is_welm_full_sink_layer(
+                SimpleNamespace(layer_id=1, sliding_window_size=511), torch.ones(6)
+            )
+        )
+
+    def test_full_sink_cache_view_is_zero_copy_head_major(self):
+        cache = torch.arange(2 * 4 * 3 * 5).reshape(2 * 4, 3, 5)
+        result = self.backend._view_welm_full_sink_kv_cache(
+            cache, page_size=4, num_heads=3, head_dim=5
+        )
+
+        self.assertEqual(result.shape, (2, 3, 4, 5))
+        self.assertEqual(result.data_ptr(), cache.data_ptr())
+        self.assertTrue(torch.equal(result[1, 2, 3], cache[7, 2]))
+
+    def test_full_sink_prefill_ignores_attention_dp_padding(self):
+        self.backend.page_size = 2
+        self.backend.forward_metadata = ForwardMetadata(
+            extend_seq_lens_cpu_int=torch.tensor([2, 1], dtype=torch.int32),
+            seq_lens_cpu_int=torch.tensor([2, 1], dtype=torch.int32),
+            seq_lens=torch.tensor([2, 1], dtype=torch.int32),
+            full_sink_prefill_cu_q_lens=torch.tensor([0, 2, 3], dtype=torch.int32),
+            full_sink_prefill_schedule=(
+                torch.tensor([0], dtype=torch.int32),
+                torch.tensor([0], dtype=torch.int32),
+                torch.tensor([0], dtype=torch.int32),
+                torch.tensor([0, 1], dtype=torch.int32),
+            ),
+            full_sink_prefill_schedule_key=(4, 2, 2, False),
+        )
+        layer = SimpleNamespace(
+            tp_q_head_num=4,
+            tp_k_head_num=2,
+            tp_v_head_num=2,
+            qk_head_dim=2,
+            v_head_dim=2,
+            scaling=0.5,
+        )
+        q = torch.randn(4, 8)
+        k_cache = torch.randn(4, 2, 2)
+        v_cache = torch.randn(4, 2, 2)
+        block_tables = torch.tensor([[0], [1]], dtype=torch.int32)
+        fake_prefill = MagicMock(side_effect=lambda **kwargs: torch.ones_like(kwargs["q"]))
+
+        with patch(
+            "sglang.srt.hardware_backend.npu.attention.ascend_backend."
+            "_load_welm_full_sink_attention_ops",
+            return_value=(None, fake_prefill, None),
+        ):
+            output = self.backend._forward_welm_full_sink_prefill(
+                q,
+                k_cache,
+                v_cache,
+                layer,
+                SimpleNamespace(),
+                block_tables,
+                torch.ones(4),
+            )
+
+        self.assertEqual(output.shape, (4, 8))
+        self.assertTrue(torch.equal(output[:3], torch.ones_like(output[:3])))
+        self.assertTrue(torch.equal(output[3], torch.zeros_like(output[3])))
+        call = fake_prefill.call_args.kwargs
+        self.assertEqual(call["q"].shape, (3, 4, 2))
+        self.assertEqual(call["key_cache"].shape, (2, 2, 2, 2))
+
+    def test_full_sink_decode_ignores_attention_dp_padding(self):
+        self.backend.page_size = 2
+        self.backend.graph_mode = False
+        self.backend.max_context_len = 32
+        self.backend.forward_metadata = ForwardMetadata(
+            seq_lens_cpu_int=torch.tensor([3, 4], dtype=torch.int32)
+        )
+        layer = SimpleNamespace(
+            tp_q_head_num=4,
+            tp_k_head_num=2,
+            tp_v_head_num=2,
+            qk_head_dim=2,
+            v_head_dim=2,
+            scaling=0.5,
+        )
+        q = torch.randn(3, 8)
+        k_cache = torch.randn(4, 2, 2)
+        v_cache = torch.randn(4, 2, 2)
+        seq_lens = torch.tensor([3, 4], dtype=torch.int32)
+        block_tables = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32)
+        fake_decode = MagicMock(side_effect=lambda **kwargs: torch.ones_like(kwargs["q"]))
+
+        with patch(
+            "sglang.srt.hardware_backend.npu.attention.ascend_backend."
+            "_load_welm_full_sink_attention_ops",
+            return_value=(None, None, fake_decode),
+        ):
+            output = self.backend._forward_welm_full_sink_decode(
+                q,
+                k_cache,
+                v_cache,
+                layer,
+                block_tables,
+                seq_lens,
+                torch.ones(4),
+            )
+
+        self.assertEqual(output.shape, (3, 8))
+        self.assertTrue(torch.equal(output[:2], torch.ones_like(output[:2])))
+        self.assertTrue(torch.equal(output[2], torch.zeros_like(output[2])))
+        call = fake_decode.call_args.kwargs
+        self.assertEqual(call["q"].shape, (2, 4, 2))
+        self.assertEqual(call["key_cache"].shape, (2, 2, 2, 2))
+        self.assertEqual(call["max_kv_len_hint"], 4)
+
 
 class TestForwardMetadata(unittest.TestCase):
     def test_is_dataclass(self):
@@ -253,6 +404,9 @@ class TestForwardMetadata(unittest.TestCase):
             "swa_mask",
             "prefix_lens",
             "flatten_prefix_block_tables",
+            "full_sink_prefill_cu_q_lens",
+            "full_sink_prefill_schedule",
+            "full_sink_prefill_schedule_key",
         }
         self.assertEqual(names, expected)
 

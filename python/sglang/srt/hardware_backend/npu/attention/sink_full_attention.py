@@ -28,6 +28,20 @@ def _tensor_to_cpu_list(tensor: torch.Tensor) -> List[int]:
     return [int(x) for x in tensor.detach().cpu().tolist()]
 
 
+def _get_prefill_tile_sizes(head_dim: int, page_size: int) -> Tuple[int, int, int]:
+    """Choose prefill tiles that fit Ascend 950 UB for wide attention heads."""
+    if head_dim >= 256:
+        # The original 128x128 tile makes the compiler keep several MxD and
+        # MxN fp32 intermediates whose combined size exceeds the 248-KiB UB.
+        query_tile = 32
+        kv_tile = 64
+    else:
+        query_tile = 128
+        kv_tile = 128
+    block_size_n = min(kv_tile, triton.next_power_of_2(page_size))
+    return query_tile, kv_tile, block_size_n
+
+
 def _build_lpt_task_schedule(
         cu_q_lens: torch.Tensor,
         seqlens_kv: Optional[torch.Tensor],
@@ -604,13 +618,13 @@ def paged_attention_prefill_prepare(
     seqlens_kv,
     num_q_heads,
     num_kv_heads,
+    head_dim,
     gqa_interleave,
     page_size,
     device=None,
 ):
     cube_num = get_num_cores("cube")
-    CHUNK_SIZE = 128
-    BLOCK_SIZE_N = min(128, triton.next_power_of_2(page_size))
+    CHUNK_SIZE, _, BLOCK_SIZE_N = _get_prefill_tile_sizes(head_dim, page_size)
 
     task_b, task_q_block, task_q_head, core_task_offsets = _build_lpt_task_schedule(
         cu_q_lens,
@@ -676,12 +690,31 @@ def paged_attention_prefill_impl(
     o = torch.empty_like(q)
     block_tables_i32 = block_tables.to(dtype=torch.int32).contiguous()
 
-    CHUNK_SIZE = 128
-    BLOCK_SIZE_N = min(128, triton.next_power_of_2(page_size))
+    CHUNK_SIZE, KV_TILE_SIZE, BLOCK_SIZE_N = _get_prefill_tile_sizes(
+        head_dim, page_size
+    )
     cube_num = get_num_cores("cube")
     grid = (cube_num,)
+    wide_head = head_dim >= 256
+    if wide_head:
+        prefill_compile_options = {
+            "hfusion_enable_multiple_consumer_fusion": False,
+            "intra_cache_num": 1,
+            "inter_cache_num": 1,
+            "enable_buffer_insert_optimization": False,
+            "enable_ub_refine_opt": True,
+        }
+    else:
+        prefill_compile_options = {
+            "limit_auto_multi_buffer_buffer": "no-limit",
+            "hfusion_enable_multiple_consumer_fusion": True,
+            "intra_cache_num": 3,
+            "inter_cache_num": 2,
+            "enable_buffer_insert_optimization": True,
+            "enable_ub_refine_opt": True,
+        }
 
-    if not (page_size < 128 and 128 % page_size == 0):
+    if not (page_size < KV_TILE_SIZE and KV_TILE_SIZE % page_size == 0):
         paged_prefill_kernel[grid](
             q,
             key_cache,
@@ -726,15 +759,10 @@ def paged_attention_prefill_impl(
             BLOCK_SIZE_N=BLOCK_SIZE_N,
             BLOCK_SIZE_D=head_dim,
             SINK_ENABLED=sink_enabled,
-            limit_auto_multi_buffer_buffer="no-limit",
-            hfusion_enable_multiple_consumer_fusion=True,
-            intra_cache_num=3,
-            inter_cache_num=2,
-            enable_buffer_insert_optimization=True,
-            enable_ub_refine_opt=True,
+            **prefill_compile_options,
         )
     else:
-        PAGE_AGGREGATION_NUM = 128 // page_size
+        PAGE_AGGREGATION_NUM = KV_TILE_SIZE // page_size
         paged_prefill_page_aggregation_kernel[grid](
             q,
             key_cache,
@@ -781,9 +809,9 @@ def paged_attention_prefill_impl(
             BLOCK_SIZE_D=head_dim,
             PAGE_AGGREGATION_NUM=PAGE_AGGREGATION_NUM,
             SINK_ENABLED=sink_enabled,
-            enable_dynamic_cv_pipeline=True,
-            enable_cube_block_merge=True,
-            enable_buffer_insert_optimization=True,
+            enable_dynamic_cv_pipeline=not wide_head,
+            enable_cube_block_merge=not wide_head,
+            enable_buffer_insert_optimization=not wide_head,
             enable_ub_refine_opt=True,
         )
 

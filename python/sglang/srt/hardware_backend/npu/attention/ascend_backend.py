@@ -63,6 +63,16 @@ def _load_welm_full_sink_attention_ops():
     )
 
 
+def _load_welm_swa_sink_attention_ops():
+    """Load the dedicated paged SWA+Sink Triton wrappers lazily."""
+    from sglang.srt.hardware_backend.npu.attention.sink_full_attention import (
+        swa_paged_decode_impl,
+        swa_paged_prefill_impl,
+    )
+
+    return swa_paged_prefill_impl, swa_paged_decode_impl
+
+
 def _is_dflash_verify(spec_info: Optional[SpecInput]) -> bool:
     return (
         spec_info is not None
@@ -113,9 +123,9 @@ class ForwardMetadata:
     prefix_lens: Optional[torch.Tensor] = None
     flatten_prefix_block_tables: Optional[torch.Tensor] = None
 
-    # Per-forward LPT schedule for the dedicated WeLM Full+Sink prefill kernel.
-    # Full layers share the same flattened request layout, so this is built once
-    # and reused by every Full layer in the batch.
+    # Per-forward cumulative Q lengths and LPT schedule for the dedicated WeLM
+    # sink prefill kernels. SWA+Sink reuses the cumulative lengths, while Full
+    # layers additionally share the LPT schedule.
     full_sink_prefill_cu_q_lens: Optional[torch.Tensor] = None
     full_sink_prefill_schedule: Optional[tuple] = None
     full_sink_prefill_schedule_key: Optional[tuple] = None
@@ -528,6 +538,25 @@ class AscendAttnBackend(AttentionBackend):
             and not self._has_layerwise_sliding_window(layer)
         )
 
+    def _is_welm_swa_sink_layer(
+        self, layer: RadixAttention, sinks: Optional[torch.Tensor]
+    ) -> bool:
+        """Whether this call should use the dedicated paged SWA+Sink kernel."""
+        return self._use_welm_sink_triton(
+            sinks
+        ) and self._has_layerwise_sliding_window(layer)
+
+    @staticmethod
+    def _get_welm_swa_sink_local_window_size(layer: RadixAttention) -> int:
+        """Return the SWA kernel's left-token count without Full-path +1."""
+        window_left = layer.sliding_window_size
+        if window_left is None or window_left < 0:
+            raise RuntimeError(
+                "The dedicated WeLM SWA+Sink kernel requires a non-negative "
+                "left sliding-window size."
+            )
+        return window_left
+
     @staticmethod
     def _view_welm_full_sink_kv_cache(
         cache: torch.Tensor,
@@ -535,8 +564,35 @@ class AscendAttnBackend(AttentionBackend):
         num_heads: int,
         head_dim: int,
     ) -> torch.Tensor:
-        """Expose the cache as [page, head, page_size, dim] without copying."""
+        """Expose cache for the dedicated sink kernels without copying."""
         return cache.view(-1, page_size, num_heads, head_dim).permute(0, 2, 1, 3)
+
+    def _get_welm_sink_prefill_cu_q_lens(
+        self, q: torch.Tensor
+    ) -> torch.Tensor:
+        """Build cumulative real-query lengths once per forward batch."""
+        metadata = self.forward_metadata
+        extend_lens_cpu = metadata.extend_seq_lens_cpu_int
+        if extend_lens_cpu is None:
+            raise RuntimeError(
+                "WeLM sink prefill requires CPU extend sequence lengths."
+            )
+        cu_q_lens = metadata.full_sink_prefill_cu_q_lens
+        if cu_q_lens is None:
+            extend_lens_cpu = extend_lens_cpu.to(dtype=torch.int32, device="cpu")
+            cu_q_lens_cpu = torch.nn.functional.pad(
+                torch.cumsum(extend_lens_cpu, dim=0, dtype=torch.int32), (1, 0)
+            )
+            cu_q_lens = cu_q_lens_cpu.to(device=q.device, non_blocking=True)
+            metadata.full_sink_prefill_cu_q_lens = cu_q_lens
+
+        real_q_tokens = int(extend_lens_cpu.sum().item())
+        if q.shape[0] < real_q_tokens:
+            raise RuntimeError(
+                "WeLM sink prefill query buffer is shorter than the real token "
+                f"count: q={q.shape[0]}, real={real_q_tokens}."
+            )
+        return cu_q_lens
 
     def _get_welm_full_sink_prefill_mask(self, device: torch.device) -> torch.Tensor:
         mask = getattr(self, "_welm_full_sink_prefill_mask", None)
@@ -687,6 +743,77 @@ class AscendAttnBackend(AttentionBackend):
             )
         return output.reshape(output.shape[0], -1)
 
+    def _forward_welm_swa_sink_prefill(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        layer: RadixAttention,
+        block_tables: torch.Tensor,
+        sinks: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run WeLM paged causal SWA with a per-query-head sink logit."""
+        prefill, _ = _load_welm_swa_sink_attention_ops()
+        q_3d = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
+        k_cache_4d = self._view_welm_full_sink_kv_cache(
+            k_cache, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+        )
+        v_cache_4d = self._view_welm_full_sink_kv_cache(
+            v_cache, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+        )
+        if k_cache_4d.shape != v_cache_4d.shape:
+            raise RuntimeError(
+                "The dedicated WeLM SWA+Sink kernel requires matching K/V "
+                f"cache shapes, got K={tuple(k_cache_4d.shape)}, "
+                f"V={tuple(v_cache_4d.shape)}."
+            )
+
+        cu_q_lens = self._get_welm_sink_prefill_cu_q_lens(q_3d)
+        batch_size = cu_q_lens.shape[0] - 1
+        if block_tables.shape[0] != batch_size:
+            raise RuntimeError(
+                "The dedicated WeLM SWA+Sink prefill kernel requires one "
+                f"block table per request, got tables={block_tables.shape[0]}, "
+                f"requests={batch_size}."
+            )
+
+        real_q_tokens = int(
+            self.forward_metadata.extend_seq_lens_cpu_int.sum().item()
+        )
+        if real_q_tokens == 0:
+            return q.new_zeros(
+                (q_3d.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+            )
+
+        output = prefill(
+            # Attention-DP padding rows are not represented by cu_q_lens.
+            q=q_3d[:real_q_tokens],
+            k_cache=k_cache_4d,
+            v_cache=v_cache_4d,
+            cu_q_lens=cu_q_lens,
+            kvlens=self.forward_metadata.seq_lens,
+            block_table=block_tables,
+            is_causal=True,
+            local_window_size=self._get_welm_swa_sink_local_window_size(layer),
+            global_window_size=0,
+            softmax_scale=layer.scaling,
+            gqa_interleave=False,
+            sinks=sinks,
+        )
+        if real_q_tokens != q_3d.shape[0]:
+            output = torch.cat(
+                [
+                    output,
+                    output.new_zeros(
+                        q_3d.shape[0] - real_q_tokens,
+                        layer.tp_q_head_num,
+                        layer.v_head_dim,
+                    ),
+                ],
+                dim=0,
+            )
+        return output.reshape(output.shape[0], -1)
+
     def _forward_welm_full_sink_decode(
         self,
         q: torch.Tensor,
@@ -746,6 +873,72 @@ class AscendAttnBackend(AttentionBackend):
             softmax_scale=layer.scaling,
             sinks=sinks,
             max_kv_len_hint=max_kv_len_hint,
+        )
+        if actual_batch_size != q_3d.shape[0]:
+            output = torch.cat(
+                [
+                    output,
+                    output.new_zeros(
+                        q_3d.shape[0] - actual_batch_size,
+                        layer.tp_q_head_num,
+                        layer.v_head_dim,
+                    ),
+                ],
+                dim=0,
+            )
+        return output.reshape(output.shape[0], -1)
+
+    def _forward_welm_swa_sink_decode(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        layer: RadixAttention,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        sinks: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run one-query paged SWA+Sink for eager, graph, or KV mirror."""
+        _, decode = _load_welm_swa_sink_attention_ops()
+        q_3d = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
+        actual_batch_size = seq_lens.shape[0]
+        if block_tables.shape[0] != actual_batch_size:
+            raise RuntimeError(
+                "The dedicated WeLM SWA+Sink decode kernel requires one block "
+                "table per request, got "
+                f"tables={block_tables.shape[0]}, requests={actual_batch_size}."
+            )
+        if q_3d.shape[0] < actual_batch_size:
+            raise RuntimeError(
+                "The dedicated WeLM SWA+Sink decode query buffer is shorter "
+                f"than the request batch: q={q_3d.shape[0]}, "
+                f"requests={actual_batch_size}."
+            )
+
+        k_cache_4d = self._view_welm_full_sink_kv_cache(
+            k_cache, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+        )
+        v_cache_4d = self._view_welm_full_sink_kv_cache(
+            v_cache, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+        )
+        if k_cache_4d.shape != v_cache_4d.shape:
+            raise RuntimeError(
+                "The dedicated WeLM SWA+Sink kernel requires matching K/V "
+                f"cache shapes, got K={tuple(k_cache_4d.shape)}, "
+                f"V={tuple(v_cache_4d.shape)}."
+            )
+
+        output = decode(
+            q=q_3d[:actual_batch_size],
+            key_cache=k_cache_4d,
+            value_cache=v_cache_4d,
+            seqlens=seq_lens,
+            block_tables=block_tables,
+            local_window_size=self._get_welm_swa_sink_local_window_size(layer),
+            global_window_size=0,
+            gqa_interleave=False,
+            softmax_scale=layer.scaling,
+            sinks=sinks,
         )
         if actual_batch_size != q_3d.shape[0]:
             output = torch.cat(
@@ -1551,6 +1744,16 @@ class AscendAttnBackend(AttentionBackend):
                     seq_lens=self.forward_metadata.seq_lens[:num_queries],
                     sinks=sinks,
                 )
+            if self._is_welm_swa_sink_layer(layer, sinks):
+                return self._forward_welm_swa_sink_decode(
+                    q=q,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    layer=layer,
+                    block_tables=block_tables,
+                    seq_lens=self.forward_metadata.seq_lens[:num_queries],
+                    sinks=sinks,
+                )
             q = q.contiguous()
             k_cache = k_cache.view(
                 -1,
@@ -1918,6 +2121,15 @@ class AscendAttnBackend(AttentionBackend):
                             v_cache=v_cache,
                             layer=layer,
                             forward_batch=forward_batch,
+                            block_tables=block_tables,
+                            sinks=sinks,
+                        )
+                    if self._is_welm_swa_sink_layer(layer, sinks) and not is_cp_mode:
+                        return self._forward_welm_swa_sink_prefill(
+                            q=q,
+                            k_cache=k_cache,
+                            v_cache=v_cache,
+                            layer=layer,
                             block_tables=block_tables,
                             sinks=sinks,
                         )
@@ -2923,6 +3135,16 @@ class AscendAttnBackend(AttentionBackend):
                         seq_lens=self.forward_metadata.seq_lens,
                         sinks=sinks,
                     )
+                if self._is_welm_swa_sink_layer(layer, sinks):
+                    return self._forward_welm_swa_sink_decode(
+                        q=q,
+                        k_cache=k_cache,
+                        v_cache=v_cache,
+                        layer=layer,
+                        block_tables=block_tables,
+                        seq_lens=self.forward_metadata.seq_lens,
+                        sinks=sinks,
+                    )
                 q = q.contiguous()
                 k_cache = k_cache.view(
                     -1,
@@ -3230,6 +3452,16 @@ class AscendAttnBackend(AttentionBackend):
                 else:
                     if self._is_welm_full_sink_layer(layer, sinks):
                         return self._forward_welm_full_sink_decode(
+                            q=q,
+                            k_cache=k_cache,
+                            v_cache=v_cache,
+                            layer=layer,
+                            block_tables=block_tables,
+                            seq_lens=self.forward_metadata.seq_lens,
+                            sinks=sinks,
+                        )
+                    if self._is_welm_swa_sink_layer(layer, sinks):
+                        return self._forward_welm_swa_sink_decode(
                             q=q,
                             k_cache=k_cache,
                             v_cache=v_cache,

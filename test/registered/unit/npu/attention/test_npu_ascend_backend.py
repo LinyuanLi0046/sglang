@@ -232,6 +232,38 @@ class TestWelMLayerwiseSinkTritonRouting(unittest.TestCase):
             )
         )
 
+    def test_only_windowed_welm_sink_layers_use_dedicated_swa_kernel(self):
+        self.backend.is_welm_v4 = True
+        sinks = torch.ones(6)
+
+        self.assertTrue(
+            self.backend._is_welm_swa_sink_layer(
+                SimpleNamespace(sliding_window_size=511), sinks
+            )
+        )
+        self.assertFalse(
+            self.backend._is_welm_swa_sink_layer(
+                SimpleNamespace(sliding_window_size=-1), sinks
+            )
+        )
+        self.assertFalse(
+            self.backend._is_welm_swa_sink_layer(
+                SimpleNamespace(sliding_window_size=511), None
+            )
+        )
+
+    def test_swa_sink_kernel_uses_left_token_count_without_plus_one(self):
+        self.assertEqual(
+            self.backend._get_welm_swa_sink_local_window_size(
+                SimpleNamespace(sliding_window_size=511)
+            ),
+            511,
+        )
+        with self.assertRaisesRegex(RuntimeError, "non-negative"):
+            self.backend._get_welm_swa_sink_local_window_size(
+                SimpleNamespace(sliding_window_size=-1)
+            )
+
     def test_other_model_does_not_use_dedicated_full_sink_kernel(self):
         self.backend.is_welm_v4 = False
         self.backend.is_hybrid_swa = False
@@ -355,6 +387,102 @@ class TestWelMLayerwiseSinkTritonRouting(unittest.TestCase):
         self.assertEqual(call["q"].shape, (2, 4, 2))
         self.assertEqual(call["key_cache"].shape, (2, 2, 2, 2))
         self.assertEqual(call["max_kv_len_hint"], 4)
+
+    def test_swa_sink_prefill_uses_paged_head_major_cache_and_left_window(self):
+        self.backend.page_size = 2
+        self.backend.forward_metadata = ForwardMetadata(
+            extend_seq_lens_cpu_int=torch.tensor([2, 1], dtype=torch.int32),
+            seq_lens=torch.tensor([2, 1], dtype=torch.int32),
+        )
+        layer = SimpleNamespace(
+            sliding_window_size=511,
+            tp_q_head_num=4,
+            tp_k_head_num=2,
+            tp_v_head_num=2,
+            qk_head_dim=2,
+            v_head_dim=2,
+            scaling=0.5,
+        )
+        q = torch.randn(4, 8, dtype=torch.float16)
+        k_cache = torch.randn(4, 2, 2, dtype=torch.float16)
+        v_cache = torch.randn(4, 2, 2, dtype=torch.float16)
+        block_tables = torch.tensor([[0], [1]], dtype=torch.int32)
+        sinks = torch.ones(4, dtype=torch.float32)
+        fake_prefill = MagicMock(side_effect=lambda **kwargs: torch.ones_like(kwargs["q"]))
+
+        with patch(
+            "sglang.srt.hardware_backend.npu.attention.ascend_backend."
+            "_load_welm_swa_sink_attention_ops",
+            return_value=(fake_prefill, None),
+        ):
+            output = self.backend._forward_welm_swa_sink_prefill(
+                q,
+                k_cache,
+                v_cache,
+                layer,
+                block_tables,
+                sinks,
+            )
+
+        self.assertEqual(output.shape, (4, 8))
+        self.assertTrue(torch.equal(output[:3], torch.ones_like(output[:3])))
+        self.assertTrue(torch.equal(output[3], torch.zeros_like(output[3])))
+        call = fake_prefill.call_args.kwargs
+        self.assertEqual(call["q"].shape, (3, 4, 2))
+        self.assertEqual(call["key_cache"].shape, (2, 2, 2, 2))
+        self.assertTrue(
+            torch.equal(
+                call["cu_q_lens"], torch.tensor([0, 2, 3], dtype=torch.int32)
+            )
+        )
+        self.assertEqual(call["local_window_size"], 511)
+        self.assertEqual(call["global_window_size"], 0)
+        self.assertIs(call["sinks"], sinks)
+
+    def test_swa_sink_decode_ignores_attention_dp_padding(self):
+        self.backend.page_size = 2
+        self.backend.forward_metadata = ForwardMetadata()
+        layer = SimpleNamespace(
+            sliding_window_size=511,
+            tp_q_head_num=4,
+            tp_k_head_num=2,
+            tp_v_head_num=2,
+            qk_head_dim=2,
+            v_head_dim=2,
+            scaling=0.5,
+        )
+        q = torch.randn(3, 8, dtype=torch.float16)
+        k_cache = torch.randn(4, 2, 2, dtype=torch.float16)
+        v_cache = torch.randn(4, 2, 2, dtype=torch.float16)
+        seq_lens = torch.tensor([3, 4], dtype=torch.int32)
+        block_tables = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32)
+        sinks = torch.ones(4, dtype=torch.float32)
+        fake_decode = MagicMock(side_effect=lambda **kwargs: torch.ones_like(kwargs["q"]))
+
+        with patch(
+            "sglang.srt.hardware_backend.npu.attention.ascend_backend."
+            "_load_welm_swa_sink_attention_ops",
+            return_value=(None, fake_decode),
+        ):
+            output = self.backend._forward_welm_swa_sink_decode(
+                q,
+                k_cache,
+                v_cache,
+                layer,
+                block_tables,
+                seq_lens,
+                sinks,
+            )
+
+        self.assertEqual(output.shape, (3, 8))
+        self.assertTrue(torch.equal(output[:2], torch.ones_like(output[:2])))
+        self.assertTrue(torch.equal(output[2], torch.zeros_like(output[2])))
+        call = fake_decode.call_args.kwargs
+        self.assertEqual(call["q"].shape, (2, 4, 2))
+        self.assertEqual(call["key_cache"].shape, (2, 2, 2, 2))
+        self.assertEqual(call["local_window_size"], 511)
+        self.assertEqual(call["global_window_size"], 0)
+        self.assertIs(call["sinks"], sinks)
 
 
 class TestForwardMetadata(unittest.TestCase):

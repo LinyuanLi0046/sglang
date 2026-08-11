@@ -93,7 +93,11 @@ if is_npu():
         process_shared_expert,
         wait_share_stream,
     )
-    from sglang.srt.layers.welmv4_npu_op import mmq_style_router_linear_npu
+    from sglang.srt.layers.welmv4_npu_op import (
+        mmq_style_router_linear_npu,
+        welmv4_oe_hash_decode_4way_npu,
+        welmv4_oe_hash_prefill_4way_npu,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -2534,7 +2538,7 @@ class Qwen2MoeModel(nn.Module):
         if history_num_tokens == 0:
             return base_hidden_states
         oe_input_ids = input_ids[:history_num_tokens]
-        req_lens = ngram_embedding_info.req_lens.to(dtype=torch.long)
+        req_lens = ngram_embedding_info.req_lens
         # Decode CUDA graphs round the batch size up and leave initialized
         # one-token rows behind the real requests. Only the first
         # ``history_num_tokens`` rows are real in non-speculative decode.
@@ -2554,55 +2558,121 @@ class Qwen2MoeModel(nn.Module):
             )
         req_lens = req_lens[:real_req_count]
         column_starts = ngram_embedding_info.column_starts[:real_req_count]
-        rows = torch.repeat_interleave(
-            forward_batch.req_pool_indices[:real_req_count].to(dtype=torch.long),
-            req_lens,
-            output_size=history_num_tokens,
+        use_npu_fused_hash = (
+            _is_npu
+            and not dump_oe
+            and tuple(self.oe_grams) == (2, 2, 3, 3)
+            and len(self.oe_vocab_sizes) == 4
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.extend_start_loc is not None
+            )
         )
-        request_starts = torch.cumsum(req_lens, dim=0) - req_lens
-        flat_starts = torch.repeat_interleave(
-            request_starts, req_lens, output_size=history_num_tokens
-        )
-        offsets = (
-            torch.arange(history_num_tokens, device=input_ids.device) - flat_starts
-        )
-        token_positions = torch.repeat_interleave(
-            column_starts.to(dtype=torch.long),
-            req_lens,
-            output_size=history_num_tokens,
-        ) + offsets
+        npu_hashed_ids = None
+        if use_npu_fused_hash:
+            req_pool_indices = forward_batch.req_pool_indices[:real_req_count]
+            if forward_batch.forward_mode.is_decode():
+                npu_hashed_ids = welmv4_oe_hash_decode_4way_npu(
+                    oe_input_ids,
+                    ngram_embedding_info.token_table,
+                    req_pool_indices,
+                    column_starts,
+                    vocab_size=self.vocab_size,
+                    oe_vocab_sizes=self.oe_vocab_sizes,
+                )
+            else:
+                extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+                max_req_len = (
+                    max(extend_seq_lens_cpu[:real_req_count], default=0)
+                    if extend_seq_lens_cpu is not None
+                    else history_num_tokens
+                )
+                npu_hashed_ids = welmv4_oe_hash_prefill_4way_npu(
+                    oe_input_ids,
+                    ngram_embedding_info.token_table,
+                    req_pool_indices,
+                    forward_batch.extend_start_loc[:real_req_count],
+                    req_lens,
+                    column_starts,
+                    max_req_len=max_req_len,
+                    vocab_size=self.vocab_size,
+                    oe_vocab_sizes=self.oe_vocab_sizes,
+                )
+        else:
+            req_lens_long = req_lens.to(dtype=torch.long)
+            rows = torch.repeat_interleave(
+                forward_batch.req_pool_indices[:real_req_count].to(dtype=torch.long),
+                req_lens_long,
+                output_size=history_num_tokens,
+            )
+            request_starts = torch.cumsum(req_lens_long, dim=0) - req_lens_long
+            flat_starts = torch.repeat_interleave(
+                request_starts,
+                req_lens_long,
+                output_size=history_num_tokens,
+            )
+            offsets = (
+                torch.arange(history_num_tokens, device=input_ids.device) - flat_starts
+            )
+            token_positions = torch.repeat_interleave(
+                column_starts.to(dtype=torch.long),
+                req_lens_long,
+                output_size=history_num_tokens,
+            ) + offsets
 
-        input_ids_ngram = []
-        input_ids_ngram_tmp = oe_input_ids
-        for g in range(1, max(self.oe_grams)):
-            history_positions = token_positions - g
-            valid_history = history_positions >= 0
-            history_positions = history_positions.clamp_min(0)
-            gram_tensor = ngram_embedding_info.token_table[
-                rows, history_positions
-            ].to(dtype=input_ids.dtype)
-            gram_tensor = torch.where(
-                valid_history, gram_tensor, torch.zeros_like(gram_tensor)
-            )
-            if dump_oe:
-                _welm_dump_tensor(f"model.oe.gram{g + 1}.ids", gram_tensor)
-            input_ids_ngram_tmp = input_ids_ngram_tmp + gram_tensor * (
-                self.vocab_size**g
-            )
-            input_ids_ngram.append(hash_input_ids_vectorized(input_ids_ngram_tmp))
+            input_ids_ngram = []
+            input_ids_ngram_tmp = oe_input_ids
+            for g in range(1, max(self.oe_grams)):
+                history_positions = token_positions - g
+                valid_history = history_positions >= 0
+                history_positions = history_positions.clamp_min(0)
+                gram_tensor = ngram_embedding_info.token_table[
+                    rows, history_positions
+                ].to(dtype=input_ids.dtype)
+                gram_tensor = torch.where(
+                    valid_history, gram_tensor, torch.zeros_like(gram_tensor)
+                )
+                if dump_oe:
+                    _welm_dump_tensor(f"model.oe.gram{g + 1}.ids", gram_tensor)
+                input_ids_ngram_tmp = input_ids_ngram_tmp + gram_tensor * (
+                    self.vocab_size**g
+                )
+                input_ids_ngram.append(
+                    hash_input_ids_vectorized(input_ids_ngram_tmp)
+                )
 
         emb_ngram = []
         for i, vs in enumerate(self.oe_vocab_sizes):
-            input_ids_ngram_hashed_tmp = input_ids_ngram[self.oe_grams[i] - 2] % vs
+            input_ids_ngram_hashed_tmp = (
+                npu_hashed_ids[i]
+                if npu_hashed_ids is not None
+                else input_ids_ngram[self.oe_grams[i] - 2] % vs
+            )
             if dump_oe:
                 _welm_dump_tensor(
                     f"model.oe.vocab{i}.hashed_ids", input_ids_ngram_hashed_tmp
                 )
-            emb_ngram_tmp = oe_embed_modules[i](input_ids_ngram_hashed_tmp)
-            if dump_oe:
-                _welm_dump_tensor(f"model.oe.vocab{i}.embedding", emb_ngram_tmp)
+            emb_ngram_tmp = (
+                oe_embed_modules[i].forward_local(input_ids_ngram_hashed_tmp)
+                if _is_npu
+                else oe_embed_modules[i](input_ids_ngram_hashed_tmp)
+            )
             emb_ngram.append(emb_ngram_tmp)
-        emb_new, _ = oe_up_proj_module(torch.cat(emb_ngram, dim=-1))
+        if _is_npu:
+            # Four native local lookups + native concat + one OE all-reduce.
+            # Base embedding communication remains unchanged in this phase.
+            emb_ngram_concat = oe_embed_modules[0].concat_and_reduce_local_outputs(
+                emb_ngram, dim=-1
+            )
+        else:
+            emb_ngram_concat = torch.cat(emb_ngram, dim=-1)
+        if dump_oe:
+            embedding_dims = [module.embedding_dim for module in oe_embed_modules]
+            for i, emb_ngram_tmp in enumerate(
+                torch.split(emb_ngram_concat, embedding_dims, dim=-1)
+            ):
+                _welm_dump_tensor(f"model.oe.vocab{i}.embedding", emb_ngram_tmp)
+        emb_new, _ = oe_up_proj_module(emb_ngram_concat)
         hidden_states = (base_hidden_states[:history_num_tokens] + emb_new) / 2.0
         if history_num_tokens < num_tokens:
             hidden_states = torch.cat(

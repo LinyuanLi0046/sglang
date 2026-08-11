@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 import triton
@@ -295,3 +295,502 @@ def welmv4_inplace_rope_npu(
             },
         )
     return query, key
+
+
+# -----------------------------------------------------------------------------
+# WeLMv4 over-encoding helpers for Ascend A5.
+#
+# These kernels intentionally stop at hashed OE ids and token-table updates.
+# OE embedding lookup/concat remains on the framework's native PyTorch path.
+# -----------------------------------------------------------------------------
+
+_WELMV4_OE_HASH_MULTIPLIER = 2654435761
+_WELMV4_OE_BRANCHES = 4
+_WELMV4_VECTOR_CORE_CACHE: dict[tuple[str, int], int] = {}
+
+
+@triton.jit
+def _welmv4_u32_remainder(value, divisor: tl.constexpr):
+    """Exact uint32 remainder supported efficiently by Triton Ascend."""
+    quotient = value // divisor
+    return value - quotient * divisor
+
+
+@triton.jit
+def _welmv4_oe_hash_prefill_4way_kernel(
+    input_ids_ptr,
+    token_table_ptr,
+    req_rows_ptr,
+    token_offsets_ptr,
+    req_lens_ptr,
+    column_starts_ptr,
+    hashed_out_ptr,
+    num_tokens,
+    context_len: tl.constexpr,
+    num_token_tiles,
+    num_tasks,
+    VOCAB_SIZE: tl.constexpr,
+    OE_V0: tl.constexpr,
+    OE_V1: tl.constexpr,
+    OE_V2: tl.constexpr,
+    OE_V3: tl.constexpr,
+    HASH_MUL: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    """Fuse request mapping, history gather, pack, hash and four mods."""
+    pid = tl.program_id(0)
+    program_count = tl.num_programs(0)
+    tasks_per_program = (num_tasks + program_count - 1) // program_count
+    task_start = pid * tasks_per_program
+    task_end = tl.minimum(task_start + tasks_per_program, num_tasks)
+    base_offsets = tl.arange(0, BLOCK_T)
+
+    for task_idx in range(task_start, task_end):
+        req_idx = task_idx // num_token_tiles
+        tile_idx = task_idx - req_idx * num_token_tiles
+        local_offsets = tile_idx * BLOCK_T + base_offsets
+
+        req_len = tl.load(req_lens_ptr + req_idx).to(tl.int32)
+        token_start = tl.load(token_offsets_ptr + req_idx).to(tl.int32)
+        request_row = tl.load(req_rows_ptr + req_idx).to(tl.int32)
+        column_start = tl.load(column_starts_ptr + req_idx).to(tl.int32)
+
+        flat_indices = token_start + local_offsets
+        token_mask = (local_offsets.to(tl.float32) < req_len.to(tl.float32)) & (
+            flat_indices.to(tl.float32) < num_tokens
+        )
+        logical_positions = column_start + local_offsets
+        current = tl.load(
+            input_ids_ptr + flat_indices, mask=token_mask, other=0
+        ).to(tl.uint32)
+
+        # Current-chunk history is contiguous in input_ids. Only the first two
+        # boundary tokens need an indexed request-token-table read.
+        local_offsets_fp32 = local_offsets.to(tl.float32)
+        logical_positions_fp32 = logical_positions.to(tl.float32)
+        prev1_from_chunk_mask = token_mask & (local_offsets_fp32 >= 1.0)
+        prev1_from_table_mask = (
+            token_mask & (local_offsets_fp32 < 1.0) & (logical_positions_fp32 >= 1.0)
+        )
+        prev1_from_chunk = tl.load(
+            input_ids_ptr + flat_indices - 1,
+            mask=prev1_from_chunk_mask,
+            other=0,
+        ).to(tl.uint32)
+        prev1_from_table = tl.load(
+            token_table_ptr
+            + request_row * context_len
+            + logical_positions
+            - 1,
+            mask=prev1_from_table_mask,
+            other=0,
+        ).to(tl.uint32)
+        previous1 = prev1_from_chunk + prev1_from_table
+
+        prev2_from_chunk_mask = token_mask & (local_offsets_fp32 >= 2.0)
+        prev2_from_table_mask = (
+            token_mask & (local_offsets_fp32 < 2.0) & (logical_positions_fp32 >= 2.0)
+        )
+        prev2_from_chunk = tl.load(
+            input_ids_ptr + flat_indices - 2,
+            mask=prev2_from_chunk_mask,
+            other=0,
+        ).to(tl.uint32)
+        prev2_from_table = tl.load(
+            token_table_ptr
+            + request_row * context_len
+            + logical_positions
+            - 2,
+            mask=prev2_from_table_mask,
+            other=0,
+        ).to(tl.uint32)
+        previous2 = prev2_from_chunk + prev2_from_table
+
+        packed2 = current + previous1 * VOCAB_SIZE
+        packed3 = packed2 + previous2 * VOCAB_SIZE * VOCAB_SIZE
+        hash2 = (packed2 * HASH_MUL).to(tl.uint32)
+        hash3 = (packed3 * HASH_MUL).to(tl.uint32)
+
+        tl.store(
+            hashed_out_ptr + flat_indices,
+            _welmv4_u32_remainder(hash2, OE_V0).to(tl.int32),
+            mask=token_mask,
+        )
+        tl.store(
+            hashed_out_ptr + num_tokens + flat_indices,
+            _welmv4_u32_remainder(hash2, OE_V1).to(tl.int32),
+            mask=token_mask,
+        )
+        tl.store(
+            hashed_out_ptr + 2 * num_tokens + flat_indices,
+            _welmv4_u32_remainder(hash3, OE_V2).to(tl.int32),
+            mask=token_mask,
+        )
+        tl.store(
+            hashed_out_ptr + 3 * num_tokens + flat_indices,
+            _welmv4_u32_remainder(hash3, OE_V3).to(tl.int32),
+            mask=token_mask,
+        )
+
+
+@triton.jit
+def _welmv4_oe_hash_decode_4way_kernel(
+    input_ids_ptr,
+    token_table_ptr,
+    req_rows_ptr,
+    column_starts_ptr,
+    hashed_out_ptr,
+    batch_size,
+    context_len: tl.constexpr,
+    num_tasks,
+    VOCAB_SIZE: tl.constexpr,
+    OE_V0: tl.constexpr,
+    OE_V1: tl.constexpr,
+    OE_V2: tl.constexpr,
+    OE_V3: tl.constexpr,
+    HASH_MUL: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+):
+    """Decode specialization: one current token per real request."""
+    pid = tl.program_id(0)
+    program_count = tl.num_programs(0)
+    tasks_per_program = (num_tasks + program_count - 1) // program_count
+    task_start = pid * tasks_per_program
+    task_end = tl.minimum(task_start + tasks_per_program, num_tasks)
+    base_offsets = tl.arange(0, BLOCK_B)
+
+    for task_idx in range(task_start, task_end):
+        req_indices = task_idx * BLOCK_B + base_offsets
+        request_mask = req_indices.to(tl.float32) < batch_size
+        request_rows = tl.load(
+            req_rows_ptr + req_indices, mask=request_mask, other=0
+        ).to(tl.int32)
+        positions = tl.load(
+            column_starts_ptr + req_indices, mask=request_mask, other=0
+        ).to(tl.int32)
+        current = tl.load(
+            input_ids_ptr + req_indices, mask=request_mask, other=0
+        ).to(tl.uint32)
+        previous1 = tl.load(
+            token_table_ptr + request_rows * context_len + positions - 1,
+            mask=request_mask & (positions.to(tl.float32) >= 1.0),
+            other=0,
+        ).to(tl.uint32)
+        previous2 = tl.load(
+            token_table_ptr + request_rows * context_len + positions - 2,
+            mask=request_mask & (positions.to(tl.float32) >= 2.0),
+            other=0,
+        ).to(tl.uint32)
+
+        packed2 = current + previous1 * VOCAB_SIZE
+        packed3 = packed2 + previous2 * VOCAB_SIZE * VOCAB_SIZE
+        hash2 = (packed2 * HASH_MUL).to(tl.uint32)
+        hash3 = (packed3 * HASH_MUL).to(tl.uint32)
+        tl.store(
+            hashed_out_ptr + req_indices,
+            _welmv4_u32_remainder(hash2, OE_V0).to(tl.int32),
+            mask=request_mask,
+        )
+        tl.store(
+            hashed_out_ptr + batch_size + req_indices,
+            _welmv4_u32_remainder(hash2, OE_V1).to(tl.int32),
+            mask=request_mask,
+        )
+        tl.store(
+            hashed_out_ptr + 2 * batch_size + req_indices,
+            _welmv4_u32_remainder(hash3, OE_V2).to(tl.int32),
+            mask=request_mask,
+        )
+        tl.store(
+            hashed_out_ptr + 3 * batch_size + req_indices,
+            _welmv4_u32_remainder(hash3, OE_V3).to(tl.int32),
+            mask=request_mask,
+        )
+
+
+@triton.jit
+def _welmv4_token_table_ragged_update_kernel(
+    token_table_ptr,
+    tokens_ptr,
+    row_indices_ptr,
+    token_offsets_ptr,
+    column_starts_ptr,
+    req_lens_ptr,
+    num_tokens,
+    context_len: tl.constexpr,
+    num_token_tiles,
+    num_tasks,
+    BLOCK_T: tl.constexpr,
+):
+    """Copy request-segmented tokens without materializing flat row/col ids."""
+    pid = tl.program_id(0)
+    program_count = tl.num_programs(0)
+    tasks_per_program = (num_tasks + program_count - 1) // program_count
+    task_start = pid * tasks_per_program
+    task_end = tl.minimum(task_start + tasks_per_program, num_tasks)
+    base_offsets = tl.arange(0, BLOCK_T)
+
+    for task_idx in range(task_start, task_end):
+        req_idx = task_idx // num_token_tiles
+        tile_idx = task_idx - req_idx * num_token_tiles
+        local_offsets = tile_idx * BLOCK_T + base_offsets
+        req_len = tl.load(req_lens_ptr + req_idx).to(tl.int32)
+        token_start = tl.load(token_offsets_ptr + req_idx).to(tl.int32)
+        row = tl.load(row_indices_ptr + req_idx).to(tl.int32)
+        column_start = tl.load(column_starts_ptr + req_idx).to(tl.int32)
+        token_indices = token_start + local_offsets
+        columns = column_start + local_offsets
+        mask = (
+            (local_offsets.to(tl.float32) < req_len.to(tl.float32))
+            & (token_indices.to(tl.float32) < num_tokens)
+            & (columns.to(tl.float32) < context_len)
+        )
+        values = tl.load(tokens_ptr + token_indices, mask=mask, other=0)
+        tl.store(token_table_ptr + row * context_len + columns, values, mask=mask)
+
+
+@triton.jit
+def _welmv4_token_table_decode_update_kernel(
+    token_table_ptr,
+    next_token_ids_ptr,
+    req_pool_indices_ptr,
+    seq_lens_ptr,
+    skip_mask_ptr,
+    batch_size,
+    context_len: tl.constexpr,
+    num_tasks,
+    HAS_SKIP_MASK: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+):
+    """Write one sampled token per real request, honoring chunk skip state."""
+    pid = tl.program_id(0)
+    program_count = tl.num_programs(0)
+    tasks_per_program = (num_tasks + program_count - 1) // program_count
+    task_start = pid * tasks_per_program
+    task_end = tl.minimum(task_start + tasks_per_program, num_tasks)
+    base_offsets = tl.arange(0, BLOCK_B)
+
+    for task_idx in range(task_start, task_end):
+        req_indices = task_idx * BLOCK_B + base_offsets
+        real_mask = req_indices.to(tl.float32) < batch_size
+        if HAS_SKIP_MASK:
+            skip = tl.load(
+                skip_mask_ptr + req_indices, mask=real_mask, other=1
+            ).to(tl.int1)
+        else:
+            skip = tl.zeros((BLOCK_B,), dtype=tl.int1)
+        rows = tl.load(
+            req_pool_indices_ptr + req_indices, mask=real_mask, other=0
+        ).to(tl.int32)
+        columns = tl.load(
+            seq_lens_ptr + req_indices, mask=real_mask, other=0
+        ).to(tl.int32)
+        values = tl.load(next_token_ids_ptr + req_indices, mask=real_mask, other=0)
+        update_mask = (
+            real_mask & (~skip) & (columns.to(tl.float32) < context_len)
+        )
+        tl.store(
+            token_table_ptr + rows * context_len + columns,
+            values,
+            mask=update_mask,
+        )
+
+
+def _welmv4_vector_core_count(device: torch.device) -> int:
+    index = torch.npu.current_device() if device.index is None else int(device.index)
+    key = (device.type, index)
+    cached = _WELMV4_VECTOR_CORE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    properties = triton.runtime.driver.active.utils.get_device_properties(index)
+    count = int(properties.get("num_vectorcore", properties.get("num_aicore", -1)))
+    if count <= 0:
+        raise RuntimeError("Failed to detect the Ascend Vector Core count")
+    _WELMV4_VECTOR_CORE_CACHE[key] = count
+    return count
+
+
+def _welmv4_1d_grid(num_tasks: int, device: torch.device) -> tuple[int]:
+    if num_tasks <= 0:
+        raise ValueError("num_tasks must be positive")
+    return (min(num_tasks, _welmv4_vector_core_count(device)),)
+
+
+def _validate_welmv4_oe_vocab_sizes(
+    oe_vocab_sizes: Sequence[int],
+) -> tuple[int, int, int, int]:
+    values = tuple(int(v) for v in oe_vocab_sizes)
+    if len(values) != _WELMV4_OE_BRANCHES or any(v <= 0 for v in values):
+        raise ValueError("oe_vocab_sizes must contain four positive integers")
+    if any(v > (1 << 31) for v in values):
+        raise ValueError("int32 OE hash output requires every vocab size <= 2^31")
+    return values
+
+
+def welmv4_oe_hash_prefill_4way_npu(
+    input_ids: torch.Tensor,
+    token_table: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    token_offsets: torch.Tensor,
+    req_lens: torch.Tensor,
+    column_starts: torch.Tensor,
+    *,
+    max_req_len: int,
+    vocab_size: int,
+    oe_vocab_sizes: Sequence[int],
+    block_t: int = 512,
+) -> torch.Tensor:
+    """Return int32 hashed ids with layout [4, num_tokens] for prefill."""
+    oe_v0, oe_v1, oe_v2, oe_v3 = _validate_welmv4_oe_vocab_sizes(
+        oe_vocab_sizes
+    )
+    num_tokens = input_ids.numel()
+    output = torch.empty(
+        (_WELMV4_OE_BRANCHES, num_tokens),
+        dtype=torch.int32,
+        device=input_ids.device,
+    )
+    if num_tokens == 0:
+        return output
+    num_token_tiles = triton.cdiv(max_req_len, block_t)
+    num_tasks = req_lens.numel() * num_token_tiles
+    _welmv4_oe_hash_prefill_4way_kernel[
+        _welmv4_1d_grid(num_tasks, input_ids.device)
+    ](
+        input_ids,
+        token_table,
+        req_pool_indices,
+        token_offsets,
+        req_lens,
+        column_starts,
+        output,
+        num_tokens,
+        token_table.shape[1],
+        num_token_tiles,
+        num_tasks,
+        VOCAB_SIZE=int(vocab_size),
+        OE_V0=oe_v0,
+        OE_V1=oe_v1,
+        OE_V2=oe_v2,
+        OE_V3=oe_v3,
+        HASH_MUL=_WELMV4_OE_HASH_MULTIPLIER,
+        BLOCK_T=block_t,
+    )
+    return output
+
+
+def welmv4_oe_hash_decode_4way_npu(
+    input_ids: torch.Tensor,
+    token_table: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    column_starts: torch.Tensor,
+    *,
+    vocab_size: int,
+    oe_vocab_sizes: Sequence[int],
+    block_b: int = 128,
+) -> torch.Tensor:
+    """Return int32 hashed ids with layout [4, batch_size] for decode."""
+    oe_v0, oe_v1, oe_v2, oe_v3 = _validate_welmv4_oe_vocab_sizes(
+        oe_vocab_sizes
+    )
+    batch_size = input_ids.numel()
+    if (
+        req_pool_indices.numel() < batch_size
+        or column_starts.numel() < batch_size
+    ):
+        raise ValueError("decode metadata must contain at least batch_size entries")
+    output = torch.empty(
+        (_WELMV4_OE_BRANCHES, batch_size),
+        dtype=torch.int32,
+        device=input_ids.device,
+    )
+    if batch_size == 0:
+        return output
+    num_tasks = triton.cdiv(batch_size, block_b)
+    _welmv4_oe_hash_decode_4way_kernel[
+        _welmv4_1d_grid(num_tasks, input_ids.device)
+    ](
+        input_ids,
+        token_table,
+        req_pool_indices,
+        column_starts,
+        output,
+        batch_size,
+        token_table.shape[1],
+        num_tasks,
+        VOCAB_SIZE=int(vocab_size),
+        OE_V0=oe_v0,
+        OE_V1=oe_v1,
+        OE_V2=oe_v2,
+        OE_V3=oe_v3,
+        HASH_MUL=_WELMV4_OE_HASH_MULTIPLIER,
+        BLOCK_B=block_b,
+    )
+    return output
+
+
+def welmv4_token_table_ragged_update_npu(
+    token_table: torch.Tensor,
+    tokens: torch.Tensor,
+    row_indices: torch.Tensor,
+    token_offsets: torch.Tensor,
+    column_starts: torch.Tensor,
+    req_lens: torch.Tensor,
+    *,
+    max_req_len: int,
+    block_t: int = 256,
+) -> None:
+    """Update prefill request segments directly in the request token table."""
+    num_tokens = tokens.numel()
+    if num_tokens == 0:
+        return
+    num_token_tiles = triton.cdiv(max_req_len, block_t)
+    num_tasks = req_lens.numel() * num_token_tiles
+    _welmv4_token_table_ragged_update_kernel[
+        _welmv4_1d_grid(num_tasks, tokens.device)
+    ](
+        token_table,
+        tokens,
+        row_indices,
+        token_offsets,
+        column_starts,
+        req_lens,
+        num_tokens,
+        token_table.shape[1],
+        num_token_tiles,
+        num_tasks,
+        BLOCK_T=block_t,
+    )
+
+
+def welmv4_token_table_decode_update_npu(
+    token_table: torch.Tensor,
+    next_token_ids: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    skip_mask: Optional[torch.Tensor],
+    *,
+    batch_size: int,
+    block_b: int = 16,
+) -> None:
+    """Update one sampled token per real request; ignore graph padding rows."""
+    if batch_size == 0:
+        return
+    num_tasks = triton.cdiv(batch_size, block_b)
+    # A compile-time flag removes the skip load for normal decode. Triton still
+    # needs a pointer argument, so next_token_ids is an unused safe placeholder.
+    skip_mask_ptr = next_token_ids if skip_mask is None else skip_mask
+    _welmv4_token_table_decode_update_kernel[
+        _welmv4_1d_grid(num_tasks, next_token_ids.device)
+    ](
+        token_table,
+        next_token_ids,
+        req_pool_indices,
+        seq_lens,
+        skip_mask_ptr,
+        batch_size,
+        token_table.shape[1],
+        num_tasks,
+        HAS_SKIP_MASK=skip_mask is not None,
+        BLOCK_B=block_b,
+    )

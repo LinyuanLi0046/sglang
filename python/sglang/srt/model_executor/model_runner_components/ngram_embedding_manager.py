@@ -105,6 +105,7 @@ class NgramEmbeddingManager:
         batch.ne_skip_token_table_update = None
         if batch.forward_mode == ForwardMode.EXTEND:
             all_tokens = []
+            token_offsets = []
             column_starts = []
             request_lengths = []
             for req in batch.reqs:
@@ -121,22 +122,41 @@ class NgramEmbeddingManager:
                     # Prepend n-1 tokens before prefix_len for n-gram context
                     tokens = fill_ids[start - self.n + 1 : end]
                     column_starts.append(start - self.n + 1)
+                token_offsets.append(len(all_tokens))
                 all_tokens.extend(tokens)
                 request_lengths.append(len(tokens))
             dtype = self.table.dtype
             device = self.table.device
-            _update_token_table(
-                ne_token_table=self.table,
-                tokens=torch.tensor(all_tokens, dtype=dtype, device=device),
-                row_indices=batch.req_pool_indices,
-                column_starts=torch.tensor(
-                    column_starts, dtype=torch.int32, device=device
-                ),
-                req_lens=torch.tensor(
-                    request_lengths, dtype=torch.int32, device=device
-                ),
-                ignore_tokens=None,
+            tokens_tensor = torch.tensor(all_tokens, dtype=dtype, device=device)
+            column_starts_tensor = torch.tensor(
+                column_starts, dtype=torch.int32, device=device
             )
+            req_lens_tensor = torch.tensor(
+                request_lengths, dtype=torch.int32, device=device
+            )
+            if is_npu():
+                from sglang.srt.layers.welmv4_npu_op import (
+                    welmv4_token_table_ragged_update_npu,
+                )
+
+                welmv4_token_table_ragged_update_npu(
+                    self.table,
+                    tokens_tensor,
+                    batch.req_pool_indices,
+                    torch.tensor(token_offsets, dtype=torch.int32, device=device),
+                    column_starts_tensor,
+                    req_lens_tensor,
+                    max_req_len=max(request_lengths, default=0),
+                )
+            else:
+                _update_token_table(
+                    ne_token_table=self.table,
+                    tokens=tokens_tensor,
+                    row_indices=batch.req_pool_indices,
+                    column_starts=column_starts_tensor,
+                    req_lens=req_lens_tensor,
+                    ignore_tokens=None,
+                )
             # Mark the chunked (not-yet-finished) prefill request so sample()
             # skips writing its pseudo next-token into the ngram token table.
             # Use self.chunked_req identity (not req.is_chunked) to avoid
@@ -166,6 +186,27 @@ def update_ngram_token_table_after_sampling(
     Returns whether the token table was updated.
     """
     skip_token_table_update = ngram_embedding_info.skip_token_table_update
+    if is_npu():
+        from sglang.srt.layers.welmv4_npu_op import (
+            welmv4_token_table_decode_update_npu,
+        )
+
+        # The kernel consumes the real batch size directly, so CUDA-graph-style
+        # padded metadata never creates writes for dummy requests. A present
+        # skip mask suppresses unfinished chunked-prefill pseudo samples.
+        welmv4_token_table_decode_update_npu(
+            ngram_embedding_info.token_table,
+            next_token_ids,
+            req_pool_indices,
+            seq_lens,
+            skip_token_table_update,
+            batch_size=batch_size,
+        )
+        # This return value is not used by the runtime. On NPU it denotes that
+        # the (possibly all-masked) device update was submitted without adding
+        # a synchronizing mask reduction to the hot path.
+        return batch_size > 0
+
     if skip_token_table_update is not None:
         # Skip chunked (not-yet-finished) prefill requests: their sampled token
         # is a pseudo prediction and must not pollute the token table.

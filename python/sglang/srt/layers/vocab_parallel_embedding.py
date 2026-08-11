@@ -561,9 +561,47 @@ class VocabParallelEmbedding(torch.nn.Module):
         output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
         return output_parallel
 
-    def forward(self, input_):
+    def forward_local(self, input_: torch.Tensor) -> torch.Tensor:
+        """Embed from this rank's vocab shard without issuing an all-reduce."""
         # Surface a bad token id (>= vocab_size, or a negative / unmasked sentinel) as a
         # located async assert instead of a silent OOB embedding gather (tp=1 does not mask).
+        maybe_detect_oob(
+            input_, 0, self.num_embeddings, "VocabParallelEmbedding input id"
+        )
+        return self._embed_local_shard(input_)
+
+    def reduce_local_output(self, output_parallel: torch.Tensor) -> torch.Tensor:
+        """Reduce a local-shard embedding result with this module's TP group."""
+        if self.tp_size > 1 and not get_attn_tp_context().input_scattered:
+            if self.use_attn_tp_group:
+                output_parallel = attn_tp_all_reduce(output_parallel)
+            else:
+                # Reduce across all the model parallel GPUs.
+                output_parallel = tensor_model_parallel_all_reduce(output_parallel)
+        return output_parallel
+
+    def concat_and_reduce_local_outputs(
+        self, outputs: Sequence[torch.Tensor], dim: int = -1
+    ) -> torch.Tensor:
+        """Native-concat local shards, then issue one correctly grouped reduce.
+
+        The concat allocation is made under the same symmetric-memory policy as
+        the normal embedding output so custom all-reduce backends keep their
+        allocator contract.
+        """
+        if not outputs:
+            raise ValueError("outputs must contain at least one local embedding")
+        symm_alloc = use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        )
+        with symm_alloc:
+            output_parallel = torch.cat(tuple(outputs), dim=dim)
+        return self.reduce_local_output(output_parallel)
+
+    def forward(self, input_):
+        # Keep the existing general embedding hot path flat. The split
+        # local/reduce APIs above are used only by callers that intentionally
+        # merge multiple vocab-parallel collectives (WeLMv4 OE on NPU).
         maybe_detect_oob(
             input_, 0, self.num_embeddings, "VocabParallelEmbedding input id"
         )
@@ -572,7 +610,6 @@ class VocabParallelEmbedding(torch.nn.Module):
             if self.use_attn_tp_group:
                 output_parallel = attn_tp_all_reduce(output_parallel)
             else:
-                # Reduce across all the model parallel GPUs.
                 output_parallel = tensor_model_parallel_all_reduce(output_parallel)
         return output_parallel
 

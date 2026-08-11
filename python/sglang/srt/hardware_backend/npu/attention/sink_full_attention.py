@@ -734,7 +734,9 @@ def paged_attention_prefill_impl(
             enable_ub_refine_opt=True,
         )
     else:
-        PAGE_AGGREGATION_NUM = 128 // page_size
+        PAGE_AGGREGATION_NUM = (
+            1 if page_size == 64 and head_dim == 256 else 128 // page_size
+        )
         paged_prefill_page_aggregation_kernel[grid](
             q,
             key_cache,

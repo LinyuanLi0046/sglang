@@ -560,7 +560,6 @@ class AscendAttnBackend(AttentionBackend):
         schedule_key = (
             layer.tp_q_head_num,
             layer.tp_k_head_num,
-            layer.qk_head_dim,
             self.page_size,
             False,  # WeLM's local GQA heads use contiguous Q-head groups.
         )
@@ -600,7 +599,6 @@ class AscendAttnBackend(AttentionBackend):
             seq_lens_cpu,
             layer.tp_q_head_num,
             layer.tp_k_head_num,
-            layer.qk_head_dim,
             False,
             self.page_size,
             device=q.device,

@@ -273,7 +273,7 @@ class TestWelMLayerwiseSinkTritonRouting(unittest.TestCase):
                 torch.tensor([0], dtype=torch.int32),
                 torch.tensor([0, 1], dtype=torch.int32),
             ),
-            full_sink_prefill_schedule_key=(4, 2, 2, 2, False),
+            full_sink_prefill_schedule_key=(4, 2, 2, False),
         )
         layer = SimpleNamespace(
             tp_q_head_num=4,

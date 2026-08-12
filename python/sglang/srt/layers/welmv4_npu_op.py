@@ -40,7 +40,7 @@ def _get_num_sms(multiplier: int = 1) -> int:
     ],
     key=["N", "K"],
 )
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def mmq_style_router_linear_kernel_npu(
     a_ptr,
     b_ptr,

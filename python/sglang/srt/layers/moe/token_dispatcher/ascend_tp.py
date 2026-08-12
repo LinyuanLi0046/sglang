@@ -4,6 +4,7 @@ from typing import NamedTuple, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.moe.finalize_routing import (
     AllGatherFinalizeRoutingWrapper,
     NPUFinalizeRouting,
@@ -53,6 +54,7 @@ class AscendTPDispatcher(BaseDispatcher):
         super().__init__()
         self.num_experts = moe_runner_config.num_experts
         self.top_k = moe_runner_config.top_k
+        self.layer_id = moe_runner_config.layer_id
         self._dispatch_output: Optional[AscendTPDispatchOutput] = None
 
         self.quant_config: Optional[dict] = None
@@ -120,6 +122,29 @@ class AscendTPDispatcher(BaseDispatcher):
             self.num_experts,
             top_k,
         )
+
+        if (
+            envs.SGLANG_NPU_PRINT_MOE_GROUP_LIST.get()
+            and get_parallel().tp_rank == 0
+        ):
+            # Debug-only D2H copy. Keep this behind an environment switch: it
+            # synchronizes the device and therefore invalidates performance
+            # measurements. Print one machine-readable line per MoE invocation.
+            group_list = expert_tokens.detach().cpu().tolist()
+            active_experts = [
+                [expert_id, token_count]
+                for expert_id, token_count in enumerate(group_list)
+                if token_count != 0
+            ]
+            print(
+                "[NPU_MOE_GROUP_LIST] "
+                f"tp_rank=0 layer_id={self.layer_id} "
+                f"num_tokens={hidden_states.shape[0]} "
+                f"group_list_type={self.group_list_type} "
+                f"active_experts={active_experts} "
+                f"group_list={group_list}",
+                flush=True,
+            )
 
         self._dispatch_output = AscendTPDispatchOutput(
             hidden_states=permuted_hidden_states,

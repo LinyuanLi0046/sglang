@@ -794,3 +794,63 @@ def welmv4_token_table_decode_update_npu(
         HAS_SKIP_MASK=skip_mask is not None,
         BLOCK_B=block_b,
     )
+
+def sigmoid_mul_ref(
+    x: torch.Tensor,
+    y: torch.Tensor,
+):
+    return torch.mul(torch.sigmoid(x.to(torch.float32)).to(y.dtype), y)
+
+
+@triton.jit(do_not_specialize=["rows"])
+def sigmoid_mul_kernel_npu(
+    x_ptr: tl.tensor,
+    y_ptr: tl.tensor,
+    rows: int,
+    cols: tl.constexpr,
+    x_row_stride: tl.constexpr,
+    y_row_stride: tl.constexpr,
+    y_col_stride: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    row_offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    row_mask = row_offset < rows
+    col_offset = tl.arange(0, cols)
+
+    x_off = row_offset[:, None] * x_row_stride
+    y_off = row_offset[:, None] * y_row_stride + col_offset[None, :] * y_col_stride
+
+    x_data = tl.load(x_ptr + x_off, mask=row_mask[:, None], other=0.0).to(tl.float32)
+    y_data = tl.load(y_ptr + y_off, mask=row_mask[:, None], other=0.0)
+
+    out_data = tl.sigmoid(x_data).to(y_ptr.dtype.element_ty) * y_data
+    tl.store(y_ptr + y_off, out_data, mask=row_mask[:, None])
+
+
+def inplace_sigmoid_mul_npu(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    BLOCK_SIZE: int = 128,
+) -> None:
+    cols = y.shape[-1]
+    rows = y.numel() // cols
+
+    assert x.is_contiguous()
+    assert y.is_contiguous()
+    assert x.shape[-1] == 1 and y.shape[-1] == 256
+
+    x_flattened = x.view(rows, -1)
+    y_flattened = y.view(rows, -1)
+
+    grid = (triton.cdiv(rows, BLOCK_SIZE),)
+    sigmoid_mul_kernel_npu[grid](
+        x_flattened,
+        y_flattened,
+        rows,
+        cols,
+        x_flattened.stride(0),
+        y_flattened.stride(0),
+        y_flattened.stride(1),
+        BLOCK_SIZE=BLOCK_SIZE
+    )

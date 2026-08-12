@@ -97,6 +97,7 @@ if is_npu():
         mmq_style_router_linear_npu,
         welmv4_oe_hash_decode_4way_npu,
         welmv4_oe_hash_prefill_4way_npu,
+        inplace_sigmoid_mul_npu,
     )
 
 logger = logging.getLogger(__name__)
@@ -1681,7 +1682,10 @@ class Qwen2MoeAttention(nn.Module):
                     f"model.layers.{self.layer_idx}.attn.router.0", gate.squeeze(-1)
                 )
             attn_output = attn_output.view(attn_shape[0], self.num_heads, -1)
-            inplace_sigmoid_mul(gate, attn_output)
+            if _is_npu:
+                inplace_sigmoid_mul_npu(gate, attn_output)
+            else:
+                inplace_sigmoid_mul(gate, attn_output)
             attn_output = attn_output.view(attn_shape)
             replay_gated_attn_output = _welm_should_replay(
                 "gated_attn_output", forward_batch, self.layer_idx

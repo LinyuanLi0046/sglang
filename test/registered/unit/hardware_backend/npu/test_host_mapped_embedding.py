@@ -75,8 +75,10 @@ def test_allocation_aligns_registers_and_releases_base_pointer(monkeypatch):
 def test_vocab_loader_writes_host_alias_after_tp_slice():
     from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
-    target = torch.full((4, 3), -1, dtype=torch.float16)
-    npu_placeholder = Parameter(torch.full((4, 3), 99, dtype=torch.float16))
+    target = torch.full((4, 3), -1, dtype=torch.float16, device="cpu")
+    npu_placeholder = Parameter(
+        torch.full((4, 3), 99, dtype=torch.float16, device="cpu")
+    )
     npu_placeholder.output_dim = 0
     npu_placeholder._host_mapped_npu_allocation = SimpleNamespace(cpu_view=target)
 
@@ -89,7 +91,7 @@ def test_vocab_loader_writes_host_alias_after_tp_slice():
             org_vocab_end_index=6,
         ),
     )
-    checkpoint = torch.arange(18, dtype=torch.float16).reshape(6, 3)
+    checkpoint = torch.arange(18, dtype=torch.float16, device="cpu").reshape(6, 3)
 
     VocabParallelEmbedding.weight_loader(layer, npu_placeholder, checkpoint)
 

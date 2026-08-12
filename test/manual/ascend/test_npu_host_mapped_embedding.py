@@ -18,11 +18,15 @@ def test_npu_host_mapped_embedding_matches_cpu(dtype):
     device_id = torch.npu.current_device()
     allocation = allocate_host_mapped_npu_tensor((32, 64), dtype, device_id)
     try:
-        reference = torch.arange(32 * 64, dtype=torch.float32).reshape(32, 64)
+        reference = torch.arange(
+            32 * 64, dtype=torch.float32, device="cpu"
+        ).reshape(32, 64)
         reference = (reference / 257.0).to(dtype)
         allocation.cpu_view.copy_(reference)
 
-        ids_cpu = torch.tensor([0, 1, 7, 31, 7], dtype=torch.long)
+        ids_cpu = torch.tensor(
+            [0, 1, 7, 31, 7], dtype=torch.long, device="cpu"
+        )
         ids_npu = ids_cpu.to(f"npu:{device_id}")
         actual = F.embedding(ids_npu, allocation.npu_view)
         torch.npu.synchronize()
@@ -44,7 +48,9 @@ def test_npu_host_mapped_embedding_graph_replay():
     dtype = torch.bfloat16
     allocation = allocate_host_mapped_npu_tensor((16, 32), dtype, device_id)
     try:
-        reference = torch.arange(16 * 32, dtype=torch.float32).reshape(16, 32)
+        reference = torch.arange(
+            16 * 32, dtype=torch.float32, device="cpu"
+        ).reshape(16, 32)
         reference = (reference / 97.0).to(dtype)
         allocation.cpu_view.copy_(reference)
         static_ids = torch.tensor(

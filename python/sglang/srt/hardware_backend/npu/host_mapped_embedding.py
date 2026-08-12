@@ -261,11 +261,16 @@ def _probe_host_mapped_embedding(dtype: torch.dtype, device_id: int) -> None:
     probe_error = None
     try:
         allocation = _allocate_without_probe((8, 16), dtype, device_id)
-        reference = torch.arange(8 * 16, dtype=torch.float32).reshape(8, 16)
+        # SGLang sets PyTorch's default device to the worker device during
+        # model initialization.  Keep the oracle explicitly on CPU instead of
+        # relying on the process-wide default device.
+        reference = torch.arange(
+            8 * 16, dtype=torch.float32, device="cpu"
+        ).reshape(8, 16)
         reference = (reference / 127.0).to(dtype=dtype)
         allocation.cpu_view.copy_(reference)
 
-        ids_cpu = torch.tensor([0, 3, 7, 3], dtype=torch.long)
+        ids_cpu = torch.tensor([0, 3, 7, 3], dtype=torch.long, device="cpu")
         ids_npu = ids_cpu.to(device=torch.device("npu", device_id))
         actual = F.embedding(ids_npu, allocation.npu_view)
         _synchronize_npu(device_id)

@@ -34,11 +34,11 @@ def _get_num_sms(multiplier: int = 1) -> int:
         triton.Config(
             {"GROUP_SIZE_M": group_size_m, "BLOCK_SIZE_N": block_size_n, "BLOCK_SIZE_K": block_size_k},
         )
-        for group_size_m in [4, 8, 16]
+        for group_size_m in [4, 8, 16, 32, 64]
         for block_size_n in [512]
         for block_size_k in [32, 64, 128, 256, 512, 1024, 2048]
     ],
-    key=["M", "N", "K"],
+    key=["N", "K"],
 )
 @triton.jit
 def mmq_style_router_linear_kernel_npu(

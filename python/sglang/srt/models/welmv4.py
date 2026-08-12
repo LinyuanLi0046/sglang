@@ -199,7 +199,14 @@ def _welm_dump_tensor(name: str, tensor: torch.Tensor) -> None:
                 _WELM_DUMP_PROCESS_DIR
             )
         _WELM_DUMP_PROCESS_DIR.mkdir(parents=True, exist_ok=True)
-    torch.save(tensor.detach().cpu(), _WELM_DUMP_PROCESS_DIR / f"{name}.pt")
+    host_allocation = getattr(tensor, "_host_mapped_npu_allocation", None)
+    if host_allocation is not None:
+        # The mapped dev_ptr is not a legal source for CANN memory-copy APIs.
+        # Dump the CPU alias over the same physical embedding storage instead.
+        tensor_to_save = host_allocation.cpu_view.detach().clone()
+    else:
+        tensor_to_save = tensor.detach().cpu()
+    torch.save(tensor_to_save, _WELM_DUMP_PROCESS_DIR / f"{name}.pt")
 
 
 def _welm_dump_module_weights(prefix: str, module: nn.Module) -> None:
@@ -2368,11 +2375,13 @@ class Qwen2MoeModel(nn.Module):
                     f"({num_logical_layers} = {config.num_hidden_layers} target + "
                     f"{num_nextn_predict_layers} NextN/MTP)."
                 )
-        # The legacy CUDA path optionally keeps the (potentially very large)
-        # base/OE embedding tables in mapped pinned host memory.  Keep this
-        # opt-in and CUDA-only so the Ascend path never imports a CUDA extension.
+        # Keep the potentially very large base/OE tables in mapped pinned host
+        # memory when explicitly requested. CUDA uses UVA; Ascend registers a
+        # page-aligned ACL host allocation and presents its dev_ptr as an NPU
+        # tensor after a one-time F.embedding compatibility probe.
         self.use_host_embeddings = (
-            _is_cuda and get_global_server_args().enable_over_encoding
+            (_is_cuda or _is_npu)
+            and get_global_server_args().enable_over_encoding
         )
         self.scale_seq_times = getattr(config, "scale_seq_times", 0)
         if self.scale_seq_times > 0:

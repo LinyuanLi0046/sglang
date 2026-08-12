@@ -150,28 +150,55 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     ):
         """Create weights for embedding layer."""
         if extra_weight_attrs.get("host_tensor", False):
-            if not torch.cuda.is_available():
-                raise RuntimeError(
-                    "CUDA host-backed embedding weights were requested, but CUDA "
-                    "is not available. Do not pass --enable-over-encoding on NPU/CPU."
-                )
-            try:
-                from over_encoding_ops_kernel import custom_empty
-            except ImportError as exc:
-                raise RuntimeError(
-                    "--enable-over-encoding requires the optional CUDA allocator. "
-                    "Install it first with: pip install --no-build-isolation "
-                    "./3rdparty/over_encoding_ops"
-                ) from exc
-
-            weight = Parameter(
-                custom_empty(
-                    (sum(output_partition_sizes), input_size_per_partition),
-                    dtype=params_dtype,
-                    device_id=torch.cuda.current_device(),
-                ),
-                requires_grad=False,
+            shape = (
+                sum(output_partition_sizes),
+                input_size_per_partition,
             )
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.host_mapped_embedding import (
+                    allocate_host_mapped_npu_tensor,
+                )
+
+                allocation = allocate_host_mapped_npu_tensor(
+                    shape,
+                    params_dtype,
+                    torch.npu.current_device(),
+                )
+                weight = Parameter(allocation.npu_view, requires_grad=False)
+                if weight.data_ptr() != allocation.dev_ptr:
+                    allocation.close(synchronize=True)
+                    raise RuntimeError(
+                        "Parameter wrapping changed the ACL mapped NPU address: "
+                        f"expected {allocation.dev_ptr:#x}, got {weight.data_ptr():#x}."
+                    )
+                # Parameter(tensor) shares storage but does not inherit arbitrary
+                # attributes from tensor.  Keep the ACL allocation alive from
+                # both the registered Parameter and its owning module.
+                weight._host_mapped_npu_allocation = allocation
+                layer._host_mapped_npu_allocations = {"weight": allocation}
+            elif not torch.cuda.is_available():
+                raise RuntimeError(
+                    "Host-backed embedding weights were requested, but neither "
+                    "CUDA nor NPU is available."
+                )
+            else:
+                try:
+                    from over_encoding_ops_kernel import custom_empty
+                except ImportError as exc:
+                    raise RuntimeError(
+                        "--enable-over-encoding requires the optional CUDA allocator. "
+                        "Install it first with: pip install --no-build-isolation "
+                        "./3rdparty/over_encoding_ops"
+                    ) from exc
+
+                weight = Parameter(
+                    custom_empty(
+                        shape,
+                        dtype=params_dtype,
+                        device_id=torch.cuda.current_device(),
+                    ),
+                    requires_grad=False,
+                )
         else:
             weight = Parameter(
                 torch.empty(

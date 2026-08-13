@@ -315,7 +315,8 @@ class TestWelMLayerwiseSinkTritonRouting(unittest.TestCase):
             v_head_dim=2,
             scaling=0.5,
         )
-        q = torch.randn(4, 8)
+        packed_qkv = torch.randn(4, 12)
+        q = packed_qkv[:, :8]
         k_cache = torch.randn(4, 2, 2)
         v_cache = torch.randn(4, 2, 2)
         block_tables = torch.tensor([[0], [1]], dtype=torch.int32)
@@ -341,6 +342,9 @@ class TestWelMLayerwiseSinkTritonRouting(unittest.TestCase):
         self.assertTrue(torch.equal(output[3], torch.zeros_like(output[3])))
         call = fake_prefill.call_args.kwargs
         self.assertEqual(call["q"].shape, (3, 4, 2))
+        self.assertEqual(call["q"].data_ptr(), q.data_ptr())
+        self.assertEqual(call["q"].stride(), (12, 2, 1))
+        self.assertFalse(call["q"].is_contiguous())
         self.assertEqual(call["key_cache"].shape, (2, 2, 2, 2))
 
     def test_full_sink_decode_ignores_attention_dp_padding(self):
@@ -358,7 +362,8 @@ class TestWelMLayerwiseSinkTritonRouting(unittest.TestCase):
             v_head_dim=2,
             scaling=0.5,
         )
-        q = torch.randn(3, 8)
+        packed_qkv = torch.randn(3, 12)
+        q = packed_qkv[:, :8]
         k_cache = torch.randn(4, 2, 2)
         v_cache = torch.randn(4, 2, 2)
         seq_lens = torch.tensor([3, 4], dtype=torch.int32)
@@ -385,6 +390,9 @@ class TestWelMLayerwiseSinkTritonRouting(unittest.TestCase):
         self.assertTrue(torch.equal(output[2], torch.zeros_like(output[2])))
         call = fake_decode.call_args.kwargs
         self.assertEqual(call["q"].shape, (2, 4, 2))
+        self.assertEqual(call["q"].data_ptr(), q.data_ptr())
+        self.assertEqual(call["q"].stride(), (12, 2, 1))
+        self.assertFalse(call["q"].is_contiguous())
         self.assertEqual(call["key_cache"].shape, (2, 2, 2, 2))
         self.assertEqual(call["max_kv_len_hint"], 4)
 
@@ -403,7 +411,8 @@ class TestWelMLayerwiseSinkTritonRouting(unittest.TestCase):
             v_head_dim=2,
             scaling=0.5,
         )
-        q = torch.randn(4, 8, dtype=torch.float16)
+        packed_qkv = torch.randn(4, 12, dtype=torch.float16)
+        q = packed_qkv[:, :8]
         k_cache = torch.randn(4, 2, 2, dtype=torch.float16)
         v_cache = torch.randn(4, 2, 2, dtype=torch.float16)
         block_tables = torch.tensor([[0], [1]], dtype=torch.int32)
@@ -429,6 +438,9 @@ class TestWelMLayerwiseSinkTritonRouting(unittest.TestCase):
         self.assertTrue(torch.equal(output[3], torch.zeros_like(output[3])))
         call = fake_prefill.call_args.kwargs
         self.assertEqual(call["q"].shape, (3, 4, 2))
+        self.assertEqual(call["q"].data_ptr(), q.data_ptr())
+        self.assertEqual(call["q"].stride(), (12, 2, 1))
+        self.assertFalse(call["q"].is_contiguous())
         self.assertEqual(call["key_cache"].shape, (2, 2, 2, 2))
         self.assertTrue(
             torch.equal(
@@ -451,7 +463,8 @@ class TestWelMLayerwiseSinkTritonRouting(unittest.TestCase):
             v_head_dim=2,
             scaling=0.5,
         )
-        q = torch.randn(3, 8, dtype=torch.float16)
+        packed_qkv = torch.randn(3, 12, dtype=torch.float16)
+        q = packed_qkv[:, :8]
         k_cache = torch.randn(4, 2, 2, dtype=torch.float16)
         v_cache = torch.randn(4, 2, 2, dtype=torch.float16)
         seq_lens = torch.tensor([3, 4], dtype=torch.int32)
@@ -479,6 +492,9 @@ class TestWelMLayerwiseSinkTritonRouting(unittest.TestCase):
         self.assertTrue(torch.equal(output[2], torch.zeros_like(output[2])))
         call = fake_decode.call_args.kwargs
         self.assertEqual(call["q"].shape, (2, 4, 2))
+        self.assertEqual(call["q"].data_ptr(), q.data_ptr())
+        self.assertEqual(call["q"].stride(), (12, 2, 1))
+        self.assertFalse(call["q"].is_contiguous())
         self.assertEqual(call["key_cache"].shape, (2, 2, 2, 2))
         self.assertEqual(call["local_window_size"], 511)
         self.assertEqual(call["global_window_size"], 0)

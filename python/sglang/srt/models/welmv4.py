@@ -885,14 +885,19 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             _welm_dump_tensor(f"{dump_prefix}.router.input", hidden_states)
             _welm_dump_tensor(f"{dump_prefix}.router.input_fp32", hidden_states_fp32)
         shared_output = None
+        is_prefill_batch = (
+            forward_batch is not None
+            and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
+                include_draft_extend_v2=True
+            )
+        )
         # Routed MoE implementations may overwrite hidden_states in-place.  Give
-        # the NPU shared branch its own snapshot so the same dual-stream path is
-        # safe for both DeepEP and the standard non-DeepEP dispatcher.
         enable_npu_dual_stream = (
             _is_npu
             and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             and self.shared_expert is not None
             and hidden_states.shape[0] > 0
+            and not is_prefill_batch
         )
         shared_input = None
         if get_moe_a2a_backend().is_deepep() and hidden_states.shape[0] == 0:

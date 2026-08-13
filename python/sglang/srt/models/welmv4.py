@@ -928,13 +928,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 )
                 _welm_dump_tensor(f"{dump_prefix}.router.scores", router_scores)
             # Ascend's generic fused TopK dispatch ignores custom routing callbacks.
-            # Keep the MMQ-style Triton path by default. The opt-in path calls the
-            # existing Ascend MoeGatingTopK op directly with WeLM's expert bias;
+            # Route WeLM's expert-bias callback through MoeGatingTopK explicitly;
             # it uses the native TopK tie order rather than MMQ's tie_rank order.
             if _is_npu and self.custom_routing_function is not None:
                 if (
-                    envs.SGLANG_NPU_WELMV4_USE_FUSED_TOPK.get()
-                    and getattr(self.custom_routing_function, "func", None)
+                    getattr(self.custom_routing_function, "func", None)
                     is expert_bias_routing
                 ):
                     topk_output = self.topk.forward_npu(

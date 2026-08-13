@@ -302,7 +302,7 @@ def _do_mmq_rms_norm(hidden, gamma, cols: int, eps: tl.constexpr):
     return out, inv_rms
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows"])
 def mmq_style_norm_after_attn_kernel(
     hidden_states_ptr: tl.tensor,
     residual_ptr: tl.tensor,
@@ -314,7 +314,6 @@ def mmq_style_norm_after_attn_kernel(
     rows: int,
     cols: tl.constexpr,
     eps: float,
-    NUM_SMS: tl.constexpr,  # pylint: disable=invalid-name
     BLOCK_SIZE: tl.constexpr,  # pylint: disable=invalid-name
 ):
     cols_offsets = tl.arange(0, BLOCK_SIZE)
@@ -323,7 +322,9 @@ def mmq_style_norm_after_attn_kernel(
     rnorm_gamma = tl.load(rnorm_gamma_ptr + cols_offsets, mask=mask, other=0.0)
     output_dtype = output_ptr.dtype.element_ty
 
-    for row_id in tl.range(tl.program_id(0), rows, NUM_SMS, num_stages=2):
+    for row_id in tl.range(
+        tl.program_id(0), rows, tl.num_programs(0), num_stages=2
+    ):
         offsets = (row_id * cols + cols_offsets).to(tl.int64)
         hs = tl.load(hidden_states_ptr + offsets, mask=mask, other=0.0)
         onorm_out, _ = _do_mmq_rms_norm(hs, onorm_gamma, cols, eps)
@@ -367,13 +368,18 @@ def mmq_style_norm_after_attn(
         rows,
         cols,
         eps,
-        num_sms,
         block_size,
     )
     return output, residual_out, fp32_out
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "rows",
+        "hidden_states_num_kv",
+        "hidden_states_kv_stride",
+    ]
+)
 def rms_norm_kernel(  # pylint: disable=too-many-arguments,too-many-locals
     hidden_states_ptr: tl.tensor,
     reisdual_ptr: tl.tensor,
@@ -389,7 +395,6 @@ def rms_norm_kernel(  # pylint: disable=too-many-arguments,too-many-locals
     hidden_states_kv_stride: int,
     residual_row_stride: int,
     residual_after_layernorm: tl.constexpr,
-    NUM_SMS: tl.constexpr,  # pylint: disable=invalid-name
     BLOCK_SIZE: tl.constexpr,  # pylint: disable=invalid-name
 ):
     row_start = tl.program_id(0)
@@ -398,7 +403,9 @@ def rms_norm_kernel(  # pylint: disable=too-many-arguments,too-many-locals
     gamma_shm = tl.load(gamma_ptr + cols_off, mask=mask, other=0.0)
 
     output_dtype = out_ptr.dtype.element_ty
-    for row_id in tl.range(row_start, rows, NUM_SMS, num_stages=2):
+    for row_id in tl.range(
+        row_start, rows, tl.num_programs(0), num_stages=2
+    ):
         kv_idx = row_id // hidden_states_num_kv
         row_idx = row_id % hidden_states_num_kv
         kv_off = kv_idx * hidden_states_kv_stride
@@ -518,7 +525,6 @@ class WelmV4FusedRMSNorm(MultiPlatformOp):
             kv_stride,
             residual_row_stride,
             residual_after_layernorm,
-            num_sms,
             block_size,
         )
         if out_residual is None:
@@ -603,7 +609,7 @@ def mmq_style_shared_experts_add_residual_rms_norm(
     return output
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["tokens"])
 def mmq_style_k_rms_norm_kernel(
     x_ptr: tl.tensor,
     gamma_ptr: tl.tensor,
@@ -614,7 +620,6 @@ def mmq_style_k_rms_norm_kernel(
     x_token_stride: int,
     out_token_stride: int,
     eps: float,
-    NUM_SMS: tl.constexpr,  # pylint: disable=invalid-name
     KV_HEADS_BLOCK: tl.constexpr,  # pylint: disable=invalid-name
 ):
     head_dim_offs = tl.arange(0, head_dim)
@@ -622,7 +627,9 @@ def mmq_style_k_rms_norm_kernel(
     block_offs = kv_head_offs[:, None] * head_dim + head_dim_offs[None, :]
     gamma = tl.load(gamma_ptr + head_dim_offs)
 
-    for token_id in tl.range(tl.program_id(0), tokens, NUM_SMS, num_stages=4):
+    for token_id in tl.range(
+        tl.program_id(0), tokens, tl.num_programs(0), num_stages=4
+    ):
         in_offs = token_id * x_token_stride.to(tl.int64) + block_offs
         x = tl.load(
             x_ptr + in_offs, mask=kv_head_offs[:, None] < kv_heads, other=0.0
@@ -658,7 +665,6 @@ def mmq_style_k_rms_norm(
         x.stride(0),
         output.stride(0),
         eps,
-        num_sms,
         triton.next_power_of_2(kv_heads),
     )
     if WELMV4_KERNEL_SHAPE_LOG_ENABLED:

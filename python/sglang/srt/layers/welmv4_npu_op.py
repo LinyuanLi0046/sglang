@@ -160,7 +160,7 @@ def _rope_npu(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["N", "BS"])
 def _welmv4_inplace_rope_kernel_npu(
     q_ptr: tl.tensor,
     k_ptr: tl.tensor,
@@ -173,7 +173,6 @@ def _welmv4_inplace_rope_kernel_npu(
     k_token_stride: tl.constexpr,
     head_dim: tl.constexpr,
     rope_dim: tl.constexpr,
-    num_sms: tl.constexpr,
     num_stages: tl.constexpr,
     num_q_heads: tl.constexpr,
     num_k_heads: tl.constexpr,
@@ -190,7 +189,9 @@ def _welmv4_inplace_rope_kernel_npu(
     half_rope_dim: tl.constexpr = rope_dim // 2
     cos_off = tl.arange(0, half_rope_dim)
     sin_off = tl.arange(half_rope_dim, rope_dim)
-    for token_id in tl.range(tl.program_id(0), N, num_sms, num_stages=num_stages):
+    for token_id in tl.range(
+        tl.program_id(0), N, tl.num_programs(0), num_stages=num_stages
+    ):
         position_id = tl.load(position_ptr + token_id)
         # [NPU 迁移] 添加 care_padding=False
         cos_sin_cache = tl.load(
@@ -266,7 +267,7 @@ def welmv4_inplace_rope_npu(
         N, BS,
         query.stride(0), key.stride(0),
         head_dim, rope_dim,
-        num_sms, num_stages,
+        num_stages,
         num_q_heads, num_k_heads,
         triton.next_power_of_2(num_q_heads),
         triton.next_power_of_2(num_k_heads),
@@ -316,7 +317,9 @@ def _welmv4_u32_remainder(value, divisor: tl.constexpr):
     return value - quotient * divisor
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["num_tokens", "num_token_tiles", "num_tasks"]
+)
 def _welmv4_oe_hash_prefill_4way_kernel(
     input_ids_ptr,
     token_table_ptr,
@@ -433,7 +436,7 @@ def _welmv4_oe_hash_prefill_4way_kernel(
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["batch_size", "num_tasks"])
 def _welmv4_oe_hash_decode_4way_kernel(
     input_ids_ptr,
     token_table_ptr,
@@ -508,7 +511,9 @@ def _welmv4_oe_hash_decode_4way_kernel(
         )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["num_tokens", "num_token_tiles", "num_tasks"]
+)
 def _welmv4_token_table_ragged_update_kernel(
     token_table_ptr,
     tokens_ptr,

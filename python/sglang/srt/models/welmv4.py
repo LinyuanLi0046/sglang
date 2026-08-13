@@ -927,11 +927,26 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     else torch.sigmoid(router_logits).type_as(router_logits)
                 )
                 _welm_dump_tensor(f"{dump_prefix}.router.scores", router_scores)
-            # Ascend's fused TopK fast path currently ignores custom routing
-            # callbacks. WeLM needs its sigmoid/expert-bias callback, so use the
-            # shared PyTorch implementation on NPU. CUDA keeps the fused dispatch.
+            # Ascend's generic fused TopK dispatch ignores custom routing callbacks.
+            # Keep the MMQ-style Triton path by default. The opt-in path calls the
+            # existing Ascend MoeGatingTopK op directly with WeLM's expert bias;
+            # it uses the native TopK tie order rather than MMQ's tie_rank order.
             if _is_npu and self.custom_routing_function is not None:
-                topk_output = self.topk.forward_native(hidden_states, router_logits)
+                if (
+                    envs.SGLANG_NPU_WELMV4_USE_FUSED_TOPK.get()
+                    and getattr(self.custom_routing_function, "func", None)
+                    is expert_bias_routing
+                ):
+                    topk_output = self.topk.forward_npu(
+                        hidden_states,
+                        router_logits,
+                        expert_bias=self.expert_bias,
+                        scoring_func_override=self.router_score_func,
+                    )
+                else:
+                    topk_output = self.topk.forward_native(
+                        hidden_states, router_logits
+                    )
             else:
                 topk_output = self.topk(hidden_states, router_logits)
         if dump_this_layer and hasattr(topk_output, "topk_weights"):

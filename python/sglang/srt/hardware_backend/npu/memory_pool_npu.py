@@ -198,36 +198,33 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
-        layer_idx = layer_id - self.start_layer
-        k_buffer_layer = self.k_buffer[layer_idx].view(
-            -1, self.page_size, self.head_num, self.head_dim
-        )
-        v_buffer_layer = self.v_buffer[layer_idx].view(
-            -1, self.page_size, self.head_num, self.v_head_dim
-        )
-        cache_k = cache_k.view(-1, self.head_num, self.head_dim)
-        cache_v = cache_v.view(-1, self.head_num, self.v_head_dim)
+        if self.use_fia:
+            k_buffer_layer = self.k_buffer[layer_id - self.start_layer]
+            v_buffer_layer = self.v_buffer[layer_id - self.start_layer]
 
-        # Float8 caches use uint8 backing storage in SGLang.  A2/A3 versions of
-        # ScatterPaKvCache accept int8 (but not uint8); reinterpret both sources
-        # and destinations as int8 so the operator still performs the same raw
-        # one-byte copy without changing the cached Float8 bit patterns.
-        if self.store_dtype == torch.uint8:
-            cache_k = cache_k.view(torch.int8)
-            cache_v = cache_v.view(torch.int8)
-            k_buffer_layer = k_buffer_layer.view(torch.int8)
-            v_buffer_layer = v_buffer_layer.view(torch.int8)
-
-        # The torch_npu API defaults to PA_NZ, while this pool is laid out as
-        # [num_blocks, page_size, num_heads, head_dim] in ordinary ND format.
-        torch_npu.npu_scatter_pa_kv_cache(
-            cache_k,
-            cache_v,
-            k_buffer_layer,
-            v_buffer_layer,
-            loc,
-            cache_mode="Norm",
-        )
+            torch_npu.npu_scatter_nd_update_(
+                k_buffer_layer,
+                loc.view(-1, 1),
+                cache_k.view(-1, 1, self.head_num, self.head_dim),
+            )
+            torch_npu.npu_scatter_nd_update_(
+                v_buffer_layer,
+                loc.view(-1, 1),
+                cache_v.view(-1, 1, self.head_num, self.v_head_dim),
+            )
+        else:
+            loc = loc.to(torch.int32)
+            torch_npu._npu_reshape_and_cache(
+                key=cache_k,
+                value=cache_v,
+                key_cache=self.k_buffer[layer_id - self.start_layer].view(
+                    -1, self.page_size, self.head_num, self.head_dim
+                ),
+                value_cache=self.v_buffer[layer_id - self.start_layer].view(
+                    -1, self.page_size, self.head_num, self.v_head_dim
+                ),
+                slot_indices=loc,
+            )
 
     def _chunk_copy_npu_to_cpu(self, buf_of_layers, indices):
         chunk_size = self.cpu_offloading_chunk_size

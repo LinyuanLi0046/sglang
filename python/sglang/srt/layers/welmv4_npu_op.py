@@ -554,7 +554,7 @@ def _welmv4_token_table_ragged_update_kernel(
         tl.store(token_table_ptr + row * context_len + columns, values, mask=mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["batch_size", "num_tasks"])
 def _welmv4_token_table_decode_update_kernel(
     token_table_ptr,
     next_token_ids_ptr,

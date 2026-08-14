@@ -89,10 +89,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_npu, make_layers
 
 if is_npu():
-    from sglang.srt.hardware_backend.npu.utils import (
-        process_shared_expert,
-        wait_share_stream,
-    )
+    from sglang.srt.hardware_backend.npu.utils import process_shared_expert
     from sglang.srt.layers.welmv4_npu_op import (
         mmq_style_router_linear_npu,
         welmv4_oe_hash_decode_4way_npu,
@@ -885,35 +882,25 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             _welm_dump_tensor(f"{dump_prefix}.router.input", hidden_states)
             _welm_dump_tensor(f"{dump_prefix}.router.input_fp32", hidden_states_fp32)
         shared_output = None
-        is_prefill_batch = (
-            forward_batch is not None
-            and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
-                include_draft_extend_v2=True
-            )
-        )
-        # Routed MoE implementations may overwrite hidden_states in-place.  Give
+        moe_a2a_backend = get_moe_a2a_backend()
         enable_npu_dual_stream = (
             _is_npu
             and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             and self.shared_expert is not None
             and hidden_states.shape[0] > 0
-            and not is_prefill_batch
+            and (moe_a2a_backend.is_none() or moe_a2a_backend.is_deepep())
         )
         shared_input = None
-        if get_moe_a2a_backend().is_deepep() and hidden_states.shape[0] == 0:
+        if moe_a2a_backend.is_deepep() and hidden_states.shape[0] == 0:
             topk_output = self.topk.empty_topk_output(
                 hidden_states.device, layer_id=self.layer_id
             )
         else:
             if self.shared_expert is not None:
                 if enable_npu_dual_stream:
-                    # Keep this local alive until the join below.  The clone is
-                    # enqueued on the main stream, and process_shared_expert makes
-                    # the shared stream wait for it before consuming the snapshot.
+                    # Routed MoE implementations may overwrite hidden_states
+                    # in-place.  Snapshot it before either branch starts.
                     shared_input = hidden_states.clone()
-                    shared_output = process_shared_expert(
-                        shared_input, self._forward_shared_expert
-                    )
                 else:
                     shared_output = self._forward_shared_expert(hidden_states)
             if _is_npu:
@@ -923,6 +910,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             else:
                 router_logits = mmq_style_router_linear(
                     hidden_states, self.gate.weight
+                )
+            if enable_npu_dual_stream:
+                # Start the shared branch only after the router matmul has
+                # completed on the main stream.  The main stream can now overlap
+                # sigmoid/TopK/gather and token init-routing with the shared
+                # expert, and FusedMoE joins the streams immediately before the
+                # routed expert core launches its first GMM.
+                shared_output = process_shared_expert(
+                    shared_input, self._forward_shared_expert
                 )
             if dump_this_layer:
                 _welm_dump_tensor(f"{dump_prefix}.router.logits", router_logits)
@@ -955,11 +951,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if dump_this_layer and hasattr(topk_output, "topk_weights"):
             _welm_dump_tensor(f"{dump_prefix}.router.topk_scores", topk_output.topk_weights)
             _welm_dump_tensor(f"{dump_prefix}.router.topk_ids", topk_output.topk_ids)
-        experts_output = self.experts(hidden_states, topk_output)
         if enable_npu_dual_stream:
-            # Join before dumps, component returns, and the final add: all three
-            # consume shared_output and must not observe an unfinished side stream.
-            wait_share_stream()
+            experts_output = self.experts.forward_with_shared_expert_stream(
+                hidden_states,
+                topk_output,
+            )
+        else:
+            experts_output = self.experts(hidden_states, topk_output)
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.experts_output", experts_output)
         if return_components and skip_component_output:

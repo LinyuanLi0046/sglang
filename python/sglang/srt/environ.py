@@ -633,10 +633,6 @@ class Envs:
     # NPU
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
-    # Debug only: copy each MoE group_list to CPU and print it on TP rank 0.
-    # This introduces a device synchronization and must stay disabled in
-    # performance runs.
-    SGLANG_NPU_PRINT_MOE_GROUP_LIST = EnvBool(False)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
     # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2
     SGLANG_NPU_FORWARD_NATIVE_GELUTANH = EnvBool(False)

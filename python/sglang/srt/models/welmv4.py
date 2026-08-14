@@ -1581,7 +1581,10 @@ class Qwen2MoeAttention(nn.Module):
             q_by_head, _ = self.q_norm(q_by_head)
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.q_after_norm", q_by_head.view(q.shape))
-        q = q_by_head.view(q.shape)
+        # Q is a strided view of the fused QKV projection when q_norm is
+        # disabled.  Attention requires packed Q later, so materialize that
+        # layout before RoPE and let downstream contiguous() calls be no-ops.
+        q = q_by_head.view(q.shape).contiguous()
 
         k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
         if self.k_norm is not None:

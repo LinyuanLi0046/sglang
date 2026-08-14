@@ -416,13 +416,25 @@ def _welmv4_inplace_rope_prefill_kernel_npu(
                 )
         else:
             q_data = q_ptr + token_base * q_token_stride + head_dim - rope_dim
+            # Split Q as 2+2+2 heads so FP32 cos/sin and the ping-pong load
+            # buffers fit in A5 UB while preserving FP32 RoPE arithmetic.
             _welmv4_apply_token_head_block_rope_npu(
                 q_data,
                 token_offsets,
                 q_token_stride,
                 cos,
                 sin,
-                4,
+                2,
+                head_dim,
+                rope_dim,
+            )
+            _welmv4_apply_token_head_block_rope_npu(
+                q_data + 2 * head_dim,
+                token_offsets,
+                q_token_stride,
+                cos,
+                sin,
+                2,
                 head_dim,
                 rope_dim,
             )
@@ -504,7 +516,7 @@ def welmv4_inplace_rope_npu(
             prefill_masked,
             _WELMV4_ROPE_PREFILL_NUM_STAGES,
             num_q_heads,
-            multibuffer=False,
+            multibuffer=True,
         )
         kernel_name = "_welmv4_inplace_rope_prefill_kernel_npu"
     else:

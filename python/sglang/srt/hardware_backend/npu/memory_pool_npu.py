@@ -10,7 +10,7 @@ from sglang.srt.mem_cache.memory_pool import (
     unwrap_write_loc,
 )
 from sglang.srt.utils import get_bool_env_var
-from sglang.srt.utils.common import get_int_env_var, is_npu
+from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -69,17 +69,6 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         self.use_scatter_pa_kv_cache = get_bool_env_var(
             "SGLANG_NPU_USE_SCATTER_PA_KV_CACHE", "False"
         )
-        self.scatter_pa_kv_cache_chunk_size = get_int_env_var(
-            "SGLANG_NPU_SCATTER_PA_KV_CACHE_CHUNK_SIZE", 8192
-        )
-        if (
-            self.use_scatter_pa_kv_cache
-            and self.scatter_pa_kv_cache_chunk_size <= 0
-        ):
-            raise ValueError(
-                "SGLANG_NPU_SCATTER_PA_KV_CACHE_CHUNK_SIZE must be greater "
-                "than 0"
-            )
         super().__init__(
             size=size,
             page_size=page_size,
@@ -194,6 +183,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
         dcp_kv_mask: Optional[torch.Tensor] = None,
+        use_scatter_pa_kv_cache: bool = False,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         if layer_id_override is not None:
@@ -212,7 +202,10 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
-        if self.use_scatter_pa_kv_cache and not self.use_fia:
+        use_scatter_pa_kv_cache = (
+            self.use_scatter_pa_kv_cache and use_scatter_pa_kv_cache
+        )
+        if use_scatter_pa_kv_cache and not self.use_fia:
             raise RuntimeError(
                 "SGLANG_NPU_USE_SCATTER_PA_KV_CACHE requires "
                 "ASCEND_USE_FIA=True"
@@ -222,7 +215,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             k_buffer_layer = self.k_buffer[layer_id - self.start_layer]
             v_buffer_layer = self.v_buffer[layer_id - self.start_layer]
 
-            if self.use_scatter_pa_kv_cache:
+            if use_scatter_pa_kv_cache:
                 if not hasattr(torch_npu, "npu_scatter_pa_kv_cache"):
                     raise RuntimeError(
                         "The installed torch_npu does not provide "
@@ -256,33 +249,14 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 )
                 slot_mapping = loc.reshape(-1).to(torch.int32).contiguous()
 
-                num_tokens = key.shape[0]
-                chunk_size = self.scatter_pa_kv_cache_chunk_size
-
-                # ScatterPaKvCache has a performance cliff at 16K tokens on
-                # the current CANN stack. Split only when at least two full
-                # chunks are present, so the observed-good 9616-token tail
-                # and decode batches still use a single operator call.
-                if num_tokens >= 2 * chunk_size:
-                    for start in range(0, num_tokens, chunk_size):
-                        end = min(start + chunk_size, num_tokens)
-                        torch_npu.npu_scatter_pa_kv_cache(
-                            key[start:end],
-                            value[start:end],
-                            key_cache,
-                            value_cache,
-                            slot_mapping[start:end],
-                            cache_mode="Norm",
-                        )
-                else:
-                    torch_npu.npu_scatter_pa_kv_cache(
-                        key,
-                        value,
-                        key_cache,
-                        value_cache,
-                        slot_mapping,
-                        cache_mode="Norm",
-                    )
+                torch_npu.npu_scatter_pa_kv_cache(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    slot_mapping,
+                    cache_mode="Norm",
+                )
             else:
                 torch_npu.npu_scatter_nd_update_(
                     k_buffer_layer,

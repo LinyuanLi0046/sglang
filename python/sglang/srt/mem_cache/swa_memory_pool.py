@@ -186,11 +186,17 @@ class SWAKVPool(BaseSWAKVPool):
         cache_v: torch.Tensor,
         k_scale: float = 1.0,
         v_scale: float = 1.0,
+        use_scatter_pa_kv_cache: bool = False,
     ):
         # loc_info bundles the full loc and the pre-translated SWA loc.
         loc, swa_loc, _ = unwrap_write_loc(loc_info)
         layer_id = layer.layer_id
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
+        scatter_pa_kwargs = (
+            {"use_scatter_pa_kv_cache": use_scatter_pa_kv_cache}
+            if hasattr(self.full_kv_pool, "use_scatter_pa_kv_cache")
+            else {}
+        )
         if is_swa_layer:
             # swa_loc is the full->SWA translation, computed once per forward by
             # the attention backend; set_kv_buffer never translates internally.
@@ -203,6 +209,7 @@ class SWAKVPool(BaseSWAKVPool):
                 k_scale,
                 v_scale,
                 layer_id_override=layer_id_pool,
+                **scatter_pa_kwargs,
             )
         else:
             self.full_kv_pool.set_kv_buffer(
@@ -213,6 +220,7 @@ class SWAKVPool(BaseSWAKVPool):
                 k_scale,
                 v_scale,
                 layer_id_override=layer_id_pool,
+                **scatter_pa_kwargs,
             )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):

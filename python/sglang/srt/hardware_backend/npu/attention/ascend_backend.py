@@ -677,7 +677,7 @@ class AscendAttnBackend(AttentionBackend):
         sinks: torch.Tensor,
     ) -> torch.Tensor:
         _, prefill, _ = _load_welm_full_sink_attention_ops()
-        q_3d = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
+        q_3d = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
         k_cache_4d = self._view_welm_full_sink_kv_cache(
             k_cache, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
         )
@@ -754,7 +754,7 @@ class AscendAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         """Run WeLM paged causal SWA with a per-query-head sink logit."""
         prefill, _ = _load_welm_swa_sink_attention_ops()
-        q_3d = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
+        q_3d = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
         k_cache_4d = self._view_welm_full_sink_kv_cache(
             k_cache, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
         )
@@ -1951,7 +1951,13 @@ class AscendAttnBackend(AttentionBackend):
                         else None
                     )
                     self.token_to_kv_pool.set_kv_buffer(
-                        layer, KVWriteLoc(cache_loc, swa_loc), k, v
+                        layer,
+                        KVWriteLoc(cache_loc, swa_loc),
+                        k,
+                        v,
+                        use_scatter_pa_kv_cache=(
+                            forward_batch.forward_mode.is_decode()
+                        ),
                     )
 
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)

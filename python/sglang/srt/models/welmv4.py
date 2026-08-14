@@ -1560,7 +1560,7 @@ class Qwen2MoeAttention(nn.Module):
         k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
         if self.k_norm is not None:
             k_by_head = mmq_style_k_rms_norm(
-                k_by_head.contiguous(),
+                k_by_head,
                 self.k_norm.weight,
                 self.k_norm.eps,
                 layer_id=self.layer_idx,

@@ -673,7 +673,10 @@ def paged_attention_prefill_impl(
         )
     sinks_pass = sinks if sink_enabled else torch.empty(1, dtype=q.dtype, device=q.device)
 
-    o = torch.empty_like(q)
+    # Q can be a strided view into the fused QKV projection. The kernel reads
+    # it with the explicit strides below, while its output remains compact for
+    # the following projection.
+    o = torch.empty_like(q, memory_format=torch.contiguous_format)
     block_tables_i32 = block_tables.to(dtype=torch.int32).contiguous()
 
     CHUNK_SIZE = 128

@@ -644,9 +644,13 @@ def mmq_style_k_rms_norm(
     stage: Optional[str] = None,
 ):
     assert x.dim() == 3
-    assert x.is_contiguous()
-    output = torch.empty_like(x)
     tokens, kv_heads, head_dim = x.shape
+    # K can be a view into the fused QKV projection. Heads and head_dim are
+    # compact inside each token; the kernel already consumes x.stride(0) for
+    # the possibly padded token pitch.
+    assert x.stride(2) == 1
+    assert x.stride(1) == head_dim
+    output = torch.empty_like(x, memory_format=torch.contiguous_format)
     num_sms = min(tokens, _get_num_sms())
     mmq_style_k_rms_norm_kernel[(num_sms,)](
         x,

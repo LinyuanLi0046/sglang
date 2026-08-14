@@ -504,6 +504,7 @@ def welmv4_inplace_rope_npu(
             prefill_masked,
             _WELMV4_ROPE_PREFILL_NUM_STAGES,
             num_q_heads,
+            multibuffer=False,
         )
         kernel_name = "_welmv4_inplace_rope_prefill_kernel_npu"
     else:

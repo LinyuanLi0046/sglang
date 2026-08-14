@@ -882,6 +882,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             _welm_dump_tensor(f"{dump_prefix}.router.input", hidden_states)
             _welm_dump_tensor(f"{dump_prefix}.router.input_fp32", hidden_states_fp32)
         shared_output = None
+        is_prefill_batch = (
+            forward_batch is not None
+            and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
+                include_draft_extend_v2=True
+            )
+        )
         moe_a2a_backend = get_moe_a2a_backend()
         enable_npu_dual_stream = (
             _is_npu
@@ -889,6 +895,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and self.shared_expert is not None
             and hidden_states.shape[0] > 0
             and (moe_a2a_backend.is_none() or moe_a2a_backend.is_deepep())
+            and not is_prefill_batch
         )
         shared_input = None
         if moe_a2a_backend.is_deepep() and hidden_states.shape[0] == 0:

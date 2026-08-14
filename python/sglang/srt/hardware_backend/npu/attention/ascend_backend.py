@@ -1955,9 +1955,6 @@ class AscendAttnBackend(AttentionBackend):
                         KVWriteLoc(cache_loc, swa_loc),
                         k,
                         v,
-                        use_scatter_pa_kv_cache=(
-                            forward_batch.forward_mode.is_decode()
-                        ),
                     )
 
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -2769,6 +2766,7 @@ class AscendAttnBackend(AttentionBackend):
                     ),
                     k,
                     v,
+                    use_scatter_pa_kv_cache=True,
                 )
 
         if not self.use_mla:
@@ -3041,6 +3039,7 @@ class AscendAttnBackend(AttentionBackend):
                     ),
                     k,
                     v,
+                    use_scatter_pa_kv_cache=True,
                 )
 
         if (
@@ -3391,7 +3390,11 @@ class AscendAttnBackend(AttentionBackend):
                     else None
                 )
                 self.token_to_kv_pool.set_kv_buffer(
-                    layer, KVWriteLoc(cache_loc, swa_loc), k, v
+                    layer,
+                    KVWriteLoc(cache_loc, swa_loc),
+                    k,
+                    v,
+                    use_scatter_pa_kv_cache=True,
                 )
             num_tokens = q.shape[0]
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)

@@ -1400,26 +1400,11 @@ class FusedMoE(torch.nn.Module):
                 hidden_states, topk_output, pre_quant_input=pre_quant_input
             )
 
-    def forward_with_shared_expert_stream(
-        self,
-        hidden_states: torch.Tensor,
-        topk_output: TopKOutput,
-    ):
-        # Pure TP and NPU DeepEP both use FusedMoE.forward_impl.  Call it
-        # explicitly so unrelated subclass forward paths stay unchanged.
-        return FusedMoE.forward_impl(
-            self,
-            hidden_states,
-            topk_output,
-            wait_for_shared_expert=True,
-        )
-
     def forward_impl(
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
         pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        wait_for_shared_expert: bool = False,
     ):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
@@ -1431,13 +1416,6 @@ class FusedMoE(torch.nn.Module):
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
-        # AscendTP dispatch contains MoeInitRouting.  Join here, after all router
-        # vector work and immediately before run_moe_core starts routed-expert
-        # GMM, so the two streams never compete for Cube.
-        if wait_for_shared_expert:
-            from sglang.srt.hardware_backend.npu.utils import wait_share_stream
-
-            wait_share_stream()
         if (
             pre_quant_input is not None
             and dispatch_output.format.is_standard()

@@ -89,7 +89,10 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_npu, make_layers
 
 if is_npu():
-    from sglang.srt.hardware_backend.npu.utils import process_shared_expert
+    from sglang.srt.hardware_backend.npu.utils import (
+        process_shared_expert,
+        wait_share_stream,
+    )
     from sglang.srt.layers.welmv4_npu_op import (
         mmq_style_router_linear_npu,
         welmv4_oe_hash_decode_4way_npu,
@@ -895,7 +898,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and self.shared_expert is not None
             and hidden_states.shape[0] > 0
             and (moe_a2a_backend.is_none() or moe_a2a_backend.is_deepep())
-            and not is_prefill_batch
         )
         shared_input = None
         if moe_a2a_backend.is_deepep() and hidden_states.shape[0] == 0:
@@ -908,6 +910,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     # Routed MoE implementations may overwrite hidden_states
                     # in-place.  Snapshot it before either branch starts.
                     shared_input = hidden_states.clone()
+                    if not is_prefill_batch:
+                        # Decode keeps the original wide-overlap schedule: start
+                        # shared before router and join only after routed experts.
+                        shared_output = process_shared_expert(
+                            shared_input, self._forward_shared_expert
+                        )
                 else:
                     shared_output = self._forward_shared_expert(hidden_states)
             if _is_npu:
@@ -918,12 +926,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 router_logits = mmq_style_router_linear(
                     hidden_states, self.gate.weight
                 )
-            if enable_npu_dual_stream:
-                # Start the shared branch only after the router matmul has
-                # completed on the main stream.  The main stream can now overlap
-                # sigmoid/TopK/gather and token init-routing with the shared
-                # expert, and FusedMoE joins the streams immediately before the
-                # routed expert core launches its first GMM.
+            if enable_npu_dual_stream and is_prefill_batch:
+                # Prefill protects the router matmul from shared-expert Cube
+                # contention, then overlaps shared with routing and routed MoE.
                 shared_output = process_shared_expert(
                     shared_input, self._forward_shared_expert
                 )
@@ -958,13 +963,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if dump_this_layer and hasattr(topk_output, "topk_weights"):
             _welm_dump_tensor(f"{dump_prefix}.router.topk_scores", topk_output.topk_weights)
             _welm_dump_tensor(f"{dump_prefix}.router.topk_ids", topk_output.topk_ids)
+        experts_output = self.experts(hidden_states, topk_output)
         if enable_npu_dual_stream:
-            experts_output = self.experts.forward_with_shared_expert_stream(
-                hidden_states,
-                topk_output,
-            )
-        else:
-            experts_output = self.experts(hidden_states, topk_output)
+            # Both schedules consume shared_output only after routed experts.
+            wait_share_stream()
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.experts_output", experts_output)
         if return_components and skip_component_output:

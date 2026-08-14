@@ -500,8 +500,34 @@ class VocabParallelEmbedding(torch.nn.Module):
         # Copy the data.
         if not self.use_presharded_weights:
             loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
-        param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
-        param[loaded_weight.shape[0] :].data.fill_(0)
+        host_allocation = getattr(param, "_host_mapped_npu_allocation", None)
+        if host_allocation is None:
+            param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
+            param[loaded_weight.shape[0] :].data.fill_(0)
+            return
+
+        # CANN mapped Device pointers are valid for Device computation but not
+        # for memory-copy operations.  Load through the CPU alias over the same
+        # physical host memory; F.embedding later reads it through dev_ptr.
+        if output_dim != 0:
+            raise RuntimeError(
+                "Host-backed vocab embedding loading requires output_dim=0, "
+                f"got {output_dim}."
+            )
+        target = host_allocation.cpu_view
+        source = loaded_weight.detach().to(device="cpu", dtype=target.dtype)
+        if source.shape[0] > target.shape[0]:
+            raise RuntimeError(
+                "Host-backed vocab embedding shard has more rows than its "
+                f"target: target={tuple(target.shape)}, source={tuple(source.shape)}"
+            )
+        if tuple(target.shape[1:]) != tuple(source.shape[1:]):
+            raise RuntimeError(
+                "Host-backed vocab embedding shard shape mismatch: "
+                f"target={tuple(target.shape)}, source={tuple(source.shape)}"
+            )
+        target[: source.shape[0]].copy_(source)
+        target[source.shape[0] :].zero_()
 
     def _use_triton_embedding(self, input_: torch.Tensor) -> bool:
         """Whether the fused Triton kernel can replace the mask+gather+fill unit."""

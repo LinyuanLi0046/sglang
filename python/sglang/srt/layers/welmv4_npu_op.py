@@ -34,13 +34,13 @@ def _get_num_sms(multiplier: int = 1) -> int:
         triton.Config(
             {"GROUP_SIZE_M": group_size_m, "BLOCK_SIZE_N": block_size_n, "BLOCK_SIZE_K": block_size_k},
         )
-        for group_size_m in [4, 8, 16]
+        for group_size_m in [4, 8, 16, 32, 64]
         for block_size_n in [512]
         for block_size_k in [32, 64, 128, 256, 512, 1024, 2048]
     ],
-    key=["M", "N", "K"],
+    key=["N", "K"],
 )
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def mmq_style_router_linear_kernel_npu(
     a_ptr,
     b_ptr,
@@ -160,7 +160,7 @@ def _rope_npu(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["N", "BS"])
 def _welmv4_inplace_rope_kernel_npu(
     q_ptr: tl.tensor,
     k_ptr: tl.tensor,
@@ -173,7 +173,6 @@ def _welmv4_inplace_rope_kernel_npu(
     k_token_stride: tl.constexpr,
     head_dim: tl.constexpr,
     rope_dim: tl.constexpr,
-    num_sms: tl.constexpr,
     num_stages: tl.constexpr,
     num_q_heads: tl.constexpr,
     num_k_heads: tl.constexpr,
@@ -190,7 +189,9 @@ def _welmv4_inplace_rope_kernel_npu(
     half_rope_dim: tl.constexpr = rope_dim // 2
     cos_off = tl.arange(0, half_rope_dim)
     sin_off = tl.arange(half_rope_dim, rope_dim)
-    for token_id in tl.range(tl.program_id(0), N, num_sms, num_stages=num_stages):
+    for token_id in tl.range(
+        tl.program_id(0), N, tl.num_programs(0), num_stages=num_stages
+    ):
         position_id = tl.load(position_ptr + token_id)
         # [NPU 迁移] 添加 care_padding=False
         cos_sin_cache = tl.load(
@@ -266,7 +267,7 @@ def welmv4_inplace_rope_npu(
         N, BS,
         query.stride(0), key.stride(0),
         head_dim, rope_dim,
-        num_sms, num_stages,
+        num_stages,
         num_q_heads, num_k_heads,
         triton.next_power_of_2(num_q_heads),
         triton.next_power_of_2(num_k_heads),
@@ -316,7 +317,9 @@ def _welmv4_u32_remainder(value, divisor: tl.constexpr):
     return value - quotient * divisor
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["num_tokens", "num_token_tiles", "num_tasks"]
+)
 def _welmv4_oe_hash_prefill_4way_kernel(
     input_ids_ptr,
     token_table_ptr,
@@ -433,7 +436,7 @@ def _welmv4_oe_hash_prefill_4way_kernel(
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["batch_size", "num_tasks"])
 def _welmv4_oe_hash_decode_4way_kernel(
     input_ids_ptr,
     token_table_ptr,
@@ -508,7 +511,9 @@ def _welmv4_oe_hash_decode_4way_kernel(
         )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["num_tokens", "num_token_tiles", "num_tasks"]
+)
 def _welmv4_token_table_ragged_update_kernel(
     token_table_ptr,
     tokens_ptr,
@@ -549,7 +554,7 @@ def _welmv4_token_table_ragged_update_kernel(
         tl.store(token_table_ptr + row * context_len + columns, values, mask=mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["batch_size", "num_tasks"])
 def _welmv4_token_table_decode_update_kernel(
     token_table_ptr,
     next_token_ids_ptr,
@@ -793,4 +798,64 @@ def welmv4_token_table_decode_update_npu(
         num_tasks,
         HAS_SKIP_MASK=skip_mask is not None,
         BLOCK_B=block_b,
+    )
+
+def sigmoid_mul_ref(
+    x: torch.Tensor,
+    y: torch.Tensor,
+):
+    return torch.mul(torch.sigmoid(x.to(torch.float32)).to(y.dtype), y)
+
+
+@triton.jit(do_not_specialize=["rows"])
+def sigmoid_mul_kernel_npu(
+    x_ptr: tl.tensor,
+    y_ptr: tl.tensor,
+    rows: int,
+    cols: tl.constexpr,
+    x_row_stride: tl.constexpr,
+    y_row_stride: tl.constexpr,
+    y_col_stride: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    row_offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    row_mask = row_offset < rows
+    col_offset = tl.arange(0, cols)
+
+    x_off = row_offset[:, None] * x_row_stride
+    y_off = row_offset[:, None] * y_row_stride + col_offset[None, :] * y_col_stride
+
+    x_data = tl.load(x_ptr + x_off, mask=row_mask[:, None], other=0.0).to(tl.float32)
+    y_data = tl.load(y_ptr + y_off, mask=row_mask[:, None], other=0.0)
+
+    out_data = tl.sigmoid(x_data).to(y_ptr.dtype.element_ty) * y_data
+    tl.store(y_ptr + y_off, out_data, mask=row_mask[:, None])
+
+
+def inplace_sigmoid_mul_npu(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    BLOCK_SIZE: int = 128,
+) -> None:
+    cols = y.shape[-1]
+    rows = y.numel() // cols
+
+    assert x.is_contiguous()
+    assert y.is_contiguous()
+    assert x.shape[-1] == 1 and y.shape[-1] == 256
+
+    x_flattened = x.view(rows, -1)
+    y_flattened = y.view(rows, -1)
+
+    grid = (triton.cdiv(rows, BLOCK_SIZE),)
+    sigmoid_mul_kernel_npu[grid](
+        x_flattened,
+        y_flattened,
+        rows,
+        cols,
+        x_flattened.stride(0),
+        y_flattened.stride(0),
+        y_flattened.stride(1),
+        BLOCK_SIZE=BLOCK_SIZE
     )

@@ -30,6 +30,75 @@ def _apply_routed_scaling_after_renorm(
     return topk_weights
 
 
+def fused_expert_bias_topk_npu(
+    router_logits: torch.Tensor,
+    expert_bias: torch.Tensor,
+    *,
+    top_k: int,
+    scoring_func: str,
+    renormalize: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run ungrouped expert-bias routing with Ascend MoeGatingTopK.
+
+    ``expert_bias`` participates only in expert selection. Returned weights are
+    gathered from the un-biased normalized scores, matching WeLM's custom
+    routing callback. Ascend's native TopK tie order is intentionally used.
+    """
+    if scoring_func not in ("softmax", "sigmoid"):
+        raise ValueError(
+            "fused_expert_bias_topk_npu only supports softmax or sigmoid, "
+            f"got {scoring_func!r}"
+        )
+    if router_logits.ndim != 2:
+        raise ValueError(
+            "router_logits must be 2D for fused NPU TopK, "
+            f"got shape {tuple(router_logits.shape)}"
+        )
+    if expert_bias.ndim != 1 or expert_bias.shape[0] != router_logits.shape[1]:
+        raise ValueError(
+            "expert_bias must be 1D and match the expert dimension, "
+            f"got {tuple(expert_bias.shape)} for logits {tuple(router_logits.shape)}"
+        )
+
+    # MoeGatingTopK requires x and bias to have the same dtype. WeLM's router
+    # and expert bias are FP32, so the casts are normally no-ops.
+    logits_fp32 = router_logits.to(torch.float32)
+    bias_fp32 = expert_bias.to(device=router_logits.device, dtype=torch.float32)
+    op_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
+        logits_fp32,
+        k=top_k,
+        bias=bias_fp32,
+        k_group=1,
+        group_count=1,
+        group_select_mode=0,
+        renorm=1 if renormalize else 0,
+        norm_type=0 if scoring_func == "softmax" else 1,
+        out_flag=False,
+        routed_scaling_factor=1.0,
+        eps=float(1e-20),
+    )
+
+    if renormalize or scoring_func == "softmax":
+        # For softmax, renorm=1 makes the op normalize the selected scores. For
+        # sigmoid, MoeGatingTopK always normalizes selected scores. Both match
+        # WeLM when renormalize=True. Softmax + renormalize=False already
+        # returns the selected un-biased softmax scores.
+        topk_weights = op_weights
+    else:
+        # Sigmoid + renormalize=False cannot use op_weights: MoeGatingTopK
+        # normalizes sigmoid weights regardless of the renorm attribute. Avoid
+        # materializing the op's full [M, E] normOut; gather only [M, K] raw
+        # logits and apply the same elementwise sigmoid used by WeLM.
+        selected_logits = torch.gather(
+            logits_fp32,
+            dim=1,
+            index=topk_ids.to(torch.int64),
+        )
+        topk_weights = torch.sigmoid(selected_logits)
+
+    return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+
 def fused_topk_npu(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -37,15 +106,28 @@ def fused_topk_npu(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional["ExpertLocationDispatchInfo"] = None,
     layer_id: Optional[int] = None,
+    expert_bias: Optional[torch.Tensor] = None,
+    scoring_func_override: Optional[str] = None,
 ) -> "TopKOutput":
 
     use_grouped_topk = topk_config.use_grouped_topk
     renormalize = topk_config.renormalize
     correction_bias = topk_config.correction_bias
 
+    # WeLM opt-in path: top-k over (scores + expert_bias); weights from the
+    # un-biased scores. This bypasses its custom callback without changing it.
+    if expert_bias is not None:
+        topk_weights, topk_ids = fused_expert_bias_topk_npu(
+            router_logits,
+            expert_bias,
+            top_k=topk_config.top_k,
+            scoring_func=scoring_func_override or topk_config.scoring_func,
+            renormalize=renormalize,
+        )
+
     # sqrtsoftplus (DSV4 noaux_tc): top-k over (scores + bias); weights from
     # un-biased scores. The custom op fuses softplus/sqrt/topk/gather/norm/cast.
-    if topk_config.scoring_func == "sqrtsoftplus":
+    elif topk_config.scoring_func == "sqrtsoftplus":
         routed_scaling_factor = (
             topk_config.routed_scaling_factor
             if topk_config.apply_routed_scaling_factor_on_output

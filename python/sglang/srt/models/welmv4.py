@@ -97,6 +97,7 @@ if is_npu():
         mmq_style_router_linear_npu,
         welmv4_oe_hash_decode_4way_npu,
         welmv4_oe_hash_prefill_4way_npu,
+        inplace_sigmoid_mul_npu,
     )
 
 logger = logging.getLogger(__name__)
@@ -199,7 +200,14 @@ def _welm_dump_tensor(name: str, tensor: torch.Tensor) -> None:
                 _WELM_DUMP_PROCESS_DIR
             )
         _WELM_DUMP_PROCESS_DIR.mkdir(parents=True, exist_ok=True)
-    torch.save(tensor.detach().cpu(), _WELM_DUMP_PROCESS_DIR / f"{name}.pt")
+    host_allocation = getattr(tensor, "_host_mapped_npu_allocation", None)
+    if host_allocation is not None:
+        # The mapped dev_ptr is not a legal source for CANN memory-copy APIs.
+        # Dump the CPU alias over the same physical embedding storage instead.
+        tensor_to_save = host_allocation.cpu_view.detach().clone()
+    else:
+        tensor_to_save = tensor.detach().cpu()
+    torch.save(tensor_to_save, _WELM_DUMP_PROCESS_DIR / f"{name}.pt")
 
 
 def _welm_dump_module_weights(prefix: str, module: nn.Module) -> None:
@@ -877,30 +885,37 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             _welm_dump_tensor(f"{dump_prefix}.router.input", hidden_states)
             _welm_dump_tensor(f"{dump_prefix}.router.input_fp32", hidden_states_fp32)
         shared_output = None
-        # Routed MoE implementations may overwrite hidden_states in-place.  Give
-        # the NPU shared branch its own snapshot so the same dual-stream path is
-        # safe for both DeepEP and the standard non-DeepEP dispatcher.
+        is_prefill_batch = (
+            forward_batch is not None
+            and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
+                include_draft_extend_v2=True
+            )
+        )
+        moe_a2a_backend = get_moe_a2a_backend()
         enable_npu_dual_stream = (
             _is_npu
             and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             and self.shared_expert is not None
             and hidden_states.shape[0] > 0
+            and (moe_a2a_backend.is_none() or moe_a2a_backend.is_deepep())
         )
         shared_input = None
-        if get_moe_a2a_backend().is_deepep() and hidden_states.shape[0] == 0:
+        if moe_a2a_backend.is_deepep() and hidden_states.shape[0] == 0:
             topk_output = self.topk.empty_topk_output(
                 hidden_states.device, layer_id=self.layer_id
             )
         else:
             if self.shared_expert is not None:
                 if enable_npu_dual_stream:
-                    # Keep this local alive until the join below.  The clone is
-                    # enqueued on the main stream, and process_shared_expert makes
-                    # the shared stream wait for it before consuming the snapshot.
+                    # Routed MoE implementations may overwrite hidden_states
+                    # in-place.  Snapshot it before either branch starts.
                     shared_input = hidden_states.clone()
-                    shared_output = process_shared_expert(
-                        shared_input, self._forward_shared_expert
-                    )
+                    if not is_prefill_batch:
+                        # Decode keeps the original wide-overlap schedule: start
+                        # shared before router and join only after routed experts.
+                        shared_output = process_shared_expert(
+                            shared_input, self._forward_shared_expert
+                        )
                 else:
                     shared_output = self._forward_shared_expert(hidden_states)
             if _is_npu:
@@ -911,6 +926,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 router_logits = mmq_style_router_linear(
                     hidden_states, self.gate.weight
                 )
+            if enable_npu_dual_stream and is_prefill_batch:
+                # Prefill protects the router matmul from shared-expert Cube
+                # contention, then overlaps shared with sigmoid/TopK/gather.
+                shared_output = process_shared_expert(
+                    shared_input, self._forward_shared_expert
+                )
             if dump_this_layer:
                 _welm_dump_tensor(f"{dump_prefix}.router.logits", router_logits)
                 router_scores = (
@@ -919,20 +940,37 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     else torch.sigmoid(router_logits).type_as(router_logits)
                 )
                 _welm_dump_tensor(f"{dump_prefix}.router.scores", router_scores)
-            # Ascend's fused TopK fast path currently ignores custom routing
-            # callbacks. WeLM needs its sigmoid/expert-bias callback, so use the
-            # shared PyTorch implementation on NPU. CUDA keeps the fused dispatch.
+            # Ascend's generic fused TopK dispatch ignores custom routing callbacks.
+            # Route WeLM's expert-bias callback through MoeGatingTopK explicitly;
+            # it uses the native TopK tie order rather than MMQ's tie_rank order.
             if _is_npu and self.custom_routing_function is not None:
-                topk_output = self.topk.forward_native(hidden_states, router_logits)
+                if (
+                    getattr(self.custom_routing_function, "func", None)
+                    is expert_bias_routing
+                ):
+                    topk_output = self.topk.forward_npu(
+                        hidden_states,
+                        router_logits,
+                        expert_bias=self.expert_bias,
+                        scoring_func_override=self.router_score_func,
+                    )
+                else:
+                    topk_output = self.topk.forward_native(
+                        hidden_states, router_logits
+                    )
             else:
                 topk_output = self.topk(hidden_states, router_logits)
         if dump_this_layer and hasattr(topk_output, "topk_weights"):
             _welm_dump_tensor(f"{dump_prefix}.router.topk_scores", topk_output.topk_weights)
             _welm_dump_tensor(f"{dump_prefix}.router.topk_ids", topk_output.topk_ids)
+        if enable_npu_dual_stream and is_prefill_batch:
+            # Prefill joins after sigmoid/TopK/gather and before self.experts()
+            # enters dispatcher.dispatch() / MoeInitRouting.
+            wait_share_stream()
         experts_output = self.experts(hidden_states, topk_output)
-        if enable_npu_dual_stream:
-            # Join before dumps, component returns, and the final add: all three
-            # consume shared_output and must not observe an unfinished side stream.
+        if enable_npu_dual_stream and not is_prefill_batch:
+            # Decode keeps the original wide overlap and joins only after routed
+            # experts, immediately before shared_output is consumed.
             wait_share_stream()
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.experts_output", experts_output)
@@ -1674,7 +1712,10 @@ class Qwen2MoeAttention(nn.Module):
                     f"model.layers.{self.layer_idx}.attn.router.0", gate.squeeze(-1)
                 )
             attn_output = attn_output.view(attn_shape[0], self.num_heads, -1)
-            inplace_sigmoid_mul(gate, attn_output)
+            if _is_npu:
+                inplace_sigmoid_mul_npu(gate, attn_output)
+            else:
+                inplace_sigmoid_mul(gate, attn_output)
             attn_output = attn_output.view(attn_shape)
             replay_gated_attn_output = _welm_should_replay(
                 "gated_attn_output", forward_batch, self.layer_idx
@@ -2368,11 +2409,13 @@ class Qwen2MoeModel(nn.Module):
                     f"({num_logical_layers} = {config.num_hidden_layers} target + "
                     f"{num_nextn_predict_layers} NextN/MTP)."
                 )
-        # The legacy CUDA path optionally keeps the (potentially very large)
-        # base/OE embedding tables in mapped pinned host memory.  Keep this
-        # opt-in and CUDA-only so the Ascend path never imports a CUDA extension.
+        # Keep the potentially very large base/OE tables in mapped pinned host
+        # memory when explicitly requested. CUDA uses UVA; Ascend registers a
+        # page-aligned ACL host allocation and presents its dev_ptr as an NPU
+        # tensor after a one-time F.embedding compatibility probe.
         self.use_host_embeddings = (
-            _is_cuda and get_global_server_args().enable_over_encoding
+            (_is_cuda or _is_npu)
+            and get_global_server_args().enable_over_encoding
         )
         self.scale_seq_times = getattr(config, "scale_seq_times", 0)
         if self.scale_seq_times > 0:

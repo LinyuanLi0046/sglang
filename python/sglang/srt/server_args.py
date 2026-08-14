@@ -3387,7 +3387,7 @@ class ServerArgs:
     ] = None
     enable_over_encoding: A[
         bool,
-        "Compatibility flag for WeLMv4. Over-encoding math is enabled from the model config automatically; the rebased runtime uses ordinary device tensors on both CUDA and NPU.",
+        "Place WeLMv4 base/OE embedding shards in mapped pinned host memory on CUDA or supported Ascend NPU devices. Over-encoding math itself is enabled from the model config automatically.",
         NS("model"),
     ] = False
     enable_kv_mirror: A[
@@ -5131,22 +5131,45 @@ class ServerArgs:
                     "with the KV cache. Use --disaggregation-mode null."
                 )
             if self.enable_over_encoding:
-                if not is_cuda():
-                    logger.warning(
-                        "--enable-over-encoding controls the optional CUDA "
-                        "host-backed embedding allocator and is ignored on %s. "
-                        "The WeLMv4 ngram embedding math remains enabled from "
-                        "oe_grams.",
-                        self.device,
+                if is_npu() and self.load_format == "dummy":
+                    raise ValueError(
+                        "--enable-over-encoding is incompatible with "
+                        "--load-format dummy: dummy initialization mutates NPU "
+                        "Parameters directly, while mapped embedding weights may "
+                        "only be initialized through their Host aliases."
                     )
-                    self.enable_over_encoding = False
-                else:
+                if is_npu() and self.cpu_offload_gb > 0:
+                    raise ValueError(
+                        "--enable-over-encoding is incompatible with "
+                        "--cpu-offload-gb: WeLMv4 embedding weights already have "
+                        "explicit Host/NPU aliases and must not be rebound by the "
+                        "generic offloader."
+                    )
+                if is_npu() and (self.enable_lora or self.lora_paths):
+                    raise ValueError(
+                        "--enable-over-encoding NPU host-backed embeddings are "
+                        "not yet compatible with LoRA. Disable LoRA or keep "
+                        "WeLMv4 embeddings in ordinary NPU memory."
+                    )
+                if is_cuda():
                     logger.warning(
                         "--enable-over-encoding places WeLMv4 base/OE embedding "
                         "tables in mapped pinned host memory. Install the optional "
                         "allocator with `pip install --no-build-isolation "
                         "./3rdparty/over_encoding_ops`; "
                         "this saves device memory at the cost of PCIe/NVLink reads."
+                    )
+                elif is_npu():
+                    logger.warning(
+                        "--enable-over-encoding places WeLMv4 base/OE embedding "
+                        "shards in ACL-registered pinned host memory. Startup will "
+                        "probe external NPU storage with F.embedding and fail "
+                        "explicitly if this CANN/TorchNPU stack is incompatible."
+                    )
+                else:
+                    raise ValueError(
+                        "--enable-over-encoding host-backed WeLMv4 embeddings are "
+                        f"supported only on CUDA and Ascend NPU, got {self.device}."
                     )
             if self.enable_kv_mirror:
                 target_mirror_layers = [

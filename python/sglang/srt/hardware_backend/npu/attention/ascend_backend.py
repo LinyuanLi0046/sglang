@@ -677,9 +677,7 @@ class AscendAttnBackend(AttentionBackend):
         sinks: torch.Tensor,
     ) -> torch.Tensor:
         _, prefill, _ = _load_welm_full_sink_attention_ops()
-        # The dedicated Triton kernel consumes the actual Q strides, so keep
-        # the QKV split as a zero-copy view instead of materializing Q.
-        q_3d = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        q_3d = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
         k_cache_4d = self._view_welm_full_sink_kv_cache(
             k_cache, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
         )
@@ -756,9 +754,7 @@ class AscendAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         """Run WeLM paged causal SWA with a per-query-head sink logit."""
         prefill, _ = _load_welm_swa_sink_attention_ops()
-        # The dedicated Triton kernel consumes the actual Q strides, so keep
-        # the QKV split as a zero-copy view instead of materializing Q.
-        q_3d = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        q_3d = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
         k_cache_4d = self._view_welm_full_sink_kv_cache(
             k_cache, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
         )
@@ -829,9 +825,7 @@ class AscendAttnBackend(AttentionBackend):
         sinks: torch.Tensor,
     ) -> torch.Tensor:
         _, _, decode = _load_welm_full_sink_attention_ops()
-        # The dedicated Triton kernel consumes the actual Q strides, so keep
-        # the QKV split as a zero-copy view instead of materializing Q.
-        q_3d = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        q_3d = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
         actual_batch_size = seq_lens.shape[0]
         if block_tables.shape[0] != actual_batch_size:
             raise RuntimeError(
@@ -906,9 +900,7 @@ class AscendAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         """Run one-query paged SWA+Sink for eager, graph, or KV mirror."""
         _, decode = _load_welm_swa_sink_attention_ops()
-        # The dedicated Triton kernel consumes the actual Q strides, so keep
-        # the QKV split as a zero-copy view instead of materializing Q.
-        q_3d = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        q_3d = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
         actual_batch_size = seq_lens.shape[0]
         if block_tables.shape[0] != actual_batch_size:
             raise RuntimeError(

@@ -928,7 +928,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 )
             if enable_npu_dual_stream and is_prefill_batch:
                 # Prefill protects the router matmul from shared-expert Cube
-                # contention, then overlaps shared with routing and routed MoE.
+                # contention, then overlaps shared with sigmoid/TopK/gather.
                 shared_output = process_shared_expert(
                     shared_input, self._forward_shared_expert
                 )
@@ -963,9 +963,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if dump_this_layer and hasattr(topk_output, "topk_weights"):
             _welm_dump_tensor(f"{dump_prefix}.router.topk_scores", topk_output.topk_weights)
             _welm_dump_tensor(f"{dump_prefix}.router.topk_ids", topk_output.topk_ids)
+        if enable_npu_dual_stream and is_prefill_batch:
+            # Prefill joins after sigmoid/TopK/gather and before self.experts()
+            # enters dispatcher.dispatch() / MoeInitRouting.
+            wait_share_stream()
         experts_output = self.experts(hidden_states, topk_output)
-        if enable_npu_dual_stream:
-            # Both schedules consume shared_output only after routed experts.
+        if enable_npu_dual_stream and not is_prefill_batch:
+            # Decode keeps the original wide overlap and joins only after routed
+            # experts, immediately before shared_output is consumed.
             wait_share_stream()
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.experts_output", experts_output)

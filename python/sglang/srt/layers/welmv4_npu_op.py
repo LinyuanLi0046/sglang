@@ -15,6 +15,7 @@ _WELMV4_ROPE_PREFILL_TOKEN_BLOCK = 64
 _WELMV4_ROPE_PREFILL_EXACT64_THRESHOLD = 576
 _WELMV4_ROPE_PREFILL_ALL_M_THRESHOLD = 640
 _WELMV4_ROPE_PROGRAMS_PER_VECTOR_CORE = 8
+_WELMV4_ROPE_PREFILL_NUM_STAGES = 1
 
 
 def _get_num_sms(multiplier: int = 1) -> int:
@@ -501,7 +502,7 @@ def welmv4_inplace_rope_npu(
             rope_dim,
             _WELMV4_ROPE_PREFILL_TOKEN_BLOCK,
             prefill_masked,
-            num_stages,
+            _WELMV4_ROPE_PREFILL_NUM_STAGES,
             num_q_heads,
         )
         kernel_name = "_welmv4_inplace_rope_prefill_kernel_npu"

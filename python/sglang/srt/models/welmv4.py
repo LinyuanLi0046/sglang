@@ -876,7 +876,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        hidden_states_fp32: torch.Tensor,
+        hidden_states_fp32: Optional[torch.Tensor],
         forward_batch: Optional[ForwardBatch] = None,
         use_reduce_scatter: bool = False,
         return_components: bool = False,
@@ -887,6 +887,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         if dump_this_layer:
+            if hidden_states_fp32 is None:
+                raise RuntimeError(
+                    "WeLM activation dump requires the FP32 post-norm output."
+                )
             _welm_dump_tensor(f"{dump_prefix}.router.input", hidden_states)
             _welm_dump_tensor(f"{dump_prefix}.router.input_fp32", hidden_states_fp32)
         shared_output = None
@@ -2202,6 +2206,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 # file records the residual actually consumed by the norm.
                 _welm_dump_tensor(residual_dump_name, residual)
 
+        replay_norm_after_attn = _welm_should_replay(
+            "norm_after_attn", forward_batch, self.layer_id
+        )
+        need_fp32_norm_after_attn = dump_this_layer or replay_norm_after_attn
         if use_mmq_norm_after_attn:
             # With attention DP, RowParallelLinear deliberately leaves the
             # output projection as an attn-TP partial.  WeLM applies o_norm
@@ -2218,6 +2226,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 self.self_attn.o_norm.weight,
                 self.post_attention_layernorm.weight,
                 self.post_attention_layernorm.eps,
+                return_fp32_out=need_fp32_norm_after_attn,
             )
             if (
                 is_dp_attention_enabled()
@@ -2239,7 +2248,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     dp_gather_replicate(
                         hidden_states, local_hidden_states, forward_batch
                     )
-                    hidden_states_fp32 = hidden_states.to(torch.float32)
+                    if need_fp32_norm_after_attn:
+                        hidden_states_fp32 = hidden_states.to(torch.float32)
         elif use_dp_o_norm_after_attn:
             # ppln=False checkpoints still may carry o_norm.  Applying it in
             # Attention.forward would normalize each RowParallel partial.
@@ -2286,10 +2296,12 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 ) = self.post_attention_layernorm(
                     hidden_states, residual, clone_fp32_out=True
                 )
-        replay_norm_after_attn = _welm_should_replay(
-            "norm_after_attn", forward_batch, self.layer_id
-        )
         if replay_norm_after_attn:
+            if hidden_states_fp32 is None:
+                raise RuntimeError(
+                    "WeLM norm_after_attn replay requires the FP32 post-norm "
+                    "output."
+                )
             _welm_validate_replay_positions(
                 positions, forward_batch, self.layer_id
             )
@@ -2329,6 +2341,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     layer_idx=self.layer_id,
                 )
         if dump_this_layer:
+            if hidden_states_fp32 is None:
+                raise RuntimeError(
+                    "WeLM activation dump requires the FP32 post-norm output."
+                )
             _welm_dump_tensor(
                 f"model.layers.{self.layer_id}.norm_after_attn.output", hidden_states
             )

@@ -315,6 +315,7 @@ def mmq_style_norm_after_attn_kernel(
     cols: tl.constexpr,
     eps: float,
     BLOCK_SIZE: tl.constexpr,  # pylint: disable=invalid-name
+    WRITE_FP32_OUT: tl.constexpr,  # pylint: disable=invalid-name
 ):
     cols_offsets = tl.arange(0, BLOCK_SIZE)
     mask = cols_offsets < cols
@@ -327,13 +328,16 @@ def mmq_style_norm_after_attn_kernel(
     ):
         offsets = (row_id * cols + cols_offsets).to(tl.int64)
         hs = tl.load(hidden_states_ptr + offsets, mask=mask, other=0.0)
+        # Start the independent residual read before the first RMSNorm so the
+        # MTE2 pipeline can overlap it with vector work on Ascend.
+        residual = tl.load(residual_ptr + offsets, mask=mask, other=0.0)
         onorm_out, _ = _do_mmq_rms_norm(hs, onorm_gamma, cols, eps)
         hs = onorm_out.to(hs.dtype)
-        residual = tl.load(residual_ptr + offsets, mask=mask, other=0.0)
         hs += residual
         rnorm_out, _ = _do_mmq_rms_norm(hs, rnorm_gamma, cols, eps)
         tl.store(residual_out_ptr + offsets, hs, mask=mask)
-        tl.store(fp32_out_ptr + offsets, rnorm_out, mask=mask)
+        if WRITE_FP32_OUT:
+            tl.store(fp32_out_ptr + offsets, rnorm_out, mask=mask)
         tl.store(output_ptr + offsets, rnorm_out.to(output_dtype), mask=mask)
 
 
@@ -343,7 +347,9 @@ def mmq_style_norm_after_attn(
     onorm_weight: torch.Tensor,
     rnorm_weight: torch.Tensor,
     eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    *,
+    return_fp32_out: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     assert hidden_states.dim() == 2
     assert residual.dim() == 2
     assert hidden_states.shape == residual.shape
@@ -353,7 +359,14 @@ def mmq_style_norm_after_attn(
     rnorm_weight = rnorm_weight.contiguous()
     output = torch.empty_like(hidden_states)
     residual_out = torch.empty_like(hidden_states, dtype=torch.float32)
-    fp32_out = torch.empty_like(hidden_states, dtype=torch.float32)
+    fp32_out = (
+        torch.empty_like(hidden_states, dtype=torch.float32)
+        if return_fp32_out
+        else None
+    )
+    # Triton kernels require a tensor argument even when the constexpr branch
+    # removes all uses of it. Reusing residual_out avoids a needless allocation.
+    fp32_out_ptr = fp32_out if fp32_out is not None else residual_out
     rows, cols = hidden_states.shape
     num_sms = min(rows, _get_num_sms(multiplier=8))
     block_size = triton.next_power_of_2(cols)
@@ -364,11 +377,12 @@ def mmq_style_norm_after_attn(
         rnorm_weight,
         output,
         residual_out,
-        fp32_out,
+        fp32_out_ptr,
         rows,
         cols,
         eps,
         block_size,
+        return_fp32_out,
     )
     return output, residual_out, fp32_out
 

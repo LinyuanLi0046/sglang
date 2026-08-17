@@ -894,35 +894,25 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             _welm_dump_tensor(f"{dump_prefix}.router.input", hidden_states)
             _welm_dump_tensor(f"{dump_prefix}.router.input_fp32", hidden_states_fp32)
         shared_output = None
-        is_prefill_batch = (
-            forward_batch is not None
-            and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
-                include_draft_extend_v2=True
-            )
-        )
-        # Routed MoE implementations may overwrite hidden_states in-place.  Give
+        moe_a2a_backend = get_moe_a2a_backend()
         enable_npu_dual_stream = (
             _is_npu
             and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             and self.shared_expert is not None
             and hidden_states.shape[0] > 0
-            and not is_prefill_batch
+            and (moe_a2a_backend.is_none() or moe_a2a_backend.is_deepep())
         )
         shared_input = None
-        if get_moe_a2a_backend().is_deepep() and hidden_states.shape[0] == 0:
+        if moe_a2a_backend.is_deepep() and hidden_states.shape[0] == 0:
             topk_output = self.topk.empty_topk_output(
                 hidden_states.device, layer_id=self.layer_id
             )
         else:
             if self.shared_expert is not None:
                 if enable_npu_dual_stream:
-                    # Keep this local alive until the join below.  The clone is
-                    # enqueued on the main stream, and process_shared_expert makes
-                    # the shared stream wait for it before consuming the snapshot.
+                    # Routed MoE may overwrite hidden_states in-place. Keep a
+                    # request-local snapshot for the shared-expert side stream.
                     shared_input = hidden_states.clone()
-                    shared_output = process_shared_expert(
-                        shared_input, self._forward_shared_expert
-                    )
                 else:
                     shared_output = self._forward_shared_expert(hidden_states)
             if _is_npu:
@@ -932,6 +922,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             else:
                 router_logits = mmq_style_router_linear(
                     hidden_states, self.gate.weight
+                )
+            if enable_npu_dual_stream:
+                # Start after the router Cube GEMM. The shared expert overlaps
+                # routing, dispatch, and the routed-expert path until final add.
+                shared_output = process_shared_expert(
+                    shared_input, self._forward_shared_expert
                 )
             if dump_this_layer:
                 _welm_dump_tensor(f"{dump_prefix}.router.logits", router_logits)
@@ -965,13 +961,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             _welm_dump_tensor(f"{dump_prefix}.router.topk_scores", topk_output.topk_weights)
             _welm_dump_tensor(f"{dump_prefix}.router.topk_ids", topk_output.topk_ids)
         experts_output = self.experts(hidden_states, topk_output)
-        if enable_npu_dual_stream:
-            # Join before dumps, component returns, and the final add: all three
-            # consume shared_output and must not observe an unfinished side stream.
-            wait_share_stream()
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.experts_output", experts_output)
         if return_components and skip_component_output:
+            if enable_npu_dual_stream:
+                # This early return hands shared_output to the caller, so it is
+                # the consumption boundary for this diagnostic path.
+                wait_share_stream()
             return (
                 experts_output.view(num_tokens, hidden_dim),
                 experts_output.view(num_tokens, hidden_dim),
@@ -984,6 +980,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.last_final_shared_output = None
         if shared_output is not None:
             if dump_this_layer:
+                if enable_npu_dual_stream:
+                    # Activation dumping consumes shared_output before the add.
+                    wait_share_stream()
                 _welm_dump_tensor(f"{dump_prefix}.shared_output", shared_output)
             if (
                 self.layer_id == self.num_hidden_layers - 1
@@ -992,6 +991,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             ):
                 self.last_final_experts_output = experts_output
                 self.last_final_shared_output = shared_output
+            if enable_npu_dual_stream and not dump_this_layer:
+                # Normal inference first consumes shared_output in this add.
+                wait_share_stream()
             final_hidden_states = final_hidden_states + shared_output
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.output", final_hidden_states)

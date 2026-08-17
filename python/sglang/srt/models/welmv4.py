@@ -1677,11 +1677,6 @@ class Qwen2MoeAttention(nn.Module):
                 segment_tile_starts=segment_tile_starts,
             )
 
-        if enable_npu_gate_alt_stream:
-            # Gate GEMM overlaps only the post-QKV normalization/RoPE region.
-            # Join before attention so the two Cube workloads cannot compete.
-            current_stream.wait_stream(self.alt_stream)
-
         replay_attention_input = _welm_should_replay(
             "attention_input", forward_batch, self.layer_idx
         )
@@ -1753,10 +1748,17 @@ class Qwen2MoeAttention(nn.Module):
                 gate = self.gate_proj(hidden_states)[0].unsqueeze(-1)
             # gate: (bs * seq_len, num_heads, 1)
             if dump_this_layer:
+                if enable_npu_gate_alt_stream:
+                    # Activation dumping consumes gate before sigmoid_mul.
+                    current_stream.wait_stream(self.alt_stream)
                 _welm_dump_tensor(
                     f"model.layers.{self.layer_idx}.attn.router.0", gate.squeeze(-1)
                 )
             attn_output = attn_output.view(attn_shape[0], self.num_heads, -1)
+            if enable_npu_gate_alt_stream and not dump_this_layer:
+                # Normal inference first consumes gate in sigmoid_mul. Joining
+                # here lets gate projection overlap the complete attention op.
+                current_stream.wait_stream(self.alt_stream)
             if _is_npu:
                 inplace_sigmoid_mul_npu(gate, attn_output)
             else:

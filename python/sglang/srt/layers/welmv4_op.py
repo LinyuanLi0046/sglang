@@ -333,7 +333,8 @@ def mmq_style_norm_after_attn_kernel(
         hs += residual
         rnorm_out, _ = _do_mmq_rms_norm(hs, rnorm_gamma, cols, eps)
         tl.store(residual_out_ptr + offsets, hs, mask=mask)
-        tl.store(fp32_out_ptr + offsets, rnorm_out, mask=mask)
+        if fp32_out_ptr is not None:
+            tl.store(fp32_out_ptr + offsets, rnorm_out, mask=mask)
         tl.store(output_ptr + offsets, rnorm_out.to(output_dtype), mask=mask)
 
 
@@ -343,7 +344,9 @@ def mmq_style_norm_after_attn(
     onorm_weight: torch.Tensor,
     rnorm_weight: torch.Tensor,
     eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    *,
+    store_fp32_out: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     assert hidden_states.dim() == 2
     assert residual.dim() == 2
     assert hidden_states.shape == residual.shape
@@ -353,7 +356,14 @@ def mmq_style_norm_after_attn(
     rnorm_weight = rnorm_weight.contiguous()
     output = torch.empty_like(hidden_states)
     residual_out = torch.empty_like(hidden_states, dtype=torch.float32)
-    fp32_out = torch.empty_like(hidden_states, dtype=torch.float32)
+    # The FP32 normalized copy is only consumed by WeLM's activation
+    # dump/replay path. Avoid writing it during normal NPU inference: for a
+    # 16K-token prefill this removes a 128 MiB device write per affected layer.
+    fp32_out = (
+        torch.empty_like(hidden_states, dtype=torch.float32)
+        if store_fp32_out
+        else None
+    )
     rows, cols = hidden_states.shape
     num_sms = min(rows, _get_num_sms(multiplier=8))
     block_size = triton.next_power_of_2(cols)

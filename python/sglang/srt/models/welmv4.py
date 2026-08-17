@@ -107,6 +107,9 @@ _is_npu = is_npu()
 _WELM_NPU_FP32_OPROJ = _is_npu and get_bool_env_var(
     "SGLANG_WELM_FP32_OPROJ", "false"
 )
+_WELM_NPU_KEEP_NORM_FP32_OUT = _is_npu and get_bool_env_var(
+    "SGLANG_WELM_NPU_KEEP_NORM_FP32_OUT", "false"
+)
 _WELM_DUMP_PROCESS_DIR = None
 _WELM_DUMP_BASE_DIR = None
 _WELM_DUMP_PASS_ID = -1
@@ -2131,6 +2134,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
         replay_norm_inputs = _welm_should_replay(
             "norm_inputs", forward_batch, self.layer_id
         )
+        replay_norm_after_attn = _welm_should_replay(
+            "norm_after_attn", forward_batch, self.layer_id
+        )
+        need_norm_after_attn_fp32 = dump_this_layer or replay_norm_after_attn
         if replay_norm_inputs:
             if residual is None:
                 raise RuntimeError(
@@ -2173,7 +2180,17 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 self.self_attn.o_norm.weight,
                 self.post_attention_layernorm.weight,
                 self.post_attention_layernorm.eps,
+                # hidden_states_fp32 is only consumed by dump/replay. Keep
+                # CUDA behavior unchanged and skip the redundant FP32 device
+                # write during normal NPU inference.
+                store_fp32_out=(
+                    not _is_npu
+                    or need_norm_after_attn_fp32
+                    or _WELM_NPU_KEEP_NORM_FP32_OUT
+                ),
             )
+            if hidden_states_fp32 is None:
+                hidden_states_fp32 = hidden_states
             if (
                 is_dp_attention_enabled()
                 and self.layer_scatter_modes.mlp_mode == ScatterMode.FULL
@@ -2194,7 +2211,11 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     dp_gather_replicate(
                         hidden_states, local_hidden_states, forward_batch
                     )
-                    hidden_states_fp32 = hidden_states.to(torch.float32)
+                    hidden_states_fp32 = (
+                        hidden_states.to(torch.float32)
+                        if need_norm_after_attn_fp32
+                        else hidden_states
+                    )
         elif use_dp_o_norm_after_attn:
             # ppln=False checkpoints still may carry o_norm.  Applying it in
             # Attention.forward would normalize each RowParallel partial.
@@ -2241,9 +2262,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 ) = self.post_attention_layernorm(
                     hidden_states, residual, clone_fp32_out=True
                 )
-        replay_norm_after_attn = _welm_should_replay(
-            "norm_after_attn", forward_batch, self.layer_id
-        )
         if replay_norm_after_attn:
             _welm_validate_replay_positions(
                 positions, forward_batch, self.layer_id

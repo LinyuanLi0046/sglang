@@ -741,7 +741,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         layer_id: int,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        alt_stream: Optional[torch.cuda.Stream] = None,
+        alt_stream: Optional[Any] = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -1281,9 +1281,11 @@ class Qwen2MoeAttention(nn.Module):
         rms_norm_eps: float = 1e-5,
         total_layer_num: int = 1,
         is_nextn: bool = False,
+        alt_stream: Optional[Any] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
+        self.alt_stream = alt_stream
 
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
@@ -1532,6 +1534,21 @@ class Qwen2MoeAttention(nn.Module):
             qkv, _ = self.qkv_proj(hidden_states)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
+        gate = None
+        enable_npu_gate_alt_stream = (
+            _is_npu
+            and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            and self.alt_stream is not None
+            and self.gated_self_attention_headwise
+            and hidden_states.shape[0] > 0
+        )
+        if enable_npu_gate_alt_stream:
+            device_module = torch.get_device_module()
+            current_stream = device_module.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            with device_module.stream(self.alt_stream):
+                gate = self.gate_proj(hidden_states)[0].unsqueeze(-1)
+
         replay_qkv = _welm_should_replay("qkv", forward_batch, self.layer_idx)
         if replay_qkv:
             _welm_validate_replay_positions(
@@ -1628,6 +1645,11 @@ class Qwen2MoeAttention(nn.Module):
         else:
             q, k = self.rotary_emb(positions, q, k, layer_id=self.layer_idx)
 
+        if enable_npu_gate_alt_stream:
+            # Gate GEMM overlaps only the post-QKV normalization/RoPE region.
+            # Join before attention so the two Cube workloads cannot compete.
+            current_stream.wait_stream(self.alt_stream)
+
         replay_attention_input = _welm_should_replay(
             "attention_input", forward_batch, self.layer_idx
         )
@@ -1695,9 +1717,9 @@ class Qwen2MoeAttention(nn.Module):
             _welm_dump_tensor(f"{dump_prefix}.attn_output", attn_output)
         if self.gated_self_attention_headwise:
             attn_shape = attn_output.shape
-            gate = self.gate_proj(hidden_states)[0].unsqueeze(
-                -1
-            )  # (bs * seq_len, num_heads, 1)
+            if gate is None:
+                gate = self.gate_proj(hidden_states)[0].unsqueeze(-1)
+            # gate: (bs * seq_len, num_heads, 1)
             if dump_this_layer:
                 _welm_dump_tensor(
                     f"model.layers.{self.layer_idx}.attn.router.0", gate.squeeze(-1)
@@ -1805,7 +1827,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        alt_stream: Optional[torch.cuda.Stream] = None,
+        alt_stream: Optional[Any] = None,
         is_nextn: bool = False,
     ) -> None:
         super().__init__()
@@ -1910,6 +1932,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             total_layer_num=total_layer_num,
             is_nextn=is_nextn,
+            alt_stream=alt_stream,
         )
         LayerManager.num_nextn_predict_layers = getattr(
             config, "num_nextn_predict_layers", 0
@@ -2345,7 +2368,7 @@ class Qwen2MoeModel(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         decoder_layer_type: type[nn.Module] = Qwen2MoeDecoderLayer,
-        alt_stream: Optional[torch.cuda.Stream] = None,
+        alt_stream: Optional[Any] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -2898,9 +2921,12 @@ class WeLMV4MoeForCausalLM(nn.Module):
         # model instance is constructed so stale state cannot survive reloads.
         KVMirrorManager.activations_dict_kv.clear()
         LayerManager.decoder_layer.clear()
-        alt_stream = (
-            torch.cuda.Stream(device=torch.cuda.current_device()) if _is_cuda else None
-        )
+        if _is_cuda:
+            alt_stream = torch.cuda.Stream(device=torch.cuda.current_device())
+        elif _is_npu:
+            alt_stream = torch.get_device_module().Stream()
+        else:
+            alt_stream = None
         self.model = Qwen2MoeModel(
             config,
             quant_config,

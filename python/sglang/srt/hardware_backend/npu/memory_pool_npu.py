@@ -66,6 +66,9 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         **kwargs,
     ):
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        self.use_scatter_pa_kv_cache = get_bool_env_var(
+            "SGLANG_NPU_USE_SCATTER_PA_KV_CACHE", "False"
+        )
         super().__init__(
             size=size,
             page_size=page_size,
@@ -180,6 +183,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
         dcp_kv_mask: Optional[torch.Tensor] = None,
+        use_scatter_pa_kv_cache: bool = False,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         if layer_id_override is not None:
@@ -198,20 +202,69 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
+        use_scatter_pa_kv_cache = (
+            self.use_scatter_pa_kv_cache and use_scatter_pa_kv_cache
+        )
+        if use_scatter_pa_kv_cache and not self.use_fia:
+            raise RuntimeError(
+                "SGLANG_NPU_USE_SCATTER_PA_KV_CACHE requires "
+                "ASCEND_USE_FIA=True"
+            )
+
         if self.use_fia:
             k_buffer_layer = self.k_buffer[layer_id - self.start_layer]
             v_buffer_layer = self.v_buffer[layer_id - self.start_layer]
 
-            torch_npu.npu_scatter_nd_update_(
-                k_buffer_layer,
-                loc.view(-1, 1),
-                cache_k.view(-1, 1, self.head_num, self.head_dim),
-            )
-            torch_npu.npu_scatter_nd_update_(
-                v_buffer_layer,
-                loc.view(-1, 1),
-                cache_v.view(-1, 1, self.head_num, self.v_head_dim),
-            )
+            if use_scatter_pa_kv_cache:
+                if not hasattr(torch_npu, "npu_scatter_pa_kv_cache"):
+                    raise RuntimeError(
+                        "The installed torch_npu does not provide "
+                        "npu_scatter_pa_kv_cache. Please upgrade torch_npu/CANN "
+                        "or unset SGLANG_NPU_USE_SCATTER_PA_KV_CACHE."
+                    )
+                if self.store_dtype not in (
+                    torch.float16,
+                    torch.bfloat16,
+                    torch.int8,
+                ):
+                    raise RuntimeError(
+                        "npu_scatter_pa_kv_cache only supports fp16, bf16, and "
+                        f"int8 KV cache, but got {self.store_dtype}."
+                    )
+
+                key = cache_k.reshape(
+                    -1, self.head_num, self.head_dim
+                ).contiguous()
+                value = cache_v.reshape(
+                    -1, self.head_num, self.v_head_dim
+                ).contiguous()
+                key_cache = k_buffer_layer.view(
+                    -1, self.page_size, self.head_num, self.head_dim
+                )
+                value_cache = v_buffer_layer.view(
+                    -1, self.page_size, self.head_num, self.v_head_dim
+                )
+                slot_mapping = loc.reshape(-1).to(torch.int32).contiguous()
+
+                torch_npu.npu_scatter_pa_kv_cache(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    slot_mapping,
+                    cache_mode="Norm",
+                )
+            else:
+                torch_npu.npu_scatter_nd_update_(
+                    k_buffer_layer,
+                    loc.view(-1, 1),
+                    cache_k.view(-1, 1, self.head_num, self.head_dim),
+                )
+                torch_npu.npu_scatter_nd_update_(
+                    v_buffer_layer,
+                    loc.view(-1, 1),
+                    cache_v.view(-1, 1, self.head_num, self.v_head_dim),
+                )
         else:
             loc = loc.to(torch.int32)
             torch_npu._npu_reshape_and_cache(

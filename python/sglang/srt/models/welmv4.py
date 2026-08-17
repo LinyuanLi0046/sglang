@@ -80,10 +80,14 @@ from sglang.srt.layers.welmv4_op import (
     mmq_style_norm_after_attn,
     mmq_style_router_linear,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.server_args import get_global_server_args
 
 # from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_npu, make_layers
@@ -94,10 +98,11 @@ if is_npu():
         wait_share_stream,
     )
     from sglang.srt.layers.welmv4_npu_op import (
+        build_welmv4_rope_segment_tile_starts,
+        inplace_sigmoid_mul_npu,
         mmq_style_router_linear_npu,
         welmv4_oe_hash_decode_4way_npu,
         welmv4_oe_hash_prefill_4way_npu,
-        inplace_sigmoid_mul_npu,
     )
 
 logger = logging.getLogger(__name__)
@@ -106,9 +111,6 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 _WELM_NPU_FP32_OPROJ = _is_npu and get_bool_env_var(
     "SGLANG_WELM_FP32_OPROJ", "false"
-)
-_WELM_NPU_KEEP_NORM_FP32_OUT = _is_npu and get_bool_env_var(
-    "SGLANG_WELM_NPU_KEEP_NORM_FP32_OUT", "false"
 )
 _WELM_DUMP_PROCESS_DIR = None
 _WELM_DUMP_BASE_DIR = None
@@ -744,7 +746,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         layer_id: int,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        alt_stream: Optional[torch.cuda.Stream] = None,
+        alt_stream: Optional[Any] = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -874,7 +876,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        hidden_states_fp32: torch.Tensor,
+        hidden_states_fp32: Optional[torch.Tensor],
         forward_batch: Optional[ForwardBatch] = None,
         use_reduce_scatter: bool = False,
         return_components: bool = False,
@@ -885,6 +887,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         if dump_this_layer:
+            if hidden_states_fp32 is None:
+                raise RuntimeError(
+                    "WeLM activation dump requires the FP32 post-norm output."
+                )
             _welm_dump_tensor(f"{dump_prefix}.router.input", hidden_states)
             _welm_dump_tensor(f"{dump_prefix}.router.input_fp32", hidden_states_fp32)
         shared_output = None
@@ -1296,9 +1302,11 @@ class Qwen2MoeAttention(nn.Module):
         rms_norm_eps: float = 1e-5,
         total_layer_num: int = 1,
         is_nextn: bool = False,
+        alt_stream: Optional[Any] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
+        self.alt_stream = alt_stream
 
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
@@ -1547,6 +1555,21 @@ class Qwen2MoeAttention(nn.Module):
             qkv, _ = self.qkv_proj(hidden_states)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
+        gate = None
+        enable_npu_gate_alt_stream = (
+            _is_npu
+            and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            and self.alt_stream is not None
+            and self.gated_self_attention_headwise
+            and hidden_states.shape[0] > 0
+        )
+        if enable_npu_gate_alt_stream:
+            device_module = torch.get_device_module()
+            current_stream = device_module.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            with device_module.stream(self.alt_stream):
+                gate = self.gate_proj(hidden_states)[0].unsqueeze(-1)
+
         replay_qkv = _welm_should_replay("qkv", forward_batch, self.layer_idx)
         if replay_qkv:
             _welm_validate_replay_positions(
@@ -1596,7 +1619,10 @@ class Qwen2MoeAttention(nn.Module):
             q_by_head, _ = self.q_norm(q_by_head)
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.q_after_norm", q_by_head.view(q.shape))
-        q = q_by_head.view(q.shape)
+        # Q is a strided view of the fused QKV projection when q_norm is
+        # disabled.  Attention requires packed Q later, so materialize that
+        # layout before RoPE and let downstream contiguous() calls be no-ops.
+        q = q_by_head.view(q.shape).contiguous()
 
         k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
         if self.k_norm is not None:
@@ -1617,6 +1643,18 @@ class Qwen2MoeAttention(nn.Module):
             _welm_dump_tensor(f"{dump_prefix}.k_after_norm", k_by_head.view(k.shape))
         k = k_by_head.view(k.shape)
 
+        # A single non-speculative extend request is globally contiguous;
+        # ordinary multi-request prefill carries independently contiguous
+        # segment metadata.  Speculative, decode, and mirror-consumer paths
+        # retain the generic kernel.
+        positions_are_contiguous = (
+            forward_batch.batch_size == 1
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        )
+        segment_tile_starts = getattr(
+            forward_batch, "welmv4_rope_segment_tile_starts", None
+        )
+
         qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
         if qk_nope_head_dim > 0:
             if (
@@ -1630,15 +1668,34 @@ class Qwen2MoeAttention(nn.Module):
                     k,
                     last_index=forward_batch.custom_last_index,
                     layer_id=self.layer_idx,
+                    positions_are_contiguous=positions_are_contiguous,
+                    segment_tile_starts=segment_tile_starts,
                 )
             else:
                 q, k = self.rotary_emb(
-                    positions, q, k, layer_id=self.layer_idx
+                    positions,
+                    q,
+                    k,
+                    layer_id=self.layer_idx,
+                    positions_are_contiguous=positions_are_contiguous,
+                    segment_tile_starts=segment_tile_starts,
                 )
             q = q.view(q_shape)
             k = k.view(k_shape)
         else:
-            q, k = self.rotary_emb(positions, q, k, layer_id=self.layer_idx)
+            q, k = self.rotary_emb(
+                positions,
+                q,
+                k,
+                layer_id=self.layer_idx,
+                positions_are_contiguous=positions_are_contiguous,
+                segment_tile_starts=segment_tile_starts,
+            )
+
+        if enable_npu_gate_alt_stream:
+            # Gate GEMM overlaps only the post-QKV normalization/RoPE region.
+            # Join before attention so the two Cube workloads cannot compete.
+            current_stream.wait_stream(self.alt_stream)
 
         replay_attention_input = _welm_should_replay(
             "attention_input", forward_batch, self.layer_idx
@@ -1707,9 +1764,9 @@ class Qwen2MoeAttention(nn.Module):
             _welm_dump_tensor(f"{dump_prefix}.attn_output", attn_output)
         if self.gated_self_attention_headwise:
             attn_shape = attn_output.shape
-            gate = self.gate_proj(hidden_states)[0].unsqueeze(
-                -1
-            )  # (bs * seq_len, num_heads, 1)
+            if gate is None:
+                gate = self.gate_proj(hidden_states)[0].unsqueeze(-1)
+            # gate: (bs * seq_len, num_heads, 1)
             if dump_this_layer:
                 _welm_dump_tensor(
                     f"model.layers.{self.layer_idx}.attn.router.0", gate.squeeze(-1)
@@ -1817,7 +1874,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        alt_stream: Optional[torch.cuda.Stream] = None,
+        alt_stream: Optional[Any] = None,
         is_nextn: bool = False,
     ) -> None:
         super().__init__()
@@ -1922,6 +1979,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             total_layer_num=total_layer_num,
             is_nextn=is_nextn,
+            alt_stream=alt_stream,
         )
         LayerManager.num_nextn_predict_layers = getattr(
             config, "num_nextn_predict_layers", 0
@@ -2134,10 +2192,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
         replay_norm_inputs = _welm_should_replay(
             "norm_inputs", forward_batch, self.layer_id
         )
-        replay_norm_after_attn = _welm_should_replay(
-            "norm_after_attn", forward_batch, self.layer_id
-        )
-        need_norm_after_attn_fp32 = dump_this_layer or replay_norm_after_attn
         if replay_norm_inputs:
             if residual is None:
                 raise RuntimeError(
@@ -2164,6 +2218,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 # file records the residual actually consumed by the norm.
                 _welm_dump_tensor(residual_dump_name, residual)
 
+        replay_norm_after_attn = _welm_should_replay(
+            "norm_after_attn", forward_batch, self.layer_id
+        )
+        need_fp32_norm_after_attn = dump_this_layer or replay_norm_after_attn
         if use_mmq_norm_after_attn:
             # With attention DP, RowParallelLinear deliberately leaves the
             # output projection as an attn-TP partial.  WeLM applies o_norm
@@ -2180,17 +2238,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 self.self_attn.o_norm.weight,
                 self.post_attention_layernorm.weight,
                 self.post_attention_layernorm.eps,
-                # hidden_states_fp32 is only consumed by dump/replay. Keep
-                # CUDA behavior unchanged and skip the redundant FP32 device
-                # write during normal NPU inference.
-                store_fp32_out=(
-                    not _is_npu
-                    or need_norm_after_attn_fp32
-                    or _WELM_NPU_KEEP_NORM_FP32_OUT
-                ),
+                return_fp32_out=need_fp32_norm_after_attn,
             )
-            if hidden_states_fp32 is None:
-                hidden_states_fp32 = hidden_states
             if (
                 is_dp_attention_enabled()
                 and self.layer_scatter_modes.mlp_mode == ScatterMode.FULL
@@ -2211,11 +2260,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     dp_gather_replicate(
                         hidden_states, local_hidden_states, forward_batch
                     )
-                    hidden_states_fp32 = (
-                        hidden_states.to(torch.float32)
-                        if need_norm_after_attn_fp32
-                        else hidden_states
-                    )
+                    if need_fp32_norm_after_attn:
+                        hidden_states_fp32 = hidden_states.to(torch.float32)
         elif use_dp_o_norm_after_attn:
             # ppln=False checkpoints still may carry o_norm.  Applying it in
             # Attention.forward would normalize each RowParallel partial.
@@ -2263,6 +2309,11 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     hidden_states, residual, clone_fp32_out=True
                 )
         if replay_norm_after_attn:
+            if hidden_states_fp32 is None:
+                raise RuntimeError(
+                    "WeLM norm_after_attn replay requires the FP32 post-norm "
+                    "output."
+                )
             _welm_validate_replay_positions(
                 positions, forward_batch, self.layer_id
             )
@@ -2302,6 +2353,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     layer_idx=self.layer_id,
                 )
         if dump_this_layer:
+            if hidden_states_fp32 is None:
+                raise RuntimeError(
+                    "WeLM activation dump requires the FP32 post-norm output."
+                )
             _welm_dump_tensor(
                 f"model.layers.{self.layer_id}.norm_after_attn.output", hidden_states
             )
@@ -2372,7 +2427,7 @@ class Qwen2MoeModel(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         decoder_layer_type: type[nn.Module] = Qwen2MoeDecoderLayer,
-        alt_stream: Optional[torch.cuda.Stream] = None,
+        alt_stream: Optional[Any] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -2787,6 +2842,28 @@ class Qwen2MoeModel(nn.Module):
     ) -> Union[torch.Tensor, PPProxyTensors]:
         _welm_start_replay_pass(forward_batch)
         _welm_start_dump_pass()
+        # Construct immutable request-segment metadata once per eager forward.
+        # EXTEND/MIXED positions are independently contiguous per request;
+        # speculative modes are deliberately excluded.  Prefill NPU Graph is
+        # disabled for WeLMv4, so no captured buffer needs to own this tensor.
+        forward_batch.welmv4_rope_segment_tile_starts = None
+        if _is_npu:
+            tile_starts = build_welmv4_rope_segment_tile_starts(
+                forward_batch.extend_seq_lens_cpu,
+                batch_size=forward_batch.batch_size,
+                num_position_tokens=positions.numel(),
+                ordinary_prefill=(
+                    forward_batch.spec_info is None
+                    and forward_batch.forward_mode
+                    in (ForwardMode.EXTEND, ForwardMode.MIXED)
+                ),
+            )
+            if tile_starts is not None:
+                forward_batch.welmv4_rope_segment_tile_starts = torch.tensor(
+                    tile_starts,
+                    dtype=torch.int32,
+                    device=positions.device,
+                )
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 if _welm_dump_enabled():
@@ -2925,9 +3002,12 @@ class WeLMV4MoeForCausalLM(nn.Module):
         # model instance is constructed so stale state cannot survive reloads.
         KVMirrorManager.activations_dict_kv.clear()
         LayerManager.decoder_layer.clear()
-        alt_stream = (
-            torch.cuda.Stream(device=torch.cuda.current_device()) if _is_cuda else None
-        )
+        if _is_cuda:
+            alt_stream = torch.cuda.Stream(device=torch.cuda.current_device())
+        elif _is_npu:
+            alt_stream = torch.get_device_module().Stream()
+        else:
+            alt_stream = None
         self.model = Qwen2MoeModel(
             config,
             quant_config,

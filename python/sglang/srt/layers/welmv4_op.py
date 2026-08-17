@@ -315,6 +315,7 @@ def mmq_style_norm_after_attn_kernel(
     cols: tl.constexpr,
     eps: float,
     BLOCK_SIZE: tl.constexpr,  # pylint: disable=invalid-name
+    WRITE_FP32_OUT: tl.constexpr,  # pylint: disable=invalid-name
 ):
     cols_offsets = tl.arange(0, BLOCK_SIZE)
     mask = cols_offsets < cols
@@ -327,13 +328,15 @@ def mmq_style_norm_after_attn_kernel(
     ):
         offsets = (row_id * cols + cols_offsets).to(tl.int64)
         hs = tl.load(hidden_states_ptr + offsets, mask=mask, other=0.0)
+        # Start the independent residual read before the first RMSNorm so the
+        # MTE2 pipeline can overlap it with vector work on Ascend.
+        residual = tl.load(residual_ptr + offsets, mask=mask, other=0.0)
         onorm_out, _ = _do_mmq_rms_norm(hs, onorm_gamma, cols, eps)
         hs = onorm_out.to(hs.dtype)
-        residual = tl.load(residual_ptr + offsets, mask=mask, other=0.0)
         hs += residual
         rnorm_out, _ = _do_mmq_rms_norm(hs, rnorm_gamma, cols, eps)
         tl.store(residual_out_ptr + offsets, hs, mask=mask)
-        if fp32_out_ptr is not None:
+        if WRITE_FP32_OUT:
             tl.store(fp32_out_ptr + offsets, rnorm_out, mask=mask)
         tl.store(output_ptr + offsets, rnorm_out.to(output_dtype), mask=mask)
 
@@ -345,7 +348,7 @@ def mmq_style_norm_after_attn(
     rnorm_weight: torch.Tensor,
     eps: float,
     *,
-    store_fp32_out: bool = True,
+    return_fp32_out: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     assert hidden_states.dim() == 2
     assert residual.dim() == 2
@@ -356,14 +359,14 @@ def mmq_style_norm_after_attn(
     rnorm_weight = rnorm_weight.contiguous()
     output = torch.empty_like(hidden_states)
     residual_out = torch.empty_like(hidden_states, dtype=torch.float32)
-    # The FP32 normalized copy is only consumed by WeLM's activation
-    # dump/replay path. Avoid writing it during normal NPU inference: for a
-    # 16K-token prefill this removes a 128 MiB device write per affected layer.
     fp32_out = (
         torch.empty_like(hidden_states, dtype=torch.float32)
-        if store_fp32_out
+        if return_fp32_out
         else None
     )
+    # Triton kernels require a tensor argument even when the constexpr branch
+    # removes all uses of it. Reusing residual_out avoids a needless allocation.
+    fp32_out_ptr = fp32_out if fp32_out is not None else residual_out
     rows, cols = hidden_states.shape
     num_sms = min(rows, _get_num_sms(multiplier=8))
     block_size = triton.next_power_of_2(cols)
@@ -374,11 +377,12 @@ def mmq_style_norm_after_attn(
         rnorm_weight,
         output,
         residual_out,
-        fp32_out,
+        fp32_out_ptr,
         rows,
         cols,
         eps,
         block_size,
+        return_fp32_out,
     )
     return output, residual_out, fp32_out
 
@@ -855,6 +859,8 @@ class WelmV4InplaceRotaryEmbedding(RotaryEmbedding):
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
         last_index: Optional[torch.Tensor] = None,
         layer_id: Optional[int] = None,
+        positions_are_contiguous: bool = False,
+        segment_tile_starts: Optional[torch.Tensor] = None,
     ):
         """Torch fallback for WeLM's tail-RoPE layout.
 
@@ -896,6 +902,8 @@ class WelmV4InplaceRotaryEmbedding(RotaryEmbedding):
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
         last_index: Optional[torch.Tensor] = None,
         layer_id: Optional[int] = None,
+        positions_are_contiguous: bool = False,
+        segment_tile_starts: Optional[torch.Tensor] = None,
     ):
         query = query.view(query.shape[0], -1, self.head_size)
         key = key.view(key.shape[0], -1, self.head_size)
@@ -933,6 +941,8 @@ class WelmV4InplaceRotaryEmbedding(RotaryEmbedding):
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
         last_index: Optional[torch.Tensor] = None,
         layer_id: Optional[int] = None,
+        positions_are_contiguous: bool = False,
+        segment_tile_starts: Optional[torch.Tensor] = None,
     ):
         from sglang.srt.layers.welmv4_npu_op import welmv4_inplace_rope_npu
 
@@ -947,6 +957,8 @@ class WelmV4InplaceRotaryEmbedding(RotaryEmbedding):
             head_dim=self.head_size,
             rope_dim=self.rotary_dim,
             layer_id=layer_id,
+            positions_are_contiguous=positions_are_contiguous,
+            segment_tile_starts=segment_tile_starts,
         )
 
     def extra_repr(self) -> str:

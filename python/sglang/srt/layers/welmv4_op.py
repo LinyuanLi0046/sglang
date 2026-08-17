@@ -842,6 +842,7 @@ class WelmV4InplaceRotaryEmbedding(RotaryEmbedding):
         last_index: Optional[torch.Tensor] = None,
         layer_id: Optional[int] = None,
         positions_are_contiguous: bool = False,
+        segment_tile_starts: Optional[torch.Tensor] = None,
     ):
         """Torch fallback for WeLM's tail-RoPE layout.
 
@@ -884,6 +885,7 @@ class WelmV4InplaceRotaryEmbedding(RotaryEmbedding):
         last_index: Optional[torch.Tensor] = None,
         layer_id: Optional[int] = None,
         positions_are_contiguous: bool = False,
+        segment_tile_starts: Optional[torch.Tensor] = None,
     ):
         query = query.view(query.shape[0], -1, self.head_size)
         key = key.view(key.shape[0], -1, self.head_size)
@@ -922,6 +924,7 @@ class WelmV4InplaceRotaryEmbedding(RotaryEmbedding):
         last_index: Optional[torch.Tensor] = None,
         layer_id: Optional[int] = None,
         positions_are_contiguous: bool = False,
+        segment_tile_starts: Optional[torch.Tensor] = None,
     ):
         from sglang.srt.layers.welmv4_npu_op import welmv4_inplace_rope_npu
 
@@ -937,6 +940,7 @@ class WelmV4InplaceRotaryEmbedding(RotaryEmbedding):
             rope_dim=self.rotary_dim,
             layer_id=layer_id,
             positions_are_contiguous=positions_are_contiguous,
+            segment_tile_starts=segment_tile_starts,
         )
 
     def extra_repr(self) -> str:

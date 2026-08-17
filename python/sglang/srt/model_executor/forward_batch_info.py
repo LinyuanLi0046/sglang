@@ -537,6 +537,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
 
+    # WeLMv4 only: immutable per-forward tile metadata for segmented prefill
+    # RoPE.  The model builds it once after eager padding and all layers reuse
+    # it.  Decode/speculative/graph forwards leave it as None.
+    welmv4_rope_segment_tile_starts: Optional[torch.Tensor] = None
+
     # For DP attention (MLP sync sizes)
     original_global_num_tokens_cpu: Optional[List[int]] = None
     _original_batch_size: Optional[int] = None

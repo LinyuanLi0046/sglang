@@ -80,10 +80,14 @@ from sglang.srt.layers.welmv4_op import (
     mmq_style_norm_after_attn,
     mmq_style_router_linear,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.server_args import get_global_server_args
 
 # from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_npu, make_layers
@@ -94,10 +98,11 @@ if is_npu():
         wait_share_stream,
     )
     from sglang.srt.layers.welmv4_npu_op import (
+        build_welmv4_rope_segment_tile_starts,
+        inplace_sigmoid_mul_npu,
         mmq_style_router_linear_npu,
         welmv4_oe_hash_decode_4way_npu,
         welmv4_oe_hash_prefill_4way_npu,
-        inplace_sigmoid_mul_npu,
     )
 
 logger = logging.getLogger(__name__)
@@ -1622,13 +1627,16 @@ class Qwen2MoeAttention(nn.Module):
             _welm_dump_tensor(f"{dump_prefix}.k_after_norm", k_by_head.view(k.shape))
         k = k_by_head.view(k.shape)
 
-        # A single non-speculative extend request has positions that advance
-        # contiguously from its runtime prefix length.  Pass this host-known
-        # semantic fact to RoPE so NPU can use regular 2D cache DMA; batched,
-        # speculative, decode, and mirror paths retain the generic kernel.
+        # A single non-speculative extend request is globally contiguous;
+        # ordinary multi-request prefill carries independently contiguous
+        # segment metadata.  Speculative, decode, and mirror-consumer paths
+        # retain the generic kernel.
         positions_are_contiguous = (
             forward_batch.batch_size == 1
             and forward_batch.forward_mode.is_extend_without_speculative()
+        )
+        segment_tile_starts = getattr(
+            forward_batch, "welmv4_rope_segment_tile_starts", None
         )
 
         qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
@@ -1645,6 +1653,7 @@ class Qwen2MoeAttention(nn.Module):
                     last_index=forward_batch.custom_last_index,
                     layer_id=self.layer_idx,
                     positions_are_contiguous=positions_are_contiguous,
+                    segment_tile_starts=segment_tile_starts,
                 )
             else:
                 q, k = self.rotary_emb(
@@ -1653,6 +1662,7 @@ class Qwen2MoeAttention(nn.Module):
                     k,
                     layer_id=self.layer_idx,
                     positions_are_contiguous=positions_are_contiguous,
+                    segment_tile_starts=segment_tile_starts,
                 )
             q = q.view(q_shape)
             k = k.view(k_shape)
@@ -1663,6 +1673,7 @@ class Qwen2MoeAttention(nn.Module):
                 k,
                 layer_id=self.layer_idx,
                 positions_are_contiguous=positions_are_contiguous,
+                segment_tile_starts=segment_tile_starts,
             )
 
         if enable_npu_gate_alt_stream:
@@ -2803,6 +2814,28 @@ class Qwen2MoeModel(nn.Module):
     ) -> Union[torch.Tensor, PPProxyTensors]:
         _welm_start_replay_pass(forward_batch)
         _welm_start_dump_pass()
+        # Construct immutable request-segment metadata once per eager forward.
+        # EXTEND/MIXED positions are independently contiguous per request;
+        # speculative modes are deliberately excluded.  Prefill NPU Graph is
+        # disabled for WeLMv4, so no captured buffer needs to own this tensor.
+        forward_batch.welmv4_rope_segment_tile_starts = None
+        if _is_npu:
+            tile_starts = build_welmv4_rope_segment_tile_starts(
+                forward_batch.extend_seq_lens_cpu,
+                batch_size=forward_batch.batch_size,
+                num_position_tokens=positions.numel(),
+                ordinary_prefill=(
+                    forward_batch.spec_info is None
+                    and forward_batch.forward_mode
+                    in (ForwardMode.EXTEND, ForwardMode.MIXED)
+                ),
+            )
+            if tile_starts is not None:
+                forward_batch.welmv4_rope_segment_tile_starts = torch.tensor(
+                    tile_starts,
+                    dtype=torch.int32,
+                    device=positions.device,
+                )
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 if _welm_dump_enabled():

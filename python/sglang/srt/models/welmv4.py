@@ -902,19 +902,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and hidden_states.shape[0] > 0
             and (moe_a2a_backend.is_none() or moe_a2a_backend.is_deepep())
         )
-        shared_input = None
         if moe_a2a_backend.is_deepep() and hidden_states.shape[0] == 0:
             topk_output = self.topk.empty_topk_output(
                 hidden_states.device, layer_id=self.layer_id
             )
         else:
-            if self.shared_expert is not None:
-                if enable_npu_dual_stream:
-                    # Routed MoE may overwrite hidden_states in-place. Keep a
-                    # request-local snapshot for the shared-expert side stream.
-                    shared_input = hidden_states.clone()
-                else:
-                    shared_output = self._forward_shared_expert(hidden_states)
+            if self.shared_expert is not None and not enable_npu_dual_stream:
+                shared_output = self._forward_shared_expert(hidden_states)
             if _is_npu:
                 router_logits = mmq_style_router_linear_npu(
                     hidden_states, self.gate.weight
@@ -925,9 +919,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 )
             if enable_npu_dual_stream:
                 # Start after the router Cube GEMM. The shared expert overlaps
-                # routing, dispatch, and the routed-expert path until final add.
+                # routing, dispatch, and the routed-expert path until final add;
+                # both paths only read the original hidden_states storage.
                 shared_output = process_shared_expert(
-                    shared_input, self._forward_shared_expert
+                    hidden_states, self._forward_shared_expert
                 )
             if dump_this_layer:
                 _welm_dump_tensor(f"{dump_prefix}.router.logits", router_logits)

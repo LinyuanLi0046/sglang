@@ -1622,6 +1622,15 @@ class Qwen2MoeAttention(nn.Module):
             _welm_dump_tensor(f"{dump_prefix}.k_after_norm", k_by_head.view(k.shape))
         k = k_by_head.view(k.shape)
 
+        # A single non-speculative extend request has positions that advance
+        # contiguously from its runtime prefix length.  Pass this host-known
+        # semantic fact to RoPE so NPU can use regular 2D cache DMA; batched,
+        # speculative, decode, and mirror paths retain the generic kernel.
+        positions_are_contiguous = (
+            forward_batch.batch_size == 1
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        )
+
         qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
         if qk_nope_head_dim > 0:
             if (
@@ -1635,15 +1644,26 @@ class Qwen2MoeAttention(nn.Module):
                     k,
                     last_index=forward_batch.custom_last_index,
                     layer_id=self.layer_idx,
+                    positions_are_contiguous=positions_are_contiguous,
                 )
             else:
                 q, k = self.rotary_emb(
-                    positions, q, k, layer_id=self.layer_idx
+                    positions,
+                    q,
+                    k,
+                    layer_id=self.layer_idx,
+                    positions_are_contiguous=positions_are_contiguous,
                 )
             q = q.view(q_shape)
             k = k.view(k_shape)
         else:
-            q, k = self.rotary_emb(positions, q, k, layer_id=self.layer_idx)
+            q, k = self.rotary_emb(
+                positions,
+                q,
+                k,
+                layer_id=self.layer_idx,
+                positions_are_contiguous=positions_are_contiguous,
+            )
 
         if enable_npu_gate_alt_stream:
             # Gate GEMM overlaps only the post-QKV normalization/RoPE region.

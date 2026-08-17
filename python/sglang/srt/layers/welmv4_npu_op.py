@@ -379,6 +379,10 @@ def _welmv4_inplace_rope_prefill_kernel_npu(
                 + sin_offsets[None, :],
                 care_padding=False,
             )
+            # Runtime position rows are genuinely discrete on the generic
+            # path.  Avoid the backend's scalarized per-row GM copies.
+            tl.extra.cann.extension.compile_hint(cos, "mayDiscretememaccess")
+            tl.extra.cann.extension.compile_hint(sin, "mayDiscretememaccess")
 
         k_data = (
             k_ptr + token_base * k_token_stride + head_dim - rope_dim
@@ -450,6 +454,141 @@ def _welmv4_inplace_rope_prefill_kernel_npu(
             )
 
 
+@triton.jit(do_not_specialize=["num_token_blocks", "N"])
+def _welmv4_inplace_rope_contiguous_prefill_kernel_npu(
+    q_ptr: tl.tensor,
+    k_ptr: tl.tensor,
+    position_ptr: tl.tensor,
+    cos_sin_cache_ptr: tl.tensor,
+    num_token_blocks: int,
+    N: int,
+    q_token_stride: tl.constexpr,
+    k_token_stride: tl.constexpr,
+    head_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    token_block: tl.constexpr,
+    masked: tl.constexpr,
+    num_stages: tl.constexpr,
+    num_q_heads: tl.constexpr,
+):
+    """A5 fast path for one ordinary-prefill request with contiguous positions."""
+    half_rope_dim: tl.constexpr = rope_dim // 2
+    token_offsets = tl.arange(0, token_block)
+    cos_offsets = tl.arange(0, half_rope_dim)
+    sin_offsets = tl.arange(half_rope_dim, rope_dim)
+    for block_id in tl.range(
+        tl.program_id(0),
+        num_token_blocks,
+        tl.num_programs(0),
+        num_stages=num_stages,
+    ):
+        token_base = block_id * token_block
+        token_mask = token_base + token_offsets < N
+
+        # For one non-speculative extend request, positions are contiguous
+        # from an arbitrary runtime prefix offset.  Express that fact so the
+        # FP32 cache reads lower to regular 2D GM-to-UB transfers.
+        position_base = tl.load(position_ptr + token_base).to(tl.int32)
+        position_ids = position_base + token_offsets
+        if masked:
+            cos = tl.load(
+                cos_sin_cache_ptr
+                + position_ids[:, None] * rope_dim
+                + cos_offsets[None, :],
+                mask=token_mask[:, None],
+                other=0.0,
+                care_padding=False,
+            )
+            sin = tl.load(
+                cos_sin_cache_ptr
+                + position_ids[:, None] * rope_dim
+                + sin_offsets[None, :],
+                mask=token_mask[:, None],
+                other=0.0,
+                care_padding=False,
+            )
+        else:
+            cos = tl.load(
+                cos_sin_cache_ptr
+                + position_ids[:, None] * rope_dim
+                + cos_offsets[None, :],
+                care_padding=False,
+            )
+            sin = tl.load(
+                cos_sin_cache_ptr
+                + position_ids[:, None] * rope_dim
+                + sin_offsets[None, :],
+                care_padding=False,
+            )
+
+        k_data = (
+            k_ptr + token_base * k_token_stride + head_dim - rope_dim
+        )
+        _welmv4_apply_token_block_rope_npu(
+            k_data,
+            token_offsets,
+            k_token_stride,
+            cos,
+            sin,
+            token_mask,
+            masked,
+            head_dim,
+            rope_dim,
+        )
+        if masked:
+            for head_id in tl.static_range(0, num_q_heads):
+                q_data = (
+                    q_ptr
+                    + token_base * q_token_stride
+                    + head_id * head_dim
+                    + head_dim
+                    - rope_dim
+                )
+                _welmv4_apply_token_block_rope_npu(
+                    q_data,
+                    token_offsets,
+                    q_token_stride,
+                    cos,
+                    sin,
+                    token_mask,
+                    masked,
+                    head_dim,
+                    rope_dim,
+                )
+        else:
+            q_data = q_ptr + token_base * q_token_stride + head_dim - rope_dim
+            _welmv4_apply_token_head_block_rope_npu(
+                q_data,
+                token_offsets,
+                q_token_stride,
+                cos,
+                sin,
+                2,
+                head_dim,
+                rope_dim,
+            )
+            _welmv4_apply_token_head_block_rope_npu(
+                q_data + 2 * head_dim,
+                token_offsets,
+                q_token_stride,
+                cos,
+                sin,
+                2,
+                head_dim,
+                rope_dim,
+            )
+            _welmv4_apply_token_head_block_rope_npu(
+                q_data + 4 * head_dim,
+                token_offsets,
+                q_token_stride,
+                cos,
+                sin,
+                2,
+                head_dim,
+                rope_dim,
+            )
+
+
 def welmv4_inplace_rope_npu(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -461,6 +600,7 @@ def welmv4_inplace_rope_npu(
     num_stages: int = 4,
     layer_id: Optional[int] = None,
     stage: Optional[str] = None,
+    positions_are_contiguous: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """对 Q/K 就地应用尾部 RoPE。
 
@@ -472,6 +612,8 @@ def welmv4_inplace_rope_npu(
         last_index: (BS,) int32 或 None; KV-mirror 模式 Q 的源 token 索引
         head_dim, rope_dim: 维度参数
         num_stages: tl.range 软件流水线阶段数
+        positions_are_contiguous: Host 已确认 positions 属于单请求、非
+            speculative extend 的连续位置序列；仅用于选择专用 kernel
 
     Returns:
         (query, key) 就地修改后返回
@@ -501,7 +643,12 @@ def welmv4_inplace_rope_npu(
             num_token_blocks,
             _get_num_sms(multiplier=_WELMV4_ROPE_PROGRAMS_PER_VECTOR_CORE),
         )
-        _welmv4_inplace_rope_prefill_kernel_npu[(num_sms,)](
+        prefill_kernel = (
+            _welmv4_inplace_rope_contiguous_prefill_kernel_npu
+            if positions_are_contiguous
+            else _welmv4_inplace_rope_prefill_kernel_npu
+        )
+        prefill_kernel[(num_sms,)](
             query,
             key,
             positions,
@@ -518,7 +665,11 @@ def welmv4_inplace_rope_npu(
             num_q_heads,
             multibuffer=True,
         )
-        kernel_name = "_welmv4_inplace_rope_prefill_kernel_npu"
+        kernel_name = (
+            "_welmv4_inplace_rope_contiguous_prefill_kernel_npu"
+            if positions_are_contiguous
+            else "_welmv4_inplace_rope_prefill_kernel_npu"
+        )
     else:
         num_sms = min(N, _get_num_sms(multiplier=8))
         _welmv4_inplace_rope_kernel_npu[(num_sms,)](
@@ -558,6 +709,7 @@ def welmv4_inplace_rope_npu(
                 "BS": BS,
                 "head_dim": head_dim,
                 "rope_dim": rope_dim,
+                "positions_are_contiguous": positions_are_contiguous,
                 "num_q_heads": num_q_heads,
                 "num_k_heads": num_k_heads,
                 "num_sms": num_sms,

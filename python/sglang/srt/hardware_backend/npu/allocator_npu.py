@@ -2,11 +2,16 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.ops.memory.allocator import (
+    NPU_ALLOC_EXTEND_BLOCK_SIZE,
+    NPU_ALLOC_EXTEND_MAX_BATCH_SIZE,
+    alloc_extend_kernel_npu,
+)
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     alloc_extend_naive,
 )
-from sglang.srt.utils import get_num_new_pages, next_power_of_2
+from sglang.srt.utils import get_num_new_pages
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -54,25 +59,33 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         if num_new_pages_item > len(self.free_pages):
             return None
 
-        if num_new_pages_item < 200:
-            from sgl_kernel_npu.mem_cache.allocator import alloc_extend_kernel
-
+        bs = prefix_lens.shape[0]
+        if bs <= NPU_ALLOC_EXTEND_MAX_BATCH_SIZE:
             out_indices = torch.empty(
                 (extend_num_tokens,),
                 dtype=torch.int64,
                 device=self.device,
             )
-            max_num_extend_tokens = next_power_of_2(extend_num_tokens)
-            bs = prefix_lens.shape[0]
-            alloc_extend_kernel[(bs,)](
+            extend_lens_cpu = seq_lens_cpu - prefix_lens_cpu
+            max_extend_per_request = int(extend_lens_cpu.max().item())
+            num_token_chunks = max(
+                1,
+                (
+                    max_extend_per_request
+                    + NPU_ALLOC_EXTEND_BLOCK_SIZE
+                    - 1
+                )
+                // NPU_ALLOC_EXTEND_BLOCK_SIZE,
+            )
+            alloc_extend_kernel_npu[(bs, num_token_chunks)](
                 prefix_lens,
                 seq_lens,
                 last_loc,
                 self.free_pages,
                 out_indices,
-                next_power_of_2(bs),
-                self.page_size,
-                max_num_extend_tokens,
+                MAX_BATCH_SIZE=NPU_ALLOC_EXTEND_MAX_BATCH_SIZE,
+                PAGE_SIZE=self.page_size,
+                BLOCK_SIZE=NPU_ALLOC_EXTEND_BLOCK_SIZE,
             )
 
         else:

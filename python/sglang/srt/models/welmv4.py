@@ -894,39 +894,28 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             _welm_dump_tensor(f"{dump_prefix}.router.input", hidden_states)
             _welm_dump_tensor(f"{dump_prefix}.router.input_fp32", hidden_states_fp32)
         shared_output = None
+        moe_a2a_backend = get_moe_a2a_backend()
         is_prefill_batch = (
             forward_batch is not None
             and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
                 include_draft_extend_v2=True
             )
         )
-        moe_a2a_backend = get_moe_a2a_backend()
         enable_npu_dual_stream = (
             _is_npu
             and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             and self.shared_expert is not None
             and hidden_states.shape[0] > 0
             and (moe_a2a_backend.is_none() or moe_a2a_backend.is_deepep())
+            and not is_prefill_batch
         )
-        shared_input = None
         if moe_a2a_backend.is_deepep() and hidden_states.shape[0] == 0:
             topk_output = self.topk.empty_topk_output(
                 hidden_states.device, layer_id=self.layer_id
             )
         else:
-            if self.shared_expert is not None:
-                if enable_npu_dual_stream:
-                    # Routed MoE implementations may overwrite hidden_states
-                    # in-place.  Snapshot it before either branch starts.
-                    shared_input = hidden_states.clone()
-                    if not is_prefill_batch:
-                        # Decode keeps the original wide-overlap schedule: start
-                        # shared before router and join only after routed experts.
-                        shared_output = process_shared_expert(
-                            shared_input, self._forward_shared_expert
-                        )
-                else:
-                    shared_output = self._forward_shared_expert(hidden_states)
+            if self.shared_expert is not None and not enable_npu_dual_stream:
+                shared_output = self._forward_shared_expert(hidden_states)
             if _is_npu:
                 router_logits = mmq_style_router_linear_npu(
                     hidden_states, self.gate.weight
@@ -935,11 +924,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 router_logits = mmq_style_router_linear(
                     hidden_states, self.gate.weight
                 )
-            if enable_npu_dual_stream and is_prefill_batch:
-                # Prefill protects the router matmul from shared-expert Cube
-                # contention, then overlaps shared with sigmoid/TopK/gather.
+            if enable_npu_dual_stream:
+                # Start after the router Cube GEMM. The shared expert overlaps
+                # routing, dispatch, and the routed-expert path until final add;
+                # both paths only read the original hidden_states storage.
                 shared_output = process_shared_expert(
-                    shared_input, self._forward_shared_expert
+                    hidden_states, self._forward_shared_expert
                 )
             if dump_this_layer:
                 _welm_dump_tensor(f"{dump_prefix}.router.logits", router_logits)
@@ -972,18 +962,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if dump_this_layer and hasattr(topk_output, "topk_weights"):
             _welm_dump_tensor(f"{dump_prefix}.router.topk_scores", topk_output.topk_weights)
             _welm_dump_tensor(f"{dump_prefix}.router.topk_ids", topk_output.topk_ids)
-        if enable_npu_dual_stream and is_prefill_batch:
-            # Prefill joins after sigmoid/TopK/gather and before self.experts()
-            # enters dispatcher.dispatch() / MoeInitRouting.
-            wait_share_stream()
         experts_output = self.experts(hidden_states, topk_output)
-        if enable_npu_dual_stream and not is_prefill_batch:
-            # Decode keeps the original wide overlap and joins only after routed
-            # experts, immediately before shared_output is consumed.
-            wait_share_stream()
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.experts_output", experts_output)
         if return_components and skip_component_output:
+            if enable_npu_dual_stream:
+                # This early return hands shared_output to the caller, so it is
+                # the consumption boundary for this diagnostic path.
+                wait_share_stream()
             return (
                 experts_output.view(num_tokens, hidden_dim),
                 experts_output.view(num_tokens, hidden_dim),
@@ -996,6 +982,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.last_final_shared_output = None
         if shared_output is not None:
             if dump_this_layer:
+                if enable_npu_dual_stream:
+                    # Activation dumping consumes shared_output before the add.
+                    wait_share_stream()
                 _welm_dump_tensor(f"{dump_prefix}.shared_output", shared_output)
             if (
                 self.layer_id == self.num_hidden_layers - 1
@@ -1004,6 +993,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             ):
                 self.last_final_experts_output = experts_output
                 self.last_final_shared_output = shared_output
+            if enable_npu_dual_stream and not dump_this_layer:
+                # Normal inference first consumes shared_output in this add.
+                wait_share_stream()
             final_hidden_states = final_hidden_states + shared_output
         if dump_this_layer:
             _welm_dump_tensor(f"{dump_prefix}.output", final_hidden_states)
@@ -1556,12 +1548,19 @@ class Qwen2MoeAttention(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         gate = None
+        is_prefill_batch = (
+            forward_batch is not None
+            and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
+                include_draft_extend_v2=True
+            )
+        )
         enable_npu_gate_alt_stream = (
             _is_npu
             and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             and self.alt_stream is not None
             and self.gated_self_attention_headwise
             and hidden_states.shape[0] > 0
+            and not is_prefill_batch
         )
         if enable_npu_gate_alt_stream:
             device_module = torch.get_device_module()
@@ -1627,7 +1626,7 @@ class Qwen2MoeAttention(nn.Module):
         k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
         if self.k_norm is not None:
             k_by_head = mmq_style_k_rms_norm(
-                k_by_head,
+                k_by_head.contiguous(),
                 self.k_norm.weight,
                 self.k_norm.eps,
                 layer_id=self.layer_idx,
@@ -1691,11 +1690,6 @@ class Qwen2MoeAttention(nn.Module):
                 positions_are_contiguous=positions_are_contiguous,
                 segment_tile_starts=segment_tile_starts,
             )
-
-        if enable_npu_gate_alt_stream:
-            # Gate GEMM overlaps only the post-QKV normalization/RoPE region.
-            # Join before attention so the two Cube workloads cannot compete.
-            current_stream.wait_stream(self.alt_stream)
 
         replay_attention_input = _welm_should_replay(
             "attention_input", forward_batch, self.layer_idx
@@ -1768,10 +1762,17 @@ class Qwen2MoeAttention(nn.Module):
                 gate = self.gate_proj(hidden_states)[0].unsqueeze(-1)
             # gate: (bs * seq_len, num_heads, 1)
             if dump_this_layer:
+                if enable_npu_gate_alt_stream:
+                    # Activation dumping consumes gate before sigmoid_mul.
+                    current_stream.wait_stream(self.alt_stream)
                 _welm_dump_tensor(
                     f"model.layers.{self.layer_idx}.attn.router.0", gate.squeeze(-1)
                 )
             attn_output = attn_output.view(attn_shape[0], self.num_heads, -1)
+            if enable_npu_gate_alt_stream and not dump_this_layer:
+                # Normal inference first consumes gate in sigmoid_mul. Joining
+                # here lets gate projection overlap the complete attention op.
+                current_stream.wait_stream(self.alt_stream)
             if _is_npu:
                 inplace_sigmoid_mul_npu(gate, attn_output)
             else:

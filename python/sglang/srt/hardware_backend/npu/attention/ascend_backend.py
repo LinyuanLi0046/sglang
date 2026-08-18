@@ -823,6 +823,7 @@ class AscendAttnBackend(AttentionBackend):
         block_tables: torch.Tensor,
         seq_lens: torch.Tensor,
         sinks: torch.Tensor,
+        mirror_prefill: bool = False,
     ) -> torch.Tensor:
         _, _, decode = _load_welm_full_sink_attention_ops()
         q_3d = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
@@ -852,7 +853,7 @@ class AscendAttnBackend(AttentionBackend):
                 f"V={tuple(v_cache_4d.shape)}."
             )
 
-        if self.graph_mode:
+        if self.graph_mode or mirror_prefill:
             max_kv_len_hint = self.max_context_len
         elif self.forward_metadata.seq_lens_cpu_int is not None:
             max_kv_len_hint = int(
@@ -897,6 +898,7 @@ class AscendAttnBackend(AttentionBackend):
         block_tables: torch.Tensor,
         seq_lens: torch.Tensor,
         sinks: torch.Tensor,
+        mirror_prefill: bool = False,
     ) -> torch.Tensor:
         """Run one-query paged SWA+Sink for eager, graph, or KV mirror."""
         _, decode = _load_welm_swa_sink_attention_ops()
@@ -1743,6 +1745,7 @@ class AscendAttnBackend(AttentionBackend):
                     block_tables=block_tables,
                     seq_lens=self.forward_metadata.seq_lens[:num_queries],
                     sinks=sinks,
+                    mirror_prefill=True,
                 )
             if self._is_welm_swa_sink_layer(layer, sinks):
                 return self._forward_welm_swa_sink_decode(
@@ -1753,6 +1756,7 @@ class AscendAttnBackend(AttentionBackend):
                     block_tables=block_tables,
                     seq_lens=self.forward_metadata.seq_lens[:num_queries],
                     sinks=sinks,
+                    mirror_prefill=True,
                 )
             q = q.contiguous()
             k_cache = k_cache.view(

@@ -232,9 +232,6 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                         f"int8 KV cache, but got {self.store_dtype}."
                     )
 
-                # The torch_npu binding uses scatter_mode="None", so K/V must
-                # be contiguous. The paged cache views below are zero-copy:
-                # [num_slots, 1, H, D] -> [num_pages, page_size, H, D].
                 key = cache_k.reshape(
                     -1, self.head_num, self.head_dim
                 ).contiguous()

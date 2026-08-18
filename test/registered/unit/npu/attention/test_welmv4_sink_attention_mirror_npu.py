@@ -5,11 +5,9 @@ import torch_npu  # noqa: F401
 
 from sglang.srt.hardware_backend.npu.attention.sink_full_attention import (
     paged_attention_decode_impl,
-    paged_attention_mirror_impl,
     paged_attention_prefill_impl,
     paged_attention_prefill_prepare,
     swa_paged_decode_impl,
-    swa_paged_mirror_impl,
     swa_paged_prefill_impl,
 )
 from sglang.test.ci.ci_register import register_npu_ci
@@ -175,6 +173,17 @@ def _assert_kernel_precision(actual, previous, reference):
     torch.testing.assert_close(actual, reference, rtol=3e-2, atol=3e-2)
 
 
+def _pad_block_table_width(block_tables, extra_pages=3):
+    padded = torch.full(
+        (block_tables.shape[0], block_tables.shape[1] + extra_pages),
+        -1,
+        device=block_tables.device,
+        dtype=block_tables.dtype,
+    )
+    padded[:, : block_tables.shape[1]] = block_tables
+    return padded
+
+
 def _make_prefill_case(q_lens=(128,), seq_lens=(256,)):
     assert len(q_lens) == len(seq_lens)
     assert all(q_len <= seq_len for q_len, seq_len in zip(q_lens, seq_lens))
@@ -279,65 +288,80 @@ def test_swa_prefill_aggregation_compiles_and_matches_reference():
 
 
 @torch.no_grad()
-def test_full_mirror_non_fd_matches_previous_kernel_and_reference():
-    case = _make_paged_case([257, 193])
+def test_shared_full_non_fd_accepts_graph_and_mirror_block_table_widths():
+    case = _make_paged_case([257])
     q, key_cache, value_cache, seq_lens, block_tables, sinks = case
-    kwargs = dict(
+    common_kwargs = dict(
         q=q,
         key_cache=key_cache,
         value_cache=value_cache,
         seqlens=seq_lens,
-        block_tables=block_tables,
         gqa_interleave=False,
         sinks=sinks,
     )
-    previous = paged_attention_decode_impl(**kwargs)
-    actual = paged_attention_mirror_impl(**kwargs)
+    graph_output = paged_attention_decode_impl(
+        **common_kwargs,
+        block_tables=_pad_block_table_width(block_tables),
+    )
+    mirror_output = paged_attention_decode_impl(
+        **common_kwargs,
+        block_tables=block_tables,
+    )
     reference = _reference_sink_attention(*case)
-    _assert_kernel_precision(actual, previous, reference)
+    _assert_kernel_precision(mirror_output, graph_output, reference)
 
 
 @torch.no_grad()
-def test_full_mirror_fd_matches_previous_kernel_and_reference():
+def test_shared_full_fd_accepts_graph_and_mirror_block_table_widths():
     case = _make_paged_case([2048])
     q, key_cache, value_cache, seq_lens, block_tables, sinks = case
-    kwargs = dict(
+    common_kwargs = dict(
         q=q,
         key_cache=key_cache,
         value_cache=value_cache,
         seqlens=seq_lens,
-        block_tables=block_tables,
         gqa_interleave=False,
         sinks=sinks,
         max_kv_len_hint=2048,
     )
-    previous = paged_attention_decode_impl(**kwargs)
-    actual = paged_attention_mirror_impl(**kwargs)
+    graph_output = paged_attention_decode_impl(
+        **common_kwargs,
+        block_tables=_pad_block_table_width(block_tables),
+    )
+    mirror_output = paged_attention_decode_impl(
+        **common_kwargs,
+        block_tables=block_tables,
+    )
     reference = _reference_sink_attention(*case)
-    _assert_kernel_precision(actual, previous, reference)
+    _assert_kernel_precision(mirror_output, graph_output, reference)
 
 
 @torch.no_grad()
-def test_swa_mirror_matches_previous_kernel_and_reference():
+def test_shared_swa_accepts_graph_and_mirror_block_table_widths():
     local_window = 128
-    case = _make_paged_case([257, 193])
+    case = _make_paged_case([257])
     q, key_cache, value_cache, seq_lens, block_tables, sinks = case
-    kwargs = dict(
+    common_kwargs = dict(
         q=q,
         key_cache=key_cache,
         value_cache=value_cache,
         seqlens=seq_lens,
-        block_tables=block_tables,
         local_window_size=local_window,
         global_window_size=0,
         gqa_interleave=False,
         sinks=sinks,
     )
-    previous = swa_paged_decode_impl(**kwargs)
-    actual = swa_paged_mirror_impl(**kwargs)
+    graph_output = swa_paged_decode_impl(
+        **common_kwargs,
+        block_tables=_pad_block_table_width(block_tables),
+    )
+    mirror_output = swa_paged_decode_impl(
+        **common_kwargs,
+        block_tables=block_tables,
+    )
     reference = _reference_sink_attention(
         *case,
         local_window=local_window,
         global_window=0,
     )
-    _assert_kernel_precision(actual, previous, reference)
+    _assert_kernel_precision(mirror_output, graph_output, reference)

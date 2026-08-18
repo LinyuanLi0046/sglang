@@ -13,6 +13,10 @@ _ATTENTION_SOURCE = (
     Path(__file__).resolve().parents[5]
     / "python/sglang/srt/hardware_backend/npu/attention/sink_full_attention.py"
 )
+_ASCEND_BACKEND_SOURCE = (
+    Path(__file__).resolve().parents[5]
+    / "python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py"
+)
 
 
 def _do_not_specialize_for(function):
@@ -259,18 +263,16 @@ def test_only_request_varying_attention_scalars_skip_specialization():
             "bsz",
             "stride_block_table_b",
         },
-        "mirror_paged_decode_fd_kernel": {
-            "BATCH_SIZE",
-            "KV_SPLIT_PARTS",
+        "paged_decode_fd_kernel": {
+            "block_tables_ptr",
             "stride_bt_batch",
         },
-        "mirror_paged_decode_fd_reduce_kernel": {
-            "BATCH_SIZE",
-            "KV_SPLIT_PARTS",
+        "paged_decode_kernel": {
+            "block_tables_ptr",
+            "stride_bt_batch",
         },
-        "mirror_paged_decode_kernel": {"BATCH_SIZE", "stride_bt_batch"},
-        "mirror_swa_paged_decode_sink_kernel": {
-            "BATCH_SIZE",
+        "_swa_paged_decode_sink_kernel": {
+            "block_tables_ptr",
             "stride_bt_batch",
         },
     }
@@ -285,3 +287,32 @@ def test_only_request_varying_attention_scalars_skip_specialization():
             and argument.annotation.attr == "constexpr"
         }
         assert expected_runtime_scalars.isdisjoint(constexpr_args)
+
+    for function_name in ("paged_decode_kernel", "_swa_paged_decode_sink_kernel"):
+        argument_names = {
+            argument.arg for argument in functions[function_name].args.args
+        }
+        assert "NUM_TOTAL_BLOCKS" not in argument_names
+        assert "MAX_NUM_BLOCKS_PER_SEQ" not in argument_names
+
+    for function_name in (
+        "paged_decode_fd_kernel",
+        "paged_decode_fd_reduce_kernel",
+    ):
+        function = functions[function_name]
+        constexpr_args = {
+            argument.arg
+            for argument in function.args.args
+            if isinstance(argument.annotation, ast.Attribute)
+            and argument.annotation.attr == "constexpr"
+        }
+        assert "KV_SPLIT_PARTS" in constexpr_args
+        assert "BATCH_SIZE" not in _do_not_specialize_for(function)
+
+
+def test_mirror_dispatch_reuses_decode_kernel_and_graph_split_policy():
+    source = _ASCEND_BACKEND_SOURCE.read_text(encoding="utf-8")
+    ast.parse(source)
+    assert "_load_welm_full_sink_mirror_attention_op" not in source
+    assert "_load_welm_swa_sink_mirror_attention_op" not in source
+    assert "if self.graph_mode or mirror_prefill:" in source

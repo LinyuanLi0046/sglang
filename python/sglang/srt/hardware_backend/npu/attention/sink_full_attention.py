@@ -856,7 +856,16 @@ def _compute_kv_split_parts(
 #     - pass 2: exp_sum += exp(s_h - lse_max)   (sink acc=0, only enlarges denominator)
 # ---------------------------------------------------------------------------
 
-@triton.jit
+# Decode Graph uses a max-context block table while eager KV-mirror prefill
+# uses a tight table derived from the current sequence length.  They share this
+# performance-specialized kernel, so suppress only the table base/row-stride
+# attributes; Q/K/V/workspace layouts and KV_SPLIT_PARTS stay specialized.
+@triton.jit(
+    do_not_specialize=[
+        "block_tables_ptr",
+        "stride_bt_batch",
+    ]
+)
 def paged_decode_fd_kernel(
     q_ptr,
     k_cache_ptr,
@@ -1460,7 +1469,14 @@ def mirror_paged_decode_fd_reduce_kernel(
         )
 
 
-@triton.jit
+# See paged_decode_fd_kernel: only the graph/eager block-table representation
+# is request-dependent.  BATCH_SIZE and all data layouts remain specialized.
+@triton.jit(
+    do_not_specialize=[
+        "block_tables_ptr",
+        "stride_bt_batch",
+    ]
+)
 def paged_decode_kernel(
     q_ptr,
     k_cache_ptr,
@@ -1470,8 +1486,6 @@ def paged_decode_kernel(
     block_tables_ptr,
     sinks_ptr,
     BATCH_SIZE,
-    NUM_TOTAL_BLOCKS,
-    MAX_NUM_BLOCKS_PER_SEQ,
     stride_qb,
     stride_qh,
     stride_qd,
@@ -1808,8 +1822,7 @@ def paged_attention_decode_impl(
     max_kv_len_hint: Optional[int] = None,
 ) -> torch.Tensor:
     batch_size, num_q_heads, head_dim = q.shape
-    num_total_blocks, num_kv_heads, page_size, head_dim_cache = key_cache.shape
-    max_num_blocks_per_seq = block_tables.shape[1]
+    _, num_kv_heads, page_size, head_dim_cache = key_cache.shape
 
     assert value_cache.shape == key_cache.shape
     assert head_dim == head_dim_cache
@@ -1910,8 +1923,6 @@ def paged_attention_decode_impl(
         block_tables_i32,
         sinks_pass,
         batch_size,
-        num_total_blocks,
-        max_num_blocks_per_seq,
         q.stride(0),
         q.stride(1),
         q.stride(2),
@@ -2873,7 +2884,14 @@ def swa_paged_prefill_impl(
 
 
 
-@triton.jit
+# SWA decode and BS=1 KV-mirror prefill share this kernel.  Tight eager tables
+# may have a different base alignment and row stride from the graph table.
+@triton.jit(
+    do_not_specialize=[
+        "block_tables_ptr",
+        "stride_bt_batch",
+    ]
+)
 def _swa_paged_decode_sink_kernel(
     q_ptr,
     k_cache_ptr,
@@ -2883,8 +2901,6 @@ def _swa_paged_decode_sink_kernel(
     block_tables_ptr,
     sinks_ptr,
     BATCH_SIZE,
-    NUM_TOTAL_BLOCKS,
-    MAX_NUM_BLOCKS_PER_SEQ,
     stride_qb,
     stride_qh,
     stride_qd,
@@ -3395,9 +3411,7 @@ def swa_paged_decode_impl(
     sinks: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     batch_size, num_q_heads, head_dim = q.shape
-    num_total_blocks, num_kv_heads, page_size, head_dim_cache = key_cache.shape
-
-    max_num_blocks_per_seq = block_tables.shape[1]
+    _, num_kv_heads, page_size, head_dim_cache = key_cache.shape
 
     assert head_dim == head_dim_cache
     if softmax_scale is None:
@@ -3432,8 +3446,6 @@ def swa_paged_decode_impl(
         block_tables,
         sinks_pass,
         batch_size,
-        num_total_blocks,
-        max_num_blocks_per_seq,
         q.stride(0),
         q.stride(1),
         q.stride(2),

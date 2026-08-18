@@ -73,6 +73,24 @@ def _load_welm_swa_sink_attention_ops():
     return swa_paged_prefill_impl, swa_paged_decode_impl
 
 
+def _load_welm_full_sink_mirror_attention_op():
+    """Load the request-shape-stable Full+Sink KV-mirror implementation."""
+    from sglang.srt.hardware_backend.npu.attention.sink_full_attention import (
+        paged_attention_mirror_impl,
+    )
+
+    return paged_attention_mirror_impl
+
+
+def _load_welm_swa_sink_mirror_attention_op():
+    """Load the request-shape-stable SWA+Sink KV-mirror implementation."""
+    from sglang.srt.hardware_backend.npu.attention.sink_full_attention import (
+        swa_paged_mirror_impl,
+    )
+
+    return swa_paged_mirror_impl
+
+
 def _is_dflash_verify(spec_info: Optional[SpecInput]) -> bool:
     return (
         spec_info is not None
@@ -823,8 +841,12 @@ class AscendAttnBackend(AttentionBackend):
         block_tables: torch.Tensor,
         seq_lens: torch.Tensor,
         sinks: torch.Tensor,
+        mirror_prefill: bool = False,
     ) -> torch.Tensor:
-        _, _, decode = _load_welm_full_sink_attention_ops()
+        if mirror_prefill:
+            decode = _load_welm_full_sink_mirror_attention_op()
+        else:
+            _, _, decode = _load_welm_full_sink_attention_ops()
         q_3d = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
         actual_batch_size = seq_lens.shape[0]
         if block_tables.shape[0] != actual_batch_size:
@@ -897,9 +919,13 @@ class AscendAttnBackend(AttentionBackend):
         block_tables: torch.Tensor,
         seq_lens: torch.Tensor,
         sinks: torch.Tensor,
+        mirror_prefill: bool = False,
     ) -> torch.Tensor:
         """Run one-query paged SWA+Sink for eager, graph, or KV mirror."""
-        _, decode = _load_welm_swa_sink_attention_ops()
+        if mirror_prefill:
+            decode = _load_welm_swa_sink_mirror_attention_op()
+        else:
+            _, decode = _load_welm_swa_sink_attention_ops()
         q_3d = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
         actual_batch_size = seq_lens.shape[0]
         if block_tables.shape[0] != actual_batch_size:
@@ -1743,6 +1769,7 @@ class AscendAttnBackend(AttentionBackend):
                     block_tables=block_tables,
                     seq_lens=self.forward_metadata.seq_lens[:num_queries],
                     sinks=sinks,
+                    mirror_prefill=True,
                 )
             if self._is_welm_swa_sink_layer(layer, sinks):
                 return self._forward_welm_swa_sink_decode(
@@ -1753,6 +1780,7 @@ class AscendAttnBackend(AttentionBackend):
                     block_tables=block_tables,
                     seq_lens=self.forward_metadata.seq_lens[:num_queries],
                     sinks=sinks,
+                    mirror_prefill=True,
                 )
             q = q.contiguous()
             k_cache = k_cache.view(

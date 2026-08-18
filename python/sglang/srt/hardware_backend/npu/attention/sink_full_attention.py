@@ -395,26 +395,7 @@ def paged_prefill_kernel(
 
 @triton.jit(
     do_not_specialize=[
-        "stride_qt",
-        "stride_qh",
-        "stride_qd",
-        "stride_k_block",
-        "stride_k_head",
-        "stride_k_blksz",
-        "stride_k_dim",
-        "stride_v_block",
-        "stride_v_head",
-        "stride_v_blksz",
-        "stride_v_dim",
-        "stride_ot",
-        "stride_oh",
-        "stride_od",
         "stride_bt_batch",
-        "stride_bt_block",
-        "stride_mask_m",
-        "stride_mask_n",
-        "stride_sink_head",
-        "softmax_scale",
     ]
 )
 def paged_prefill_page_aggregation_kernel(
@@ -1175,25 +1156,7 @@ def paged_decode_fd_reduce_kernel(
 
 @triton.jit(
     do_not_specialize=[
-        "stride_qb",
-        "stride_qh",
-        "stride_qd",
-        "stride_k_block",
-        "stride_k_head",
-        "stride_k_blksz",
-        "stride_k_dim",
-        "stride_v_block",
-        "stride_v_head",
-        "stride_v_blksz",
-        "stride_v_dim",
         "stride_bt_batch",
-        "stride_bt_block",
-        "stride_aws_task",
-        "stride_aws_g",
-        "stride_aws_d",
-        "stride_lse_task",
-        "stride_lse_g",
-        "softmax_scale",
         "BATCH_SIZE",
         "KV_SPLIT_PARTS",
     ]
@@ -1381,15 +1344,6 @@ def mirror_paged_decode_fd_kernel(
 
 @triton.jit(
     do_not_specialize=[
-        "stride_aws_task",
-        "stride_aws_g",
-        "stride_aws_d",
-        "stride_lse_task",
-        "stride_lse_g",
-        "stride_ob",
-        "stride_oh",
-        "stride_od",
-        "stride_sink_head",
         "BATCH_SIZE",
         "KV_SPLIT_PARTS",
     ]
@@ -1656,24 +1610,7 @@ def paged_decode_kernel(
 @triton.jit(
     do_not_specialize=[
         "BATCH_SIZE",
-        "stride_qb",
-        "stride_qh",
-        "stride_qd",
-        "stride_k_block",
-        "stride_k_head",
-        "stride_k_blksz",
-        "stride_k_dim",
-        "stride_v_block",
-        "stride_v_head",
-        "stride_v_blksz",
-        "stride_v_dim",
-        "stride_ob",
-        "stride_oh",
-        "stride_od",
         "stride_bt_batch",
-        "stride_bt_block",
-        "stride_sink_head",
-        "softmax_scale",
     ]
 )
 def mirror_paged_decode_kernel(
@@ -2563,24 +2500,7 @@ def _swa_paged_prefill_sink_kernel(
 @triton.jit(
     do_not_specialize=[
         "bsz",
-        "scale",
-        "stride_ot",
-        "stride_oh",
-        "stride_od",
-        "stride_qt",
-        "stride_qh",
-        "stride_qd",
-        "stride_kp",
-        "stride_kh",
-        "stride_kt",
-        "stride_kd",
-        "stride_vp",
-        "stride_vh",
-        "stride_vt",
-        "stride_vd",
         "stride_block_table_b",
-        "stride_block_table_p",
-        "stride_sink_head",
     ]
 )
 def _swa_paged_prefill_aggregation_sink_kernel(
@@ -3159,24 +3079,7 @@ def _swa_paged_decode_sink_kernel(
 @triton.jit(
     do_not_specialize=[
         "BATCH_SIZE",
-        "stride_qb",
-        "stride_qh",
-        "stride_qd",
-        "stride_k_block",
-        "stride_k_head",
-        "stride_k_blksz",
-        "stride_k_dim",
-        "stride_v_block",
-        "stride_v_head",
-        "stride_v_blksz",
-        "stride_v_dim",
-        "stride_ob",
-        "stride_oh",
-        "stride_od",
         "stride_bt_batch",
-        "stride_bt_block",
-        "stride_sink_head",
-        "softmax_scale",
     ]
 )
 def mirror_swa_paged_decode_sink_kernel(

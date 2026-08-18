@@ -1,10 +1,28 @@
+import ast
 import math
+from pathlib import Path
 
 import numpy as np
 
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=1, suite="stage-a-unit-test-npu")
+
+
+_ATTENTION_SOURCE = (
+    Path(__file__).resolve().parents[5]
+    / "python/sglang/srt/hardware_backend/npu/attention/sink_full_attention.py"
+)
+
+
+def _do_not_specialize_for(function):
+    for decorator in function.decorator_list:
+        if not isinstance(decorator, ast.Call):
+            continue
+        for keyword in decorator.keywords:
+            if keyword.arg == "do_not_specialize":
+                return {element.value for element in keyword.value.elts}
+    return set()
 
 
 def _as_bfloat16_then_float32(values):
@@ -226,3 +244,44 @@ def test_mirror_swa_online_softmax_matches_direct_attention():
                 visible=visible,
             )
             np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
+
+
+def test_only_request_varying_attention_scalars_skip_specialization():
+    module = ast.parse(_ATTENTION_SOURCE.read_text(encoding="utf-8"))
+    functions = {
+        node.name: node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef)
+    }
+    expected = {
+        "paged_prefill_page_aggregation_kernel": {"stride_bt_batch"},
+        "_swa_paged_prefill_aggregation_sink_kernel": {
+            "bsz",
+            "stride_block_table_b",
+        },
+        "mirror_paged_decode_fd_kernel": {
+            "BATCH_SIZE",
+            "KV_SPLIT_PARTS",
+            "stride_bt_batch",
+        },
+        "mirror_paged_decode_fd_reduce_kernel": {
+            "BATCH_SIZE",
+            "KV_SPLIT_PARTS",
+        },
+        "mirror_paged_decode_kernel": {"BATCH_SIZE", "stride_bt_batch"},
+        "mirror_swa_paged_decode_sink_kernel": {
+            "BATCH_SIZE",
+            "stride_bt_batch",
+        },
+    }
+
+    for function_name, expected_runtime_scalars in expected.items():
+        function = functions[function_name]
+        assert _do_not_specialize_for(function) == expected_runtime_scalars
+        constexpr_args = {
+            argument.arg
+            for argument in function.args.args
+            if isinstance(argument.annotation, ast.Attribute)
+            and argument.annotation.attr == "constexpr"
+        }
+        assert expected_runtime_scalars.isdisjoint(constexpr_args)

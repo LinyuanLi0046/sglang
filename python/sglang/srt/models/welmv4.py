@@ -2982,6 +2982,16 @@ class Qwen2MoeModel(nn.Module):
 class WeLMV4MoeForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
 
+    # Map SGLang's fused projection modules back to the separate checkpoint
+    # names used by ModelSlim's quant_model_description.json. This lets the
+    # generic quantization layer select MXFP8 only for entries marked as such
+    # while keeping FLOAT entries (including the current attention weights)
+    # on the unquantized path.
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -2989,12 +2999,6 @@ class WeLMV4MoeForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        if quant_config is not None:
-            raise NotImplementedError(
-                "Quantized WeLMv4 checkpoints are not supported by this rebase. "
-                "KV-mirror rewrites QKV projections as dense tensors and the "
-                "custom routing/clamp path has only been validated for BF16/FP16."
-            )
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config

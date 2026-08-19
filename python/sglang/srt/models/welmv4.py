@@ -839,6 +839,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             prefix=add_prefix("gate", prefix),
         )
         self.gate.weight.data = self.gate.weight.to(torch.float32)
+        self.register_buffer("_npu_router_compute_weight", None, persistent=False)
         if config.shared_expert_intermediate_size > 0:
             self.shared_expert = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
@@ -876,6 +877,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
             )
         return shared_output
+
+    def get_npu_router_compute_weight(
+        self, dtype: torch.dtype
+    ) -> torch.Tensor:
+        if self._npu_router_compute_weight is None:
+            self._npu_router_compute_weight = self.gate.weight.to(
+                dtype=dtype
+            ).contiguous()
+        return self._npu_router_compute_weight
 
     def forward(
         self,
@@ -922,7 +932,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 shared_output = self._forward_shared_expert(hidden_states)
             if _is_npu:
                 router_logits = mmq_style_router_linear_npu(
-                    hidden_states, self.gate.weight
+                    hidden_states,
+                    self.get_npu_router_compute_weight(hidden_states.dtype),
                 )
             else:
                 router_logits = mmq_style_router_linear(
@@ -2256,7 +2267,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
         need_fp32_norm_after_attn = dump_this_layer or replay_norm_after_attn
         router_prefetch_started = False
         if enable_npu_weight_prefetch and hidden_states.shape[0] > 0:
-            prepare_weight_cache(hidden_states, self.mlp.gate.weight)
+            router_compute_weight = self.mlp.get_npu_router_compute_weight(
+                hidden_states.dtype
+            )
+            prepare_weight_cache(hidden_states, router_compute_weight)
             router_prefetch_started = True
         if use_mmq_norm_after_attn:
             # With attention DP, RowParallelLinear deliberately leaves the

@@ -840,6 +840,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )
         self.gate.weight.data = self.gate.weight.to(torch.float32)
         self.register_buffer("_npu_router_compute_weight", None, persistent=False)
+        self.register_buffer("_npu_router_compute_weight_t", None, persistent=False)
         if config.shared_expert_intermediate_size > 0:
             self.shared_expert = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
@@ -887,6 +888,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             ).contiguous()
         return self._npu_router_compute_weight
 
+    def prepare_npu_router_compute_weight_t(self, dtype: torch.dtype) -> None:
+        self._npu_router_compute_weight_t = (
+            self.gate.weight.to(dtype=dtype).t().contiguous()
+        )
+
+    def get_npu_router_compute_weight_t(self) -> torch.Tensor:
+        assert self._npu_router_compute_weight_t is not None
+        return self._npu_router_compute_weight_t
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -931,9 +941,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             if self.shared_expert is not None and not enable_npu_dual_stream:
                 shared_output = self._forward_shared_expert(hidden_states)
             if _is_npu:
-                router_logits = mmq_style_router_linear_npu(
+                # router_logits = mmq_style_router_linear_npu(
+                #     hidden_states,
+                #     self.get_npu_router_compute_weight(hidden_states.dtype),
+                # )
+                router_logits = torch.mm(
                     hidden_states,
-                    self.get_npu_router_compute_weight(hidden_states.dtype),
+                    self.get_npu_router_compute_weight_t(),
+                    out_dtype=torch.float32,
                 )
             else:
                 router_logits = mmq_style_router_linear(
@@ -2267,9 +2282,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         need_fp32_norm_after_attn = dump_this_layer or replay_norm_after_attn
         router_prefetch_started = False
         if enable_npu_weight_prefetch and hidden_states.shape[0] > 0:
-            router_compute_weight = self.mlp.get_npu_router_compute_weight(
-                hidden_states.dtype
-            )
+            router_compute_weight = self.mlp.get_npu_router_compute_weight_t()
             prepare_weight_cache(hidden_states, router_compute_weight)
             router_prefetch_started = True
         if use_mmq_norm_after_attn:
@@ -3472,6 +3485,14 @@ class WeLMV4MoeForCausalLM(nn.Module):
                 decoder_layer.self_attn.kv_mirror_layer_idx
                 for decoder_layer in self.model.layers
             }
+        if _is_npu:
+            router_decoder_layers = (
+                self.model.decoder_layers if is_nextn else self.model.layers
+            )
+            for decoder_layer in router_decoder_layers:
+                decoder_layer.mlp.prepare_npu_router_compute_weight_t(
+                    decoder_layer.post_attention_layernorm.weight.dtype
+                )
         # Preserve pair alignment while selecting consumers owned by this
         # model.  In particular, list[-0:] would return the entire source list
         # when a target-only model filters out all MTP consumers.

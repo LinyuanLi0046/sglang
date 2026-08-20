@@ -24,6 +24,7 @@ from sglang.srt.layers.moe.utils import (
     get_ascend_dispatcher_output_dtype,
 )
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import get_bool_env_var
 
 
 class AscendTPDispatchOutput(NamedTuple):
@@ -78,9 +79,16 @@ class AscendTPDispatcher(BaseDispatcher):
         self.ascend_dispatcher_output_dtype = get_ascend_dispatcher_output_dtype(self)
 
         if self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.BF16:
-            self.init = NPUMoEInitRouting_v2(quant_mode=-1)
+            self.group_list_type = (
+                2
+                if get_bool_env_var("SGLANG_NPU_MOE_USE_GROUP_LIST_TYPE_2")
+                else 1
+            )
+            self.init = NPUMoEInitRouting_v2(
+                quant_mode=-1,
+                expert_tokens_num_type=self.group_list_type,
+            )
             self.finalize = NPUFinalizeRouting(drop_pad_mode=2)
-            self.group_list_type = 1
         elif self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.INT8:
             self.init = NPUMoEInitRouting_v2(quant_mode=1)
             self.finalize = NPUFinalizeRouting(drop_pad_mode=2)

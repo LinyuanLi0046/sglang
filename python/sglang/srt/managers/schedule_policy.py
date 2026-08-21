@@ -459,6 +459,7 @@ class PrefillAdder:
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
+        mixed_decode_kv_tokens: Optional[int] = None,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -474,8 +475,10 @@ class PrefillAdder:
 
         if self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= num_mixed_decode_tokens
-        self.rem_total_token_offset = num_mixed_decode_tokens
-        self.cur_rem_token_offset = num_mixed_decode_tokens
+        if mixed_decode_kv_tokens is None:
+            mixed_decode_kv_tokens = num_mixed_decode_tokens
+        self.rem_total_token_offset = mixed_decode_kv_tokens
+        self.cur_rem_token_offset = mixed_decode_kv_tokens
 
         self.req_states = None
         self.can_run_list = []
@@ -507,7 +510,9 @@ class PrefillAdder:
         )
         self.is_hybrid_ssm_cache = self.tree_cache.supports_mamba()
 
-        self.rem_swa_token_offset = 0
+        self.rem_swa_token_offset = (
+            mixed_decode_kv_tokens if self.is_hybrid_swa else 0
+        )
 
         # Unified-pool joint budget: a new mamba state consumes shared-gap bytes
         # that `rem_total_tokens` (full KV) otherwise counts as free, so reserve

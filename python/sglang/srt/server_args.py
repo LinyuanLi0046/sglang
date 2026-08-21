@@ -5069,10 +5069,19 @@ class ServerArgs:
                     "TRT-LLM MHA, or Ascend as appropriate for the device."
                 )
 
-            # The model keeps imitated-layer KV activations in process-local
-            # forward state, so mixed chunks and two-batch overlap would
-            # interleave two independent requests through the same state.
-            self.enable_mixed_chunk = False
+            # A mixed-chunk batch is still one serialized model forward, so
+            # KV-mirror source activations remain paired with their consumers
+            # as one concatenated ragged batch.  Other devices have not been
+            # validated with this model-specific path yet.
+            if self.enable_mixed_chunk and not is_npu():
+                logger.warning(
+                    "Mixed chunked prefill is disabled for WeLMv4 outside "
+                    "Ascend NPU because that path has not been validated."
+                )
+                self.enable_mixed_chunk = False
+
+            # TBO can interleave two independent model forwards through the
+            # process-local KV-mirror activation dictionary and remains unsafe.
             self.enable_two_batch_overlap = False
             if self.enable_pdmux:
                 raise ValueError(

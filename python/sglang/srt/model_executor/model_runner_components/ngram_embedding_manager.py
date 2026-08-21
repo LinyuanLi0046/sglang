@@ -103,7 +103,7 @@ class NgramEmbeddingManager:
         # This mask is valid only for the current forward pass. Rebuild it
         # below when the current batch contains an unfinished chunked request.
         batch.ne_skip_token_table_update = None
-        if batch.forward_mode == ForwardMode.EXTEND:
+        if batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
             all_tokens = []
             token_offsets = []
             column_starts = []

@@ -204,7 +204,7 @@ def _rope_npu(
     )
 
 
-@triton.jit(do_not_specialize=["N", "BS"])
+@triton.jit(do_not_specialize=["position_ptr", "N", "BS"])
 def _welmv4_inplace_rope_kernel_npu(
     q_ptr: tl.tensor,
     k_ptr: tl.tensor,
@@ -1041,6 +1041,7 @@ def welmv4_inplace_rope_npu(
     stage: Optional[str] = None,
     positions_are_contiguous: bool = False,
     segment_tile_starts: Optional[torch.Tensor] = None,
+    mixed_decode_count: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """对 Q/K 就地应用尾部 RoPE。
 
@@ -1056,6 +1057,8 @@ def welmv4_inplace_rope_npu(
             speculative extend 的连续位置序列；仅用于选择专用 kernel
         segment_tile_starts: 多请求普通 prefill/mirror 的 64-token tile
             起点和末尾哨兵；长度相关参数保持运行时值，不参与 JIT 特化
+        mixed_decode_count: Mixed Chunk 追加在所有 Prefill 请求之后的单
+            token Decode 请求数；仅用于 Host 侧拆分，不进入 JIT cache key
 
     Returns:
         (query, key) 就地修改后返回
@@ -1116,7 +1119,115 @@ def welmv4_inplace_rope_npu(
         and query.shape[0] == N
         and key.shape[0] == N
     )
-    if use_contiguous_mirror:
+    mixed_decode_count = int(mixed_decode_count)
+    total_segment_tiles = 0
+    use_mixed_segment_split = False
+    if mixed_decode_count > 0 and (
+        use_segmented_prefill or use_segmented_mirror
+    ):
+        total_segment_tiles = segment_tile_starts.numel() - 1
+        use_mixed_segment_split = (
+            mixed_decode_count < N
+            and total_segment_tiles > mixed_decode_count
+            and (not use_segmented_mirror or mixed_decode_count < BS)
+        )
+    decode_num_sms = 0
+    if use_mixed_segment_split:
+        # mix_with_running appends one token for every running Decode request.
+        # Consequently, the last D request-local tiles each contain one Decode
+        # token, and the first N-D rows remain the original Prefill prefix.
+        prefill_num_tokens = N - mixed_decode_count
+        prefill_num_segment_tiles = total_segment_tiles - mixed_decode_count
+
+        if use_segmented_mirror:
+            prefill_bs = BS - mixed_decode_count
+            num_sms = min(
+                max(prefill_num_segment_tiles, prefill_bs),
+                _get_num_sms(),
+            )
+            _welmv4_inplace_rope_segmented_mirror_kernel_npu[(num_sms,)](
+                query,
+                key,
+                positions,
+                cos_sin_cache,
+                last_index,
+                segment_tile_starts,
+                prefill_num_segment_tiles,
+                prefill_bs,
+                query.stride(0),
+                key.stride(0),
+                head_dim,
+                rope_dim,
+                _WELMV4_ROPE_PREFILL_TOKEN_BLOCK,
+                _WELMV4_ROPE_PREFILL_NUM_STAGES,
+                num_q_heads,
+                triton.next_power_of_2(num_q_heads),
+                multibuffer=True,
+            )
+            prefill_kernel_name = (
+                "_welmv4_inplace_rope_segmented_mirror_kernel_npu"
+            )
+            decode_query = query[prefill_bs:]
+        else:
+            num_sms = min(
+                prefill_num_segment_tiles,
+                _get_num_sms(
+                    multiplier=_WELMV4_ROPE_PROGRAMS_PER_VECTOR_CORE
+                ),
+            )
+            _welmv4_inplace_rope_segmented_prefill_kernel_npu[(num_sms,)](
+                query,
+                key,
+                positions,
+                cos_sin_cache,
+                segment_tile_starts,
+                prefill_num_segment_tiles,
+                prefill_num_tokens,
+                query.stride(0),
+                key.stride(0),
+                head_dim,
+                rope_dim,
+                _WELMV4_ROPE_PREFILL_TOKEN_BLOCK,
+                _WELMV4_ROPE_PREFILL_NUM_STAGES,
+                multibuffer=True,
+            )
+            prefill_kernel_name = (
+                "_welmv4_inplace_rope_segmented_prefill_kernel_npu"
+            )
+            decode_query = query[prefill_num_tokens:]
+
+        # Decode suffix rows are one-to-one in Q/K/positions even for mirror:
+        # last_index for each appended request points to that request's sole
+        # token. Reusing the existing generic kernel therefore applies exactly
+        # the same RoPE without allocating metadata or adding a JIT kernel.
+        decode_key = key[prefill_num_tokens:]
+        decode_positions = positions[prefill_num_tokens:]
+        decode_num_sms = min(
+            mixed_decode_count,
+            _get_num_sms(multiplier=8),
+        )
+        _welmv4_inplace_rope_kernel_npu[(decode_num_sms,)](
+            decode_query,
+            decode_key,
+            decode_positions,
+            cos_sin_cache,
+            None,
+            mixed_decode_count,
+            0,
+            decode_query.stride(0),
+            decode_key.stride(0),
+            head_dim,
+            rope_dim,
+            num_stages,
+            num_q_heads,
+            num_k_heads,
+            triton.next_power_of_2(num_q_heads),
+            triton.next_power_of_2(num_k_heads),
+        )
+        kernel_name = (
+            f"{prefill_kernel_name}+_welmv4_inplace_rope_kernel_npu"
+        )
+    elif use_contiguous_mirror:
         num_token_blocks = triton.cdiv(N, _WELMV4_ROPE_PREFILL_TOKEN_BLOCK)
         num_sms = min(num_token_blocks, _get_num_sms())
         _welmv4_inplace_rope_contiguous_mirror_kernel_npu[(num_sms,)](
@@ -1269,6 +1380,9 @@ def welmv4_inplace_rope_npu(
                 "contiguous_mirror": use_contiguous_mirror,
                 "segmented_prefill": use_segmented_prefill,
                 "segmented_mirror": use_segmented_mirror,
+                "mixed_decode_count": mixed_decode_count,
+                "mixed_segment_split": use_mixed_segment_split,
+                "decode_num_sms": decode_num_sms,
             },
         )
     return query, key

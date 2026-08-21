@@ -1165,6 +1165,8 @@ def paged_decode_fd_reduce_kernel(
 
 @triton.jit(
     do_not_specialize=[
+        "seqlens_ptr",
+        "block_tables_ptr",
         "stride_bt_batch",
         "BATCH_SIZE",
         "KV_SPLIT_PARTS",
@@ -1353,6 +1355,7 @@ def mirror_paged_decode_fd_kernel(
 
 @triton.jit(
     do_not_specialize=[
+        "seqlens_ptr",
         "BATCH_SIZE",
         "KV_SPLIT_PARTS",
     ]
@@ -1623,6 +1626,8 @@ def paged_decode_kernel(
 
 @triton.jit(
     do_not_specialize=[
+        "seqlens_ptr",
+        "block_tables_ptr",
         "BATCH_SIZE",
         "stride_bt_batch",
     ]
@@ -3094,6 +3099,8 @@ def _swa_paged_decode_sink_kernel(
 
 @triton.jit(
     do_not_specialize=[
+        "seqlens_ptr",
+        "block_tables_ptr",
         "BATCH_SIZE",
         "stride_bt_batch",
     ]

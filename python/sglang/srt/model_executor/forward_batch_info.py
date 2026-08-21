@@ -537,6 +537,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
 
+    # Mixed chunk only: running Decode requests are appended after every
+    # Prefill request.  Keep the scheduler-provided boundary explicitly;
+    # extend_seq_lens == 1 is not a safe discriminator because a real Prefill
+    # request (or its final chunk) may also contain exactly one token.
+    mixed_decode_count: int = 0
+
     # WeLMv4 only: immutable per-forward tile metadata for segmented prefill
     # RoPE.  The model builds it once after eager padding and all layers reuse
     # it.  Decode/speculative/graph forwards leave it as None.
@@ -812,6 +818,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
             enable_kv_mirror=getattr(model_runner.server_args, "enable_kv_mirror", False),
+            mixed_decode_count=(
+                len(batch.decoding_reqs or [])
+                if batch.forward_mode == ForwardMode.MIXED
+                else 0
+            ),
         )
 
         ret._maybe_init_non_generation_fields(batch)

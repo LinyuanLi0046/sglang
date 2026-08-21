@@ -1694,6 +1694,7 @@ class Qwen2MoeAttention(nn.Module):
         segment_tile_starts = getattr(
             forward_batch, "welmv4_rope_segment_tile_starts", None
         )
+        mixed_decode_count = getattr(forward_batch, "mixed_decode_count", 0)
 
         qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
         if qk_nope_head_dim > 0:
@@ -1710,6 +1711,7 @@ class Qwen2MoeAttention(nn.Module):
                     layer_id=self.layer_idx,
                     positions_are_contiguous=positions_are_contiguous,
                     segment_tile_starts=segment_tile_starts,
+                    mixed_decode_count=mixed_decode_count,
                 )
             else:
                 q, k = self.rotary_emb(
@@ -1719,6 +1721,7 @@ class Qwen2MoeAttention(nn.Module):
                     layer_id=self.layer_idx,
                     positions_are_contiguous=positions_are_contiguous,
                     segment_tile_starts=segment_tile_starts,
+                    mixed_decode_count=mixed_decode_count,
                 )
             q = q.view(q_shape)
             k = k.view(k_shape)
@@ -1730,6 +1733,7 @@ class Qwen2MoeAttention(nn.Module):
                 layer_id=self.layer_idx,
                 positions_are_contiguous=positions_are_contiguous,
                 segment_tile_starts=segment_tile_starts,
+                mixed_decode_count=mixed_decode_count,
             )
 
         replay_attention_input = _welm_should_replay(

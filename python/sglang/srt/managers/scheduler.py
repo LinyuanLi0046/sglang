@@ -3160,14 +3160,17 @@ class Scheduler(
                 chunked_prefill_size = dynamic_size
 
         mixed_decode_kv_tokens = 0
-        if self.is_mixed_chunk:
+        if self.is_mixed_chunk and not running_batch.is_empty():
             # Mixed decode uses one compute token per request, but KV grows by page.
             live_running_indices = [
                 i for i, req in enumerate(running_batch.reqs) if not req.finished()
             ]
-            mixed_decode_kv_tokens = running_batch.new_tokens_required_next_decode(
-                live_running_indices
-            )
+            if live_running_indices:
+                mixed_decode_kv_tokens = (
+                    running_batch.new_tokens_required_next_decode(
+                        live_running_indices
+                    )
+                )
 
         # Prefill policy
         adder = PrefillAdder(

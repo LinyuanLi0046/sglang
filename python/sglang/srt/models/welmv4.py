@@ -136,6 +136,17 @@ _WELM_REPLAY_POINT_ALIASES = {
 }
 
 
+def _welm_weight_load_trace_enabled() -> bool:
+    if not get_bool_env_var("SGLANG_WELMV4_TRACE_WEIGHT_LOADING", "false"):
+        return False
+
+    tp_rank = get_parallel().tp_rank
+    trace_tp_rank = int(
+        os.getenv("SGLANG_WELMV4_TRACE_WEIGHT_LOADING_TP_RANK", "0")
+    )
+    return tp_rank == trace_tp_rank
+
+
 def _welm_trace_weight_loading(
     weights: Iterable[Tuple[str, torch.Tensor]],
 ) -> Iterable[Tuple[str, torch.Tensor]]:
@@ -146,18 +157,11 @@ def _welm_trace_weight_loading(
     BEGIN line without its matching END line identifies the exact tensor whose
     weight loader is blocked.
     """
-    if not get_bool_env_var("SGLANG_WELMV4_TRACE_WEIGHT_LOADING", "false"):
+    if not _welm_weight_load_trace_enabled():
         yield from weights
         return
 
     tp_rank = get_parallel().tp_rank
-    trace_tp_rank = int(
-        os.getenv("SGLANG_WELMV4_TRACE_WEIGHT_LOADING_TP_RANK", "0")
-    )
-    if tp_rank != trace_tp_rank:
-        yield from weights
-        return
-
     for tensor_index, (name, loaded_weight) in enumerate(weights):
         start = time.perf_counter()
         tensor_bytes = loaded_weight.numel() * loaded_weight.element_size()
@@ -184,6 +188,87 @@ def _welm_trace_weight_loading(
             name,
             (time.perf_counter() - start) * 1000.0,
         )
+
+
+def _welm_trace_stacked_weight_target(
+    checkpoint_name: str,
+    mapped_name: str,
+    loaded_weight: torch.Tensor,
+    param: nn.Parameter,
+    weight_loader: Any,
+    shard_id: Union[str, int],
+) -> None:
+    """Log the effective TP source and fused target views before a copy."""
+    if not _welm_weight_load_trace_enabled():
+        return
+
+    owner = getattr(weight_loader, "__self__", None)
+    source_view = loaded_weight
+    target_view = param.data
+    output_dim = getattr(param, "output_dim", None)
+
+    if (
+        type(owner).__name__ == "QKVParallelLinear"
+        and shard_id in ("q", "k", "v")
+        and output_dim is not None
+    ):
+        if shard_id == "q":
+            shard_offset = 0
+            shard_size = owner.num_heads * owner.head_size
+            source_shard_id = owner.tp_rank
+        elif shard_id == "k":
+            shard_offset = owner.num_heads * owner.head_size
+            shard_size = owner.num_kv_heads * owner.head_size
+            source_shard_id = owner.tp_rank // owner.num_kv_head_replicas
+        else:
+            shard_offset = (owner.num_heads + owner.num_kv_heads) * owner.head_size
+            shard_size = owner.num_kv_heads * owner.v_head_size
+            source_shard_id = owner.tp_rank // owner.num_kv_head_replicas
+
+        target_view = target_view.narrow(output_dim, shard_offset, shard_size)
+        if not owner.use_presharded_weights:
+            source_view = source_view.narrow(
+                output_dim, source_shard_id * shard_size, shard_size
+            )
+
+    quant_method = getattr(owner, "quant_method", None)
+    scheme = getattr(owner, "scheme", None)
+    logger.warning(
+        "[WeLMv4 weight-load trace] TARGET checkpoint_name=%s mapped_name=%s "
+        "shard_id=%s tp_rank=%d owner=%s param_class=%s quant_method=%s "
+        "scheme=%s output_dim=%s full_target_shape=%s full_target_dtype=%s "
+        "full_target_device=%s full_target_data_ptr=%#x "
+        "source_view_shape=%s source_view_dtype=%s source_view_contiguous=%s "
+        "source_view_storage_offset=%d source_view_storage_bytes=%d "
+        "source_view_data_ptr=%#x target_view_shape=%s target_view_dtype=%s "
+        "target_view_contiguous=%s target_view_storage_offset=%d "
+        "target_view_storage_bytes=%d target_view_data_ptr=%#x",
+        checkpoint_name,
+        mapped_name,
+        shard_id,
+        get_parallel().tp_rank,
+        type(owner).__name__,
+        type(param).__name__,
+        type(quant_method).__name__,
+        type(scheme).__name__,
+        output_dim,
+        tuple(param.shape),
+        param.dtype,
+        param.device,
+        param.data_ptr(),
+        tuple(source_view.shape),
+        source_view.dtype,
+        source_view.is_contiguous(),
+        source_view.storage_offset(),
+        source_view.untyped_storage().nbytes(),
+        source_view.data_ptr(),
+        tuple(target_view.shape),
+        target_view.dtype,
+        target_view.is_contiguous(),
+        target_view.storage_offset(),
+        target_view.untyped_storage().nbytes(),
+        target_view.data_ptr(),
+    )
 
 
 _WELM_REPLAY_CONFIGURED_POINTS = frozenset(
@@ -3602,6 +3687,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
             ]
 
         for name, loaded_weight in _welm_trace_weight_loading(weights):
+            checkpoint_name = name
             if not is_nextn:
                 if hasattr(self.config, "num_nextn_predict_layers"):
                     num_nextn_layers = self.config.num_nextn_predict_layers
@@ -3690,6 +3776,14 @@ class WeLMV4MoeForCausalLM(nn.Module):
 
                 param = params_dict[name]
                 weight_loader = param.weight_loader
+                _welm_trace_stacked_weight_target(
+                    checkpoint_name,
+                    name,
+                    loaded_weight,
+                    param,
+                    weight_loader,
+                    shard_id,
+                )
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:

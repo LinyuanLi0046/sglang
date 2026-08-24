@@ -17,6 +17,7 @@
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -133,6 +134,58 @@ _WELM_REPLAY_POINT_ALIASES = {
     "norm_input": "norm_inputs",
     "norm_after_attention": "norm_after_attn",
 }
+
+
+def _welm_trace_weight_loading(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    """Optionally trace each checkpoint tensor around its weight loader.
+
+    Code after ``yield`` runs only after ``load_weights`` has finished handling
+    that tensor and asks the upstream iterator for the next one. Therefore, a
+    BEGIN line without its matching END line identifies the exact tensor whose
+    weight loader is blocked.
+    """
+    if not get_bool_env_var("SGLANG_WELMV4_TRACE_WEIGHT_LOADING", "false"):
+        yield from weights
+        return
+
+    tp_rank = get_parallel().tp_rank
+    trace_tp_rank = int(
+        os.getenv("SGLANG_WELMV4_TRACE_WEIGHT_LOADING_TP_RANK", "0")
+    )
+    if tp_rank != trace_tp_rank:
+        yield from weights
+        return
+
+    for tensor_index, (name, loaded_weight) in enumerate(weights):
+        start = time.perf_counter()
+        tensor_bytes = loaded_weight.numel() * loaded_weight.element_size()
+        logger.warning(
+            "[WeLMv4 weight-load trace] BEGIN index=%d tp_rank=%d name=%s "
+            "shape=%s dtype=%s device=%s contiguous=%s storage_offset=%d "
+            "tensor_bytes=%d",
+            tensor_index,
+            tp_rank,
+            name,
+            tuple(loaded_weight.shape),
+            loaded_weight.dtype,
+            loaded_weight.device,
+            loaded_weight.is_contiguous(),
+            loaded_weight.storage_offset(),
+            tensor_bytes,
+        )
+        yield name, loaded_weight
+        logger.warning(
+            "[WeLMv4 weight-load trace] END index=%d tp_rank=%d name=%s "
+            "elapsed_ms=%.3f",
+            tensor_index,
+            tp_rank,
+            name,
+            (time.perf_counter() - start) * 1000.0,
+        )
+
+
 _WELM_REPLAY_CONFIGURED_POINTS = frozenset(
     _WELM_REPLAY_POINT_ALIASES.get(point, point)
     for point in (
@@ -3548,7 +3601,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
                 "hnorm",
             ]
 
-        for name, loaded_weight in weights:
+        for name, loaded_weight in _welm_trace_weight_loading(weights):
             if not is_nextn:
                 if hasattr(self.config, "num_nextn_predict_layers"):
                     num_nextn_layers = self.config.num_nextn_predict_layers

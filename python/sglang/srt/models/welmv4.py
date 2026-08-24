@@ -538,6 +538,41 @@ class KVMirrorManager:
         return kv_activation
 
 
+class _WelmDerivedMXFP8Linear(nn.Module):
+    """A load-time derived projection that reuses an existing MXFP8 method.
+
+    Target-model source and mirror layers can rewrite their existing qkv_proj in
+    place.  A NextN mirror consumer is the sole exception: extend needs Q only,
+    while decode/verify still needs its original full QKV projection.  This
+    small holder keeps the Q-only weights for that second execution mode without
+    introducing another quantization implementation.
+    """
+
+    def __init__(
+        self,
+        source_proj: nn.Module,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        bias: Optional[torch.Tensor],
+    ) -> None:
+        super().__init__()
+        self.quant_method = source_proj.quant_method
+        self.scheme = source_proj.scheme
+        self.weight = nn.Parameter(weight.clone(), requires_grad=False)
+        self.weight_scale = nn.Parameter(
+            weight_scale.clone(), requires_grad=False
+        )
+        if bias is None:
+            self.register_parameter("bias", None)
+        else:
+            self.bias = nn.Parameter(bias.clone(), requires_grad=False)
+
+    def forward(
+        self, hidden_states: torch.Tensor
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        return self.quant_method.apply(self, hidden_states, self.bias), None
+
+
 class LayerManager:
     decoder_layer = dict()
     num_nextn_predict_layers: int = 0
@@ -547,6 +582,49 @@ class LayerManager:
     @staticmethod
     def set_decoder_layer(layer_idx, decoder_layer):
         LayerManager.decoder_layer[layer_idx] = decoder_layer
+
+    @staticmethod
+    def _qkv_quant_kind(qkv_proj: nn.Module) -> str:
+        quant_method_name = type(qkv_proj.quant_method).__name__
+        if quant_method_name == "UnquantizedLinearMethod":
+            return "unquantized"
+        if (
+            quant_method_name == "ModelSlimLinearMethod"
+            and type(getattr(qkv_proj, "scheme", None)).__name__
+            == "ModelSlimMXFP8Scheme"
+        ):
+            return "modelslim_mxfp8"
+        scheme_name = type(getattr(qkv_proj, "scheme", None)).__name__
+        return f"unsupported:{quant_method_name}/{scheme_name}"
+
+    @staticmethod
+    def _replace_qkv_with_raw_mxfp8(
+        qkv_proj: nn.Module,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        output_partition_sizes: List[int],
+    ) -> None:
+        """Replace a loaded QKV payload before ModelSlim runtime relayout."""
+        qkv_proj.weight = nn.Parameter(weight.clone(), requires_grad=False)
+        qkv_proj.weight_scale = nn.Parameter(
+            weight_scale.clone(), requires_grad=False
+        )
+        if bias is None:
+            qkv_proj.bias = None
+        else:
+            qkv_proj.bias = nn.Parameter(bias.clone(), requires_grad=False)
+
+        # ColumnParallelLinear.forward uses the actual weight shape.  Keep its
+        # metadata consistent as well for prefetch, debug output and optional
+        # consumers such as LoRA that inspect partition widths after loading.
+        local_output_size = int(weight.shape[0])
+        qkv_proj.output_size_per_partition = local_output_size
+        qkv_proj.output_partition_sizes = list(output_partition_sizes)
+        qkv_proj.output_size = local_output_size * qkv_proj.tp_size
+        qkv_proj.output_sizes = [
+            int(size) * qkv_proj.tp_size for size in output_partition_sizes
+        ]
 
     @staticmethod
     def post_init(kv_mirror_layers, kv_mirror_imitated_layers, is_nextn=False):
@@ -564,6 +642,27 @@ class LayerManager:
                 imitated_layer_id
             ].self_attn
 
+            mirror_quant_kind = LayerManager._qkv_quant_kind(
+                mirror_layer_attn.qkv_proj
+            )
+            imitated_quant_kind = LayerManager._qkv_quant_kind(
+                imitated_layer_attn.qkv_proj
+            )
+            if mirror_quant_kind != imitated_quant_kind:
+                raise ValueError(
+                    "WeLMv4 KV-mirror source and consumer QKV projections must "
+                    "use the same precision, but pair "
+                    f"{imitated_layer_id}->{mirror_layer_id} uses "
+                    f"{imitated_quant_kind} and {mirror_quant_kind}."
+                )
+            if mirror_quant_kind.startswith("unsupported:"):
+                raise NotImplementedError(
+                    "WeLMv4 KV-mirror projection rewriting currently supports "
+                    "only unquantized or ModelSlim W8A8_MXFP8 QKV weights; pair "
+                    f"{imitated_layer_id}->{mirror_layer_id} uses "
+                    f"{mirror_quant_kind.removeprefix('unsupported:')}."
+                )
+
             mirror_qkv_proj_weight = mirror_layer_attn.qkv_proj.weight
             mirror_qkv_proj_bias = getattr(mirror_layer_attn.qkv_proj, "bias", None)
             imitated_qkv_proj_weight = imitated_layer_attn.qkv_proj.weight
@@ -571,6 +670,94 @@ class LayerManager:
             assert (mirror_qkv_proj_bias is not None) == (
                 imitated_qkv_proj_bias is not None
             )
+
+            if mirror_quant_kind == "modelslim_mxfp8":
+                mirror_qkv_proj = mirror_layer_attn.qkv_proj
+                imitated_qkv_proj = imitated_layer_attn.qkv_proj
+                if not hasattr(mirror_qkv_proj, "weight_scale") or not hasattr(
+                    imitated_qkv_proj, "weight_scale"
+                ):
+                    raise RuntimeError(
+                        "WeLMv4 ModelSlim KV-mirror QKV rewriting must run on "
+                        "the raw [N, K] checkpoint layout before MXFP8 weight "
+                        "post-processing."
+                    )
+
+                mirror_q_size = mirror_layer_attn.q_size
+                mirror_weight_data = mirror_qkv_proj_weight[:mirror_q_size, :]
+                mirror_scale_data = mirror_qkv_proj.weight_scale[
+                    :mirror_q_size, :
+                ]
+                imitated_weight_data = torch.concat(
+                    [
+                        imitated_qkv_proj_weight,
+                        mirror_qkv_proj_weight[mirror_q_size:, :],
+                    ],
+                    dim=0,
+                )
+                imitated_scale_data = torch.concat(
+                    [
+                        imitated_qkv_proj.weight_scale,
+                        mirror_qkv_proj.weight_scale[mirror_q_size:, :],
+                    ],
+                    dim=0,
+                )
+
+                mirror_bias_data = (
+                    mirror_qkv_proj_bias[:mirror_q_size]
+                    if mirror_qkv_proj_bias is not None
+                    else None
+                )
+                imitated_bias_data = (
+                    torch.concat(
+                        [
+                            imitated_qkv_proj_bias,
+                            mirror_qkv_proj_bias[mirror_q_size:],
+                        ],
+                        dim=0,
+                    )
+                    if mirror_qkv_proj_bias is not None
+                    else None
+                )
+
+                # Build both payloads before replacing either projection: the
+                # source needs the consumer's original K/V rows.
+                LayerManager._replace_qkv_with_raw_mxfp8(
+                    imitated_qkv_proj,
+                    imitated_weight_data,
+                    imitated_scale_data,
+                    imitated_bias_data,
+                    [
+                        imitated_layer_attn.q_size,
+                        imitated_layer_attn.kv_size,
+                        imitated_layer_attn.kv_size,
+                        mirror_layer_attn.kv_size,
+                        mirror_layer_attn.kv_size,
+                    ],
+                )
+                imitated_layer_attn._kv_mirror_mxfp8_source_projection = True
+
+                if mirror_layer_attn.is_nextn:
+                    # NextN decode/verify still needs the original full QKV;
+                    # extend uses this additional Q-only projection.
+                    mirror_layer_attn.kv_mirror_query_proj = (
+                        _WelmDerivedMXFP8Linear(
+                            mirror_qkv_proj,
+                            mirror_weight_data,
+                            mirror_scale_data,
+                            mirror_bias_data,
+                        )
+                    )
+                else:
+                    LayerManager._replace_qkv_with_raw_mxfp8(
+                        mirror_qkv_proj,
+                        mirror_weight_data,
+                        mirror_scale_data,
+                        mirror_bias_data,
+                        [mirror_layer_attn.q_size],
+                    )
+                    mirror_layer_attn._kv_mirror_mxfp8_query_projection = True
+                continue
 
             mirror_weight_data = mirror_qkv_proj_weight[
                 : mirror_layer_attn.q_size, :
@@ -1521,7 +1708,19 @@ class Qwen2MoeAttention(nn.Module):
             )
         self.is_nextn = is_nextn
 
-    def get_qkv_prefetch_weight(self, forward_batch: ForwardBatch) -> torch.Tensor:
+    @staticmethod
+    def _linear_prefetch_tensors(
+        projection: nn.Module,
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        tensors = [projection.weight]
+        weight_scale = getattr(projection, "weight_scale_inv", None)
+        if weight_scale is not None:
+            tensors.append(weight_scale)
+        return tensors if len(tensors) > 1 else tensors[0]
+
+    def get_qkv_prefetch_weight(
+        self, forward_batch: ForwardBatch
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
         use_full_qkv = (
             self.kv_mirror_layer_idx in self.kv_mirror_layers
             and self.kv_mirror_layer_idx
@@ -1529,8 +1728,12 @@ class Qwen2MoeAttention(nn.Module):
             and not forward_batch.forward_mode.is_extend_without_speculative()
         )
         if use_full_qkv:
-            return self.qkv_proj.weight
-        return getattr(self, "qkv_proj_weight", self.qkv_proj.weight)
+            return self._linear_prefetch_tensors(self.qkv_proj)
+        if hasattr(self, "kv_mirror_query_proj"):
+            return self._linear_prefetch_tensors(self.kv_mirror_query_proj)
+        if hasattr(self, "qkv_proj_weight"):
+            return self.qkv_proj_weight
+        return self._linear_prefetch_tensors(self.qkv_proj)
 
     def forward(
         self,
@@ -1542,7 +1745,22 @@ class Qwen2MoeAttention(nn.Module):
         dump_this_layer = _welm_should_dump_layer(self.layer_idx)
         dump_prefix = f"model.layers.{self.layer_idx}.self_attn"
         if self.kv_mirror_layer_idx in self.kv_mirror_imitated_layers:
-            if hasattr(self, "qkv_proj_weight"):
+            if getattr(self, "_kv_mirror_mxfp8_source_projection", False):
+                qkv, _ = self.qkv_proj(hidden_states)
+                q, k, v, mirror_k, mirror_v = qkv.split(
+                    [
+                        self.q_size,
+                        self.kv_size,
+                        self.kv_size,
+                        self.kv_size,
+                        self.kv_size,
+                    ],
+                    dim=-1,
+                )
+                KVMirrorManager.set_kv_activation(
+                    self.kv_mirror_layer_idx, (mirror_k, mirror_v)
+                )
+            elif hasattr(self, "qkv_proj_weight"):
                 qkv = F.linear(hidden_states, self.qkv_proj_weight, self.qkv_proj_bias)
                 q, k, v, mirror_k, mirror_v = qkv.split(
                     [
@@ -1583,7 +1801,14 @@ class Qwen2MoeAttention(nn.Module):
                 k, v = KVMirrorManager.get_kv_activation(
                     mirror_layer_number, clear=self.need_clear_kv_cache
                 )
-                q = F.linear(hidden_states, self.qkv_proj_weight, self.qkv_proj_bias)
+                if hasattr(self, "kv_mirror_query_proj"):
+                    q, _ = self.kv_mirror_query_proj(hidden_states)
+                elif getattr(self, "_kv_mirror_mxfp8_query_projection", False):
+                    q, _ = self.qkv_proj(hidden_states)
+                else:
+                    q = F.linear(
+                        hidden_states, self.qkv_proj_weight, self.qkv_proj_bias
+                    )
         else:
             qkv, _ = self.qkv_proj(hidden_states)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -2118,10 +2343,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 f"model.layers.{self.layer_id}.__weights__", self
             )
 
-            # LayerManager.post_init() constructs these tensors for KV-mirror
-            # source/consumer layers.  They are plain Tensor attributes (not
-            # Parameters), and Qwen2MoeAttention.forward() passes them directly
-            # to F.linear, so named_parameters() above cannot see them.
+            # The unquantized KV-mirror path keeps its derived projections as
+            # plain Tensor attributes and passes them directly to F.linear, so
+            # named_parameters() above cannot see them. ModelSlim MXFP8 rewrites
+            # registered qkv_proj modules and is already covered above.
             if hasattr(self.self_attn, "qkv_proj_weight"):
                 _welm_dump_tensor(
                     f"model.layers.{self.layer_id}.__weights__."
@@ -3054,11 +3279,10 @@ class WeLMV4MoeForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        if quant_config is not None:
+        if quant_config is not None and quant_config.get_name() != "modelslim":
             raise NotImplementedError(
-                "Quantized WeLMv4 checkpoints are not supported by this rebase. "
-                "KV-mirror rewrites QKV projections as dense tensors and the "
-                "custom routing/clamp path has only been validated for BF16/FP16."
+                "WeLMv4 currently supports only ModelSlim quantized checkpoints; "
+                f"got quantization method {quant_config.get_name()!r}."
             )
         self.pp_group = get_pp_group()
         self.config = config

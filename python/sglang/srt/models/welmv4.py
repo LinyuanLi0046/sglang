@@ -93,6 +93,8 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_npu, make_layers
 
 if is_npu():
+    import torch_npu
+
     from sglang.srt.hardware_backend.npu.cmo import (
         prepare_weight_cache,
         wait_cmo_stream,
@@ -115,6 +117,12 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 _WELM_NPU_FP32_OPROJ = _is_npu and get_bool_env_var(
     "SGLANG_WELM_FP32_OPROJ", "false"
+)
+_WELM_NPU_USE_MATMUL_ALL_REDUCE_OPROJ = _is_npu and get_bool_env_var(
+    "SGLANG_NPU_USE_MATMUL_ALL_REDUCE_OPROJ", "false"
+)
+_WELM_NPU_MATMUL_ALL_REDUCE_MIN_M = max(
+    1, int(os.getenv("SGLANG_NPU_MATMUL_ALL_REDUCE_MIN_M", "128"))
 )
 _WELM_DUMP_PROCESS_DIR = None
 _WELM_DUMP_BASE_DIR = None
@@ -1432,6 +1440,8 @@ class Qwen2MoeAttention(nn.Module):
             "_welm_fp32_o_proj_weight", None, persistent=False
         )
         self.register_buffer("_welm_fp32_o_proj_bias", None, persistent=False)
+        self._welm_npu_o_proj_hcom_name = None
+        self._welm_use_npu_o_proj_matmul_all_reduce = False
         if _WELM_NPU_FP32_OPROJ:
             if is_dp_attention_enabled():
                 raise RuntimeError(
@@ -1455,6 +1465,51 @@ class Qwen2MoeAttention(nn.Module):
                 logger.warning(
                     "WeLM NPU FP32 OProj diagnostic path is enabled: local "
                     "F.linear and TP AllReduce run in FP32 before casting back."
+                )
+        if _WELM_NPU_USE_MATMUL_ALL_REDUCE_OPROJ:
+            if _WELM_NPU_FP32_OPROJ:
+                raise RuntimeError(
+                    "SGLANG_NPU_USE_MATMUL_ALL_REDUCE_OPROJ cannot be used "
+                    "with SGLANG_WELM_FP32_OPROJ."
+                )
+            if is_dp_attention_enabled():
+                raise RuntimeError(
+                    "SGLANG_NPU_USE_MATMUL_ALL_REDUCE_OPROJ only supports "
+                    "pure TP; attention DP reduces OProj on a different group."
+                )
+            if self.o_proj.tp_size <= 1:
+                raise RuntimeError(
+                    "SGLANG_NPU_USE_MATMUL_ALL_REDUCE_OPROJ requires TP > 1."
+                )
+            if self.o_proj.tp_size != get_tensor_model_parallel_world_size():
+                raise RuntimeError(
+                    "SGLANG_NPU_USE_MATMUL_ALL_REDUCE_OPROJ requires OProj "
+                    "TP size to match the global tensor-parallel size."
+                )
+            if not self.o_proj.reduce_results:
+                raise RuntimeError(
+                    "SGLANG_NPU_USE_MATMUL_ALL_REDUCE_OPROJ requires OProj "
+                    "to reduce its row-parallel partial results."
+                )
+            if (
+                self.o_proj.quant_method.__class__.__name__
+                != "UnquantizedLinearMethod"
+            ):
+                raise RuntimeError(
+                    "SGLANG_NPU_USE_MATMUL_ALL_REDUCE_OPROJ currently only "
+                    "supports unquantized OProj weights."
+                )
+            if not hasattr(torch_npu, "npu_mm_all_reduce_base"):
+                raise RuntimeError(
+                    "The installed torch_npu does not provide "
+                    "npu_mm_all_reduce_base."
+                )
+            self._welm_use_npu_o_proj_matmul_all_reduce = True
+            if self.layer_idx == 0:
+                logger.warning(
+                    "WeLM NPU OProj MatMulAllReduce is enabled for prefill "
+                    "with min_m=%d.",
+                    _WELM_NPU_MATMUL_ALL_REDUCE_MIN_M,
                 )
         if rope_scaling is None:
             rope_scaling = {"type": "linear", "factor": 1 / self.compress}
@@ -1531,6 +1586,15 @@ class Qwen2MoeAttention(nn.Module):
         if use_full_qkv:
             return self.qkv_proj.weight
         return getattr(self, "qkv_proj_weight", self.qkv_proj.weight)
+
+    def _get_welm_npu_o_proj_hcom_name(self) -> str:
+        if self._welm_npu_o_proj_hcom_name is None:
+            process_group = get_tp_group().device_group
+            backend = process_group._get_backend(torch.device("npu"))
+            self._welm_npu_o_proj_hcom_name = backend.get_hccl_comm_name(
+                process_group.rank()
+            )
+        return self._welm_npu_o_proj_hcom_name
 
     def forward(
         self,
@@ -1867,6 +1931,27 @@ class Qwen2MoeAttention(nn.Module):
             if self.o_proj.tp_size > 1:
                 output_fp32 = tensor_model_parallel_all_reduce(output_fp32)
             output = output_fp32.to(attn_output.dtype)
+        elif (
+            self._welm_use_npu_o_proj_matmul_all_reduce
+            and is_prefill_batch
+            and attn_output.shape[0] >= _WELM_NPU_MATMUL_ALL_REDUCE_MIN_M
+        ):
+            # RowParallelLinear stores weight as [N, K]. MatmulAllReduce accepts
+            # the transpose view [K, N], so this does not materialize a second
+            # copy of the OProj weight. Bias must be injected on rank 0 only;
+            # otherwise AllReduce would add it once per TP rank.
+            o_proj_bias = (
+                self.o_proj.bias
+                if self.o_proj.tp_rank == 0 and not self.o_proj.skip_bias_add
+                else None
+            )
+            output = torch_npu.npu_mm_all_reduce_base(
+                attn_output.contiguous(),
+                self.o_proj.weight.transpose(0, 1),
+                self._get_welm_npu_o_proj_hcom_name(),
+                reduce_op="sum",
+                bias=o_proj_bias,
+            )
         else:
             output, _ = self.o_proj(attn_output)
         replay_o_proj_point = None

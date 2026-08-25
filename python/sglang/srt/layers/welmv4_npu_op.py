@@ -4,10 +4,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.welmv4_shape_logger import (
-    WELMV4_KERNEL_SHAPE_LOG_ENABLED,
-    log_welmv4_kernel_shapes_once,
-)
 from sglang.srt.utils import is_npu
 
 
@@ -1308,8 +1304,6 @@ def welmv4_inplace_rope_npu(
     head_dim: int = 128,
     rope_dim: int = 64,
     num_stages: int = 4,
-    layer_id: Optional[int] = None,
-    stage: Optional[str] = None,
     positions_are_contiguous: bool = False,
     segment_tile_starts: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1408,7 +1402,6 @@ def welmv4_inplace_rope_npu(
             triton.next_power_of_2(num_q_heads),
             multibuffer=True,
         )
-        kernel_name = "_welmv4_inplace_rope_contiguous_mirror_kernel_npu"
     elif use_segmented_mirror:
         num_segment_tiles = segment_tile_starts.numel() - 1
         num_sms = min(
@@ -1434,7 +1427,6 @@ def welmv4_inplace_rope_npu(
             triton.next_power_of_2(num_q_heads),
             multibuffer=True,
         )
-        kernel_name = "_welmv4_inplace_rope_segmented_mirror_kernel_npu"
     elif use_segmented_prefill:
         num_segment_tiles = segment_tile_starts.numel() - 1
         num_sms = min(
@@ -1457,7 +1449,6 @@ def welmv4_inplace_rope_npu(
             _WELMV4_ROPE_PREFILL_NUM_STAGES,
             multibuffer=True,
         )
-        kernel_name = "_welmv4_inplace_rope_segmented_prefill_kernel_npu"
     elif use_blocked_prefill:
         prefill_masked = N % _WELMV4_ROPE_PREFILL_TOKEN_BLOCK != 0
         num_token_blocks = triton.cdiv(N, _WELMV4_ROPE_PREFILL_TOKEN_BLOCK)
@@ -1487,11 +1478,6 @@ def welmv4_inplace_rope_npu(
             num_q_heads,
             multibuffer=True,
         )
-        kernel_name = (
-            "_welmv4_inplace_rope_contiguous_prefill_kernel_npu"
-            if positions_are_contiguous
-            else "_welmv4_inplace_rope_prefill_kernel_npu"
-        )
     else:
         num_sms = min(N, _get_num_sms(multiplier=8))
         _welmv4_inplace_rope_kernel_npu[(num_sms,)](
@@ -1511,36 +1497,6 @@ def welmv4_inplace_rope_npu(
             num_k_heads,
             triton.next_power_of_2(num_q_heads),
             triton.next_power_of_2(num_k_heads),
-        )
-        kernel_name = "_welmv4_inplace_rope_kernel_npu"
-    if WELMV4_KERNEL_SHAPE_LOG_ENABLED:
-        log_welmv4_kernel_shapes_once(
-            kernel=kernel_name,
-            layer_id=layer_id,
-            stage=stage,
-            m=N,
-            inputs={
-                "query": query,
-                "key": key,
-                "positions": positions,
-                "cos_sin_cache": cos_sin_cache,
-                "last_index": last_index,
-                "segment_tile_starts": segment_tile_starts,
-            },
-            outputs={"query": query, "key": key},
-            parameters={
-                "BS": BS,
-                "head_dim": head_dim,
-                "rope_dim": rope_dim,
-                "positions_are_contiguous": positions_are_contiguous,
-                "num_q_heads": num_q_heads,
-                "num_k_heads": num_k_heads,
-                "num_sms": num_sms,
-                "blocked_prefill": use_blocked_prefill,
-                "contiguous_mirror": use_contiguous_mirror,
-                "segmented_prefill": use_segmented_prefill,
-                "segmented_mirror": use_segmented_mirror,
-            },
         )
     return query, key
 

@@ -16,9 +16,6 @@
 # https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen2_moe.py
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 import logging
-import os
-import time
-from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -114,171 +111,6 @@ logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
-_WELM_NPU_FP32_OPROJ = _is_npu and get_bool_env_var(
-    "SGLANG_WELM_FP32_OPROJ", "false"
-)
-_WELM_DUMP_PROCESS_DIR = None
-_WELM_DUMP_BASE_DIR = None
-_WELM_DUMP_PASS_ID = -1
-_WELM_REPLAY_PASS_ID = -1
-_WELM_REPLAY_LOGGED_KEYS = set()
-_WELM_REPLAY_VALIDATED_PASSES = set()
-_WELM_REPLAY_POINT_ALIASES = {
-    "attn": "attention_input",
-    "attention": "attention_input",
-    "post_rope": "attention_input",
-    "attention_output": "attn_output",
-    "gated_attention_output": "gated_attn_output",
-    "oproj": "o_proj_out",
-    "o_proj": "o_proj_out",
-    "norm_input": "norm_inputs",
-    "norm_after_attention": "norm_after_attn",
-}
-
-
-def _welm_weight_load_trace_enabled() -> bool:
-    if not get_bool_env_var("SGLANG_WELMV4_TRACE_WEIGHT_LOADING", "false"):
-        return False
-
-    tp_rank = get_parallel().tp_rank
-    trace_tp_rank = int(
-        os.getenv("SGLANG_WELMV4_TRACE_WEIGHT_LOADING_TP_RANK", "0")
-    )
-    return tp_rank == trace_tp_rank
-
-
-def _welm_trace_weight_loading(
-    weights: Iterable[Tuple[str, torch.Tensor]],
-) -> Iterable[Tuple[str, torch.Tensor]]:
-    """Optionally trace each checkpoint tensor around its weight loader.
-
-    Code after ``yield`` runs only after ``load_weights`` has finished handling
-    that tensor and asks the upstream iterator for the next one. Therefore, a
-    BEGIN line without its matching END line identifies the exact tensor whose
-    weight loader is blocked.
-    """
-    if not _welm_weight_load_trace_enabled():
-        yield from weights
-        return
-
-    tp_rank = get_parallel().tp_rank
-    for tensor_index, (name, loaded_weight) in enumerate(weights):
-        start = time.perf_counter()
-        tensor_bytes = loaded_weight.numel() * loaded_weight.element_size()
-        logger.warning(
-            "[WeLMv4 weight-load trace] BEGIN index=%d tp_rank=%d name=%s "
-            "shape=%s dtype=%s device=%s contiguous=%s storage_offset=%d "
-            "tensor_bytes=%d",
-            tensor_index,
-            tp_rank,
-            name,
-            tuple(loaded_weight.shape),
-            loaded_weight.dtype,
-            loaded_weight.device,
-            loaded_weight.is_contiguous(),
-            loaded_weight.storage_offset(),
-            tensor_bytes,
-        )
-        yield name, loaded_weight
-        logger.warning(
-            "[WeLMv4 weight-load trace] END index=%d tp_rank=%d name=%s "
-            "elapsed_ms=%.3f",
-            tensor_index,
-            tp_rank,
-            name,
-            (time.perf_counter() - start) * 1000.0,
-        )
-
-
-def _welm_trace_stacked_weight_target(
-    checkpoint_name: str,
-    mapped_name: str,
-    loaded_weight: torch.Tensor,
-    param: nn.Parameter,
-    weight_loader: Any,
-    shard_id: Union[str, int],
-) -> None:
-    """Log the effective TP source and fused target views before a copy."""
-    if not _welm_weight_load_trace_enabled():
-        return
-
-    owner = getattr(weight_loader, "__self__", None)
-    source_view = loaded_weight
-    target_view = param.data
-    output_dim = getattr(param, "output_dim", None)
-
-    if (
-        type(owner).__name__ == "QKVParallelLinear"
-        and shard_id in ("q", "k", "v")
-        and output_dim is not None
-    ):
-        if shard_id == "q":
-            shard_offset = 0
-            shard_size = owner.num_heads * owner.head_size
-            source_shard_id = owner.tp_rank
-        elif shard_id == "k":
-            shard_offset = owner.num_heads * owner.head_size
-            shard_size = owner.num_kv_heads * owner.head_size
-            source_shard_id = owner.tp_rank // owner.num_kv_head_replicas
-        else:
-            shard_offset = (owner.num_heads + owner.num_kv_heads) * owner.head_size
-            shard_size = owner.num_kv_heads * owner.v_head_size
-            source_shard_id = owner.tp_rank // owner.num_kv_head_replicas
-
-        target_view = target_view.narrow(output_dim, shard_offset, shard_size)
-        if not owner.use_presharded_weights:
-            source_view = source_view.narrow(
-                output_dim, source_shard_id * shard_size, shard_size
-            )
-
-    quant_method = getattr(owner, "quant_method", None)
-    scheme = getattr(owner, "scheme", None)
-    logger.warning(
-        "[WeLMv4 weight-load trace] TARGET checkpoint_name=%s mapped_name=%s "
-        "shard_id=%s tp_rank=%d owner=%s param_class=%s quant_method=%s "
-        "scheme=%s output_dim=%s full_target_shape=%s full_target_dtype=%s "
-        "full_target_device=%s full_target_data_ptr=%#x "
-        "source_view_shape=%s source_view_dtype=%s source_view_contiguous=%s "
-        "source_view_storage_offset=%d source_view_storage_bytes=%d "
-        "source_view_data_ptr=%#x target_view_shape=%s target_view_dtype=%s "
-        "target_view_contiguous=%s target_view_storage_offset=%d "
-        "target_view_storage_bytes=%d target_view_data_ptr=%#x",
-        checkpoint_name,
-        mapped_name,
-        shard_id,
-        get_parallel().tp_rank,
-        type(owner).__name__,
-        type(param).__name__,
-        type(quant_method).__name__,
-        type(scheme).__name__,
-        output_dim,
-        tuple(param.shape),
-        param.dtype,
-        param.device,
-        param.data_ptr(),
-        tuple(source_view.shape),
-        source_view.dtype,
-        source_view.is_contiguous(),
-        source_view.storage_offset(),
-        source_view.untyped_storage().nbytes(),
-        source_view.data_ptr(),
-        tuple(target_view.shape),
-        target_view.dtype,
-        target_view.is_contiguous(),
-        target_view.storage_offset(),
-        target_view.untyped_storage().nbytes(),
-        target_view.data_ptr(),
-    )
-
-
-_WELM_REPLAY_CONFIGURED_POINTS = frozenset(
-    _WELM_REPLAY_POINT_ALIASES.get(point, point)
-    for point in (
-        item.strip().lower()
-        for item in os.getenv("SGLANG_WELM_REPLAY_POINT", "").split(",")
-    )
-    if point
-)
 
 
 class WelmV4CommunicatorRMSNorm(nn.Module):
@@ -308,343 +140,6 @@ class WelmV4CommunicatorRMSNorm(nn.Module):
         if not kwargs and residual is None and isinstance(output, tuple):
             return output[0]
         return output
-
-
-def _welm_dump_enabled() -> bool:
-    return os.getenv("SGLANG_DUMP_ACTIVATIONS", "0").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-
-
-def _welm_should_dump_layer(layer_idx: int) -> bool:
-    if not _welm_dump_enabled():
-        return False
-    layer_idxs = os.getenv("SGLANG_DUMP_ACTIVATIONS_LAYER_IDXS")
-    if not layer_idxs:
-        return True
-    return str(layer_idx) in {x.strip() for x in layer_idxs.split(",") if x.strip()}
-
-
-def _welm_dump_tensor(name: str, tensor: torch.Tensor) -> None:
-    global _WELM_DUMP_PROCESS_DIR
-    if not isinstance(tensor, torch.Tensor):
-        return
-    if _WELM_DUMP_PROCESS_DIR is None:
-        process_dir = os.getenv("SGLANG_DUMP_ACTIVATIONS_PROCESS_DIR")
-        if process_dir:
-            _WELM_DUMP_PROCESS_DIR = Path(process_dir)
-        else:
-            base_dir = Path(
-                os.getenv("SGLANG_DUMP_ACTIVATIONS_DIR", "/tmp/sglang_welm_dump")
-            )
-            _WELM_DUMP_PROCESS_DIR = (
-                base_dir / f"TP0_PP0_Rank0_pid{os.getpid()}" / "Pass00000"
-            )
-            os.environ["SGLANG_DUMP_ACTIVATIONS_PROCESS_DIR"] = str(
-                _WELM_DUMP_PROCESS_DIR
-            )
-        _WELM_DUMP_PROCESS_DIR.mkdir(parents=True, exist_ok=True)
-    host_allocation = getattr(tensor, "_host_mapped_npu_allocation", None)
-    if host_allocation is not None:
-        # The mapped dev_ptr is not a legal source for CANN memory-copy APIs.
-        # Dump the CPU alias over the same physical embedding storage instead.
-        tensor_to_save = host_allocation.cpu_view.detach().clone()
-    else:
-        tensor_to_save = tensor.detach().cpu()
-    torch.save(tensor_to_save, _WELM_DUMP_PROCESS_DIR / f"{name}.pt")
-
-
-def _welm_dump_module_weights(prefix: str, module: nn.Module) -> None:
-    """Dump the parameter shards that are resident on this worker.
-
-    SGLang parallel layers replace a checkpoint parameter with the shard owned
-    by the current TP/EP rank during weight loading.  Iterating the live module
-    (instead of the checkpoint) therefore records the exact tensors consumed
-    by this worker.
-
-    Buffers are deliberately excluded: RoPE caches and other buffers are
-    runtime state rather than learned weights.  WeLM's KV-mirror QKV tensors
-    are an exception because they are unregistered tensors assembled after
-    loading; those are dumped explicitly in the decoder layer below.
-    """
-    if not get_bool_env_var("DUMP_WEIGHT", "false"):
-        return
-    for name, parameter in module.named_parameters(recurse=True):
-        parameter_name = f"{prefix}.{name}" if name else prefix
-        _welm_dump_tensor(parameter_name, parameter)
-
-
-def _welm_start_dump_pass() -> None:
-    global _WELM_DUMP_BASE_DIR, _WELM_DUMP_PASS_ID, _WELM_DUMP_PROCESS_DIR
-    if not _welm_dump_enabled():
-        return
-    if _WELM_DUMP_BASE_DIR is None:
-        _WELM_DUMP_BASE_DIR = (
-            Path(os.getenv("SGLANG_DUMP_ACTIVATIONS_DIR", "/tmp/sglang_welm_dump"))
-            / f"TP0_PP0_Rank0_pid{os.getpid()}"
-        )
-    _WELM_DUMP_PASS_ID += 1
-    _WELM_DUMP_PROCESS_DIR = _WELM_DUMP_BASE_DIR / f"Pass{_WELM_DUMP_PASS_ID:05d}"
-    os.environ["SGLANG_DUMP_ACTIVATIONS_PROCESS_DIR"] = str(_WELM_DUMP_PROCESS_DIR)
-    _WELM_DUMP_PROCESS_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def _welm_replay_points() -> frozenset[str]:
-    """Return the optional CUDA-activation replay points.
-
-    This is intentionally an eager-only debugging facility.  The caller is
-    responsible for disabling graph capture/replay before enabling it.
-    """
-    return _WELM_REPLAY_CONFIGURED_POINTS
-
-
-def _welm_replay_point() -> str:
-    """Return a normalized replay-point string for compatibility/debug logs."""
-    return ",".join(sorted(_welm_replay_points()))
-
-
-def _welm_start_replay_pass(forward_batch: ForwardBatch) -> None:
-    global _WELM_REPLAY_PASS_ID
-    # Model profiling/dummy forwards do not carry request IDs.  Do not consume
-    # CUDA dump passes or attempt disk I/O until a real scheduled request runs.
-    if _welm_replay_points() and forward_batch.rids:
-        _WELM_REPLAY_PASS_ID += 1
-
-
-def _welm_replay_stage(forward_batch: ForwardBatch) -> str:
-    if forward_batch.forward_mode.is_decode():
-        return "decode"
-    if forward_batch.forward_mode.is_extend():
-        return "prefill"
-    return "other"
-
-
-def _welm_replay_layer_ids() -> set[int]:
-    value = os.getenv("SGLANG_WELM_REPLAY_LAYER_IDXS")
-    if value is None:
-        value = os.getenv("SGLANG_DUMP_ACTIVATIONS_LAYER_IDXS", "0")
-    try:
-        return {int(item.strip()) for item in value.split(",") if item.strip()}
-    except ValueError as exc:
-        raise ValueError(
-            "SGLANG_WELM_REPLAY_LAYER_IDXS must be a comma-separated list "
-            f"of integers, got {value!r}."
-        ) from exc
-
-
-def _welm_should_replay(
-    point: str,
-    forward_batch: ForwardBatch,
-    layer_idx: Optional[int] = None,
-) -> bool:
-    configured_points = _welm_replay_points()
-    if not configured_points:
-        return False
-    if not forward_batch.rids or _WELM_REPLAY_PASS_ID < 0:
-        return False
-    valid_points = {
-        "embedding",
-        "qkv",
-        "attention_input",
-        "attn_output",
-        "gated_attn_output",
-        "o_proj_out",
-        "norm_inputs",
-        "norm_after_attn",
-    }
-    invalid_points = configured_points - valid_points
-    if invalid_points:
-        raise ValueError(
-            "Each comma-separated SGLANG_WELM_REPLAY_POINT value must be one of "
-            "embedding, qkv, "
-            "attention_input, attn_output, gated_attn_output, o_proj_out, "
-            f"norm_inputs, or norm_after_attn, got {sorted(invalid_points)!r}."
-        )
-    if point not in configured_points:
-        return False
-
-    stages = {
-        item.strip().lower()
-        for item in os.getenv(
-            "SGLANG_WELM_REPLAY_STAGES", "prefill,decode"
-        ).split(",")
-        if item.strip()
-    }
-    stage = _welm_replay_stage(forward_batch)
-    if stage not in stages:
-        return False
-    if layer_idx is not None and layer_idx not in _welm_replay_layer_ids():
-        return False
-    return True
-
-
-def _welm_replay_pass_dir() -> Path:
-    if _WELM_REPLAY_PASS_ID < 0:
-        raise RuntimeError(
-            "WeLM activation replay pass was not initialized before tensor load."
-        )
-
-    tp_rank = get_parallel().tp_rank
-    directory_template = os.getenv(f"SGLANG_WELM_REPLAY_DIR_TP{tp_rank}")
-    if not directory_template:
-        directory_template = os.getenv("SGLANG_WELM_REPLAY_DIR")
-    if not directory_template:
-        raise RuntimeError(
-            "WeLM activation replay is enabled but no source directory was "
-            "configured. Set SGLANG_WELM_REPLAY_DIR (it may contain "
-            "{tp_rank}, {pass_id}, or {pass_name}) or set the rank-specific "
-            f"SGLANG_WELM_REPLAY_DIR_TP{tp_rank}."
-        )
-
-    try:
-        pass_offset = int(os.getenv("SGLANG_WELM_REPLAY_PASS_OFFSET", "0"))
-    except ValueError as exc:
-        raise ValueError("SGLANG_WELM_REPLAY_PASS_OFFSET must be an integer.") from exc
-    source_pass_id = _WELM_REPLAY_PASS_ID + pass_offset
-    if source_pass_id < 0:
-        raise RuntimeError(
-            "The resolved CUDA replay pass is negative: "
-            f"npu_pass={_WELM_REPLAY_PASS_ID}, offset={pass_offset}."
-        )
-    pass_name = f"Pass{source_pass_id:05d}"
-
-    try:
-        formatted = directory_template.format(
-            tp_rank=tp_rank,
-            attn_tp_rank=get_parallel().attn_tp_rank,
-            pass_id=source_pass_id,
-            pass_name=pass_name,
-        )
-    except (KeyError, ValueError) as exc:
-        raise ValueError(
-            "Invalid placeholder in SGLANG_WELM_REPLAY_DIR: only {tp_rank}, "
-            "{attn_tp_rank}, {pass_id}, and {pass_name} are supported."
-        ) from exc
-
-    replay_dir = Path(os.path.expandvars(formatted)).expanduser()
-    template_has_pass = (
-        "{pass_id" in directory_template or "{pass_name" in directory_template
-    )
-    path_is_explicit_pass = (
-        replay_dir.name.startswith("Pass") and replay_dir.name[4:].isdigit()
-    )
-    if not template_has_pass and not path_is_explicit_pass:
-        replay_dir = replay_dir / pass_name
-    return replay_dir
-
-
-def _welm_load_replay_tensor(
-    tensor_name: str,
-    reference: torch.Tensor,
-    *,
-    point: str,
-    forward_batch: ForwardBatch,
-    layer_idx: Optional[int] = None,
-) -> torch.Tensor:
-    """Load one CPU CUDA dump tensor and move it to the reference device."""
-    source_path = _welm_replay_pass_dir() / f"{tensor_name}.pt"
-    if not source_path.is_file():
-        raise FileNotFoundError(
-            "Missing WeLM CUDA replay tensor for "
-            f"point={point}, stage={_welm_replay_stage(forward_batch)}, "
-            f"layer={layer_idx}, npu_pass={_WELM_REPLAY_PASS_ID}: {source_path}"
-        )
-    try:
-        source = torch.load(source_path, map_location="cpu", weights_only=True)
-    except TypeError:
-        # Compatibility with older PyTorch versions that do not expose
-        # weights_only on torch.load.
-        source = torch.load(source_path, map_location="cpu")
-    if not isinstance(source, torch.Tensor):
-        raise TypeError(f"Replay file does not contain a tensor: {source_path}")
-    if tuple(source.shape) != tuple(reference.shape):
-        raise RuntimeError(
-            "WeLM CUDA replay shape mismatch for "
-            f"{tensor_name}: source={tuple(source.shape)}, "
-            f"npu={tuple(reference.shape)}, stage={_welm_replay_stage(forward_batch)}, "
-            f"npu_pass={_WELM_REPLAY_PASS_ID}, file={source_path}. This normally "
-            "means the requests, tokenizer output, batching, or pass offset differ."
-        )
-    if source.dtype != reference.dtype:
-        raise RuntimeError(
-            "WeLM CUDA replay dtype mismatch for "
-            f"{tensor_name}: source={source.dtype}, npu={reference.dtype}, "
-            f"file={source_path}. Refusing an implicit cast because it would "
-            "invalidate the precision comparison."
-        )
-
-    result = source.to(device=reference.device).contiguous()
-    log_key = (point, _welm_replay_stage(forward_batch), layer_idx)
-    if log_key not in _WELM_REPLAY_LOGGED_KEYS:
-        _WELM_REPLAY_LOGGED_KEYS.add(log_key)
-        logger.info(
-            "WeLM CUDA activation replay enabled: point=%s stage=%s layer=%s "
-            "npu_pass=%d source=%s",
-            point,
-            _welm_replay_stage(forward_batch),
-            layer_idx,
-            _WELM_REPLAY_PASS_ID,
-            source_path,
-        )
-    return result
-
-
-def _welm_validate_replay_positions(
-    positions: torch.Tensor,
-    forward_batch: ForwardBatch,
-    layer_idx: int,
-) -> None:
-    """Reject a same-shape decode dump from the wrong token position/pass."""
-    if os.getenv("SGLANG_WELM_REPLAY_VALIDATE_POSITIONS", "1").lower() in (
-        "0",
-        "false",
-        "no",
-        "off",
-    ):
-        return
-    validation_key = (_WELM_REPLAY_PASS_ID, _welm_replay_stage(forward_batch))
-    if validation_key in _WELM_REPLAY_VALIDATED_PASSES:
-        return
-
-    tensor_name = f"model.layers.{layer_idx}.self_attn.positions"
-    source_path = _welm_replay_pass_dir() / f"{tensor_name}.pt"
-    if not source_path.is_file():
-        raise FileNotFoundError(
-            "Cannot validate WeLM replay positions because the CUDA dump is "
-            f"missing {source_path}. Set "
-            "SGLANG_WELM_REPLAY_VALIDATE_POSITIONS=0 only if pass alignment "
-            "has been verified separately."
-        )
-    try:
-        source_positions = torch.load(
-            source_path, map_location="cpu", weights_only=True
-        )
-    except TypeError:
-        source_positions = torch.load(source_path, map_location="cpu")
-    current_positions = positions.detach().to(device="cpu")
-    positions_match = (
-        isinstance(source_positions, torch.Tensor)
-        and tuple(source_positions.shape) == tuple(current_positions.shape)
-        and torch.equal(
-            source_positions.to(torch.int64), current_positions.to(torch.int64)
-        )
-    )
-    if not positions_match:
-        source_shape = (
-            tuple(source_positions.shape)
-            if isinstance(source_positions, torch.Tensor)
-            else type(source_positions).__name__
-        )
-        raise RuntimeError(
-            "WeLM CUDA replay positions do not match the current NPU batch: "
-            f"source_shape={source_shape}, npu_shape={tuple(current_positions.shape)}, "
-            f"stage={_welm_replay_stage(forward_batch)}, "
-            f"replay_step={_WELM_REPLAY_PASS_ID}, file={source_path}."
-        )
-    _WELM_REPLAY_VALIDATED_PASSES.add(validation_key)
 
 
 def hash_input_ids_vectorized(input_ids: torch.Tensor) -> torch.Tensor:
@@ -1015,7 +510,6 @@ def expert_bias_routing(
     expert_bias: torch.Tensor,
     renormalize: bool = False,
     score_func: str = "sigmoid",
-    layer_id: Optional[int] = None,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     if score_func == "softmax":
@@ -1028,9 +522,7 @@ def expert_bias_routing(
         and scores.dtype == torch.float32
         and expert_bias.dtype == torch.float32
     ):
-        topk_scores, indices = mmq_style_expert_bias_topk(
-            scores, expert_bias, topk, layer_id=layer_id
-        )
+        topk_scores, indices = mmq_style_expert_bias_topk(scores, expert_bias, topk)
     else:
         scores_for_routing = scores + expert_bias
         _, indices = torch.topk(scores_for_routing, topk, dim=-1)
@@ -1119,7 +611,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 expert_bias_routing,
                 expert_bias=self.expert_bias,
                 score_func=self.router_score_func,
-                layer_id=self.layer_id,
             )
             self.custom_routing_function = custom_routing_function
         else:
@@ -1231,17 +722,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         return_components: bool = False,
         skip_component_output: bool = False,
     ) -> torch.Tensor:
-        dump_this_layer = _welm_should_dump_layer(self.layer_id)
-        dump_prefix = f"model.layers.{self.layer_id}.mlp"
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-        if dump_this_layer:
-            if hidden_states_fp32 is None:
-                raise RuntimeError(
-                    "WeLM activation dump requires the FP32 post-norm output."
-                )
-            _welm_dump_tensor(f"{dump_prefix}.router.input", hidden_states)
-            _welm_dump_tensor(f"{dump_prefix}.router.input_fp32", hidden_states_fp32)
         shared_output = None
         moe_a2a_backend = get_moe_a2a_backend()
         is_prefill_batch = (
@@ -1286,14 +768,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 shared_output = process_shared_expert(
                     hidden_states, self._forward_shared_expert
                 )
-            if dump_this_layer:
-                _welm_dump_tensor(f"{dump_prefix}.router.logits", router_logits)
-                router_scores = (
-                    torch.softmax(router_logits, dim=-1).type_as(router_logits)
-                    if self.router_score_func == "softmax"
-                    else torch.sigmoid(router_logits).type_as(router_logits)
-                )
-                _welm_dump_tensor(f"{dump_prefix}.router.scores", router_scores)
             # Ascend's generic fused TopK dispatch ignores custom routing callbacks.
             # Route WeLM's expert-bias callback through MoeGatingTopK explicitly;
             # it uses the native TopK tie order rather than MMQ's tie_rank order.
@@ -1314,16 +788,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     )
             else:
                 topk_output = self.topk(hidden_states, router_logits)
-        if dump_this_layer and hasattr(topk_output, "topk_weights"):
-            _welm_dump_tensor(f"{dump_prefix}.router.topk_scores", topk_output.topk_weights)
-            _welm_dump_tensor(f"{dump_prefix}.router.topk_ids", topk_output.topk_ids)
         experts_output = self.experts(hidden_states, topk_output)
-        if dump_this_layer:
-            _welm_dump_tensor(f"{dump_prefix}.experts_output", experts_output)
         if return_components and skip_component_output:
             if enable_npu_dual_stream:
                 # This early return hands shared_output to the caller, so it is
-                # the consumption boundary for this diagnostic path.
+                # the consumption boundary.
                 wait_share_stream()
             return (
                 experts_output.view(num_tokens, hidden_dim),
@@ -1336,11 +805,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.last_final_experts_output = None
         self.last_final_shared_output = None
         if shared_output is not None:
-            if dump_this_layer:
-                if enable_npu_dual_stream:
-                    # Activation dumping consumes shared_output before the add.
-                    wait_share_stream()
-                _welm_dump_tensor(f"{dump_prefix}.shared_output", shared_output)
             if (
                 self.layer_id == self.num_hidden_layers - 1
                 and self.tp_size == 1
@@ -1348,12 +812,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             ):
                 self.last_final_experts_output = experts_output
                 self.last_final_shared_output = shared_output
-            if enable_npu_dual_stream and not dump_this_layer:
+            if enable_npu_dual_stream:
                 # Normal inference first consumes shared_output in this add.
                 wait_share_stream()
             final_hidden_states = final_hidden_states + shared_output
-        if dump_this_layer:
-            _welm_dump_tensor(f"{dump_prefix}.output", final_hidden_states)
         if (
             self.tp_size > 1
             and not use_reduce_scatter
@@ -1753,34 +1215,6 @@ class Qwen2MoeAttention(nn.Module):
             reduce_results=not is_dp_attention_enabled(),
             prefix=add_prefix("o_proj", prefix),
         )
-        self.register_buffer(
-            "_welm_fp32_o_proj_weight", None, persistent=False
-        )
-        self.register_buffer("_welm_fp32_o_proj_bias", None, persistent=False)
-        if _WELM_NPU_FP32_OPROJ:
-            if is_dp_attention_enabled():
-                raise RuntimeError(
-                    "SGLANG_WELM_FP32_OPROJ only supports pure TP; "
-                    "attention DP leaves OProj reduction to a different path."
-                )
-            if self.o_proj.tp_size != get_tensor_model_parallel_world_size():
-                raise RuntimeError(
-                    "SGLANG_WELM_FP32_OPROJ requires OProj TP size to "
-                    "match the global tensor-parallel size."
-                )
-            if (
-                self.o_proj.quant_method.__class__.__name__
-                != "UnquantizedLinearMethod"
-            ):
-                raise RuntimeError(
-                    "SGLANG_WELM_FP32_OPROJ only supports unquantized "
-                    "OProj weights."
-                )
-            if self.layer_idx == 0:
-                logger.warning(
-                    "WeLM NPU FP32 OProj diagnostic path is enabled: local "
-                    "F.linear and TP AllReduce run in FP32 before casting back."
-                )
         if rope_scaling is None:
             rope_scaling = {"type": "linear", "factor": 1 / self.compress}
         else:
@@ -1880,8 +1314,6 @@ class Qwen2MoeAttention(nn.Module):
         forward_batch: ForwardBatch,
         skip_o_norm: bool = False,
     ) -> torch.Tensor:
-        dump_this_layer = _welm_should_dump_layer(self.layer_idx)
-        dump_prefix = f"model.layers.{self.layer_idx}.self_attn"
         if self.kv_mirror_layer_idx in self.kv_mirror_imitated_layers:
             if getattr(self, "_kv_mirror_mxfp8_source_projection", False):
                 qkv, _ = self.qkv_proj(hidden_states)
@@ -1973,55 +1405,12 @@ class Qwen2MoeAttention(nn.Module):
             with device_module.stream(self.alt_stream):
                 gate = self.gate_proj(hidden_states)[0].unsqueeze(-1)
 
-        replay_qkv = _welm_should_replay("qkv", forward_batch, self.layer_idx)
-        if replay_qkv:
-            _welm_validate_replay_positions(
-                positions, forward_batch, self.layer_idx
-            )
-            if dump_this_layer:
-                _welm_dump_tensor(f"{dump_prefix}.q_pre_rope_npu_before_replay", q)
-                _welm_dump_tensor(f"{dump_prefix}.k_pre_rope_npu_before_replay", k)
-                _welm_dump_tensor(f"{dump_prefix}.v_npu_before_replay", v)
-            q = _welm_load_replay_tensor(
-                f"{dump_prefix}.q_pre_rope",
-                q,
-                point="qkv",
-                forward_batch=forward_batch,
-                layer_idx=self.layer_idx,
-            )
-            k = _welm_load_replay_tensor(
-                f"{dump_prefix}.k_pre_rope",
-                k,
-                point="qkv",
-                forward_batch=forward_batch,
-                layer_idx=self.layer_idx,
-            )
-            v = _welm_load_replay_tensor(
-                f"{dump_prefix}.v",
-                v,
-                point="qkv",
-                forward_batch=forward_batch,
-                layer_idx=self.layer_idx,
-            )
-        if dump_this_layer:
-            _welm_dump_tensor(f"{dump_prefix}.positions", positions)
-            if forward_batch.extend_seq_lens is not None:
-                _welm_dump_tensor(
-                    f"{dump_prefix}.extend_seq_lens",
-                    forward_batch.extend_seq_lens,
-                )
-            _welm_dump_tensor(f"{dump_prefix}.q_pre_rope", q)
-            _welm_dump_tensor(f"{dump_prefix}.k_pre_rope", k)
-            _welm_dump_tensor(f"{dump_prefix}.v", v)
-
         q_shape = q.shape
         k_shape = k.shape
 
         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
         if self.q_norm is not None:
             q_by_head, _ = self.q_norm(q_by_head)
-        if dump_this_layer:
-            _welm_dump_tensor(f"{dump_prefix}.q_after_norm", q_by_head.view(q.shape))
         # Q is a strided view of the fused QKV projection when q_norm is
         # disabled.  Attention requires packed Q later, so materialize that
         # layout before RoPE and let downstream contiguous() calls be no-ops.
@@ -2033,17 +1422,7 @@ class Qwen2MoeAttention(nn.Module):
                 k_by_head.contiguous(),
                 self.k_norm.weight,
                 self.k_norm.eps,
-                layer_id=self.layer_idx,
-                stage=(
-                    "prefill"
-                    if forward_batch.forward_mode.is_extend()
-                    else "decode"
-                    if forward_batch.forward_mode.is_decode()
-                    else None
-                ),
             )
-        if dump_this_layer:
-            _welm_dump_tensor(f"{dump_prefix}.k_after_norm", k_by_head.view(k.shape))
         k = k_by_head.view(k.shape)
 
         # A single non-speculative extend request is globally contiguous;
@@ -2070,7 +1449,6 @@ class Qwen2MoeAttention(nn.Module):
                     q,
                     k,
                     last_index=forward_batch.custom_last_index,
-                    layer_id=self.layer_idx,
                     positions_are_contiguous=positions_are_contiguous,
                     segment_tile_starts=segment_tile_starts,
                 )
@@ -2079,7 +1457,6 @@ class Qwen2MoeAttention(nn.Module):
                     positions,
                     q,
                     k,
-                    layer_id=self.layer_idx,
                     positions_are_contiguous=positions_are_contiguous,
                     segment_tile_starts=segment_tile_starts,
                 )
@@ -2090,90 +1467,21 @@ class Qwen2MoeAttention(nn.Module):
                 positions,
                 q,
                 k,
-                layer_id=self.layer_idx,
                 positions_are_contiguous=positions_are_contiguous,
                 segment_tile_starts=segment_tile_starts,
             )
-
-        replay_attention_input = _welm_should_replay(
-            "attention_input", forward_batch, self.layer_idx
-        )
-        if replay_attention_input:
-            _welm_validate_replay_positions(
-                positions, forward_batch, self.layer_idx
-            )
-            if dump_this_layer:
-                _welm_dump_tensor(f"{dump_prefix}.q_post_rope_npu_before_replay", q)
-                _welm_dump_tensor(f"{dump_prefix}.k_post_rope_npu_before_replay", k)
-                _welm_dump_tensor(f"{dump_prefix}.v_npu_before_replay", v)
-            q = _welm_load_replay_tensor(
-                f"{dump_prefix}.q_post_rope",
-                q,
-                point="attention_input",
-                forward_batch=forward_batch,
-                layer_idx=self.layer_idx,
-            )
-            k = _welm_load_replay_tensor(
-                f"{dump_prefix}.k_post_rope",
-                k,
-                point="attention_input",
-                forward_batch=forward_batch,
-                layer_idx=self.layer_idx,
-            )
-            v = _welm_load_replay_tensor(
-                f"{dump_prefix}.v",
-                v,
-                point="attention_input",
-                forward_batch=forward_batch,
-                layer_idx=self.layer_idx,
-            )
-        if dump_this_layer:
-            _welm_dump_tensor(f"{dump_prefix}.q_post_rope", q)
-            _welm_dump_tensor(f"{dump_prefix}.k_post_rope", k)
-            if replay_attention_input:
-                # The regular V dump happens before RoPE.  Overwrite it here so
-                # the canonical file records the value actually consumed by
-                # attention in an attention-input replay run.
-                _welm_dump_tensor(f"{dump_prefix}.v", v)
 
         attn_kwargs = {}
         if self.attn_sink is not None:
             attn_kwargs["sinks"] = self.attn_sink
         attn_output = self.attn(q, k, v, forward_batch, **attn_kwargs)
-        replay_attn_output = _welm_should_replay(
-            "attn_output", forward_batch, self.layer_idx
-        )
-        if replay_attn_output:
-            _welm_validate_replay_positions(
-                positions, forward_batch, self.layer_idx
-            )
-            if dump_this_layer:
-                _welm_dump_tensor(
-                    f"{dump_prefix}.attn_output_npu_before_replay", attn_output
-                )
-            attn_output = _welm_load_replay_tensor(
-                f"{dump_prefix}.attn_output",
-                attn_output,
-                point="attn_output",
-                forward_batch=forward_batch,
-                layer_idx=self.layer_idx,
-            )
-        if dump_this_layer:
-            _welm_dump_tensor(f"{dump_prefix}.attn_output", attn_output)
         if self.gated_self_attention_headwise:
             attn_shape = attn_output.shape
             if gate is None:
                 gate = self.gate_proj(hidden_states)[0].unsqueeze(-1)
             # gate: (bs * seq_len, num_heads, 1)
-            if dump_this_layer:
-                if enable_npu_gate_alt_stream:
-                    # Activation dumping consumes gate before sigmoid_mul.
-                    current_stream.wait_stream(self.alt_stream)
-                _welm_dump_tensor(
-                    f"model.layers.{self.layer_idx}.attn.router.0", gate.squeeze(-1)
-                )
             attn_output = attn_output.view(attn_shape[0], self.num_heads, -1)
-            if enable_npu_gate_alt_stream and not dump_this_layer:
+            if enable_npu_gate_alt_stream:
                 # Normal inference first consumes gate in sigmoid_mul. Joining
                 # here lets gate projection overlap the complete attention op.
                 current_stream.wait_stream(self.alt_stream)
@@ -2182,92 +1490,10 @@ class Qwen2MoeAttention(nn.Module):
             else:
                 inplace_sigmoid_mul(gate, attn_output)
             attn_output = attn_output.view(attn_shape)
-            replay_gated_attn_output = _welm_should_replay(
-                "gated_attn_output", forward_batch, self.layer_idx
-            )
-            if replay_gated_attn_output:
-                _welm_validate_replay_positions(
-                    positions, forward_batch, self.layer_idx
-                )
-                if dump_this_layer:
-                    _welm_dump_tensor(
-                        f"{dump_prefix}.gated_attn_output_npu_before_replay",
-                        attn_output,
-                    )
-                attn_output = _welm_load_replay_tensor(
-                    f"{dump_prefix}.gated_attn_output",
-                    attn_output,
-                    point="gated_attn_output",
-                    forward_batch=forward_batch,
-                    layer_idx=self.layer_idx,
-                )
-            if dump_this_layer:
-                _welm_dump_tensor(f"{dump_prefix}.gated_attn_output", attn_output)
 
-        if _WELM_NPU_FP32_OPROJ:
-            # Keep both the local row-parallel GEMM partial and its TP sum in
-            # FP32.  Casting only after the AllReduce separates OProj numeric
-            # error from the normal BF16 projection/reduction path.
-            if self._welm_fp32_o_proj_weight is None:
-                self._welm_fp32_o_proj_weight = (
-                    self.o_proj.weight.detach().float().contiguous()
-                )
-                if self.o_proj.bias is not None:
-                    self._welm_fp32_o_proj_bias = (
-                        self.o_proj.bias.detach().float().contiguous()
-                    )
-
-            o_proj_bias = (
-                self._welm_fp32_o_proj_bias
-                if self.o_proj.tp_rank == 0 and not self.o_proj.skip_bias_add
-                else None
-            )
-            output_fp32 = F.linear(
-                attn_output.float().contiguous(),
-                self._welm_fp32_o_proj_weight,
-                o_proj_bias,
-            )
-            if self.o_proj.tp_size > 1:
-                output_fp32 = tensor_model_parallel_all_reduce(output_fp32)
-            output = output_fp32.to(attn_output.dtype)
-        else:
-            output, _ = self.o_proj(attn_output)
-        replay_o_proj_point = None
-        if _welm_should_replay("norm_inputs", forward_batch, self.layer_idx):
-            # ``norm_inputs`` remains the existing composite replay point: it
-            # replaces both o_proj_out here and the FP32 residual below.
-            replay_o_proj_point = "norm_inputs"
-        elif _welm_should_replay("o_proj_out", forward_batch, self.layer_idx):
-            replay_o_proj_point = "o_proj_out"
-        replay_o_proj_out = replay_o_proj_point is not None
-        o_proj_dump_name = (
-            f"model.layers.{self.layer_idx}.attn.mixer.o_proj_out"
-        )
-        if replay_o_proj_out:
-            _welm_validate_replay_positions(
-                positions, forward_batch, self.layer_idx
-            )
-            if dump_this_layer:
-                _welm_dump_tensor(
-                    f"{o_proj_dump_name}_npu_before_replay", output
-                )
-            output = _welm_load_replay_tensor(
-                o_proj_dump_name,
-                output,
-                point=replay_o_proj_point,
-                forward_batch=forward_batch,
-                layer_idx=self.layer_idx,
-            )
-        if dump_this_layer:
-            _welm_dump_tensor(o_proj_dump_name, output)
+        output, _ = self.o_proj(attn_output)
         if self.o_norm is not None and not skip_o_norm:
             output, _ = self.o_norm(output)
-            if dump_this_layer:
-                _welm_dump_tensor(
-                    f"model.layers.{self.layer_idx}.attn.mixer.o_norm_out", output
-                )
-        if dump_this_layer:
-            _welm_dump_tensor(f"model.layers.{self.layer_idx}.attn.mixer.0", output)
         return output
 
 
@@ -2458,45 +1684,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        dump_this_layer = _welm_should_dump_layer(self.layer_id)
-        if (
-            self.layer_id == 0
-            and _welm_should_replay("embedding", forward_batch)
-        ):
-            _welm_validate_replay_positions(positions, forward_batch, self.layer_id)
-            if dump_this_layer:
-                _welm_dump_tensor(
-                    "model.layers.0.__input__.0_npu_before_replay", hidden_states
-                )
-            hidden_states = _welm_load_replay_tensor(
-                "model.layers.0.__input__.0",
-                hidden_states,
-                point="embedding",
-                forward_batch=forward_batch,
-                layer_idx=0,
-            )
-        if dump_this_layer:
-            _welm_dump_tensor(f"model.layers.{self.layer_id}.__input__.0", hidden_states)
-            _welm_dump_module_weights(
-                f"model.layers.{self.layer_id}.__weights__", self
-            )
-
-            # The unquantized KV-mirror path keeps its derived projections as
-            # plain Tensor attributes and passes them directly to F.linear, so
-            # named_parameters() above cannot see them. ModelSlim MXFP8 rewrites
-            # registered qkv_proj modules and is already covered above.
-            if hasattr(self.self_attn, "qkv_proj_weight"):
-                _welm_dump_tensor(
-                    f"model.layers.{self.layer_id}.__weights__."
-                    "self_attn.qkv_proj_weight",
-                    self.self_attn.qkv_proj_weight,
-                )
-                if self.self_attn.qkv_proj_bias is not None:
-                    _welm_dump_tensor(
-                        f"model.layers.{self.layer_id}.__weights__."
-                        "self_attn.qkv_proj_bias",
-                        self.self_attn.qkv_proj_bias,
-                    )
         residual_after_layernorm = (
             self.ppln and self.layer_id not in self.prenorm_layer_idx
         )
@@ -2539,12 +1726,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
         if qkv_prefetch_started:
             # Keep CMO overlap bounded to input RMSNorm; QKV starts afterwards.
             wait_cmo_stream()
-        if dump_this_layer:
-            _welm_dump_tensor(
-                f"model.layers.{self.layer_id}.input_layernorm.0", hidden_states
-            )
-            if residual is not None:
-                _welm_dump_tensor(f"model.layers.{self.layer_id}.attn.mixer.1", residual)
         use_mmq_norm_after_attn = residual_after_layernorm and self.self_attn.use_o_norm
         use_dp_o_norm_after_attn = (
             is_dp_attention_enabled() and self.self_attn.use_o_norm
@@ -2610,39 +1791,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     new_global_num_tokens,
                 )
 
-        replay_norm_inputs = _welm_should_replay(
-            "norm_inputs", forward_batch, self.layer_id
-        )
-        if replay_norm_inputs:
-            if residual is None:
-                raise RuntimeError(
-                    "WeLM norm_inputs replay requires a pre-norm residual, "
-                    f"but layer {self.layer_id} received residual=None."
-                )
-            _welm_validate_replay_positions(
-                positions, forward_batch, self.layer_id
-            )
-            residual_dump_name = f"model.layers.{self.layer_id}.attn.mixer.1"
-            if dump_this_layer:
-                _welm_dump_tensor(
-                    f"{residual_dump_name}_npu_before_replay", residual
-                )
-            residual = _welm_load_replay_tensor(
-                residual_dump_name,
-                residual,
-                point="norm_inputs",
-                forward_batch=forward_batch,
-                layer_idx=self.layer_id,
-            )
-            if dump_this_layer:
-                # Overwrite the earlier pre-attention dump so the canonical
-                # file records the residual actually consumed by the norm.
-                _welm_dump_tensor(residual_dump_name, residual)
-
-        replay_norm_after_attn = _welm_should_replay(
-            "norm_after_attn", forward_batch, self.layer_id
-        )
-        need_fp32_norm_after_attn = dump_this_layer or replay_norm_after_attn
         router_prefetch_started = False
         if enable_npu_weight_prefetch and hidden_states.shape[0] > 0:
             router_compute_weight = self.mlp.get_npu_router_compute_weight_t()
@@ -2664,7 +1812,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 self.self_attn.o_norm.weight,
                 self.post_attention_layernorm.weight,
                 self.post_attention_layernorm.eps,
-                return_fp32_out=need_fp32_norm_after_attn,
+                return_fp32_out=False,
             )
             if (
                 is_dp_attention_enabled()
@@ -2686,8 +1834,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     dp_gather_replicate(
                         hidden_states, local_hidden_states, forward_batch
                     )
-                    if need_fp32_norm_after_attn:
-                        hidden_states_fp32 = hidden_states.to(torch.float32)
         elif use_dp_o_norm_after_attn:
             # ppln=False checkpoints still may carry o_norm.  Applying it in
             # Attention.forward would normalize each RowParallel partial.
@@ -2737,66 +1883,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
         if router_prefetch_started:
             # Keep CMO overlap bounded to post-attention RMSNorm.
             wait_cmo_stream()
-        if replay_norm_after_attn:
-            if hidden_states_fp32 is None:
-                raise RuntimeError(
-                    "WeLM norm_after_attn replay requires the FP32 post-norm "
-                    "output."
-                )
-            _welm_validate_replay_positions(
-                positions, forward_batch, self.layer_id
-            )
-            norm_dump_prefix = f"model.layers.{self.layer_id}.norm_after_attn"
-            if dump_this_layer:
-                _welm_dump_tensor(
-                    f"{norm_dump_prefix}.output_npu_before_replay", hidden_states
-                )
-                _welm_dump_tensor(
-                    f"{norm_dump_prefix}.output_fp32_npu_before_replay",
-                    hidden_states_fp32,
-                )
-                if residual is not None:
-                    _welm_dump_tensor(
-                        f"{norm_dump_prefix}.residual_npu_before_replay", residual
-                    )
-            hidden_states = _welm_load_replay_tensor(
-                f"{norm_dump_prefix}.output",
-                hidden_states,
-                point="norm_after_attn",
-                forward_batch=forward_batch,
-                layer_idx=self.layer_id,
-            )
-            hidden_states_fp32 = _welm_load_replay_tensor(
-                f"{norm_dump_prefix}.output_fp32",
-                hidden_states_fp32,
-                point="norm_after_attn",
-                forward_batch=forward_batch,
-                layer_idx=self.layer_id,
-            )
-            if residual is not None:
-                residual = _welm_load_replay_tensor(
-                    f"{norm_dump_prefix}.residual",
-                    residual,
-                    point="norm_after_attn",
-                    forward_batch=forward_batch,
-                    layer_idx=self.layer_id,
-                )
-        if dump_this_layer:
-            if hidden_states_fp32 is None:
-                raise RuntimeError(
-                    "WeLM activation dump requires the FP32 post-norm output."
-                )
-            _welm_dump_tensor(
-                f"model.layers.{self.layer_id}.norm_after_attn.output", hidden_states
-            )
-            _welm_dump_tensor(
-                f"model.layers.{self.layer_id}.norm_after_attn.output_fp32",
-                hidden_states_fp32,
-            )
-            if residual is not None:
-                _welm_dump_tensor(
-                    f"model.layers.{self.layer_id}.norm_after_attn.residual", residual
-                )
         # For DP with padding, reduce scatter can be used instead of all-reduce.
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
@@ -2808,11 +1894,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
             hidden_states_fp32,
             forward_batch,
             use_reduce_scatter,
-            return_components=dump_this_layer or self.is_final_layer,
+            return_components=self.is_final_layer,
             skip_component_output=(
                 self.is_final_layer
                 and residual is not None
-                and not dump_this_layer
                 and getattr(self.mlp, "tp_size", 1) == 1
                 and not is_dp_attention_enabled()
             ),
@@ -2832,20 +1917,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
         if self.is_final_layer:
             self.final_mlp_experts_output = experts_output
             self.final_mlp_shared_output = shared_output
-        if dump_this_layer:
-            output_with_residual = hidden_states
-            if (
-                residual is not None
-                and experts_output is not None
-                and experts_output.shape == residual.shape
-            ):
-                output_with_residual = experts_output.float() + residual.float()
-                if shared_output is not None:
-                    output_with_residual = output_with_residual + shared_output.float()
-            _welm_dump_tensor(
-                f"model.layers.{self.layer_id}.mlp.output_with_residual",
-                output_with_residual,
-            )
         return hidden_states, residual
 
 
@@ -3046,15 +2117,6 @@ class Qwen2MoeModel(nn.Module):
         if oe_up_proj_module is None:
             oe_up_proj_module = self.oe_gate_up_proj
 
-        dump_oe = _welm_dump_enabled()
-        if dump_oe:
-            _welm_dump_module_weights("model.oe.__weights__.embed", oe_embed_modules)
-            _welm_dump_module_weights(
-                "model.oe.__weights__.up_proj", oe_up_proj_module
-            )
-            _welm_dump_tensor("model.oe.input_ids", input_ids)
-            _welm_dump_tensor("model.oe.base_hidden_states", base_hidden_states)
-
         ngram_embedding_info = forward_batch.ngram_embedding_info
         if ngram_embedding_info is None:
             raise RuntimeError(
@@ -3105,7 +2167,6 @@ class Qwen2MoeModel(nn.Module):
         column_starts = ngram_embedding_info.column_starts[:real_req_count]
         use_npu_fused_hash = (
             _is_npu
-            and not dump_oe
             and tuple(self.oe_grams) == (2, 2, 3, 3)
             and len(self.oe_vocab_sizes) == 4
             and (
@@ -3177,8 +2238,6 @@ class Qwen2MoeModel(nn.Module):
                 gram_tensor = torch.where(
                     valid_history, gram_tensor, torch.zeros_like(gram_tensor)
                 )
-                if dump_oe:
-                    _welm_dump_tensor(f"model.oe.gram{g + 1}.ids", gram_tensor)
                 input_ids_ngram_tmp = input_ids_ngram_tmp + gram_tensor * (
                     self.vocab_size**g
                 )
@@ -3193,10 +2252,6 @@ class Qwen2MoeModel(nn.Module):
                 if npu_hashed_ids is not None
                 else input_ids_ngram[self.oe_grams[i] - 2] % vs
             )
-            if dump_oe:
-                _welm_dump_tensor(
-                    f"model.oe.vocab{i}.hashed_ids", input_ids_ngram_hashed_tmp
-                )
             emb_ngram_tmp = (
                 oe_embed_modules[i].forward_local(input_ids_ngram_hashed_tmp)
                 if _is_npu
@@ -3211,21 +2266,12 @@ class Qwen2MoeModel(nn.Module):
             )
         else:
             emb_ngram_concat = torch.cat(emb_ngram, dim=-1)
-        if dump_oe:
-            embedding_dims = [module.embedding_dim for module in oe_embed_modules]
-            for i, emb_ngram_tmp in enumerate(
-                torch.split(emb_ngram_concat, embedding_dims, dim=-1)
-            ):
-                _welm_dump_tensor(f"model.oe.vocab{i}.embedding", emb_ngram_tmp)
         emb_new, _ = oe_up_proj_module(emb_ngram_concat)
         hidden_states = (base_hidden_states[:history_num_tokens] + emb_new) / 2.0
         if history_num_tokens < num_tokens:
             hidden_states = torch.cat(
                 (hidden_states, base_hidden_states[history_num_tokens:]), dim=0
             )
-        if dump_oe:
-            _welm_dump_tensor("model.oe.projected", emb_new)
-            _welm_dump_tensor("model.oe.output", hidden_states)
         return hidden_states
 
     def _expand_scale_seq(self, input_ids, forward_batch, hidden_states):
@@ -3269,8 +2315,6 @@ class Qwen2MoeModel(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-        _welm_start_replay_pass(forward_batch)
-        _welm_start_dump_pass()
         # Construct immutable request-segment metadata once per eager forward.
         # EXTEND/MIXED positions are independently contiguous per request;
         # speculative modes are deliberately excluded.  Prefill NPU Graph is
@@ -3295,15 +2339,9 @@ class Qwen2MoeModel(nn.Module):
                 )
         if self.pp_group.is_first_rank:
             if input_embeds is None:
-                if _welm_dump_enabled():
-                    _welm_dump_module_weights(
-                        "model.embed_tokens.__weights__", self.embed_tokens
-                    )
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            if _welm_dump_enabled():
-                _welm_dump_tensor("model.embed_tokens.output", hidden_states)
 
             if len(self.oe_grams) > 0 and forward_batch.ngram_embedding_info is not None:
                 hidden_states = self._compute_oe_embedding(
@@ -3354,8 +2392,6 @@ class Qwen2MoeModel(nn.Module):
         else:
             pre_norm_hidden_states = None
             if hidden_states.shape[0] != 0:
-                if _welm_dump_enabled():
-                    _welm_dump_module_weights("model.norm.__weights__", self.norm)
                 if residual is None:
                     pre_norm_hidden_states = hidden_states
                     hidden_states, _ = self.norm(hidden_states)
@@ -3533,8 +2569,6 @@ class WeLMV4MoeForCausalLM(nn.Module):
                         forward_batch.extend_num_tokens // scale
                     )
 
-            if _welm_dump_enabled():
-                _welm_dump_module_weights("lm_head.__weights__", self.lm_head)
             return self.logits_processor(
                 input_ids,
                 hidden_states,
@@ -3557,13 +2591,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
         start, end = split_interval
         # embed
         if start == 0:
-            _welm_start_replay_pass(forward_batch)
-            _welm_start_dump_pass()
             if input_embeds is None:
-                if _welm_dump_enabled():
-                    _welm_dump_module_weights(
-                        "model.embed_tokens.__weights__", self.model.embed_tokens
-                    )
                 forward_batch.hidden_states = self.model.embed_tokens(input_ids)
             else:
                 forward_batch.hidden_states = input_embeds
@@ -3594,8 +2622,6 @@ class WeLMV4MoeForCausalLM(nn.Module):
 
         if end == self.model.config.num_hidden_layers:
             # norm
-            if _welm_dump_enabled():
-                _welm_dump_module_weights("model.norm.__weights__", self.model.norm)
             hidden_states, _ = self.model.norm(
                 forward_batch.hidden_states, forward_batch.residual
             )
@@ -3631,8 +2657,6 @@ class WeLMV4MoeForCausalLM(nn.Module):
                     )
 
             # logits process
-            if _welm_dump_enabled():
-                _welm_dump_module_weights("lm_head.__weights__", self.lm_head)
             result = self.logits_processor(
                 input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
             )
@@ -3686,8 +2710,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
                 "hnorm",
             ]
 
-        for name, loaded_weight in _welm_trace_weight_loading(weights):
-            checkpoint_name = name
+        for name, loaded_weight in weights:
             if not is_nextn:
                 if hasattr(self.config, "num_nextn_predict_layers"):
                     num_nextn_layers = self.config.num_nextn_predict_layers
@@ -3776,14 +2799,6 @@ class WeLMV4MoeForCausalLM(nn.Module):
 
                 param = params_dict[name]
                 weight_loader = param.weight_loader
-                _welm_trace_stacked_weight_target(
-                    checkpoint_name,
-                    name,
-                    loaded_weight,
-                    param,
-                    weight_loader,
-                    shard_id,
-                )
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:

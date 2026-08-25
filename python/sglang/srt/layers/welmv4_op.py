@@ -9,10 +9,6 @@ from torch import nn
 
 from sglang.srt.layers.rotary_embedding import RotaryEmbedding
 from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.layers.welmv4_shape_logger import (
-    WELMV4_KERNEL_SHAPE_LOG_ENABLED,
-    log_welmv4_kernel_shapes_once,
-)
 from sglang.srt.utils import is_npu
 
 if is_npu():
@@ -247,9 +243,6 @@ def mmq_style_expert_bias_topk(
     scores: torch.Tensor,
     expert_bias: torch.Tensor,
     topk: int,
-    *,
-    layer_id: Optional[int] = None,
-    stage: Optional[str] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert scores.dim() == 2
     assert expert_bias.dim() == 1
@@ -276,16 +269,6 @@ def mmq_style_expert_bias_topk(
         TOPK=topk,
         BLOCK_SIZE=triton.next_power_of_2(num_experts),
     )
-    if WELMV4_KERNEL_SHAPE_LOG_ENABLED:
-        log_welmv4_kernel_shapes_once(
-            kernel="mmq_style_expert_bias_topk_kernel",
-            layer_id=layer_id,
-            stage=stage,
-            m=num_tokens,
-            inputs={"scores": scores, "expert_bias": expert_bias},
-            outputs={"topk_weights": topk_weights, "topk_ids": topk_ids},
-            parameters={"topk": topk, "num_experts": num_experts},
-        )
     return topk_weights, topk_ids
 
 
@@ -718,9 +701,6 @@ def mmq_style_k_rms_norm(
     x: torch.Tensor,
     gamma: torch.Tensor,
     eps: float,
-    *,
-    layer_id: Optional[int] = None,
-    stage: Optional[str] = None,
 ):
     assert x.dim() == 3
     assert x.is_contiguous()
@@ -739,21 +719,6 @@ def mmq_style_k_rms_norm(
         eps,
         triton.next_power_of_2(kv_heads),
     )
-    if WELMV4_KERNEL_SHAPE_LOG_ENABLED:
-        log_welmv4_kernel_shapes_once(
-            kernel="mmq_style_k_rms_norm_kernel",
-            layer_id=layer_id,
-            stage=stage,
-            m=tokens,
-            inputs={"x": x, "gamma": gamma},
-            outputs={"output": output},
-            parameters={
-                "eps": eps,
-                "kv_heads": kv_heads,
-                "head_dim": head_dim,
-                "num_sms": num_sms,
-            },
-        )
     return output
 
 
@@ -912,7 +877,6 @@ class WelmV4InplaceRotaryEmbedding(RotaryEmbedding):
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
         last_index: Optional[torch.Tensor] = None,
-        layer_id: Optional[int] = None,
         positions_are_contiguous: bool = False,
         segment_tile_starts: Optional[torch.Tensor] = None,
     ):
@@ -955,7 +919,6 @@ class WelmV4InplaceRotaryEmbedding(RotaryEmbedding):
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
         last_index: Optional[torch.Tensor] = None,
-        layer_id: Optional[int] = None,
         positions_are_contiguous: bool = False,
         segment_tile_starts: Optional[torch.Tensor] = None,
     ):
@@ -994,7 +957,6 @@ class WelmV4InplaceRotaryEmbedding(RotaryEmbedding):
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
         last_index: Optional[torch.Tensor] = None,
-        layer_id: Optional[int] = None,
         positions_are_contiguous: bool = False,
         segment_tile_starts: Optional[torch.Tensor] = None,
     ):
@@ -1010,7 +972,6 @@ class WelmV4InplaceRotaryEmbedding(RotaryEmbedding):
             last_index=last_index,
             head_dim=self.head_size,
             rope_dim=self.rotary_dim,
-            layer_id=layer_id,
             positions_are_contiguous=positions_are_contiguous,
             segment_tile_starts=segment_tile_starts,
         )

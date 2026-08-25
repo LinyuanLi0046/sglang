@@ -117,6 +117,9 @@ _is_npu = is_npu()
 _WELM_NPU_FP32_OPROJ = _is_npu and get_bool_env_var(
     "SGLANG_WELM_FP32_OPROJ", "false"
 )
+_WELM_NPU_PREFILL_MOE_RS_NORM_AG = _is_npu and get_bool_env_var(
+    "SGLANG_NPU_PREFILL_MOE_RS_NORM_AG", "false"
+)
 _WELM_DUMP_PROCESS_DIR = None
 _WELM_DUMP_BASE_DIR = None
 _WELM_DUMP_PASS_ID = -1
@@ -2451,6 +2454,118 @@ class Qwen2MoeDecoderLayer(nn.Module):
             )
         LayerManager.set_decoder_layer(self.self_attn.kv_mirror_layer_idx, self)
 
+    def _use_npu_prefill_moe_rs_norm_ag(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        consume_partial_moe_output: bool,
+    ) -> bool:
+        """Use token-sequence parallelism around the input RMSNorm in prefill.
+
+        The producer leaves the MoE TP partial unreduced. The next layer
+        reduce-scatters it along the token dimension, applies RMSNorm to the
+        local token shard, then all-gathers the normalized output. This first
+        implementation also all-gathers the updated residual because OProj
+        still uses the legacy all-reduce and therefore produces a full-token
+        tensor.
+        """
+        if not _WELM_NPU_PREFILL_MOE_RS_NORM_AG:
+            return False
+        if is_dp_attention_enabled() or not get_moe_a2a_backend().is_none():
+            return False
+        tp_size = get_tensor_model_parallel_world_size()
+        if (
+            tp_size <= 1
+            or self.attn_tp_size != tp_size
+            or hidden_states.dim() != 2
+            or hidden_states.shape[0] == 0
+            or hidden_states.shape[0] % tp_size != 0
+            or hidden_states.dtype != torch.bfloat16
+            or not forward_batch.forward_mode.is_extend_without_speculative()
+            or forward_batch.can_run_tbo
+            or _welm_dump_enabled()
+            or bool(_welm_replay_points())
+        ):
+            return False
+        if consume_partial_moe_output:
+            return self.layer_id > 0
+        # Keep the final layer on the legacy all-reduce path until the model
+        # final RMSNorm/logits boundary also supports scattered residuals.
+        return not self.is_final_layer
+
+    def _npu_prefill_moe_reduce_scatter_norm_all_gather(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        *,
+        residual_after_layernorm: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            raise RuntimeError(
+                "NPU prefill MoE sequence parallelism requires a residual tensor."
+            )
+        if hidden_states.shape != residual.shape:
+            raise RuntimeError(
+                "NPU prefill MoE sequence parallelism requires hidden_states "
+                f"and residual to have the same shape, got "
+                f"{tuple(hidden_states.shape)} and {tuple(residual.shape)}."
+            )
+
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_parallel().tp_rank
+        num_tokens, hidden_size = hidden_states.shape
+        local_tokens = num_tokens // tp_size
+        tp_group = get_tp_group()
+
+        local_hidden_states = hidden_states.new_empty((local_tokens, hidden_size))
+        tp_group.reduce_scatter_tensor(
+            local_hidden_states,
+            hidden_states.contiguous(),
+        )
+        local_residual = residual.narrow(
+            0, tp_rank * local_tokens, local_tokens
+        ).contiguous()
+
+        if residual_after_layernorm:
+            (
+                local_hidden_states,
+                _,
+                local_residual,
+            ) = self.input_layernorm(
+                local_hidden_states,
+                local_residual,
+                residual_after_layernorm=True,
+                clone_fp32_out=True,
+                output_dtype=self.input_layernorm.weight.dtype
+                if hidden_states.dtype == torch.float32
+                else hidden_states.dtype,
+            )
+        else:
+            local_hidden_states, local_residual = self.input_layernorm(
+                local_hidden_states,
+                local_residual,
+                residual_after_layernorm=False,
+            )
+
+        gathered_hidden_states = local_hidden_states.new_empty(
+            (num_tokens, hidden_size)
+        )
+        tp_group.all_gather_into_tensor(
+            gathered_hidden_states,
+            local_hidden_states.contiguous(),
+        )
+
+        # OProj still returns FULL tokens in this first-stage implementation,
+        # so its residual input must also be FULL. Once OProj uses MM+RS this
+        # second all-gather can be removed and residual can remain scattered.
+        gathered_residual = local_residual.new_empty((num_tokens, hidden_size))
+        tp_group.all_gather_into_tensor(
+            gathered_residual,
+            local_residual.contiguous(),
+        )
+        return gathered_hidden_states, gathered_residual
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -2501,6 +2616,14 @@ class Qwen2MoeDecoderLayer(nn.Module):
             self.ppln and self.layer_id not in self.prenorm_layer_idx
         )
         use_dp_layer_communicator = is_dp_attention_enabled()
+        use_npu_prefill_moe_rs_norm_ag = (
+            not use_dp_layer_communicator
+            and self._use_npu_prefill_moe_rs_norm_ag(
+                hidden_states,
+                forward_batch,
+                consume_partial_moe_output=True,
+            )
+        )
         enable_npu_weight_prefetch = (
             _is_npu
             and not use_dp_layer_communicator
@@ -2520,6 +2643,14 @@ class Qwen2MoeDecoderLayer(nn.Module):
             )
             if residual_after_layernorm:
                 residual = hidden_states.to(torch.float32)
+        elif use_npu_prefill_moe_rs_norm_ag:
+            hidden_states, residual = (
+                self._npu_prefill_moe_reduce_scatter_norm_all_gather(
+                    hidden_states,
+                    residual,
+                    residual_after_layernorm=residual_after_layernorm,
+                )
+            )
         elif residual_after_layernorm:
             hidden_states, _, residual = self.input_layernorm(
                 hidden_states,
@@ -2800,6 +2931,17 @@ class Qwen2MoeDecoderLayer(nn.Module):
         # For DP with padding, reduce scatter can be used instead of all-reduce.
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
+        )
+        # In NPU prefill sequence-parallel mode, leave this layer's MoE output
+        # as a TP partial. The next layer consumes it with ReduceScatter before
+        # input RMSNorm. The final layer stays on the legacy AllReduce path.
+        use_reduce_scatter = use_reduce_scatter or (
+            not use_dp_layer_communicator
+            and self._use_npu_prefill_moe_rs_norm_ag(
+                hidden_states,
+                forward_batch,
+                consume_partial_moe_output=False,
+            )
         )
         self.final_mlp_experts_output = None
         self.final_mlp_shared_output = None

@@ -118,11 +118,12 @@ def _welmv4_fused_rms_norm_true_true_kernel_npu(
     for row_id in tl.range(row_begin, row_end, num_stages=2):
         offsets = row_id * cols + cols_off
         hidden = tl.load(hidden_states_ptr + offsets).to(tl.float32)
-        residual = tl.load(residual_ptr + offsets).to(tl.float32)
-        norm_input = hidden + residual
+        if residual_ptr is not None:
+            residual = tl.load(residual_ptr + offsets).to(tl.float32)
+            hidden = hidden + residual
 
         out = _welmv4_fused_rms_norm_compute_npu(
-            norm_input, gamma_shm, cols, eps
+            hidden, gamma_shm, cols, eps
         )
         tl.store(fp32_out_ptr + offsets, out)
         tl.store(out_ptr + offsets, out.to(output_dtype))
@@ -157,13 +158,14 @@ def _welmv4_fused_rms_norm_true_true_multirow_kernel_npu(
         hidden = tl.load(
             hidden_states_ptr + offsets, mask=mask, other=0.0
         ).to(tl.float32)
-        residual = tl.load(
-            residual_ptr + offsets, mask=mask, other=0.0
-        ).to(tl.float32)
-        norm_input = hidden + residual
+        if residual_ptr is not None:
+            residual = tl.load(
+                residual_ptr + offsets, mask=mask, other=0.0
+            ).to(tl.float32)
+            hidden = hidden + residual
 
         out = _welmv4_fused_rms_norm_compute_2d_npu(
-            norm_input, gamma_shm, cols, eps
+            hidden, gamma_shm, cols, eps
         )
         tl.store(fp32_out_ptr + offsets, out, mask=mask)
         tl.store(out_ptr + offsets, out.to(output_dtype), mask=mask)
@@ -244,7 +246,7 @@ def _welmv4_fused_rms_norm_false_false_multirow_kernel_npu(
 
 def welmv4_fused_rms_norm_true_true_npu(
     hidden_states: torch.Tensor,
-    residual: torch.Tensor,
+    residual: Optional[torch.Tensor],
     weight: torch.Tensor,
     eps: float,
     output_dtype: torch.dtype,

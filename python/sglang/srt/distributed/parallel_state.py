@@ -1906,7 +1906,7 @@ def get_dcp_group() -> GroupCoordinator:
 
 _MOE_DP: Optional[GroupCoordinator] = None
 _MOE_EP: Optional[GroupCoordinator] = None
-_MOE_EP_NORMAL_A2A: Optional[GroupCoordinator] = None
+_MOE_EP_NORMAL_COMM: Optional[GroupCoordinator] = None
 _MOE_TP: Optional[GroupCoordinator] = None
 
 
@@ -1920,11 +1920,11 @@ def get_moe_ep_group() -> GroupCoordinator:
     return _MOE_EP
 
 
-def get_moe_ep_normal_a2a_group() -> GroupCoordinator:
-    assert _MOE_EP_NORMAL_A2A is not None, (
-        "DeepEP normal alltoall group is not initialized"
+def get_moe_ep_normal_comm_group() -> GroupCoordinator:
+    assert _MOE_EP_NORMAL_COMM is not None, (
+        "DeepEP standalone normal communication group is not initialized"
     )
-    return _MOE_EP_NORMAL_A2A
+    return _MOE_EP_NORMAL_COMM
 
 
 def get_moe_tp_group() -> GroupCoordinator:
@@ -2485,23 +2485,31 @@ def initialize_model_parallel(
             max_world_size=max_world_size,
         )
 
-    # DeepEP's NPU normal-alltoall path and its low-latency runtime issue
-    # different collective sequences. They therefore need distinct HCCL
-    # communicators even though their EP rank membership is identical. Create
-    # the duplicate group here, where every world rank enters new_group in a
+    # DeepEP's NPU normal collective strategies and its low-latency runtime may
+    # issue different collective sequences. Keep their HCCL communicators
+    # distinct even though their EP rank membership is identical. Create the
+    # duplicate group here, where every world rank enters new_group in a
     # deterministic order, rather than lazily during the first model forward.
-    global _MOE_EP_NORMAL_A2A
-    assert _MOE_EP_NORMAL_A2A is None, (
-        "DeepEP normal alltoall group is already initialized"
+    global _MOE_EP_NORMAL_COMM
+    assert _MOE_EP_NORMAL_COMM is None, (
+        "DeepEP standalone normal communication group is already initialized"
     )
-    if _is_npu and envs.SGLANG_DEEPEP_NORMAL_USE_ALLTOALL.get():
-        _MOE_EP_NORMAL_A2A = init_model_parallel_group(
+    use_normal_alltoall = envs.SGLANG_DEEPEP_NORMAL_USE_ALLTOALL.get()
+    use_normal_allgather = envs.SGLANG_DEEPEP_NORMAL_USE_ALLGATHER.get()
+    if use_normal_alltoall and use_normal_allgather:
+        raise RuntimeError(
+            "SGLANG_DEEPEP_NORMAL_USE_ALLTOALL and "
+            "SGLANG_DEEPEP_NORMAL_USE_ALLGATHER cannot both be enabled"
+        )
+    use_separate_normal_comm = use_normal_alltoall or use_normal_allgather
+    if _is_npu and use_separate_normal_comm:
+        _MOE_EP_NORMAL_COMM = init_model_parallel_group(
             moe_ep_group_ranks,
             get_world_group().local_rank,
             backend,
             use_pynccl=False,
             use_custom_allreduce=False,
-            group_name="moe_ep_normal_a2a",
+            group_name="moe_ep_normal_comm",
             recovered_rank=recovered_rank,
             rank_offset=rank_offset,
             max_world_size=max_world_size,
@@ -2797,10 +2805,10 @@ def destroy_model_parallel():
         _DCP.destroy()
     _DCP = None
 
-    global _MOE_EP_NORMAL_A2A
-    if _MOE_EP_NORMAL_A2A:
-        _MOE_EP_NORMAL_A2A.destroy()
-    _MOE_EP_NORMAL_A2A = None
+    global _MOE_EP_NORMAL_COMM
+    if _MOE_EP_NORMAL_COMM:
+        _MOE_EP_NORMAL_COMM.destroy()
+    _MOE_EP_NORMAL_COMM = None
 
     global _MOE_EP
     if _MOE_EP:

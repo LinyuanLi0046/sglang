@@ -180,59 +180,77 @@ class DeepEPBuffer:
                 num_max_dispatch_tokens_per_rank=None,
                 num_experts=None,
                 base_group=None,
-                normal_alltoall_group=None,
-                normal_alltoall_enabled=False,
+                normal_comm_group=None,
+                normal_strategy_name=None,
             )
             buffers["deepep_ep_state"] = state
         return state
 
     @staticmethod
-    def _maybe_enable_normal_alltoall(
+    def _requested_normal_strategy(deepep_mode: DeepEPMode) -> Optional[str]:
+        use_alltoall = envs.SGLANG_DEEPEP_NORMAL_USE_ALLTOALL.get()
+        use_allgather = envs.SGLANG_DEEPEP_NORMAL_USE_ALLGATHER.get()
+        if use_alltoall and use_allgather:
+            raise RuntimeError(
+                "SGLANG_DEEPEP_NORMAL_USE_ALLTOALL and "
+                "SGLANG_DEEPEP_NORMAL_USE_ALLGATHER cannot both be enabled"
+            )
+        if not deepep_mode.enable_normal():
+            return None
+        if use_alltoall:
+            return "alltoall"
+        if use_allgather:
+            return "allgather"
+        return None
+
+    @classmethod
+    def _maybe_enable_separate_normal_strategy(
+        cls,
         buffer,
         deepep_mode: DeepEPMode,
-        normal_alltoall_group: Optional[dist.ProcessGroup],
+        normal_comm_group: Optional[dist.ProcessGroup],
     ):
-        if (
-            not envs.SGLANG_DEEPEP_NORMAL_USE_ALLTOALL.get()
-            or not deepep_mode.enable_normal()
-        ):
+        normal_strategy_name = cls._requested_normal_strategy(deepep_mode)
+        if normal_strategy_name is None:
             return
 
         if not _is_npu:
             raise RuntimeError(
-                "SGLANG_DEEPEP_NORMAL_USE_ALLTOALL is only supported on NPU"
+                "A standalone DeepEP normal communication group is only "
+                "supported on NPU"
             )
         if _use_zbal:
             raise RuntimeError(
-                "SGLANG_DEEPEP_NORMAL_USE_ALLTOALL requires the DeepEP Buffer; "
-                "disable ZBAL first"
+                f"DeepEP normal {normal_strategy_name} requires the DeepEP "
+                "Buffer; disable ZBAL first"
             )
 
         deep_use_mode = os.getenv("DEEP_USE_MODE", "default").lower()
-        if deep_use_mode == "alltoall":
+        if deep_use_mode != "default":
             raise RuntimeError(
-                "SGLANG_DEEPEP_NORMAL_USE_ALLTOALL=1 must not be combined "
-                "with DEEP_USE_MODE=alltoall because the latter also replaces "
-                "the low-latency strategy"
+                f"The standalone DeepEP normal {normal_strategy_name} selector "
+                "requires DEEP_USE_MODE=default; the strategy will be bound "
+                "to its dedicated communication group after Buffer construction"
             )
 
-        if normal_alltoall_group is None:
+        if normal_comm_group is None:
             raise RuntimeError(
-                "DeepEP normal alltoall requires a standalone HCCL process group"
+                f"DeepEP normal {normal_strategy_name} requires a standalone "
+                "HCCL process group"
             )
 
         original_group = buffer.group
-        if normal_alltoall_group is original_group:
+        if normal_comm_group is original_group:
             raise RuntimeError(
-                "DeepEP normal alltoall and low-latency must not share a "
+                "DeepEP normal communication and low-latency must not share a "
                 "process group"
             )
         if (
-            normal_alltoall_group.size() != original_group.size()
-            or normal_alltoall_group.rank() != original_group.rank()
+            normal_comm_group.size() != original_group.size()
+            or normal_comm_group.rank() != original_group.rank()
         ):
             raise RuntimeError(
-                "DeepEP normal alltoall group must have the same rank layout "
+                "DeepEP normal communication group must have the same rank layout "
                 "as the low-latency group"
             )
 
@@ -240,7 +258,7 @@ class DeepEPBuffer:
         if init_normal_strategy is None:
             raise RuntimeError(
                 "The installed deep_ep package does not support the normal "
-                "alltoall strategy"
+                f"{normal_strategy_name} strategy"
             )
 
         # Buffer construction binds deep_ep_cpp and the low-latency strategy to
@@ -249,39 +267,54 @@ class DeepEPBuffer:
         # process-wide state until this method returns.
         original_low_latency_strategy = buffer.low_latency_strategy
         try:
-            buffer.group = normal_alltoall_group
-            init_normal_strategy("alltoall")
+            buffer.group = normal_comm_group
+            init_normal_strategy(normal_strategy_name)
         finally:
             buffer.group = original_group
 
         if buffer.low_latency_strategy is not original_low_latency_strategy:
             raise RuntimeError(
-                "Enabling DeepEP normal alltoall unexpectedly replaced the "
-                "low-latency strategy"
+                f"Enabling DeepEP normal {normal_strategy_name} unexpectedly "
+                "replaced the low-latency strategy"
             )
         if buffer.low_latency_strategy.group is not original_group:
             raise RuntimeError(
                 "DeepEP low-latency strategy did not remain on its original "
                 "process group"
             )
-        if buffer.normal_strategy.group is not normal_alltoall_group:
+        if buffer.normal_strategy.group is not normal_comm_group:
             raise RuntimeError(
-                "DeepEP normal alltoall strategy did not bind to its standalone "
-                "process group"
+                f"DeepEP normal {normal_strategy_name} strategy did not bind "
+                "to its standalone process group"
+            )
+
+        get_normal_strategy_name = getattr(
+            buffer.normal_strategy, "get_name", None
+        )
+        actual_normal_strategy_name = (
+            get_normal_strategy_name()
+            if callable(get_normal_strategy_name)
+            else getattr(buffer.normal_strategy, "name", None)
+        )
+        if (
+            actual_normal_strategy_name is not None
+            and actual_normal_strategy_name != normal_strategy_name
+        ):
+            raise RuntimeError(
+                f"Requested DeepEP normal strategy {normal_strategy_name!r}, "
+                f"but initialized {actual_normal_strategy_name!r}"
             )
 
         original_comm_name = None
         normal_comm_name = None
         try:
             original_backend = original_group._get_backend(torch.device("npu"))
-            normal_backend = normal_alltoall_group._get_backend(
-                torch.device("npu")
-            )
+            normal_backend = normal_comm_group._get_backend(torch.device("npu"))
             original_comm_name = original_backend.get_hccl_comm_name(
                 original_group.rank()
             )
             normal_comm_name = normal_backend.get_hccl_comm_name(
-                normal_alltoall_group.rank()
+                normal_comm_group.rank()
             )
         except Exception as exc:
             logger.warning(
@@ -293,14 +326,15 @@ class DeepEPBuffer:
             and original_comm_name == normal_comm_name
         ):
             raise RuntimeError(
-                "DeepEP normal alltoall and low-latency resolved to the same "
+                "DeepEP normal communication and low-latency resolved to the same "
                 "HCCL communicator"
             )
 
         logger.info(
-            "Enabled DeepEP normal alltoall on a standalone process group; "
+            "Enabled DeepEP normal %s on a standalone process group; "
             "low-latency strategy is unchanged (normal_comm=%s, "
             "low_latency_comm=%s)",
+            normal_strategy_name,
             normal_comm_name,
             original_comm_name,
         )
@@ -314,29 +348,27 @@ class DeepEPBuffer:
         deepep_mode: DeepEPMode,
         num_max_dispatch_tokens_per_rank: int = -1,
         num_experts: int = -1,
-        normal_alltoall_group: Optional[dist.ProcessGroup] = None,
+        normal_comm_group: Optional[dist.ProcessGroup] = None,
     ):
         state = cls._state()
+        requested_normal_strategy = cls._requested_normal_strategy(deepep_mode)
         if state.buffer is not None:
-            requested_normal_alltoall = (
-                envs.SGLANG_DEEPEP_NORMAL_USE_ALLTOALL.get()
-                and deepep_mode.enable_normal()
-            )
             if state.base_group is not group:
                 raise RuntimeError(
                     "DeepEP process-wide Buffer was requested with a different "
                     "base process group"
                 )
-            if state.normal_alltoall_enabled != requested_normal_alltoall:
+            if state.normal_strategy_name != requested_normal_strategy:
                 raise RuntimeError(
-                    "DeepEP normal alltoall mode changed after Buffer initialization"
+                    "DeepEP standalone normal strategy changed after Buffer "
+                    "initialization"
                 )
             if (
-                requested_normal_alltoall
-                and state.normal_alltoall_group is not normal_alltoall_group
+                requested_normal_strategy is not None
+                and state.normal_comm_group is not normal_comm_group
             ):
                 raise RuntimeError(
-                    "DeepEP normal alltoall process group changed after Buffer "
+                    "DeepEP normal communication group changed after Buffer "
                     "initialization"
                 )
             return state.buffer
@@ -427,17 +459,14 @@ class DeepEPBuffer:
             buffer_kwargs["use_fabric"] = True
 
         buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
-        cls._maybe_enable_normal_alltoall(
-            buffer, deepep_mode, normal_alltoall_group
+        cls._maybe_enable_separate_normal_strategy(
+            buffer, deepep_mode, normal_comm_group
         )
         state.buffer = buffer
         state.base_group = group
-        state.normal_alltoall_enabled = (
-            envs.SGLANG_DEEPEP_NORMAL_USE_ALLTOALL.get()
-            and deepep_mode.enable_normal()
-        )
-        state.normal_alltoall_group = (
-            normal_alltoall_group if state.normal_alltoall_enabled else None
+        state.normal_strategy_name = requested_normal_strategy
+        state.normal_comm_group = (
+            normal_comm_group if requested_normal_strategy is not None else None
         )
         return buffer
 
@@ -513,7 +542,7 @@ class _DeepEPDispatcherImplBase:
         hidden_size: int,
         params_dtype: torch.dtype,
         deepep_mode: DeepEPMode,
-        normal_alltoall_group: Optional[torch.distributed.ProcessGroup] = None,
+        normal_comm_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         if not use_deepep:
             raise ImportError(
@@ -529,7 +558,7 @@ class _DeepEPDispatcherImplBase:
         self.hidden_size = hidden_size
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
-        self.normal_alltoall_group = normal_alltoall_group
+        self.normal_comm_group = normal_comm_group
 
         self.params_bytes = 2
         # A large value will lead to large memory occupation, thus users should change it accordingly
@@ -809,7 +838,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             self.deepep_mode,
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
-            normal_alltoall_group=self.normal_alltoall_group,
+            normal_comm_group=self.normal_comm_group,
         )
 
 
@@ -1014,7 +1043,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             self.deepep_mode,
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
-            normal_alltoall_group=self.normal_alltoall_group,
+            normal_comm_group=self.normal_comm_group,
         )
 
 
@@ -1039,21 +1068,19 @@ class DeepEPDispatcher(BaseDispatcher):
         deepep_mode: DeepEPMode = DeepEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
-        normal_alltoall_group: Optional[torch.distributed.ProcessGroup] = None,
+        normal_comm_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super().__init__()
 
         self.deepep_mode = deepep_mode
 
-        if (
-            normal_alltoall_group is None
-            and _is_npu
-            and envs.SGLANG_DEEPEP_NORMAL_USE_ALLTOALL.get()
-            and deepep_mode.enable_normal()
-        ):
-            from sglang.srt.distributed import get_moe_ep_normal_a2a_group
+        requested_normal_strategy = DeepEPBuffer._requested_normal_strategy(
+            deepep_mode
+        )
+        if normal_comm_group is None and _is_npu and requested_normal_strategy:
+            from sglang.srt.distributed import get_moe_ep_normal_comm_group
 
-            normal_alltoall_group = get_moe_ep_normal_a2a_group().device_group
+            normal_comm_group = get_moe_ep_normal_comm_group().device_group
 
         common_kwargs = dict(
             group=group,
@@ -1064,7 +1091,7 @@ class DeepEPDispatcher(BaseDispatcher):
             hidden_size=hidden_size,
             params_dtype=params_dtype,
             deepep_mode=deepep_mode,
-            normal_alltoall_group=normal_alltoall_group,
+            normal_comm_group=normal_comm_group,
         )
 
         if self.deepep_mode.enable_low_latency():

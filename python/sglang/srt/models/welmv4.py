@@ -94,6 +94,8 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_npu, make_layers
 
 if is_npu():
+    import torch_npu
+
     from sglang.srt.hardware_backend.npu.cmo import (
         prepare_weight_cache,
         wait_cmo_stream,
@@ -123,6 +125,23 @@ _WELM_NPU_PREFILL_MOE_RS_NORM_AG = _is_npu and get_bool_env_var(
 _WELM_NPU_PREFILL_ATTN_RS_NORM_AG = _is_npu and get_bool_env_var(
     "SGLANG_NPU_PREFILL_ATTN_RS_NORM_AG", "false"
 )
+_WELM_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER = (
+    _is_npu
+    and get_bool_env_var(
+        "SGLANG_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER", "false"
+    )
+)
+_WELM_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER_MIN_M = max(
+    1,
+    int(
+        os.getenv(
+            "SGLANG_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER_MIN_M", "128"
+        )
+    ),
+)
+_WELM_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER_COMM_MODE = os.getenv(
+    "SGLANG_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER_COMM_MODE", "ccu"
+).strip().lower()
 _WELM_DUMP_PROCESS_DIR = None
 _WELM_DUMP_BASE_DIR = None
 _WELM_DUMP_PASS_ID = -1
@@ -1763,6 +1782,70 @@ class Qwen2MoeAttention(nn.Module):
             "_welm_fp32_o_proj_weight", None, persistent=False
         )
         self.register_buffer("_welm_fp32_o_proj_bias", None, persistent=False)
+        self._welm_npu_o_proj_hcom_name = None
+        self._welm_use_npu_o_proj_matmul_reduce_scatter = False
+        if _WELM_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER:
+            if not (
+                _WELM_NPU_PREFILL_MOE_RS_NORM_AG
+                and _WELM_NPU_PREFILL_ATTN_RS_NORM_AG
+            ):
+                raise RuntimeError(
+                    "SGLANG_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER requires "
+                    "both prefill RS+Norm+AG switches to be enabled."
+                )
+            if _WELM_NPU_FP32_OPROJ:
+                raise RuntimeError(
+                    "SGLANG_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER cannot "
+                    "be used with SGLANG_WELM_FP32_OPROJ."
+                )
+            if is_dp_attention_enabled():
+                raise RuntimeError(
+                    "WeLM OProj MatMulReduceScatter only supports pure TP."
+                )
+            if self.o_proj.tp_size <= 1:
+                raise RuntimeError(
+                    "WeLM OProj MatMulReduceScatter requires TP > 1."
+                )
+            if self.o_proj.tp_size != get_tensor_model_parallel_world_size():
+                raise RuntimeError(
+                    "WeLM OProj MatMulReduceScatter requires OProj TP size "
+                    "to match the global tensor-parallel size."
+                )
+            if not self.o_proj.reduce_results:
+                raise RuntimeError(
+                    "WeLM OProj MatMulReduceScatter requires a reducing "
+                    "RowParallelLinear projection."
+                )
+            if (
+                self.o_proj.quant_method.__class__.__name__
+                != "UnquantizedLinearMethod"
+            ):
+                raise RuntimeError(
+                    "WeLM OProj MatMulReduceScatter currently supports only "
+                    "unquantized BF16 OProj weights."
+                )
+            if not hasattr(torch_npu, "npu_mm_reduce_scatter_base"):
+                raise RuntimeError(
+                    "The installed torch_npu does not provide "
+                    "npu_mm_reduce_scatter_base."
+                )
+            if (
+                _WELM_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER_COMM_MODE
+                not in ("ccu", "aiv")
+            ):
+                raise RuntimeError(
+                    "WeLM OProj MatMulReduceScatterV2 requires comm mode "
+                    "'ccu' on Ascend 950 or 'aiv' on Atlas A2/A3, got "
+                    f"{_WELM_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER_COMM_MODE}."
+                )
+            self._welm_use_npu_o_proj_matmul_reduce_scatter = True
+            if self.layer_idx == 0:
+                logger.warning(
+                    "WeLM NPU prefill OProj MatMulReduceScatterV2 is enabled "
+                    "with comm_mode=%s and min_m=%d.",
+                    _WELM_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER_COMM_MODE,
+                    _WELM_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER_MIN_M,
+                )
         if _WELM_NPU_FP32_OPROJ:
             if is_dp_attention_enabled():
                 raise RuntimeError(
@@ -1879,6 +1962,40 @@ class Qwen2MoeAttention(nn.Module):
             return self.qkv_proj_weight
         return self._linear_prefetch_tensors(self.qkv_proj)
 
+    def _get_welm_npu_o_proj_hcom_name(self) -> str:
+        if self._welm_npu_o_proj_hcom_name is None:
+            process_group = get_tp_group().device_group
+            backend = process_group._get_backend(torch.device("npu"))
+            self._welm_npu_o_proj_hcom_name = backend.get_hccl_comm_name(
+                process_group.rank()
+            )
+        return self._welm_npu_o_proj_hcom_name
+
+    def should_use_npu_o_proj_matmul_reduce_scatter(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        enable_sequence_parallel: bool,
+    ) -> bool:
+        if not (
+            enable_sequence_parallel
+            and self._welm_use_npu_o_proj_matmul_reduce_scatter
+        ):
+            return False
+        tp_size = self.o_proj.tp_size
+        weight = self.o_proj.weight
+        return (
+            hidden_states.dim() == 2
+            and hidden_states.shape[0]
+            >= _WELM_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER_MIN_M
+            and hidden_states.shape[0] % tp_size == 0
+            and hidden_states.dtype == torch.bfloat16
+            and weight.dim() == 2
+            and weight.shape[1] == self.o_proj.input_size_per_partition
+            and weight.dtype == hidden_states.dtype
+            and self.o_proj.input_is_parallel
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1886,6 +2003,7 @@ class Qwen2MoeAttention(nn.Module):
         forward_batch: ForwardBatch,
         skip_o_norm: bool = False,
         skip_o_proj_all_reduce: bool = False,
+        use_o_proj_matmul_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         dump_this_layer = _welm_should_dump_layer(self.layer_idx)
         dump_prefix = f"model.layers.{self.layer_idx}.self_attn"
@@ -2237,6 +2355,46 @@ class Qwen2MoeAttention(nn.Module):
             if self.o_proj.tp_size > 1 and not skip_o_proj_all_reduce:
                 output_fp32 = tensor_model_parallel_all_reduce(output_fp32)
             output = output_fp32.to(attn_output.dtype)
+        elif use_o_proj_matmul_reduce_scatter:
+            if not skip_o_proj_all_reduce:
+                raise RuntimeError(
+                    "OProj MatMulReduceScatter requires the standalone "
+                    "RowParallelLinear AllReduce to be disabled."
+                )
+            if (
+                attn_output.dim() != 2
+                or attn_output.shape[1] != self.o_proj.weight.shape[1]
+                or attn_output.dtype != self.o_proj.weight.dtype
+            ):
+                raise RuntimeError(
+                    "OProj MatMulReduceScatter received incompatible input/"
+                    f"weight metadata: shape={tuple(attn_output.shape)}/"
+                    f"{tuple(self.o_proj.weight.shape)}, dtype="
+                    f"{attn_output.dtype}/{self.o_proj.weight.dtype}."
+                )
+            # RowParallelLinear stores [N, K]. MatMulReduceScatterV2 accepts
+            # the transpose view [K, N], avoiding a materialized weight copy.
+            # Add bias on TP rank 0 only so the ReduceScatter sum contains it
+            # exactly once, matching RowParallelLinear's original semantics.
+            o_proj_bias = (
+                self.o_proj.bias
+                if self.o_proj.tp_rank == 0 and not self.o_proj.skip_bias_add
+                else None
+            )
+            # op-plugin dispatches non-ai_cpu communication modes to
+            # aclnnMatmulReduceScatterV2. Ascend 950 uses the CCU mode here.
+            output = torch_npu.npu_mm_reduce_scatter_base(
+                attn_output.contiguous(),
+                self.o_proj.weight.transpose(0, 1),
+                self._get_welm_npu_o_proj_hcom_name(),
+                self.o_proj.tp_size,
+                reduce_op="sum",
+                bias=o_proj_bias,
+                comm_turn=0,
+                comm_mode=(
+                    _WELM_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER_COMM_MODE
+                ),
+            )
         else:
             output, _ = self.o_proj(
                 attn_output,
@@ -2630,40 +2788,59 @@ class Qwen2MoeDecoderLayer(nn.Module):
         *,
         use_mmq_norm_after_attn: bool,
         need_fp32_norm_after_attn: bool,
+        input_is_reduce_scattered: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Consume OProj TP partials with token RS, local norms and BF16 AG."""
         if residual is None:
             raise RuntimeError(
                 "NPU prefill Attention sequence parallelism requires a residual."
             )
-        if hidden_states.dim() != 2 or residual.dim() != 2:
+        if (
+            hidden_states.dim() != 2
+            or residual.dim() != 2
+            or hidden_states.shape[1] != residual.shape[1]
+        ):
             raise RuntimeError(
-                "NPU prefill Attention sequence parallelism requires 2D tensors."
+                "NPU prefill Attention sequence parallelism requires "
+                "compatible 2D tensors."
             )
 
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_parallel().tp_rank
-        num_tokens, hidden_size = hidden_states.shape
-        local_tokens = num_tokens // tp_size
         tp_group = get_tp_group()
+        if input_is_reduce_scattered:
+            local_tokens, hidden_size = hidden_states.shape
+            num_tokens = local_tokens * tp_size
+            local_hidden_states = hidden_states.contiguous()
+        else:
+            num_tokens, hidden_size = hidden_states.shape
+            if num_tokens % tp_size != 0:
+                raise RuntimeError(
+                    "NPU prefill Attention sequence parallelism requires the "
+                    f"token count {num_tokens} to be divisible by TP {tp_size}."
+                )
+            local_tokens = num_tokens // tp_size
+            local_hidden_states = hidden_states.new_empty(
+                (local_tokens, hidden_size)
+            )
+            tp_group.reduce_scatter_tensor(
+                local_hidden_states,
+                hidden_states.contiguous(),
+            )
 
-        local_hidden_states = hidden_states.new_empty((local_tokens, hidden_size))
-        tp_group.reduce_scatter_tensor(
-            local_hidden_states,
-            hidden_states.contiguous(),
-        )
-        if residual.shape == hidden_states.shape:
+        global_shape = (num_tokens, hidden_size)
+        local_shape = (local_tokens, hidden_size)
+        if residual.shape == global_shape:
             local_residual = residual.narrow(
                 0, tp_rank * local_tokens, local_tokens
             ).contiguous()
-        elif residual.shape == local_hidden_states.shape:
+        elif residual.shape == local_shape:
             local_residual = residual.contiguous()
         else:
             raise RuntimeError(
                 "NPU prefill Attention sequence parallelism expected a full "
                 f"or token-sharded residual, got {tuple(residual.shape)} for "
-                f"global/local shapes {tuple(hidden_states.shape)}/"
-                f"{tuple(local_hidden_states.shape)}."
+                f"global/local shapes {global_shape}/{local_shape}."
             )
 
         if use_mmq_norm_after_attn:
@@ -2842,6 +3019,12 @@ class Qwen2MoeDecoderLayer(nn.Module):
         use_dp_o_norm_after_attn = (
             is_dp_attention_enabled() and self.self_attn.use_o_norm
         )
+        use_npu_prefill_oproj_matmul_reduce_scatter = (
+            self.self_attn.should_use_npu_o_proj_matmul_reduce_scatter(
+                hidden_states,
+                enable_sequence_parallel=use_npu_prefill_attn_rs_norm_ag,
+            )
+        )
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
@@ -2856,6 +3039,9 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     or use_npu_prefill_attn_rs_norm_ag
                 ),
                 skip_o_proj_all_reduce=use_npu_prefill_attn_rs_norm_ag,
+                use_o_proj_matmul_reduce_scatter=(
+                    use_npu_prefill_oproj_matmul_reduce_scatter
+                ),
             )
         if (
             forward_batch.enable_kv_mirror
@@ -2956,6 +3142,9 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 residual,
                 use_mmq_norm_after_attn=use_mmq_norm_after_attn,
                 need_fp32_norm_after_attn=need_fp32_norm_after_attn,
+                input_is_reduce_scattered=(
+                    use_npu_prefill_oproj_matmul_reduce_scatter
+                ),
             )
         elif use_mmq_norm_after_attn:
             # With attention DP, RowParallelLinear deliberately leaves the

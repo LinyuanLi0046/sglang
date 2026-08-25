@@ -15,6 +15,12 @@ from sglang.srt.layers.welmv4_shape_logger import (
 )
 from sglang.srt.utils import is_npu
 
+if is_npu():
+    from sglang.srt.layers.welmv4_npu_op import (
+        welmv4_fused_rms_norm_false_false_npu,
+        welmv4_fused_rms_norm_true_true_npu,
+    )
+
 if TYPE_CHECKING:
     from sglang.kernels.ops.attention.rope import FusedSetKVBufferArg
 
@@ -549,8 +555,60 @@ class WelmV4FusedRMSNorm(MultiPlatformOp):
         else:
             return output, out_residual
 
-    def forward_npu(self, *args, **kwargs):
-        return self.forward_cuda(*args, **kwargs)
+    def forward_npu(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        residual_after_layernorm: bool = False,
+        clone_fp32_out: bool = False,
+        output_dtype: Optional[torch.dtype] = None,
+    ):
+        requested_output_dtype = output_dtype or x.dtype
+        can_use_specialized_kernel = (
+            self.hidden_size == 2048
+            and x.dim() == 2
+            and x.shape[-1] == 2048
+            and x.shape[0] > 0
+            and x.dtype == torch.bfloat16
+            and x.is_contiguous()
+            and self.weight.dtype == torch.bfloat16
+            and self.weight.is_contiguous()
+            and self.weight.device == x.device
+            and residual is not None
+            and residual.shape == x.shape
+            and residual.dtype == torch.float32
+            and residual.is_contiguous()
+            and residual.device == x.device
+            and requested_output_dtype == torch.bfloat16
+        )
+        if can_use_specialized_kernel:
+            num_vector_cores = self.num_sms // 8
+            if residual_after_layernorm and clone_fp32_out:
+                return welmv4_fused_rms_norm_true_true_npu(
+                    x,
+                    residual,
+                    self.weight,
+                    self.eps,
+                    requested_output_dtype,
+                    num_vector_cores,
+                )
+            if not residual_after_layernorm and not clone_fp32_out:
+                return welmv4_fused_rms_norm_false_false_npu(
+                    x,
+                    residual,
+                    self.weight,
+                    self.eps,
+                    requested_output_dtype,
+                    num_vector_cores,
+                )
+
+        return self.forward_cuda(
+            x,
+            residual,
+            residual_after_layernorm,
+            clone_fp32_out,
+            output_dtype,
+        )
 
 
 @triton.jit

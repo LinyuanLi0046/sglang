@@ -22,9 +22,7 @@ class ConsecutivePrefillLimiter:
 
     def on_prefill(self) -> None:
         if self._limit > 0:
-            self._consecutive_prefill_batches = min(
-                self._consecutive_prefill_batches + 1, self._limit
-            )
+            self._consecutive_prefill_batches += 1
 
     def on_decode(self) -> None:
         self._consecutive_prefill_batches = 0

@@ -17,6 +17,7 @@
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -141,6 +142,143 @@ _WELM_REPLAY_POINT_ALIASES = {
     "norm_input": "norm_inputs",
     "norm_after_attention": "norm_after_attn",
 }
+
+
+def _welm_weight_load_trace_enabled() -> bool:
+    if not get_bool_env_var("SGLANG_WELMV4_TRACE_WEIGHT_LOADING", "false"):
+        return False
+
+    tp_rank = get_parallel().tp_rank
+    trace_tp_rank = int(
+        os.getenv("SGLANG_WELMV4_TRACE_WEIGHT_LOADING_TP_RANK", "0")
+    )
+    return tp_rank == trace_tp_rank
+
+
+def _welm_trace_weight_loading(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    """Optionally trace each checkpoint tensor around its weight loader.
+
+    Code after ``yield`` runs only after ``load_weights`` has finished handling
+    that tensor and asks the upstream iterator for the next one. Therefore, a
+    BEGIN line without its matching END line identifies the exact tensor whose
+    weight loader is blocked.
+    """
+    if not _welm_weight_load_trace_enabled():
+        yield from weights
+        return
+
+    tp_rank = get_parallel().tp_rank
+    for tensor_index, (name, loaded_weight) in enumerate(weights):
+        start = time.perf_counter()
+        tensor_bytes = loaded_weight.numel() * loaded_weight.element_size()
+        logger.warning(
+            "[WeLMv4 weight-load trace] BEGIN index=%d tp_rank=%d name=%s "
+            "shape=%s dtype=%s device=%s contiguous=%s storage_offset=%d "
+            "tensor_bytes=%d",
+            tensor_index,
+            tp_rank,
+            name,
+            tuple(loaded_weight.shape),
+            loaded_weight.dtype,
+            loaded_weight.device,
+            loaded_weight.is_contiguous(),
+            loaded_weight.storage_offset(),
+            tensor_bytes,
+        )
+        yield name, loaded_weight
+        logger.warning(
+            "[WeLMv4 weight-load trace] END index=%d tp_rank=%d name=%s "
+            "elapsed_ms=%.3f",
+            tensor_index,
+            tp_rank,
+            name,
+            (time.perf_counter() - start) * 1000.0,
+        )
+
+
+def _welm_trace_stacked_weight_target(
+    checkpoint_name: str,
+    mapped_name: str,
+    loaded_weight: torch.Tensor,
+    param: nn.Parameter,
+    weight_loader: Any,
+    shard_id: Union[str, int],
+) -> None:
+    """Log the effective TP source and fused target views before a copy."""
+    if not _welm_weight_load_trace_enabled():
+        return
+
+    owner = getattr(weight_loader, "__self__", None)
+    source_view = loaded_weight
+    target_view = param.data
+    output_dim = getattr(param, "output_dim", None)
+
+    if (
+        type(owner).__name__ == "QKVParallelLinear"
+        and shard_id in ("q", "k", "v")
+        and output_dim is not None
+    ):
+        if shard_id == "q":
+            shard_offset = 0
+            shard_size = owner.num_heads * owner.head_size
+            source_shard_id = owner.tp_rank
+        elif shard_id == "k":
+            shard_offset = owner.num_heads * owner.head_size
+            shard_size = owner.num_kv_heads * owner.head_size
+            source_shard_id = owner.tp_rank // owner.num_kv_head_replicas
+        else:
+            shard_offset = (owner.num_heads + owner.num_kv_heads) * owner.head_size
+            shard_size = owner.num_kv_heads * owner.v_head_size
+            source_shard_id = owner.tp_rank // owner.num_kv_head_replicas
+
+        target_view = target_view.narrow(output_dim, shard_offset, shard_size)
+        if not owner.use_presharded_weights:
+            source_view = source_view.narrow(
+                output_dim, source_shard_id * shard_size, shard_size
+            )
+
+    quant_method = getattr(owner, "quant_method", None)
+    scheme = getattr(owner, "scheme", None)
+    logger.warning(
+        "[WeLMv4 weight-load trace] TARGET checkpoint_name=%s mapped_name=%s "
+        "shard_id=%s tp_rank=%d owner=%s param_class=%s quant_method=%s "
+        "scheme=%s output_dim=%s full_target_shape=%s full_target_dtype=%s "
+        "full_target_device=%s full_target_data_ptr=%#x "
+        "source_view_shape=%s source_view_dtype=%s source_view_contiguous=%s "
+        "source_view_storage_offset=%d source_view_storage_bytes=%d "
+        "source_view_data_ptr=%#x target_view_shape=%s target_view_dtype=%s "
+        "target_view_contiguous=%s target_view_storage_offset=%d "
+        "target_view_storage_bytes=%d target_view_data_ptr=%#x",
+        checkpoint_name,
+        mapped_name,
+        shard_id,
+        get_parallel().tp_rank,
+        type(owner).__name__,
+        type(param).__name__,
+        type(quant_method).__name__,
+        type(scheme).__name__,
+        output_dim,
+        tuple(param.shape),
+        param.dtype,
+        param.device,
+        param.data_ptr(),
+        tuple(source_view.shape),
+        source_view.dtype,
+        source_view.is_contiguous(),
+        source_view.storage_offset(),
+        source_view.untyped_storage().nbytes(),
+        source_view.data_ptr(),
+        tuple(target_view.shape),
+        target_view.dtype,
+        target_view.is_contiguous(),
+        target_view.storage_offset(),
+        target_view.untyped_storage().nbytes(),
+        target_view.data_ptr(),
+    )
+
+
 _WELM_REPLAY_CONFIGURED_POINTS = frozenset(
     _WELM_REPLAY_POINT_ALIASES.get(point, point)
     for point in (
@@ -546,6 +684,41 @@ class KVMirrorManager:
         return kv_activation
 
 
+class _WelmDerivedMXFP8Linear(nn.Module):
+    """A load-time derived projection that reuses an existing MXFP8 method.
+
+    Target-model source and mirror layers can rewrite their existing qkv_proj in
+    place.  A NextN mirror consumer is the sole exception: extend needs Q only,
+    while decode/verify still needs its original full QKV projection.  This
+    small holder keeps the Q-only weights for that second execution mode without
+    introducing another quantization implementation.
+    """
+
+    def __init__(
+        self,
+        source_proj: nn.Module,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        bias: Optional[torch.Tensor],
+    ) -> None:
+        super().__init__()
+        self.quant_method = source_proj.quant_method
+        self.scheme = source_proj.scheme
+        self.weight = nn.Parameter(weight.clone(), requires_grad=False)
+        self.weight_scale = nn.Parameter(
+            weight_scale.clone(), requires_grad=False
+        )
+        if bias is None:
+            self.register_parameter("bias", None)
+        else:
+            self.bias = nn.Parameter(bias.clone(), requires_grad=False)
+
+    def forward(
+        self, hidden_states: torch.Tensor
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        return self.quant_method.apply(self, hidden_states, self.bias), None
+
+
 class LayerManager:
     decoder_layer = dict()
     num_nextn_predict_layers: int = 0
@@ -555,6 +728,49 @@ class LayerManager:
     @staticmethod
     def set_decoder_layer(layer_idx, decoder_layer):
         LayerManager.decoder_layer[layer_idx] = decoder_layer
+
+    @staticmethod
+    def _qkv_quant_kind(qkv_proj: nn.Module) -> str:
+        quant_method_name = type(qkv_proj.quant_method).__name__
+        if quant_method_name == "UnquantizedLinearMethod":
+            return "unquantized"
+        if (
+            quant_method_name == "ModelSlimLinearMethod"
+            and type(getattr(qkv_proj, "scheme", None)).__name__
+            == "ModelSlimMXFP8Scheme"
+        ):
+            return "modelslim_mxfp8"
+        scheme_name = type(getattr(qkv_proj, "scheme", None)).__name__
+        return f"unsupported:{quant_method_name}/{scheme_name}"
+
+    @staticmethod
+    def _replace_qkv_with_raw_mxfp8(
+        qkv_proj: nn.Module,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        output_partition_sizes: List[int],
+    ) -> None:
+        """Replace a loaded QKV payload before ModelSlim runtime relayout."""
+        qkv_proj.weight = nn.Parameter(weight.clone(), requires_grad=False)
+        qkv_proj.weight_scale = nn.Parameter(
+            weight_scale.clone(), requires_grad=False
+        )
+        if bias is None:
+            qkv_proj.bias = None
+        else:
+            qkv_proj.bias = nn.Parameter(bias.clone(), requires_grad=False)
+
+        # ColumnParallelLinear.forward uses the actual weight shape.  Keep its
+        # metadata consistent as well for prefetch, debug output and optional
+        # consumers such as LoRA that inspect partition widths after loading.
+        local_output_size = int(weight.shape[0])
+        qkv_proj.output_size_per_partition = local_output_size
+        qkv_proj.output_partition_sizes = list(output_partition_sizes)
+        qkv_proj.output_size = local_output_size * qkv_proj.tp_size
+        qkv_proj.output_sizes = [
+            int(size) * qkv_proj.tp_size for size in output_partition_sizes
+        ]
 
     @staticmethod
     def post_init(kv_mirror_layers, kv_mirror_imitated_layers, is_nextn=False):
@@ -572,6 +788,27 @@ class LayerManager:
                 imitated_layer_id
             ].self_attn
 
+            mirror_quant_kind = LayerManager._qkv_quant_kind(
+                mirror_layer_attn.qkv_proj
+            )
+            imitated_quant_kind = LayerManager._qkv_quant_kind(
+                imitated_layer_attn.qkv_proj
+            )
+            if mirror_quant_kind != imitated_quant_kind:
+                raise ValueError(
+                    "WeLMv4 KV-mirror source and consumer QKV projections must "
+                    "use the same precision, but pair "
+                    f"{imitated_layer_id}->{mirror_layer_id} uses "
+                    f"{imitated_quant_kind} and {mirror_quant_kind}."
+                )
+            if mirror_quant_kind.startswith("unsupported:"):
+                raise NotImplementedError(
+                    "WeLMv4 KV-mirror projection rewriting currently supports "
+                    "only unquantized or ModelSlim W8A8_MXFP8 QKV weights; pair "
+                    f"{imitated_layer_id}->{mirror_layer_id} uses "
+                    f"{mirror_quant_kind.removeprefix('unsupported:')}."
+                )
+
             mirror_qkv_proj_weight = mirror_layer_attn.qkv_proj.weight
             mirror_qkv_proj_bias = getattr(mirror_layer_attn.qkv_proj, "bias", None)
             imitated_qkv_proj_weight = imitated_layer_attn.qkv_proj.weight
@@ -579,6 +816,94 @@ class LayerManager:
             assert (mirror_qkv_proj_bias is not None) == (
                 imitated_qkv_proj_bias is not None
             )
+
+            if mirror_quant_kind == "modelslim_mxfp8":
+                mirror_qkv_proj = mirror_layer_attn.qkv_proj
+                imitated_qkv_proj = imitated_layer_attn.qkv_proj
+                if not hasattr(mirror_qkv_proj, "weight_scale") or not hasattr(
+                    imitated_qkv_proj, "weight_scale"
+                ):
+                    raise RuntimeError(
+                        "WeLMv4 ModelSlim KV-mirror QKV rewriting must run on "
+                        "the raw [N, K] checkpoint layout before MXFP8 weight "
+                        "post-processing."
+                    )
+
+                mirror_q_size = mirror_layer_attn.q_size
+                mirror_weight_data = mirror_qkv_proj_weight[:mirror_q_size, :]
+                mirror_scale_data = mirror_qkv_proj.weight_scale[
+                    :mirror_q_size, :
+                ]
+                imitated_weight_data = torch.concat(
+                    [
+                        imitated_qkv_proj_weight,
+                        mirror_qkv_proj_weight[mirror_q_size:, :],
+                    ],
+                    dim=0,
+                )
+                imitated_scale_data = torch.concat(
+                    [
+                        imitated_qkv_proj.weight_scale,
+                        mirror_qkv_proj.weight_scale[mirror_q_size:, :],
+                    ],
+                    dim=0,
+                )
+
+                mirror_bias_data = (
+                    mirror_qkv_proj_bias[:mirror_q_size]
+                    if mirror_qkv_proj_bias is not None
+                    else None
+                )
+                imitated_bias_data = (
+                    torch.concat(
+                        [
+                            imitated_qkv_proj_bias,
+                            mirror_qkv_proj_bias[mirror_q_size:],
+                        ],
+                        dim=0,
+                    )
+                    if mirror_qkv_proj_bias is not None
+                    else None
+                )
+
+                # Build both payloads before replacing either projection: the
+                # source needs the consumer's original K/V rows.
+                LayerManager._replace_qkv_with_raw_mxfp8(
+                    imitated_qkv_proj,
+                    imitated_weight_data,
+                    imitated_scale_data,
+                    imitated_bias_data,
+                    [
+                        imitated_layer_attn.q_size,
+                        imitated_layer_attn.kv_size,
+                        imitated_layer_attn.kv_size,
+                        mirror_layer_attn.kv_size,
+                        mirror_layer_attn.kv_size,
+                    ],
+                )
+                imitated_layer_attn._kv_mirror_mxfp8_source_projection = True
+
+                if mirror_layer_attn.is_nextn:
+                    # NextN decode/verify still needs the original full QKV;
+                    # extend uses this additional Q-only projection.
+                    mirror_layer_attn.kv_mirror_query_proj = (
+                        _WelmDerivedMXFP8Linear(
+                            mirror_qkv_proj,
+                            mirror_weight_data,
+                            mirror_scale_data,
+                            mirror_bias_data,
+                        )
+                    )
+                else:
+                    LayerManager._replace_qkv_with_raw_mxfp8(
+                        mirror_qkv_proj,
+                        mirror_weight_data,
+                        mirror_scale_data,
+                        mirror_bias_data,
+                        [mirror_layer_attn.q_size],
+                    )
+                    mirror_layer_attn._kv_mirror_mxfp8_query_projection = True
+                continue
 
             mirror_weight_data = mirror_qkv_proj_weight[
                 : mirror_layer_attn.q_size, :
@@ -1576,7 +1901,19 @@ class Qwen2MoeAttention(nn.Module):
             )
         self.is_nextn = is_nextn
 
-    def get_qkv_prefetch_weight(self, forward_batch: ForwardBatch) -> torch.Tensor:
+    @staticmethod
+    def _linear_prefetch_tensors(
+        projection: nn.Module,
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        tensors = [projection.weight]
+        weight_scale = getattr(projection, "weight_scale_inv", None)
+        if weight_scale is not None:
+            tensors.append(weight_scale)
+        return tensors if len(tensors) > 1 else tensors[0]
+
+    def get_qkv_prefetch_weight(
+        self, forward_batch: ForwardBatch
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
         use_full_qkv = (
             self.kv_mirror_layer_idx in self.kv_mirror_layers
             and self.kv_mirror_layer_idx
@@ -1584,8 +1921,12 @@ class Qwen2MoeAttention(nn.Module):
             and not forward_batch.forward_mode.is_extend_without_speculative()
         )
         if use_full_qkv:
-            return self.qkv_proj.weight
-        return getattr(self, "qkv_proj_weight", self.qkv_proj.weight)
+            return self._linear_prefetch_tensors(self.qkv_proj)
+        if hasattr(self, "kv_mirror_query_proj"):
+            return self._linear_prefetch_tensors(self.kv_mirror_query_proj)
+        if hasattr(self, "qkv_proj_weight"):
+            return self.qkv_proj_weight
+        return self._linear_prefetch_tensors(self.qkv_proj)
 
     def _get_welm_npu_o_proj_hcom_name(self) -> str:
         if self._welm_npu_o_proj_hcom_name is None:
@@ -1606,7 +1947,22 @@ class Qwen2MoeAttention(nn.Module):
         dump_this_layer = _welm_should_dump_layer(self.layer_idx)
         dump_prefix = f"model.layers.{self.layer_idx}.self_attn"
         if self.kv_mirror_layer_idx in self.kv_mirror_imitated_layers:
-            if hasattr(self, "qkv_proj_weight"):
+            if getattr(self, "_kv_mirror_mxfp8_source_projection", False):
+                qkv, _ = self.qkv_proj(hidden_states)
+                q, k, v, mirror_k, mirror_v = qkv.split(
+                    [
+                        self.q_size,
+                        self.kv_size,
+                        self.kv_size,
+                        self.kv_size,
+                        self.kv_size,
+                    ],
+                    dim=-1,
+                )
+                KVMirrorManager.set_kv_activation(
+                    self.kv_mirror_layer_idx, (mirror_k, mirror_v)
+                )
+            elif hasattr(self, "qkv_proj_weight"):
                 qkv = F.linear(hidden_states, self.qkv_proj_weight, self.qkv_proj_bias)
                 q, k, v, mirror_k, mirror_v = qkv.split(
                     [
@@ -1647,7 +2003,14 @@ class Qwen2MoeAttention(nn.Module):
                 k, v = KVMirrorManager.get_kv_activation(
                     mirror_layer_number, clear=self.need_clear_kv_cache
                 )
-                q = F.linear(hidden_states, self.qkv_proj_weight, self.qkv_proj_bias)
+                if hasattr(self, "kv_mirror_query_proj"):
+                    q, _ = self.kv_mirror_query_proj(hidden_states)
+                elif getattr(self, "_kv_mirror_mxfp8_query_projection", False):
+                    q, _ = self.qkv_proj(hidden_states)
+                else:
+                    q = F.linear(
+                        hidden_states, self.qkv_proj_weight, self.qkv_proj_bias
+                    )
         else:
             qkv, _ = self.qkv_proj(hidden_states)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -2203,10 +2566,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 f"model.layers.{self.layer_id}.__weights__", self
             )
 
-            # LayerManager.post_init() constructs these tensors for KV-mirror
-            # source/consumer layers.  They are plain Tensor attributes (not
-            # Parameters), and Qwen2MoeAttention.forward() passes them directly
-            # to F.linear, so named_parameters() above cannot see them.
+            # The unquantized KV-mirror path keeps its derived projections as
+            # plain Tensor attributes and passes them directly to F.linear, so
+            # named_parameters() above cannot see them. ModelSlim MXFP8 rewrites
+            # registered qkv_proj modules and is already covered above.
             if hasattr(self.self_attn, "qkv_proj_weight"):
                 _welm_dump_tensor(
                     f"model.layers.{self.layer_id}.__weights__."
@@ -3149,6 +3512,11 @@ class WeLMV4MoeForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        if quant_config is not None and quant_config.get_name() != "modelslim":
+            raise NotImplementedError(
+                "WeLMv4 currently supports only ModelSlim quantized checkpoints; "
+                f"got quantization method {quant_config.get_name()!r}."
+            )
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
@@ -3413,7 +3781,8 @@ class WeLMV4MoeForCausalLM(nn.Module):
                 "hnorm",
             ]
 
-        for name, loaded_weight in weights:
+        for name, loaded_weight in _welm_trace_weight_loading(weights):
+            checkpoint_name = name
             if not is_nextn:
                 if hasattr(self.config, "num_nextn_predict_layers"):
                     num_nextn_layers = self.config.num_nextn_predict_layers
@@ -3502,6 +3871,14 @@ class WeLMV4MoeForCausalLM(nn.Module):
 
                 param = params_dict[name]
                 weight_loader = param.weight_loader
+                _welm_trace_stacked_weight_target(
+                    checkpoint_name,
+                    name,
+                    loaded_weight,
+                    param,
+                    weight_loader,
+                    shard_id,
+                )
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:

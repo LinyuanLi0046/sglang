@@ -17,6 +17,13 @@ _WELMV4_ROPE_PREFILL_ALL_M_THRESHOLD = 640
 _WELMV4_ROPE_PROGRAMS_PER_VECTOR_CORE = 8
 _WELMV4_ROPE_PREFILL_NUM_STAGES = 1
 
+_WELMV4_RMS_NORM_HIDDEN_SIZE = 2048
+_WELMV4_RMS_NORM_BLOCK_SIZE = 2048
+_WELMV4_RMS_NORM_TWO_ROW_MIN = 40
+_WELMV4_RMS_NORM_FOUR_ROW_MIN = 224
+_WELMV4_RMS_NORM_TWO_ROWS = 2
+_WELMV4_RMS_NORM_FOUR_ROWS = 4
+
 
 def build_welmv4_rope_segment_tile_starts(
     segment_lengths: Optional[Sequence[int]],
@@ -71,6 +78,270 @@ def _get_num_sms(multiplier: int = 1) -> int:
         torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
         * multiplier
     )
+
+
+@triton.jit
+def _welmv4_fused_rms_norm_compute_npu(hidden, gamma, cols: int, eps: tl.constexpr):
+    hidden = hidden.to(gamma.dtype).to(tl.float32)
+    inv_rms = tl.math.rsqrt(tl.sum(hidden * hidden, axis=-1) / cols + eps)
+    out = hidden * inv_rms
+    out *= gamma
+    return out
+
+
+@triton.jit
+def _welmv4_fused_rms_norm_compute_2d_npu(
+    hidden, gamma, cols: int, eps: tl.constexpr
+):
+    hidden = hidden.to(gamma.dtype).to(tl.float32)
+    inv_rms = tl.math.rsqrt(tl.sum(hidden * hidden, axis=-1) / cols + eps)
+    out = hidden * inv_rms[:, None]
+    out *= gamma[None, :]
+    return out
+
+
+@triton.jit(do_not_specialize=["rows"])
+def _welmv4_fused_rms_norm_true_true_kernel_npu(
+    hidden_states_ptr: tl.tensor,
+    residual_ptr: tl.tensor,
+    gamma_ptr: tl.tensor,
+    out_ptr: tl.tensor,
+    fp32_out_ptr: tl.tensor,
+    rows: int,
+    cols: tl.constexpr,
+    eps: float,
+    BLOCK_SIZE: tl.constexpr,
+):
+    program_id = tl.program_id(0)
+    num_programs = tl.num_programs(0)
+    row_begin = program_id * rows // num_programs
+    row_end = (program_id + 1) * rows // num_programs
+    cols_off = tl.arange(0, BLOCK_SIZE)
+    gamma_shm = tl.load(gamma_ptr + cols_off)
+    output_dtype = out_ptr.dtype.element_ty
+    for row_id in tl.range(row_begin, row_end, num_stages=2):
+        offsets = row_id * cols + cols_off
+        hidden = tl.load(hidden_states_ptr + offsets).to(tl.float32)
+        residual = tl.load(residual_ptr + offsets).to(tl.float32)
+        norm_input = hidden + residual
+
+        out = _welmv4_fused_rms_norm_compute_npu(
+            norm_input, gamma_shm, cols, eps
+        )
+        tl.store(fp32_out_ptr + offsets, out)
+        tl.store(out_ptr + offsets, out.to(output_dtype))
+
+
+@triton.jit(do_not_specialize=["rows"])
+def _welmv4_fused_rms_norm_true_true_multirow_kernel_npu(
+    hidden_states_ptr: tl.tensor,
+    residual_ptr: tl.tensor,
+    gamma_ptr: tl.tensor,
+    out_ptr: tl.tensor,
+    fp32_out_ptr: tl.tensor,
+    rows: int,
+    cols: tl.constexpr,
+    eps: float,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+):
+    program_id = tl.program_id(0)
+    num_programs = tl.num_programs(0)
+    num_row_blocks = tl.cdiv(rows, BLOCK_ROWS)
+    block_begin = program_id * num_row_blocks // num_programs
+    block_end = (program_id + 1) * num_row_blocks // num_programs
+    row_lanes = tl.arange(0, BLOCK_ROWS)
+    cols_off = tl.arange(0, BLOCK_SIZE)
+    gamma_shm = tl.load(gamma_ptr + cols_off)
+    output_dtype = out_ptr.dtype.element_ty
+    for block_id in tl.range(block_begin, block_end, num_stages=2):
+        row_ids = block_id * BLOCK_ROWS + row_lanes
+        offsets = row_ids[:, None] * cols + cols_off[None, :]
+        mask = row_ids[:, None] < rows
+        hidden = tl.load(
+            hidden_states_ptr + offsets, mask=mask, other=0.0
+        ).to(tl.float32)
+        residual = tl.load(
+            residual_ptr + offsets, mask=mask, other=0.0
+        ).to(tl.float32)
+        norm_input = hidden + residual
+
+        out = _welmv4_fused_rms_norm_compute_2d_npu(
+            norm_input, gamma_shm, cols, eps
+        )
+        tl.store(fp32_out_ptr + offsets, out, mask=mask)
+        tl.store(out_ptr + offsets, out.to(output_dtype), mask=mask)
+
+
+@triton.jit(do_not_specialize=["rows"])
+def _welmv4_fused_rms_norm_false_false_kernel_npu(
+    hidden_states_ptr: tl.tensor,
+    residual_ptr: tl.tensor,
+    gamma_ptr: tl.tensor,
+    out_ptr: tl.tensor,
+    out_residual_ptr: tl.tensor,
+    rows: int,
+    cols: tl.constexpr,
+    eps: float,
+    BLOCK_SIZE: tl.constexpr,
+):
+    program_id = tl.program_id(0)
+    num_programs = tl.num_programs(0)
+    row_begin = program_id * rows // num_programs
+    row_end = (program_id + 1) * rows // num_programs
+    cols_off = tl.arange(0, BLOCK_SIZE)
+    gamma_shm = tl.load(gamma_ptr + cols_off)
+    output_dtype = out_ptr.dtype.element_ty
+    for row_id in tl.range(row_begin, row_end, num_stages=2):
+        offsets = row_id * cols + cols_off
+        hidden = tl.load(hidden_states_ptr + offsets).to(tl.float32)
+        residual = tl.load(residual_ptr + offsets).to(tl.float32)
+        norm_input = hidden + residual
+        tl.store(out_residual_ptr + offsets, norm_input)
+
+        out = _welmv4_fused_rms_norm_compute_npu(
+            norm_input, gamma_shm, cols, eps
+        )
+        tl.store(out_ptr + offsets, out.to(output_dtype))
+
+
+@triton.jit(do_not_specialize=["rows"])
+def _welmv4_fused_rms_norm_false_false_multirow_kernel_npu(
+    hidden_states_ptr: tl.tensor,
+    residual_ptr: tl.tensor,
+    gamma_ptr: tl.tensor,
+    out_ptr: tl.tensor,
+    out_residual_ptr: tl.tensor,
+    rows: int,
+    cols: tl.constexpr,
+    eps: float,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+):
+    program_id = tl.program_id(0)
+    num_programs = tl.num_programs(0)
+    num_row_blocks = tl.cdiv(rows, BLOCK_ROWS)
+    block_begin = program_id * num_row_blocks // num_programs
+    block_end = (program_id + 1) * num_row_blocks // num_programs
+    row_lanes = tl.arange(0, BLOCK_ROWS)
+    cols_off = tl.arange(0, BLOCK_SIZE)
+    gamma_shm = tl.load(gamma_ptr + cols_off)
+    output_dtype = out_ptr.dtype.element_ty
+    for block_id in tl.range(block_begin, block_end, num_stages=2):
+        row_ids = block_id * BLOCK_ROWS + row_lanes
+        offsets = row_ids[:, None] * cols + cols_off[None, :]
+        mask = row_ids[:, None] < rows
+        hidden = tl.load(
+            hidden_states_ptr + offsets, mask=mask, other=0.0
+        ).to(tl.float32)
+        residual = tl.load(
+            residual_ptr + offsets, mask=mask, other=0.0
+        ).to(tl.float32)
+        norm_input = hidden + residual
+        tl.store(out_residual_ptr + offsets, norm_input, mask=mask)
+
+        out = _welmv4_fused_rms_norm_compute_2d_npu(
+            norm_input, gamma_shm, cols, eps
+        )
+        tl.store(out_ptr + offsets, out.to(output_dtype), mask=mask)
+
+
+def welmv4_fused_rms_norm_true_true_npu(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    output_dtype: torch.dtype,
+    num_vector_cores: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """NPU-only True+True path; the unused BF16 residual aliases output."""
+    rows = hidden_states.shape[0]
+    output = torch.empty_like(hidden_states, dtype=output_dtype)
+    fp32_out = torch.empty_like(hidden_states, dtype=torch.float32)
+
+    if rows < _WELMV4_RMS_NORM_TWO_ROW_MIN:
+        num_programs = min(rows, num_vector_cores)
+        _welmv4_fused_rms_norm_true_true_kernel_npu[(num_programs,)](
+            hidden_states,
+            residual,
+            weight,
+            output,
+            fp32_out,
+            rows,
+            _WELMV4_RMS_NORM_HIDDEN_SIZE,
+            eps,
+            _WELMV4_RMS_NORM_BLOCK_SIZE,
+        )
+    else:
+        block_rows = (
+            _WELMV4_RMS_NORM_TWO_ROWS
+            if rows < _WELMV4_RMS_NORM_FOUR_ROW_MIN
+            else _WELMV4_RMS_NORM_FOUR_ROWS
+        )
+        num_programs = min(triton.cdiv(rows, block_rows), num_vector_cores)
+        _welmv4_fused_rms_norm_true_true_multirow_kernel_npu[(num_programs,)](
+            hidden_states,
+            residual,
+            weight,
+            output,
+            fp32_out,
+            rows,
+            _WELMV4_RMS_NORM_HIDDEN_SIZE,
+            eps,
+            _WELMV4_RMS_NORM_BLOCK_SIZE,
+            block_rows,
+        )
+
+    return output, output, fp32_out
+
+
+def welmv4_fused_rms_norm_false_false_npu(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    output_dtype: torch.dtype,
+    num_vector_cores: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """NPU-only False+False path with the required FP32 pre-norm residual."""
+    rows = hidden_states.shape[0]
+    output = torch.empty_like(hidden_states, dtype=output_dtype)
+    out_residual = torch.empty_like(residual)
+
+    if rows < _WELMV4_RMS_NORM_TWO_ROW_MIN:
+        num_programs = min(rows, num_vector_cores)
+        _welmv4_fused_rms_norm_false_false_kernel_npu[(num_programs,)](
+            hidden_states,
+            residual,
+            weight,
+            output,
+            out_residual,
+            rows,
+            _WELMV4_RMS_NORM_HIDDEN_SIZE,
+            eps,
+            _WELMV4_RMS_NORM_BLOCK_SIZE,
+        )
+    else:
+        block_rows = (
+            _WELMV4_RMS_NORM_TWO_ROWS
+            if rows < _WELMV4_RMS_NORM_FOUR_ROW_MIN
+            else _WELMV4_RMS_NORM_FOUR_ROWS
+        )
+        num_programs = min(triton.cdiv(rows, block_rows), num_vector_cores)
+        _welmv4_fused_rms_norm_false_false_multirow_kernel_npu[(num_programs,)](
+            hidden_states,
+            residual,
+            weight,
+            output,
+            out_residual,
+            rows,
+            _WELMV4_RMS_NORM_HIDDEN_SIZE,
+            eps,
+            _WELMV4_RMS_NORM_BLOCK_SIZE,
+            block_rows,
+        )
+
+    return output, out_residual
 
 
 @triton.autotune(

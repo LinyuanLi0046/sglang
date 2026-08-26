@@ -1689,10 +1689,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         )
         use_dp_layer_communicator = is_dp_attention_enabled()
         enable_npu_weight_prefetch = (
-            _is_npu
-            and not use_dp_layer_communicator
-            and get_tensor_model_parallel_world_size() > 1
-            and hidden_states.shape[0] > 0
+            _is_npu and hidden_states.shape[0] > 0
         )
         qkv_prefetch_started = False
         if enable_npu_weight_prefetch:
@@ -1708,6 +1705,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             if residual_after_layernorm:
                 residual = hidden_states.to(torch.float32)
         elif residual_after_layernorm:
+            # 纯TP layer0 layer2-47
             hidden_states, _, residual = self.input_layernorm(
                 hidden_states,
                 residual,
@@ -1718,6 +1716,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 else hidden_states.dtype,
             )
         else:
+            # 纯TP layer1
             hidden_states, residual = self.input_layernorm(
                 hidden_states,
                 residual,
@@ -1726,6 +1725,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         if qkv_prefetch_started:
             # Keep CMO overlap bounded to input RMSNorm; QKV starts afterwards.
             wait_cmo_stream()
+        # use_mmq_norm_after_attn 纯TP 0+2-47 layer 为True
         use_mmq_norm_after_attn = residual_after_layernorm and self.self_attn.use_o_norm
         use_dp_o_norm_after_attn = (
             is_dp_attention_enabled() and self.self_attn.use_o_norm

@@ -542,9 +542,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # it.  Decode/speculative/graph forwards leave it as None.
     welmv4_rope_segment_tile_starts: Optional[torch.Tensor] = None
 
-    # WeLMv4 NPU DeepEP prefill keeps hidden/residual token-sharded between
-    # decoder layers. KV Mirror contracts the prompt layout to one row per
-    # request midway through the model and pads that smaller layout for TP
+    # WeLMv4 NPU DeepEP prefill/decode keeps hidden/residual token-sharded
+    # between decoder layers. During prefill, KV Mirror contracts the prompt
+    # layout to one row per request and pads that smaller layout for TP
     # reduce-scatter/low-latency DeepEP.
     welmv4_npu_deepep_scattered: bool = False
     kv_mirror_num_real_rows: Optional[int] = None

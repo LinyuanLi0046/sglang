@@ -751,6 +751,9 @@ class Envs:
     SGLANG_DEEPEP_NORMAL_USE_ALLTOALL = EnvBool(False)
     SGLANG_DEEPEP_NORMAL_USE_ALLGATHER = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    SGLANG_WELMV4_MIRROR_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = (
+        EnvInt(None)
+    )
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     # Force dynamic Waterfill with runtime EP all-reduce instead of the default

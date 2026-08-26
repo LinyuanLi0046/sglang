@@ -885,6 +885,59 @@ class TestForwardFlags(_IsolatedServerArgs):
             self.assertIs(fwd.deepep_mode_override, DeepEPMode.LOW_LATENCY)
         self.assertIsNone(fwd.deepep_mode_override)
 
+    def test_deepep_dispatch_capacity_override_is_scoped(self):
+        from sglang.srt.runtime_context import get_forward
+
+        reset_context()
+        fwd = get_forward()
+        self.assertIsNone(fwd.deepep_num_max_dispatch_tokens_override)
+        with fwd.scoped(deepep_num_max_dispatch_tokens_override=512):
+            self.assertEqual(
+                fwd.deepep_num_max_dispatch_tokens_override, 512
+            )
+        self.assertIsNone(fwd.deepep_num_max_dispatch_tokens_override)
+
+    def test_deepep_ll_dispatch_uses_per_call_capacity_with_max_buffer(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.token_dispatcher import deepep as deepep_module
+        from sglang.srt.runtime_context import get_forward
+
+        with (
+            envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(128),
+            envs.SGLANG_WELMV4_MIRROR_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(
+                512
+            ),
+        ):
+            default_capacity, buffer_capacity = (
+                deepep_module._get_deepep_ll_token_capacities()
+            )
+
+        dispatcher = object.__new__(
+            deepep_module._DeepEPDispatcherImplLowLatency
+        )
+        dispatcher.num_max_dispatch_tokens_per_rank = default_capacity
+        dispatcher.num_max_dispatch_tokens_per_rank_capacity = buffer_capacity
+
+        reset_context()
+        self.assertEqual(
+            dispatcher._resolve_num_max_dispatch_tokens_per_rank(64), 128
+        )
+        with get_forward().scoped(
+            deepep_num_max_dispatch_tokens_override=512
+        ):
+            self.assertEqual(
+                dispatcher._resolve_num_max_dispatch_tokens_per_rank(300), 512
+            )
+        with self.assertRaisesRegex(RuntimeError, "input tokens per rank"):
+            dispatcher._resolve_num_max_dispatch_tokens_per_rank(129)
+        with (
+            get_forward().scoped(
+                deepep_num_max_dispatch_tokens_override=513
+            ),
+            self.assertRaisesRegex(RuntimeError, "buffer capacity"),
+        ):
+            dispatcher._resolve_num_max_dispatch_tokens_per_rank(300)
+
     def test_deepep_dispatcher_locks_impl_for_complete_call(self):
         from sglang.srt.layers.moe import utils as moe_utils
         from sglang.srt.layers.moe.token_dispatcher import deepep as deepep_module

@@ -486,6 +486,9 @@ class ForwardFlags:
         # lets a model switch a small prefill suffix to low-latency dispatch
         # without changing the batch's prefill/decode identity.
         "deepep_mode_override": None,
+        # Optional per-call LL dispatch capacity. The process-wide DeepEP
+        # buffer remains sized for the largest configured capacity.
+        "deepep_num_max_dispatch_tokens_override": None,
     }
 
     # Read/written inside compiled graphs (vocab embedding, communicator,

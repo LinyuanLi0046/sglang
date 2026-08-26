@@ -1779,10 +1779,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         return (
             _is_npu
             and get_moe_a2a_backend().is_deepep()
-            and (
-                forward_batch.forward_mode.is_extend_without_speculative()
-                or forward_batch.forward_mode.is_decode()
-            )
+            and forward_batch.forward_mode.is_extend_without_speculative()
             and not is_dp_attention_enabled()
             and tp_size > 1
             and get_parallel().moe_ep_size == tp_size
@@ -1857,7 +1854,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             num_tokens, hidden_size = hidden_states.shape
             if num_tokens % tp_size != 0:
                 raise RuntimeError(
-                    "NPU DeepEP token padding must be completed before OProj "
+                    "Prefill token padding must be completed before OProj "
                     f"ReduceScatter: {num_tokens} tokens are not divisible by "
                     f"TP{tp_size}"
                 )
@@ -2052,7 +2049,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         if use_npu_prefill_deepep_scattered:
             if forward_batch.num_token_non_padded is None:
                 raise RuntimeError(
-                    "WeLMv4 NPU DeepEP scattered prefill/decode requires localized "
+                    "WeLMv4 NPU DeepEP scattered prefill requires localized "
                     "num_token_non_padded metadata"
                 )
             forward_batch.welmv4_npu_deepep_scattered = True

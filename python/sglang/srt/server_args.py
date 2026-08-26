@@ -879,6 +879,18 @@ class ServerArgs:
         ),
         NS("schedule"),
     ] = 0.8
+    disable_swa_chunk_cap: A[
+        bool,
+        Arg(
+            help=(
+                "Disable request/chunk-derived fixed sizing for hybrid SWA pools. "
+                "When enabled, use --swa-full-tokens-ratio even if "
+                "--max-running-requests is explicitly set."
+            ),
+            resolvable=True,
+        ),
+        NS("schedule"),
+    ] = False
     disable_hybrid_swa_memory: A[
         bool,
         Arg(help="Disable the hybrid SWA memory pool.", resolvable=True),

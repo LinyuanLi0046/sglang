@@ -28,6 +28,7 @@ from sglang.srt.layers.moe.utils import (
     get_deepep_output_dtype,
     is_tbo_enabled,
 )
+from sglang.srt.runtime_context import get_forward
 from sglang.srt.utils import (
     get_bool_env_var,
     get_cuda_version,
@@ -1106,6 +1107,7 @@ class DeepEPDispatcher(BaseDispatcher):
             )
 
         self._stage = _Stage.INITIAL
+        self._active_impl: Optional[_DeepEPDispatcherImplBase] = None
         self._deepep_dispatch_hooks = DeepEPPDispatchHooks()
 
         # DeepEP/Mooncake/Nixl mark invalid topk slots with -1; the AITER
@@ -1138,7 +1140,10 @@ class DeepEPDispatcher(BaseDispatcher):
         topk_output: TopKOutput,
     ):
         self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
-        inner_state = self._get_impl().dispatch_a(
+        if self._active_impl is not None:
+            raise RuntimeError("DeepEP dispatcher already has an active implementation")
+        self._active_impl = self._get_impl()
+        inner_state = self._active_impl.dispatch_a(
             hidden_states=hidden_states,
             topk_output=topk_output,
         )
@@ -1148,7 +1153,7 @@ class DeepEPDispatcher(BaseDispatcher):
         self._update_stage(_Stage.AFTER_DISPATCH_A, _Stage.AFTER_DISPATCH_B)
         inner_state = self._dispatch_intermediate_state
         del self._dispatch_intermediate_state
-        return self._get_impl().dispatch_b(*inner_state)
+        return self._require_active_impl().dispatch_b(*inner_state)
 
     def combine(
         self,
@@ -1164,7 +1169,7 @@ class DeepEPDispatcher(BaseDispatcher):
     ):
         hidden_states, topk_ids, topk_weights = combine_input
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
-        inner_state = self._get_impl().combine_a(
+        inner_state = self._require_active_impl().combine_a(
             hidden_states=hidden_states,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
@@ -1175,17 +1180,41 @@ class DeepEPDispatcher(BaseDispatcher):
         self._update_stage(_Stage.AFTER_COMBINE_A, _Stage.INITIAL)
         inner_state = self._combine_intermediate_state
         del self._combine_intermediate_state
-        return self._get_impl().combine_b(*inner_state)
+        impl = self._require_active_impl()
+        try:
+            return impl.combine_b(*inner_state)
+        finally:
+            self._active_impl = None
 
     def _get_impl(self) -> _DeepEPDispatcherImplBase:
-        is_extend_in_batch = get_is_extend_in_batch()
-        resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch)
+        mode_override = get_forward().deepep_mode_override
+        if mode_override is not None and not isinstance(mode_override, DeepEPMode):
+            raise TypeError(
+                "deepep_mode_override must be a DeepEPMode or None, got "
+                f"{type(mode_override).__name__}"
+            )
+        resolved_deepep_mode = (
+            mode_override
+            if mode_override is not None
+            else self.deepep_mode.resolve(get_is_extend_in_batch())
+        )
         if resolved_deepep_mode == DeepEPMode.NORMAL:
-            return self._normal_dispatcher
+            impl = getattr(self, "_normal_dispatcher", None)
         elif resolved_deepep_mode == DeepEPMode.LOW_LATENCY:
-            return self._low_latency_dispatcher
+            impl = getattr(self, "_low_latency_dispatcher", None)
         else:
-            raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
+            raise ValueError(f"Invalid deepep_mode: {resolved_deepep_mode}")
+        if impl is None:
+            raise RuntimeError(
+                f"DeepEP mode {resolved_deepep_mode.value!r} was selected but "
+                "that strategy was not initialized"
+            )
+        return impl
+
+    def _require_active_impl(self) -> _DeepEPDispatcherImplBase:
+        if self._active_impl is None:
+            raise RuntimeError("DeepEP dispatcher has no active implementation")
+        return self._active_impl
 
     def _update_stage(self, old_stage, new_stage):
         assert self._stage == old_stage

@@ -874,6 +874,90 @@ class TestForwardFlags(_IsolatedServerArgs):
             self.assertTrue(fwd.multi_stream)
         self.assertFalse(fwd.multi_stream)
 
+    def test_deepep_mode_override_is_scoped(self):
+        from sglang.srt.layers.moe.utils import DeepEPMode
+        from sglang.srt.runtime_context import get_forward
+
+        reset_context()
+        fwd = get_forward()
+        self.assertIsNone(fwd.deepep_mode_override)
+        with fwd.scoped(deepep_mode_override=DeepEPMode.LOW_LATENCY):
+            self.assertIs(fwd.deepep_mode_override, DeepEPMode.LOW_LATENCY)
+        self.assertIsNone(fwd.deepep_mode_override)
+
+    def test_deepep_dispatcher_locks_impl_for_complete_call(self):
+        from sglang.srt.layers.moe import utils as moe_utils
+        from sglang.srt.layers.moe.token_dispatcher import deepep as deepep_module
+        from sglang.srt.runtime_context import get_forward
+
+        class _FakeImpl:
+            def __init__(self, name):
+                self.name = name
+                self.calls = []
+
+            def dispatch_a(self, **kwargs):
+                self.calls.append("dispatch_a")
+                return (kwargs["hidden_states"],)
+
+            def dispatch_b(self, *args):
+                self.calls.append("dispatch_b")
+                return args[0]
+
+            def combine_a(self, **kwargs):
+                self.calls.append("combine_a")
+                return (kwargs["hidden_states"],)
+
+            def combine_b(self, *args):
+                self.calls.append("combine_b")
+                return args[0]
+
+        reset_context()
+        dispatcher = object.__new__(deepep_module.DeepEPDispatcher)
+        normal_impl = _FakeImpl("normal")
+        ll_impl = _FakeImpl("low_latency")
+        dispatcher.deepep_mode = moe_utils.DeepEPMode.AUTO
+        dispatcher._normal_dispatcher = normal_impl
+        dispatcher._low_latency_dispatcher = ll_impl
+        dispatcher._stage = deepep_module._Stage.INITIAL
+        dispatcher._active_impl = None
+
+        with get_forward().scoped(
+            deepep_mode_override=moe_utils.DeepEPMode.LOW_LATENCY
+        ):
+            dispatcher.dispatch_a("hidden", "topk")
+        # The scope has ended, but the remaining phases must keep using the
+        # implementation selected by dispatch_a.
+        dispatcher.dispatch_b()
+        dispatcher.combine_a(("experts", "ids", "weights"))
+        self.assertEqual(dispatcher.combine_b(), "experts")
+        self.assertEqual(
+            ll_impl.calls,
+            ["dispatch_a", "dispatch_b", "combine_a", "combine_b"],
+        )
+        self.assertEqual(normal_impl.calls, [])
+        self.assertIsNone(dispatcher._active_impl)
+
+    def test_deepep_dispatcher_auto_resolution_without_override(self):
+        from sglang.srt.layers.moe import utils as moe_utils
+        from sglang.srt.layers.moe.token_dispatcher import deepep as deepep_module
+
+        reset_context()
+        dispatcher = object.__new__(deepep_module.DeepEPDispatcher)
+        normal_impl = object()
+        ll_impl = object()
+        dispatcher.deepep_mode = moe_utils.DeepEPMode.AUTO
+        dispatcher._normal_dispatcher = normal_impl
+        dispatcher._low_latency_dispatcher = ll_impl
+
+        with patch.object(
+            deepep_module, "get_is_extend_in_batch", return_value=True
+        ):
+            self.assertIs(dispatcher._get_impl(), normal_impl)
+        with patch.object(
+            deepep_module, "get_is_extend_in_batch", return_value=False
+        ):
+            self.assertIs(dispatcher._get_impl(), ll_impl)
+
     def test_scoped_restores_on_exception_and_validates_keys(self):
         from sglang.srt.runtime_context import get_forward
 

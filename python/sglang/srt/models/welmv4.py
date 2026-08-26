@@ -52,7 +52,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.layers.moe import get_deepep_mode, get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
@@ -718,22 +718,40 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     def _mask_npu_padded_topk(
         topk_output: StandardTopKOutput,
         num_token_non_padded: torch.Tensor,
+        preserve_padded_ids: bool = False,
     ) -> StandardTopKOutput:
         padded_rows = torch.arange(
             topk_output.topk_ids.shape[0], device=topk_output.topk_ids.device
         ) >= num_token_non_padded
+        topk_ids = topk_output.topk_ids
+        if not preserve_padded_ids:
+            topk_ids = torch.where(
+                padded_rows[:, None],
+                torch.full_like(topk_output.topk_ids, -1),
+                topk_output.topk_ids,
+            )
         return StandardTopKOutput(
             torch.where(
                 padded_rows[:, None],
                 torch.zeros_like(topk_output.topk_weights),
                 topk_output.topk_weights,
             ),
-            torch.where(
-                padded_rows[:, None],
-                torch.full_like(topk_output.topk_ids, -1),
-                topk_output.topk_ids,
-            ),
+            topk_ids,
             topk_output.router_logits,
+        )
+
+    @staticmethod
+    def _resolve_deepep_mode_for_topk(is_prefill_batch: bool) -> DeepEPMode:
+        mode_override = get_forward().deepep_mode_override
+        if mode_override is not None and not isinstance(mode_override, DeepEPMode):
+            raise TypeError(
+                "deepep_mode_override must be a DeepEPMode or None, got "
+                f"{type(mode_override).__name__}"
+            )
+        return (
+            mode_override
+            if mode_override is not None
+            else get_deepep_mode().resolve(is_prefill_batch)
         )
 
     def forward(
@@ -829,8 +847,19 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     "WeLMv4 NPU padding requires StandardTopKOutput, got "
                     f"{type(topk_output).__name__}"
                 )
+            # NPU DeepEP normal AllGather consumes -1 as an inactive route. The
+            # legacy low-latency kernels do not unless their optional negative-ID
+            # mode is enabled, so keep the router's valid, distinct expert IDs
+            # there and make dummy routes numerically inert via zero weights.
+            preserve_padded_ids = (
+                moe_a2a_backend.is_deepep()
+                and self._resolve_deepep_mode_for_topk(is_prefill_batch)
+                == DeepEPMode.LOW_LATENCY
+            )
             topk_output = self._mask_npu_padded_topk(
-                topk_output, num_token_non_padded
+                topk_output,
+                num_token_non_padded,
+                preserve_padded_ids=preserve_padded_ids,
             )
         experts_output = self.experts(hidden_states, topk_output)
         if return_components and skip_component_output:

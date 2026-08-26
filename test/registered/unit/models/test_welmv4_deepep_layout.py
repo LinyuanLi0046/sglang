@@ -5,6 +5,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.model_executor import forward_batch_info
 from sglang.srt.models import welmv4
 from sglang.srt.models.welmv4 import (
@@ -49,7 +50,7 @@ class TestWeLMv4DeepEPLayout(unittest.TestCase):
 
         self.assertEqual(local_real_rows, [4123, 4123, 4123, 4120])
 
-    def test_npu_topk_padding_masks_ids_and_weights(self):
+    def test_npu_normal_topk_padding_masks_ids_and_weights(self):
         topk_output = StandardTopKOutput(
             topk_weights=torch.ones((4, 2), dtype=torch.float32),
             topk_ids=torch.tensor([[0, 1], [2, 3], [4, 5], [6, 7]]),
@@ -62,6 +63,51 @@ class TestWeLMv4DeepEPLayout(unittest.TestCase):
         torch.testing.assert_close(masked.topk_weights[3], torch.zeros(2))
         torch.testing.assert_close(masked.topk_ids[:3], topk_output.topk_ids[:3])
         torch.testing.assert_close(masked.topk_ids[3], torch.full((2,), -1))
+
+    def test_npu_low_latency_topk_padding_preserves_ids_and_masks_weights(self):
+        topk_output = StandardTopKOutput(
+            topk_weights=torch.ones((4, 2), dtype=torch.float32),
+            topk_ids=torch.tensor([[0, 1], [2, 3], [4, 5], [6, 7]]),
+            router_logits=torch.randn((4, 8)),
+        )
+        masked = Qwen2MoeSparseMoeBlock._mask_npu_padded_topk(
+            topk_output,
+            torch.tensor(3, dtype=torch.int32),
+            preserve_padded_ids=True,
+        )
+        torch.testing.assert_close(masked.topk_weights[:3], torch.ones((3, 2)))
+        torch.testing.assert_close(masked.topk_weights[3], torch.zeros(2))
+        torch.testing.assert_close(masked.topk_ids, topk_output.topk_ids)
+
+    def test_npu_topk_padding_policy_resolves_deepep_mode(self):
+        with (
+            patch.object(welmv4, "get_deepep_mode", return_value=DeepEPMode.AUTO),
+            patch.object(
+                welmv4,
+                "get_forward",
+                return_value=SimpleNamespace(deepep_mode_override=None),
+            ),
+        ):
+            self.assertEqual(
+                Qwen2MoeSparseMoeBlock._resolve_deepep_mode_for_topk(True),
+                DeepEPMode.NORMAL,
+            )
+            self.assertEqual(
+                Qwen2MoeSparseMoeBlock._resolve_deepep_mode_for_topk(False),
+                DeepEPMode.LOW_LATENCY,
+            )
+
+        with patch.object(
+            welmv4,
+            "get_forward",
+            return_value=SimpleNamespace(
+                deepep_mode_override=DeepEPMode.LOW_LATENCY
+            ),
+        ):
+            self.assertEqual(
+                Qwen2MoeSparseMoeBlock._resolve_deepep_mode_for_topk(True),
+                DeepEPMode.LOW_LATENCY,
+            )
 
     def test_kv_mirror_owner_partials_reconstruct_full_residual(self):
         tp_size = 4

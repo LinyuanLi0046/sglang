@@ -778,6 +778,22 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             if forward_batch is not None
             else None
         )
+        # Decode keeps the legacy FULL replicated token layout when the
+        # WeLMv4 DeepEP scattered path is disabled.  The generic gathered-
+        # buffer metadata above is TP-localized, so applying it to FULL rows
+        # would incorrectly mask real requests after the first local shard.
+        # Leave padding unmasked in this layout, matching the pre-scattered
+        # decode behavior; prefill/scattered paths continue to use the local
+        # count and mask their padded suffix.
+        is_full_deepep_decode = (
+            _is_npu
+            and moe_a2a_backend.is_deepep()
+            and forward_batch is not None
+            and forward_batch.forward_mode.is_decode()
+            and not forward_batch.welmv4_npu_deepep_scattered
+        )
+        if is_full_deepep_decode:
+            num_token_non_padded = None
         if moe_a2a_backend.is_deepep() and hidden_states.shape[0] == 0:
             topk_output = self.topk.empty_topk_output(
                 hidden_states.device, layer_id=self.layer_id

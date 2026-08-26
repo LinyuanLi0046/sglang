@@ -1980,20 +1980,32 @@ class Qwen2MoeDecoderLayer(nn.Module):
         )
         local_offset = custom_last_index - tp_rank * prompt_local_rows
         owned = owner_rank == tp_rank
-        request_rows = torch.arange(
-            mirror_num_real_rows,
-            device=residual.device,
-            dtype=torch.long,
-        )[owned]
-        owned_offsets = local_offset[owned].to(torch.long)
+
+        # Keep every intermediate shape fixed at [B] or [B, D].  Boolean
+        # indexing such as local_offset[owned] has a data-dependent output
+        # shape and forces the host to wait for the NPU to count the selected
+        # rows, draining the queued non-mirror prefill work at the first mirror
+        # layer.  Non-owner ranks use a valid dummy offset and are masked back
+        # to exact FP32 zero before the owner-partial all-reduce.
+        safe_local_offset = torch.where(
+            owned,
+            local_offset,
+            torch.zeros_like(local_offset),
+        ).to(torch.long)
+        selected = residual.index_select(0, safe_local_offset)
+        selected = torch.where(
+            owned[:, None],
+            selected,
+            torch.zeros_like(selected),
+        )
+
+        if mirror_num_padded_rows == mirror_num_real_rows:
+            return selected
+
         residual_partial = residual.new_zeros(
             (mirror_num_padded_rows, residual.shape[1])
         )
-        residual_partial.index_copy_(
-            0,
-            request_rows,
-            residual.index_select(0, owned_offsets),
-        )
+        residual_partial.narrow(0, 0, mirror_num_real_rows).copy_(selected)
         return residual_partial
 
     @staticmethod

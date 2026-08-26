@@ -254,6 +254,49 @@ class TestWeLMv4DeepEPLayout(unittest.TestCase):
                     use_mmq_norm_after_attn=False,
                 )
 
+    def test_fused_oproj_output_skips_second_reduce_scatter(self):
+        local_hidden = torch.arange(16, dtype=torch.bfloat16).reshape(2, 8)
+        full_residual = torch.arange(64, dtype=torch.float32).reshape(8, 8)
+        expected_residual = full_residual[4:6]
+
+        def post_attention_layernorm(hidden_states, residual, **kwargs):
+            torch.testing.assert_close(hidden_states, local_hidden)
+            torch.testing.assert_close(residual, expected_residual)
+            self.assertTrue(kwargs["clone_fp32_out"])
+            return hidden_states, residual, None
+
+        layer = SimpleNamespace(
+            self_attn=SimpleNamespace(o_norm=None),
+            post_attention_layernorm=post_attention_layernorm,
+        )
+        with (
+            patch.object(
+                welmv4,
+                "get_tensor_model_parallel_world_size",
+                return_value=4,
+            ),
+            patch.object(
+                welmv4,
+                "get_parallel",
+                return_value=SimpleNamespace(tp_rank=2),
+            ),
+            patch.object(welmv4, "get_tp_group") as tp_group,
+        ):
+            hidden, residual, hidden_fp32 = (
+                Qwen2MoeDecoderLayer._npu_prefill_deepep_finish_attention(
+                    layer,
+                    local_hidden,
+                    full_residual,
+                    use_mmq_norm_after_attn=False,
+                    input_is_reduce_scattered=True,
+                )
+            )
+
+        tp_group.assert_not_called()
+        torch.testing.assert_close(hidden, local_hidden)
+        torch.testing.assert_close(residual, expected_residual)
+        self.assertIsNone(hidden_fp32)
+
     def test_final_output_gathers_then_removes_kv_mirror_padding(self):
         model = object.__new__(Qwen2MoeModel)
         local_hidden = torch.tensor([[0.0, 1.0], [2.0, 3.0]])

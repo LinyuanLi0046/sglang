@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.model_executor import forward_batch_info
@@ -80,8 +81,15 @@ class TestWeLMv4DeepEPLayout(unittest.TestCase):
         torch.testing.assert_close(masked.topk_ids, topk_output.topk_ids)
 
     def test_npu_topk_padding_policy_resolves_deepep_mode(self):
-        with patch.object(
-            welmv4, "get_deepep_mode", return_value=DeepEPMode.AUTO
+        with (
+            patch.object(
+                welmv4, "get_deepep_mode", return_value=DeepEPMode.AUTO
+            ),
+            patch.object(
+                welmv4,
+                "get_forward",
+                return_value=SimpleNamespace(deepep_mode_override=None),
+            ),
         ):
             self.assertEqual(
                 Qwen2MoeSparseMoeBlock._resolve_deepep_mode_for_topk(True),
@@ -92,12 +100,23 @@ class TestWeLMv4DeepEPLayout(unittest.TestCase):
                 DeepEPMode.LOW_LATENCY,
             )
 
+        with patch.object(
+            welmv4,
+            "get_forward",
+            return_value=SimpleNamespace(
+                deepep_mode_override=DeepEPMode.LOW_LATENCY
+            ),
+        ):
+            self.assertEqual(
+                Qwen2MoeSparseMoeBlock._resolve_deepep_mode_for_topk(True),
+                DeepEPMode.LOW_LATENCY,
+            )
+
     def test_kv_mirror_owner_partials_reconstruct_full_residual(self):
         tp_size = 4
         prompt_rows = 16
         prompt_local_rows = prompt_rows // tp_size
         mirror_rows = 5
-        mirror_padded_rows = 8
         hidden_size = 3
         full_residual = torch.arange(
             prompt_rows * hidden_size, dtype=torch.float32
@@ -115,89 +134,67 @@ class TestWeLMv4DeepEPLayout(unittest.TestCase):
                     custom_last_index,
                     prompt_local_rows=prompt_local_rows,
                     mirror_num_real_rows=mirror_rows,
-                    mirror_num_padded_rows=mirror_padded_rows,
+                    mirror_num_padded_rows=mirror_rows,
                     tp_rank=tp_rank,
                 )
             )
 
         reconstructed = torch.stack(partials).sum(dim=0)
-        expected = full_residual.new_zeros((mirror_padded_rows, hidden_size))
-        expected[:mirror_rows] = full_residual.index_select(
-            0, custom_last_index
-        )
+        expected = full_residual.index_select(0, custom_last_index)
         torch.testing.assert_close(reconstructed, expected)
 
-    def test_kv_mirror_metadata_uses_contiguous_tp_shards(self):
-        cases = (
-            (5, 8, [2, 2, 1, 0]),
-            (1, 4, [1, 0, 0, 0]),
+    def test_kv_mirror_metadata_switches_to_exact_full_rows(self):
+        mirror_rows = 5
+        forward_batch = SimpleNamespace(
+            kv_mirror_num_real_rows=None,
+            kv_mirror_num_padded_rows=None,
+            kv_mirror_local_num_tokens=None,
+            global_dp_buffer_len=16,
+            global_num_tokens_cpu=[16],
+            global_num_tokens_gpu=torch.tensor([16], dtype=torch.int32),
+            num_token_non_padded=torch.tensor(4, dtype=torch.int32),
+            num_token_non_padded_cpu=4,
+            welmv4_npu_deepep_scattered=True,
+            welmv4_npu_deepep_full_mirror=False,
         )
-        for mirror_rows, mirror_padded_rows, expected_counts in cases:
-            self._assert_kv_mirror_metadata(
-                mirror_rows, mirror_padded_rows, expected_counts
+        Qwen2MoeDecoderLayer._update_kv_mirror_full_metadata(
+            forward_batch,
+            mirror_num_real_rows=mirror_rows,
+        )
+
+        self.assertEqual(forward_batch.kv_mirror_num_real_rows, mirror_rows)
+        self.assertEqual(forward_batch.kv_mirror_num_padded_rows, mirror_rows)
+        self.assertEqual(forward_batch.kv_mirror_local_num_tokens, mirror_rows)
+        self.assertEqual(forward_batch.global_dp_buffer_len, mirror_rows)
+        self.assertEqual(forward_batch.global_num_tokens_cpu, [mirror_rows])
+        self.assertEqual(forward_batch.global_num_tokens_gpu.item(), mirror_rows)
+        self.assertEqual(forward_batch.num_token_non_padded.item(), mirror_rows)
+        self.assertEqual(forward_batch.num_token_non_padded_cpu, mirror_rows)
+        self.assertFalse(forward_batch.welmv4_npu_deepep_scattered)
+        self.assertTrue(forward_batch.welmv4_npu_deepep_full_mirror)
+
+    def test_kv_mirror_ll_capacity_can_differ_from_decode(self):
+        with (
+            envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(128),
+            envs.SGLANG_WELMV4_MIRROR_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(
+                None
+            ),
+        ):
+            self.assertEqual(
+                Qwen2MoeDecoderLayer._get_kv_mirror_prefill_ll_capacity(),
+                128,
             )
 
-    def _assert_kv_mirror_metadata(
-        self, mirror_rows, mirror_padded_rows, expected_counts
-    ):
-        expected_local_rows = mirror_padded_rows // 4
-        for tp_rank, expected_real_rows in enumerate(expected_counts):
-            forward_batch = SimpleNamespace(
-                kv_mirror_num_real_rows=None,
-                kv_mirror_num_padded_rows=None,
-                kv_mirror_local_num_tokens=None,
-                global_dp_buffer_len=16,
-                global_num_tokens_cpu=[16],
-                global_num_tokens_gpu=torch.tensor([16], dtype=torch.int32),
-                num_token_non_padded=torch.tensor(4, dtype=torch.int32),
-                num_token_non_padded_cpu=4,
-            )
-            with (
-                patch.object(
-                    welmv4,
-                    "get_tensor_model_parallel_world_size",
-                    return_value=4,
-                ),
-                patch.object(
-                    welmv4,
-                    "get_parallel",
-                    return_value=SimpleNamespace(tp_rank=tp_rank),
-                ),
-            ):
-                Qwen2MoeDecoderLayer._update_kv_mirror_scattered_metadata(
-                    forward_batch,
-                    mirror_num_real_rows=mirror_rows,
-                    mirror_num_padded_rows=mirror_padded_rows,
-                )
-
-            self.assertEqual(forward_batch.kv_mirror_num_real_rows, mirror_rows)
+        with (
+            envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(128),
+            envs.SGLANG_WELMV4_MIRROR_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(
+                512
+            ),
+        ):
             self.assertEqual(
-                forward_batch.kv_mirror_num_padded_rows, mirror_padded_rows
+                Qwen2MoeDecoderLayer._get_kv_mirror_prefill_ll_capacity(),
+                512,
             )
-            self.assertEqual(
-                forward_batch.kv_mirror_local_num_tokens, expected_local_rows
-            )
-            self.assertEqual(
-                forward_batch.global_dp_buffer_len, mirror_padded_rows
-            )
-            self.assertEqual(
-                forward_batch.global_num_tokens_cpu, [mirror_padded_rows]
-            )
-            self.assertEqual(
-                forward_batch.global_num_tokens_gpu.item(), mirror_padded_rows
-            )
-            self.assertEqual(
-                forward_batch.num_token_non_padded.item(), expected_real_rows
-            )
-            self.assertEqual(
-                forward_batch.num_token_non_padded_cpu, expected_real_rows
-            )
-
-    def test_pad_rows_only_appends_zero_rows(self):
-        hidden = torch.arange(10, dtype=torch.bfloat16).reshape(5, 2)
-        padded = Qwen2MoeDecoderLayer._pad_rows(hidden, 8)
-        torch.testing.assert_close(padded[:5], hidden)
-        torch.testing.assert_close(padded[5:], torch.zeros_like(padded[5:]))
 
     def test_attention_reduce_scatter_rejects_unaligned_rows(self):
         layer = object.__new__(Qwen2MoeDecoderLayer)
@@ -256,14 +253,15 @@ class TestWeLMv4DeepEPLayout(unittest.TestCase):
         torch.testing.assert_close(residual, expected_residual)
         self.assertIsNone(hidden_fp32)
 
-    def test_final_output_gathers_then_removes_kv_mirror_padding(self):
+    def test_final_scattered_prompt_output_gathers_full_rows(self):
         model = object.__new__(Qwen2MoeModel)
         local_hidden = torch.tensor([[0.0, 1.0], [2.0, 3.0]])
         full_hidden = torch.arange(16, dtype=torch.float32).reshape(8, 2)
         forward_batch = SimpleNamespace(
             welmv4_npu_deepep_scattered=True,
-            kv_mirror_num_real_rows=5,
-            kv_mirror_num_padded_rows=8,
+            welmv4_npu_deepep_full_mirror=False,
+            kv_mirror_num_real_rows=None,
+            kv_mirror_num_padded_rows=None,
             global_dp_buffer_len=8,
         )
         with (
@@ -281,7 +279,21 @@ class TestWeLMv4DeepEPLayout(unittest.TestCase):
             )
 
         gather.assert_called_once_with(local_hidden)
-        torch.testing.assert_close(restored, full_hidden[:5])
+        torch.testing.assert_close(restored, full_hidden)
+        self.assertEqual(aux, [])
+
+    def test_final_full_kv_mirror_output_needs_no_gather_or_trim(self):
+        model = object.__new__(Qwen2MoeModel)
+        hidden = torch.arange(10, dtype=torch.float32).reshape(5, 2)
+        forward_batch = SimpleNamespace(
+            welmv4_npu_deepep_scattered=False,
+            welmv4_npu_deepep_full_mirror=True,
+            kv_mirror_num_real_rows=5,
+        )
+        restored, aux = model._restore_npu_prefill_deepep_output_layout(
+            hidden, [], forward_batch
+        )
+        self.assertIs(restored, hidden)
         self.assertEqual(aux, [])
 
 

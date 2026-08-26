@@ -85,7 +85,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.server_args import get_global_server_args
 
 # from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
@@ -744,7 +744,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
     @staticmethod
     def _resolve_deepep_mode_for_topk(is_prefill_batch: bool) -> DeepEPMode:
-        return get_deepep_mode().resolve(is_prefill_batch)
+        mode_override = get_forward().deepep_mode_override
+        if mode_override is not None and not isinstance(mode_override, DeepEPMode):
+            raise TypeError(
+                "deepep_mode_override must be a DeepEPMode or None, got "
+                f"{type(mode_override).__name__}"
+            )
+        return (
+            mode_override
+            if mode_override is not None
+            else get_deepep_mode().resolve(is_prefill_batch)
+        )
 
     def forward(
         self,
@@ -1921,14 +1931,13 @@ class Qwen2MoeDecoderLayer(nn.Module):
             clone_fp32_out=True,
         )
 
-    def _npu_prefill_redistribute_kv_mirror_residual(
+    def _npu_prefill_replicate_kv_mirror_residual(
         self,
         residual: torch.Tensor,
         custom_last_index: torch.Tensor,
         *,
         prompt_num_padded_rows: int,
         mirror_num_real_rows: int,
-        mirror_num_padded_rows: int,
     ) -> torch.Tensor:
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_parallel().tp_rank
@@ -1947,17 +1956,14 @@ class Qwen2MoeDecoderLayer(nn.Module):
             custom_last_index,
             prompt_local_rows=prompt_local_rows,
             mirror_num_real_rows=mirror_num_real_rows,
-            mirror_num_padded_rows=mirror_num_padded_rows,
+            mirror_num_padded_rows=mirror_num_real_rows,
             tp_rank=tp_rank,
         )
-        local_mirror_rows = mirror_num_padded_rows // tp_size
-        local_residual = residual.new_empty(
-            (local_mirror_rows, residual.shape[1])
-        )
-        get_tp_group().reduce_scatter_tensor(
-            local_residual, residual_partial.contiguous()
-        )
-        return local_residual
+        # Each request's last prompt token is owned by exactly one prompt
+        # shard.  Sum the disjoint owner rows to reconstruct the exact [B, D]
+        # FP32 residual on every TP/EP rank.  Do not index a LOCAL residual
+        # with a global prompt position and do not pad B for this FULL layout.
+        return get_tp_group().all_reduce(residual_partial.contiguous())
 
     @staticmethod
     def _build_kv_mirror_residual_partial(
@@ -1991,62 +1997,44 @@ class Qwen2MoeDecoderLayer(nn.Module):
         return residual_partial
 
     @staticmethod
-    def _pad_rows(hidden_states: torch.Tensor, padded_rows: int) -> torch.Tensor:
-        if hidden_states.shape[0] > padded_rows:
-            raise RuntimeError(
-                f"Cannot pad {hidden_states.shape[0]} rows to smaller size {padded_rows}"
-            )
-        if hidden_states.shape[0] == padded_rows:
-            return hidden_states
-        return torch.cat(
-            [
-                hidden_states,
-                hidden_states.new_zeros(
-                    (padded_rows - hidden_states.shape[0], hidden_states.shape[1])
-                ),
-            ],
-            dim=0,
-        )
-
-    @staticmethod
-    def _update_kv_mirror_scattered_metadata(
+    def _update_kv_mirror_full_metadata(
         forward_batch: ForwardBatch,
         *,
         mirror_num_real_rows: int,
-        mirror_num_padded_rows: int,
     ) -> None:
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_parallel().tp_rank
-        if mirror_num_padded_rows % tp_size != 0:
-            raise RuntimeError(
-                "KV Mirror padded rows must be divisible by tensor parallel size"
-            )
-        local_rows = mirror_num_padded_rows // tp_size
-        local_real_rows = min(
-            max(mirror_num_real_rows - tp_rank * local_rows, 0), local_rows
-        )
         forward_batch.kv_mirror_num_real_rows = mirror_num_real_rows
-        forward_batch.kv_mirror_num_padded_rows = mirror_num_padded_rows
-        forward_batch.kv_mirror_local_num_tokens = local_rows
-        forward_batch.global_dp_buffer_len = mirror_num_padded_rows
+        forward_batch.kv_mirror_num_padded_rows = mirror_num_real_rows
+        forward_batch.kv_mirror_local_num_tokens = mirror_num_real_rows
+        forward_batch.global_dp_buffer_len = mirror_num_real_rows
         if forward_batch.global_num_tokens_cpu is not None:
             if len(forward_batch.global_num_tokens_cpu) != 1:
                 raise RuntimeError(
-                    "WeLMv4 scattered KV Mirror currently supports pure TP only"
+                    "WeLMv4 FULL KV Mirror currently supports pure TP only"
                 )
-            forward_batch.global_num_tokens_cpu = [mirror_num_padded_rows]
+            forward_batch.global_num_tokens_cpu = [mirror_num_real_rows]
         if forward_batch.global_num_tokens_gpu is not None:
             if forward_batch.global_num_tokens_gpu.numel() != 1:
                 raise RuntimeError(
-                    "WeLMv4 scattered KV Mirror currently supports pure TP only"
+                    "WeLMv4 FULL KV Mirror currently supports pure TP only"
                 )
-            forward_batch.global_num_tokens_gpu.fill_(mirror_num_padded_rows)
+            forward_batch.global_num_tokens_gpu.fill_(mirror_num_real_rows)
         if forward_batch.num_token_non_padded is None:
             raise RuntimeError(
                 "WeLMv4 NPU DeepEP requires num_token_non_padded metadata"
             )
-        forward_batch.num_token_non_padded.fill_(local_real_rows)
-        forward_batch.num_token_non_padded_cpu = local_real_rows
+        forward_batch.num_token_non_padded.fill_(mirror_num_real_rows)
+        forward_batch.num_token_non_padded_cpu = mirror_num_real_rows
+        forward_batch.welmv4_npu_deepep_scattered = False
+        forward_batch.welmv4_npu_deepep_full_mirror = True
+
+    @staticmethod
+    def _get_kv_mirror_prefill_ll_capacity() -> int:
+        mirror_capacity = (
+            envs.SGLANG_WELMV4_MIRROR_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+        )
+        if mirror_capacity is not None:
+            return mirror_capacity
+        return envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
 
     def forward(
         self,
@@ -2062,13 +2050,46 @@ class Qwen2MoeDecoderLayer(nn.Module):
         use_npu_prefill_deepep_scattered = (
             self._use_npu_prefill_deepep_scattered(hidden_states, forward_batch)
         )
-        if use_npu_prefill_deepep_scattered:
+        is_kv_mirror_prefill = (
+            forward_batch.enable_kv_mirror
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and self.first_target_kv_mirror_layer is not None
+        )
+        is_first_kv_mirror_consumer = (
+            is_kv_mirror_prefill
+            and self.layer_id == self.first_target_kv_mirror_layer
+        )
+        already_full_mirror = (
+            is_kv_mirror_prefill
+            and forward_batch.welmv4_npu_deepep_full_mirror
+        )
+        # The prompt prefix stays LOCAL between layers.  The first mirror
+        # consumer receives a LOCAL input, selects one row per request after
+        # attention, and changes the persistent layout to FULL.  Every later
+        # mirror layer consumes and produces the same exact [B, D] FULL rows.
+        input_hidden_is_scattered = (
+            use_npu_prefill_deepep_scattered
+            and self.layer_id > 0
+            and not already_full_mirror
+        )
+        output_hidden_is_scattered = (
+            use_npu_prefill_deepep_scattered
+            and not is_first_kv_mirror_consumer
+            and not already_full_mirror
+        )
+        use_full_mirror_layout = (
+            use_npu_prefill_deepep_scattered
+            and is_kv_mirror_prefill
+            and (is_first_kv_mirror_consumer or already_full_mirror)
+        )
+        if use_npu_prefill_deepep_scattered and not already_full_mirror:
             if forward_batch.num_token_non_padded is None:
                 raise RuntimeError(
                     "WeLMv4 NPU DeepEP scattered prefill requires localized "
                     "num_token_non_padded metadata"
                 )
-            forward_batch.welmv4_npu_deepep_scattered = True
+            if output_hidden_is_scattered:
+                forward_batch.welmv4_npu_deepep_scattered = True
         enable_npu_weight_prefetch = (
             _is_npu and hidden_states.shape[0] > 0
         )
@@ -2079,7 +2100,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             )
             prepare_weight_cache(hidden_states, qkv_prefetch_weight)
             qkv_prefetch_started = True
-        if use_npu_prefill_deepep_scattered and self.layer_id > 0:
+        if input_hidden_is_scattered:
             hidden_states, residual = self._npu_prefill_deepep_prepare_attention(
                 hidden_states,
                 residual,
@@ -2118,15 +2139,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
             is_dp_attention_enabled() and self.self_attn.use_o_norm
         )
 
-        is_kv_mirror_prefill = (
-            forward_batch.enable_kv_mirror
-            and forward_batch.forward_mode.is_extend_without_speculative()
-            and self.first_target_kv_mirror_layer is not None
-        )
-        is_first_kv_mirror_consumer = (
-            is_kv_mirror_prefill
-            and self.layer_id == self.first_target_kv_mirror_layer
-        )
         prompt_num_padded_rows = None
         if is_first_kv_mirror_consumer:
             custom_last_index = getattr(forward_batch, "custom_last_index", None)
@@ -2139,23 +2151,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
             hidden_states = hidden_states.index_select(
                 0, custom_last_index.to(torch.long)
             )
-        elif (
-            use_npu_prefill_deepep_scattered
-            and is_kv_mirror_prefill
-            and self.layer_id > self.first_target_kv_mirror_layer
-        ):
-            mirror_num_real_rows = forward_batch.kv_mirror_num_real_rows
-            if mirror_num_real_rows is None:
-                raise RuntimeError("KV Mirror scattered metadata was not initialized")
-            hidden_states = hidden_states[:mirror_num_real_rows]
-
         use_npu_prefill_oproj_matmul_reduce_scatter = (
             envs.SGLANG_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER.get()
-            and use_npu_prefill_deepep_scattered
-            and not (
-                is_kv_mirror_prefill
-                and self.layer_id >= self.first_target_kv_mirror_layer
-            )
+            and output_hidden_is_scattered
+            and not use_full_mirror_layout
             and hidden_states.shape[0] % get_tensor_model_parallel_world_size()
             == 0
         )
@@ -2170,40 +2169,41 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 skip_o_norm=(
                     use_mmq_norm_after_attn
                     or use_dp_o_norm_after_attn
-                    or use_npu_prefill_deepep_scattered
+                    or output_hidden_is_scattered
                 ),
-                skip_o_proj_all_reduce=use_npu_prefill_deepep_scattered,
+                skip_o_proj_all_reduce=output_hidden_is_scattered,
                 use_o_proj_matmul_reduce_scatter=(
                     use_npu_prefill_oproj_matmul_reduce_scatter
                 ),
             )
         if is_first_kv_mirror_consumer:
-            if use_npu_prefill_deepep_scattered:
-                mirror_num_real_rows = int(forward_batch.batch_size)
-                if forward_batch.custom_last_index.numel() != mirror_num_real_rows:
-                    raise RuntimeError(
-                        "KV Mirror request count does not match custom_last_index: "
-                        f"{mirror_num_real_rows} != "
-                        f"{forward_batch.custom_last_index.numel()}"
+            mirror_num_real_rows = int(forward_batch.batch_size)
+            if forward_batch.custom_last_index.numel() != mirror_num_real_rows:
+                raise RuntimeError(
+                    "KV Mirror request count does not match custom_last_index: "
+                    f"{mirror_num_real_rows} != "
+                    f"{forward_batch.custom_last_index.numel()}"
+                )
+            if use_full_mirror_layout:
+                if input_hidden_is_scattered:
+                    residual = self._npu_prefill_replicate_kv_mirror_residual(
+                        residual,
+                        forward_batch.custom_last_index,
+                        prompt_num_padded_rows=prompt_num_padded_rows,
+                        mirror_num_real_rows=mirror_num_real_rows,
                     )
-                tp_size = get_tensor_model_parallel_world_size()
-                mirror_num_padded_rows = (
-                    (mirror_num_real_rows + tp_size - 1) // tp_size * tp_size
-                )
-                residual = self._npu_prefill_redistribute_kv_mirror_residual(
-                    residual,
-                    forward_batch.custom_last_index,
-                    prompt_num_padded_rows=prompt_num_padded_rows,
-                    mirror_num_real_rows=mirror_num_real_rows,
-                    mirror_num_padded_rows=mirror_num_padded_rows,
-                )
-                hidden_states = self._pad_rows(
-                    hidden_states, mirror_num_padded_rows
-                )
-                self._update_kv_mirror_scattered_metadata(
+                else:
+                    residual = residual.index_select(
+                        0, forward_batch.custom_last_index.to(torch.long)
+                    )
+                if hidden_states.shape[0] != mirror_num_real_rows:
+                    raise RuntimeError(
+                        "KV Mirror FULL attention rows do not match request count: "
+                        f"{hidden_states.shape[0]} != {mirror_num_real_rows}"
+                    )
+                self._update_kv_mirror_full_metadata(
                     forward_batch,
                     mirror_num_real_rows=mirror_num_real_rows,
-                    mirror_num_padded_rows=mirror_num_padded_rows,
                 )
             else:
                 residual = residual.index_select(
@@ -2253,24 +2253,13 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     forward_batch.dp_padding_mode.is_max_len(),
                     new_global_num_tokens,
                 )
-        elif (
-            use_npu_prefill_deepep_scattered
-            and is_kv_mirror_prefill
-            and self.layer_id > self.first_target_kv_mirror_layer
-        ):
-            mirror_num_padded_rows = forward_batch.kv_mirror_num_padded_rows
-            if mirror_num_padded_rows is None:
-                raise RuntimeError("KV Mirror scattered metadata was not initialized")
-            hidden_states = self._pad_rows(
-                hidden_states, mirror_num_padded_rows
-            )
 
         router_prefetch_started = False
         if enable_npu_weight_prefetch and hidden_states.shape[0] > 0:
             router_compute_weight = self.mlp.get_npu_router_compute_weight_t()
             prepare_weight_cache(hidden_states, router_compute_weight)
             router_prefetch_started = True
-        if use_npu_prefill_deepep_scattered:
+        if output_hidden_is_scattered:
             hidden_states, residual, hidden_states_fp32 = (
                 self._npu_prefill_deepep_finish_attention(
                     hidden_states,
@@ -2368,28 +2357,48 @@ class Qwen2MoeDecoderLayer(nn.Module):
         if router_prefetch_started:
             # Keep CMO overlap bounded to post-attention RMSNorm.
             wait_cmo_stream()
-        # DeepEP already returns a complete LOCAL token shard. Do not involve
-        # LayerCommunicator or request a second framework ReduceScatter.
+        # The prefix's normal-AllGather DeepEP returns a complete LOCAL token
+        # shard.  The mirror suffix's LL DeepEP returns one complete FULL
+        # request-row set.  Neither layout needs a second framework RS.
         use_reduce_scatter = (
             False
-            if use_npu_prefill_deepep_scattered
+            if output_hidden_is_scattered or use_full_mirror_layout
             else self.layer_communicator.should_use_reduce_scatter(forward_batch)
         )
         self.final_mlp_experts_output = None
         self.final_mlp_shared_output = None
-        mlp_output = self.mlp(
-            hidden_states,
-            hidden_states_fp32,
-            forward_batch,
-            use_reduce_scatter,
-            return_components=self.is_final_layer,
-            skip_component_output=(
-                self.is_final_layer
-                and residual is not None
-                and getattr(self.mlp, "tp_size", 1) == 1
-                and not is_dp_attention_enabled()
-            ),
+        use_kv_mirror_prefill_ll = (
+            use_full_mirror_layout
+            and forward_batch.welmv4_npu_deepep_full_mirror
         )
+        mirror_ll_capacity = None
+        if use_kv_mirror_prefill_ll:
+            mirror_ll_capacity = self._get_kv_mirror_prefill_ll_capacity()
+            if hidden_states.shape[0] > mirror_ll_capacity:
+                raise RuntimeError(
+                    "WeLMv4 mirror prefill LL capacity is smaller than the "
+                    f"FULL request-row count: {mirror_ll_capacity} < "
+                    f"{hidden_states.shape[0]}"
+                )
+        with get_forward().scoped(
+            deepep_mode_override=(
+                DeepEPMode.LOW_LATENCY if use_kv_mirror_prefill_ll else None
+            ),
+            deepep_num_max_dispatch_tokens_override=mirror_ll_capacity,
+        ):
+            mlp_output = self.mlp(
+                hidden_states,
+                hidden_states_fp32,
+                forward_batch,
+                use_reduce_scatter,
+                return_components=self.is_final_layer,
+                skip_component_output=(
+                    self.is_final_layer
+                    and residual is not None
+                    and getattr(self.mlp, "tp_size", 1) == 1
+                    and not is_dp_attention_enabled()
+                ),
+            )
         experts_output = None
         shared_output = None
         if isinstance(mlp_output, tuple):
@@ -2801,6 +2810,16 @@ class Qwen2MoeModel(nn.Module):
         aux_hidden_states: List[torch.Tensor],
         forward_batch: ForwardBatch,
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        if forward_batch.welmv4_npu_deepep_full_mirror:
+            mirror_num_real_rows = forward_batch.kv_mirror_num_real_rows
+            if mirror_num_real_rows is None:
+                raise RuntimeError("KV Mirror FULL output metadata is incomplete")
+            if hidden_states.shape[0] != mirror_num_real_rows:
+                raise RuntimeError(
+                    "WeLMv4 FULL KV Mirror output row count changed: "
+                    f"{hidden_states.shape[0]} != {mirror_num_real_rows}"
+                )
+            return hidden_states, aux_hidden_states
         if not forward_batch.welmv4_npu_deepep_scattered:
             return hidden_states, aux_hidden_states
 

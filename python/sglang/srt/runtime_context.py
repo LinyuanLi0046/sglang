@@ -482,6 +482,13 @@ class ForwardFlags:
         "fuse_mlp_allreduce": False,
         "mlp_reduce_scatter": False,
         "flashinfer_trtllm_bypass": False,
+        # Eager-only DeepEP strategy override for one complete MoE call. This
+        # lets WeLMv4 switch its small mirror suffix to low-latency dispatch
+        # without changing the batch's prefill identity.
+        "deepep_mode_override": None,
+        # Optional per-call LL dispatch capacity. The process-wide DeepEP
+        # buffer remains sized for the largest configured capacity.
+        "deepep_num_max_dispatch_tokens_override": None,
     }
 
     # Read/written inside compiled graphs (vocab embedding, communicator,

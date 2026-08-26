@@ -874,74 +874,9 @@ class TestForwardFlags(_IsolatedServerArgs):
             self.assertTrue(fwd.multi_stream)
         self.assertFalse(fwd.multi_stream)
 
-    def test_deepep_mode_override_is_scoped(self):
-        from sglang.srt.layers.moe.utils import DeepEPMode
-        from sglang.srt.runtime_context import get_forward
-
-        reset_context()
-        fwd = get_forward()
-        self.assertIsNone(fwd.deepep_mode_override)
-        with fwd.scoped(deepep_mode_override=DeepEPMode.LOW_LATENCY):
-            self.assertIs(fwd.deepep_mode_override, DeepEPMode.LOW_LATENCY)
-        self.assertIsNone(fwd.deepep_mode_override)
-
-    def test_deepep_dispatch_capacity_override_is_scoped(self):
-        from sglang.srt.runtime_context import get_forward
-
-        reset_context()
-        fwd = get_forward()
-        self.assertIsNone(fwd.deepep_num_max_dispatch_tokens_override)
-        with fwd.scoped(deepep_num_max_dispatch_tokens_override=512):
-            self.assertEqual(
-                fwd.deepep_num_max_dispatch_tokens_override, 512
-            )
-        self.assertIsNone(fwd.deepep_num_max_dispatch_tokens_override)
-
-    def test_deepep_ll_dispatch_uses_per_call_capacity_with_max_buffer(self):
-        from sglang.srt.environ import envs
-        from sglang.srt.layers.moe.token_dispatcher import deepep as deepep_module
-        from sglang.srt.runtime_context import get_forward
-
-        with (
-            envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(128),
-            envs.SGLANG_WELMV4_MIRROR_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(
-                512
-            ),
-        ):
-            default_capacity, buffer_capacity = (
-                deepep_module._get_deepep_ll_token_capacities()
-            )
-
-        dispatcher = object.__new__(
-            deepep_module._DeepEPDispatcherImplLowLatency
-        )
-        dispatcher.num_max_dispatch_tokens_per_rank = default_capacity
-        dispatcher.num_max_dispatch_tokens_per_rank_capacity = buffer_capacity
-
-        reset_context()
-        self.assertEqual(
-            dispatcher._resolve_num_max_dispatch_tokens_per_rank(64), 128
-        )
-        with get_forward().scoped(
-            deepep_num_max_dispatch_tokens_override=512
-        ):
-            self.assertEqual(
-                dispatcher._resolve_num_max_dispatch_tokens_per_rank(300), 512
-            )
-        with self.assertRaisesRegex(RuntimeError, "input tokens per rank"):
-            dispatcher._resolve_num_max_dispatch_tokens_per_rank(129)
-        with (
-            get_forward().scoped(
-                deepep_num_max_dispatch_tokens_override=513
-            ),
-            self.assertRaisesRegex(RuntimeError, "buffer capacity"),
-        ):
-            dispatcher._resolve_num_max_dispatch_tokens_per_rank(300)
-
     def test_deepep_dispatcher_locks_impl_for_complete_call(self):
         from sglang.srt.layers.moe import utils as moe_utils
         from sglang.srt.layers.moe.token_dispatcher import deepep as deepep_module
-        from sglang.srt.runtime_context import get_forward
 
         class _FakeImpl:
             def __init__(self, name):
@@ -974,12 +909,12 @@ class TestForwardFlags(_IsolatedServerArgs):
         dispatcher._stage = deepep_module._Stage.INITIAL
         dispatcher._active_impl = None
 
-        with get_forward().scoped(
-            deepep_mode_override=moe_utils.DeepEPMode.LOW_LATENCY
+        with patch.object(
+            deepep_module, "get_is_extend_in_batch", return_value=False
         ):
             dispatcher.dispatch_a("hidden", "topk")
-        # The scope has ended, but the remaining phases must keep using the
-        # implementation selected by dispatch_a.
+        # The remaining phases must keep using the implementation selected by
+        # dispatch_a without resolving AUTO again.
         dispatcher.dispatch_b()
         dispatcher.combine_a(("experts", "ids", "weights"))
         self.assertEqual(dispatcher.combine_b(), "experts")

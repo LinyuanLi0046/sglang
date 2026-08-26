@@ -85,7 +85,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_forward, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 
 # from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
@@ -744,17 +744,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
     @staticmethod
     def _resolve_deepep_mode_for_topk(is_prefill_batch: bool) -> DeepEPMode:
-        mode_override = get_forward().deepep_mode_override
-        if mode_override is not None and not isinstance(mode_override, DeepEPMode):
-            raise TypeError(
-                "deepep_mode_override must be a DeepEPMode or None, got "
-                f"{type(mode_override).__name__}"
-            )
-        return (
-            mode_override
-            if mode_override is not None
-            else get_deepep_mode().resolve(is_prefill_batch)
-        )
+        return get_deepep_mode().resolve(is_prefill_batch)
 
     def forward(
         self,
@@ -2003,15 +1993,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
         )
 
     @staticmethod
-    def _get_kv_mirror_prefill_ll_capacity() -> int:
-        mirror_capacity = (
-            envs.SGLANG_WELMV4_MIRROR_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
-        )
-        if mirror_capacity is not None:
-            return mirror_capacity
-        return envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
-
-    @staticmethod
     def _update_kv_mirror_scattered_metadata(
         forward_batch: ForwardBatch,
         *,
@@ -2378,45 +2359,21 @@ class Qwen2MoeDecoderLayer(nn.Module):
             if use_npu_prefill_deepep_scattered
             else self.layer_communicator.should_use_reduce_scatter(forward_batch)
         )
-        use_kv_mirror_prefill_ll = (
-            use_npu_prefill_deepep_scattered
-            and is_kv_mirror_prefill
-            and self.layer_id >= self.first_target_kv_mirror_layer
-            and forward_batch.kv_mirror_num_padded_rows is not None
-        )
-        mirror_ll_capacity = None
-        if use_kv_mirror_prefill_ll:
-            local_mirror_tokens = forward_batch.kv_mirror_local_num_tokens
-            mirror_ll_capacity = self._get_kv_mirror_prefill_ll_capacity()
-            if (
-                local_mirror_tokens is None
-                or local_mirror_tokens > mirror_ll_capacity
-            ):
-                raise RuntimeError(
-                    "KV Mirror prefill LL tokens per rank exceed DeepEP "
-                    f"capacity: {local_mirror_tokens} > {mirror_ll_capacity}"
-                )
         self.final_mlp_experts_output = None
         self.final_mlp_shared_output = None
-        with get_forward().scoped(
-            deepep_mode_override=(
-                DeepEPMode.LOW_LATENCY if use_kv_mirror_prefill_ll else None
+        mlp_output = self.mlp(
+            hidden_states,
+            hidden_states_fp32,
+            forward_batch,
+            use_reduce_scatter,
+            return_components=self.is_final_layer,
+            skip_component_output=(
+                self.is_final_layer
+                and residual is not None
+                and getattr(self.mlp, "tp_size", 1) == 1
+                and not is_dp_attention_enabled()
             ),
-            deepep_num_max_dispatch_tokens_override=mirror_ll_capacity,
-        ):
-            mlp_output = self.mlp(
-                hidden_states,
-                hidden_states_fp32,
-                forward_batch,
-                use_reduce_scatter,
-                return_components=self.is_final_layer,
-                skip_component_output=(
-                    self.is_final_layer
-                    and residual is not None
-                    and getattr(self.mlp, "tp_size", 1) == 1
-                    and not is_dp_attention_enabled()
-                ),
-            )
+        )
         experts_output = None
         shared_output = None
         if isinstance(mlp_output, tuple):

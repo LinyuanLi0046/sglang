@@ -28,7 +28,6 @@ from sglang.srt.layers.moe.utils import (
     get_deepep_output_dtype,
     is_tbo_enabled,
 )
-from sglang.srt.runtime_context import get_forward
 from sglang.srt.utils import (
     get_bool_env_var,
     get_cuda_version,
@@ -69,30 +68,6 @@ import torch.distributed as dist
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
-
-
-def _get_deepep_ll_token_capacities() -> Tuple[int, int]:
-    default_capacity = (
-        envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
-    )
-    mirror_capacity = (
-        envs.SGLANG_WELMV4_MIRROR_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
-    )
-    if mirror_capacity is None:
-        mirror_capacity = default_capacity
-
-    for name, capacity in (
-        ("default", default_capacity),
-        ("WeLMv4 mirror prefill", mirror_capacity),
-    ):
-        if capacity <= 0:
-            raise ValueError(
-                f"DeepEP {name} LL dispatch capacity must be positive, got "
-                f"{capacity}"
-            )
-
-    buffer_capacity = max(default_capacity, mirror_capacity)
-    return default_capacity, buffer_capacity
 
 
 def _is_mnnvl_fabric_supported() -> bool:
@@ -383,15 +358,6 @@ class DeepEPBuffer:
                     "DeepEP process-wide Buffer was requested with a different "
                     "base process group"
                 )
-            if (
-                state.num_max_dispatch_tokens_per_rank
-                != num_max_dispatch_tokens_per_rank
-            ):
-                raise RuntimeError(
-                    "DeepEP process-wide Buffer capacity changed after "
-                    f"initialization: {state.num_max_dispatch_tokens_per_rank} "
-                    f"!= {num_max_dispatch_tokens_per_rank}"
-                )
             if state.normal_strategy_name != requested_normal_strategy:
                 raise RuntimeError(
                     "DeepEP standalone normal strategy changed after Buffer "
@@ -596,16 +562,12 @@ class _DeepEPDispatcherImplBase:
 
         self.params_bytes = 2
         # A large value will lead to large memory occupation, thus users should change it accordingly
-        (
-            self.num_max_dispatch_tokens_per_rank,
-            self.num_max_dispatch_tokens_per_rank_capacity,
-        ) = _get_deepep_ll_token_capacities()
-        # DeepEP internode_ll dispatch uses FINISHED_SUM_TAG=1024 and requires
-        # the per-rank token capacity to stay below that protocol limit.
-        assert self.num_max_dispatch_tokens_per_rank_capacity <= 1024, (
-            "DeepEP LL buffer capacity must be <= 1024, got "
-            f"{self.num_max_dispatch_tokens_per_rank_capacity}"
+        self.num_max_dispatch_tokens_per_rank = (
+            envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
+        # DeepEP internode_ll dispatch uses FINISHED_SUM_TAG=1024
+        # and the logic requires num-tokens-sent-from-one-rank-to-another-rank less than it
+        assert self.num_max_dispatch_tokens_per_rank <= 1024
 
         self.handle = None
 
@@ -874,7 +836,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             self.hidden_size,
             self.params_bytes,
             self.deepep_mode,
-            self.num_max_dispatch_tokens_per_rank_capacity,
+            self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
             normal_comm_group=self.normal_comm_group,
         )
@@ -891,38 +853,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self.return_recv_hook = return_recv_hook
         self.device_module = torch.get_device_module()
         self.quant_config = {}
-
-    def _resolve_num_max_dispatch_tokens_per_rank(self, num_tokens: int) -> int:
-        capacity_override = (
-            get_forward().deepep_num_max_dispatch_tokens_override
-        )
-        call_capacity = (
-            capacity_override
-            if capacity_override is not None
-            else self.num_max_dispatch_tokens_per_rank
-        )
-        if not isinstance(call_capacity, int) or isinstance(call_capacity, bool):
-            raise TypeError(
-                "deepep_num_max_dispatch_tokens_override must be an int or "
-                f"None, got {type(call_capacity).__name__}"
-            )
-        if call_capacity <= 0:
-            raise ValueError(
-                "DeepEP LL dispatch capacity must be positive, got "
-                f"{call_capacity}"
-            )
-        if call_capacity > self.num_max_dispatch_tokens_per_rank_capacity:
-            raise RuntimeError(
-                "DeepEP LL call capacity exceeds the process-wide buffer "
-                f"capacity: {call_capacity} > "
-                f"{self.num_max_dispatch_tokens_per_rank_capacity}"
-            )
-        if num_tokens > call_capacity:
-            raise RuntimeError(
-                "DeepEP LL input tokens per rank exceed the selected call "
-                f"capacity: {num_tokens} > {call_capacity}"
-            )
-        return call_capacity
 
     def dispatch_a(
         self,
@@ -1004,16 +934,13 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             else dict()
         )
 
-        call_capacity = self._resolve_num_max_dispatch_tokens_per_rank(
-            hidden_states.shape[0]
-        )
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
                 topk_ids,
-                call_capacity,
+                self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
                 use_fp8=self.use_fp8,
                 **(
@@ -1114,7 +1041,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             self.hidden_size,
             self.params_bytes,
             self.deepep_mode,
-            self.num_max_dispatch_tokens_per_rank_capacity,
+            self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
             normal_comm_group=self.normal_comm_group,
         )
@@ -1259,17 +1186,7 @@ class DeepEPDispatcher(BaseDispatcher):
             self._active_impl = None
 
     def _get_impl(self) -> _DeepEPDispatcherImplBase:
-        mode_override = get_forward().deepep_mode_override
-        if mode_override is not None and not isinstance(mode_override, DeepEPMode):
-            raise TypeError(
-                "deepep_mode_override must be a DeepEPMode or None, got "
-                f"{type(mode_override).__name__}"
-            )
-        resolved_deepep_mode = (
-            mode_override
-            if mode_override is not None
-            else self.deepep_mode.resolve(get_is_extend_in_batch())
-        )
+        resolved_deepep_mode = self.deepep_mode.resolve(get_is_extend_in_batch())
         if resolved_deepep_mode == DeepEPMode.NORMAL:
             impl = getattr(self, "_normal_dispatcher", None)
         elif resolved_deepep_mode == DeepEPMode.LOW_LATENCY:

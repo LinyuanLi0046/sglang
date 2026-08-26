@@ -4,7 +4,6 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.model_executor import forward_batch_info
@@ -81,13 +80,8 @@ class TestWeLMv4DeepEPLayout(unittest.TestCase):
         torch.testing.assert_close(masked.topk_ids, topk_output.topk_ids)
 
     def test_npu_topk_padding_policy_resolves_deepep_mode(self):
-        with (
-            patch.object(welmv4, "get_deepep_mode", return_value=DeepEPMode.AUTO),
-            patch.object(
-                welmv4,
-                "get_forward",
-                return_value=SimpleNamespace(deepep_mode_override=None),
-            ),
+        with patch.object(
+            welmv4, "get_deepep_mode", return_value=DeepEPMode.AUTO
         ):
             self.assertEqual(
                 Qwen2MoeSparseMoeBlock._resolve_deepep_mode_for_topk(True),
@@ -95,18 +89,6 @@ class TestWeLMv4DeepEPLayout(unittest.TestCase):
             )
             self.assertEqual(
                 Qwen2MoeSparseMoeBlock._resolve_deepep_mode_for_topk(False),
-                DeepEPMode.LOW_LATENCY,
-            )
-
-        with patch.object(
-            welmv4,
-            "get_forward",
-            return_value=SimpleNamespace(
-                deepep_mode_override=DeepEPMode.LOW_LATENCY
-            ),
-        ):
-            self.assertEqual(
-                Qwen2MoeSparseMoeBlock._resolve_deepep_mode_for_topk(True),
                 DeepEPMode.LOW_LATENCY,
             )
 
@@ -216,29 +198,6 @@ class TestWeLMv4DeepEPLayout(unittest.TestCase):
         padded = Qwen2MoeDecoderLayer._pad_rows(hidden, 8)
         torch.testing.assert_close(padded[:5], hidden)
         torch.testing.assert_close(padded[5:], torch.zeros_like(padded[5:]))
-
-    def test_kv_mirror_ll_capacity_can_differ_from_decode(self):
-        with (
-            envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(128),
-            envs.SGLANG_WELMV4_MIRROR_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(
-                None
-            ),
-        ):
-            self.assertEqual(
-                Qwen2MoeDecoderLayer._get_kv_mirror_prefill_ll_capacity(),
-                128,
-            )
-
-        with (
-            envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(128),
-            envs.SGLANG_WELMV4_MIRROR_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(
-                512
-            ),
-        ):
-            self.assertEqual(
-                Qwen2MoeDecoderLayer._get_kv_mirror_prefill_ll_capacity(),
-                512,
-            )
 
     def test_attention_reduce_scatter_rejects_unaligned_rows(self):
         layer = object.__new__(Qwen2MoeDecoderLayer)

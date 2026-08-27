@@ -2649,6 +2649,19 @@ class Qwen2MoeDecoderLayer(nn.Module):
             use_full_mirror_layout
             and forward_batch.welmv4_npu_deepep_full_mirror
         )
+        # Spec-V2 DRAFT_EXTEND_V2 is a multi-token extend even though it is
+        # launched from a decode ScheduleBatch.  In the eager path the copied
+        # ``is_extend_in_batch`` flag therefore still selects DeepEP LL.  That
+        # disagrees with both the padded-row routing above (normal mode uses
+        # expert id -1 for dummy rows) and the draft-extend graph adapter,
+        # which captures DeepEP as an extend batch.  Keep the correction local
+        # to the WeLM NextN physical MTP layer: recurrent draft DECODE remains
+        # LL and the target model's mirror-prefill override below remains LL.
+        use_nextn_draft_extend_normal = (
+            _is_npu
+            and self.is_nextn
+            and forward_batch.forward_mode.is_draft_extend_v2()
+        )
         mirror_ll_capacity = None
         if use_kv_mirror_prefill_ll:
             mirror_ll_capacity = self._get_kv_mirror_prefill_ll_capacity()
@@ -2660,7 +2673,11 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 )
         with get_forward().scoped(
             deepep_mode_override=(
-                DeepEPMode.LOW_LATENCY if use_kv_mirror_prefill_ll else None
+                DeepEPMode.LOW_LATENCY
+                if use_kv_mirror_prefill_ll
+                else (
+                    DeepEPMode.NORMAL if use_nextn_draft_extend_normal else None
+                )
             ),
             deepep_num_max_dispatch_tokens_override=mirror_ll_capacity,
         ):

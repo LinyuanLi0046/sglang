@@ -1119,6 +1119,21 @@ class AscendAttnBackend(AttentionBackend):
                 self.device
             ).int()
 
+        # WeLM MTP has two different length semantics during TARGET_VERIFY:
+        # ForwardBatch.seq_lens is the pre-verify length L used by ngram
+        # embedding, while attention must see the post-write KV length L + D.
+        # The addition also creates independent storage, so attention metadata
+        # cannot overwrite the ForwardBatch input when it is already int32.
+        if (
+            self.is_welm_v4
+            and forward_batch.forward_mode.is_target_verify()
+            and not _is_dflash_verify(forward_batch.spec_info)
+        ):
+            self.forward_metadata.seq_lens = (
+                self.forward_metadata.seq_lens
+                + self.speculative_num_draft_tokens
+            )
+
         self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
         if (
             not forward_batch.forward_mode.is_draft_extend_v2()
@@ -1270,6 +1285,11 @@ class AscendAttnBackend(AttentionBackend):
             metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[:num_tokens]
         metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
         metadata.seq_lens = seq_lens
+        if self.is_welm_v4 and forward_mode.is_target_verify():
+            # Keep the graph input's pre-verify L intact for WeLM ngram
+            # embedding. Attention owns this stable capture buffer and replay
+            # fills it with L + D in _apply_cuda_graph_metadata().
+            metadata.seq_lens = torch.empty_like(seq_lens)
         if self.is_welm_v4 and (
             forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
         ):
@@ -1413,15 +1433,18 @@ class AscendAttnBackend(AttentionBackend):
         metadata.block_tables[:bs, max_seq_pages:].fill_(0)
         metadata.block_tables[bs:, :].fill_(0)
 
+        attention_seq_lens = seq_lens
         if forward_mode.is_target_verify():
-            seq_lens = seq_lens + self.speculative_num_draft_tokens
+            attention_seq_lens = (
+                seq_lens + self.speculative_num_draft_tokens
+            )
         elif (
             forward_mode.is_decode_or_idle()
             and spec_info is not None
             and not bool(getattr(spec_info, "welmv4_mtp_frozen_kv", False))
         ):
-            seq_lens = seq_lens + self.speculative_step_offset_npu
-        metadata.seq_lens[:bs].copy_(seq_lens[:bs])
+            attention_seq_lens = seq_lens + self.speculative_step_offset_npu
+        metadata.seq_lens[:bs].copy_(attention_seq_lens[:bs])
 
         if (
             welm_mtp_real_rows is not None

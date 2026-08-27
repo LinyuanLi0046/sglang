@@ -1884,6 +1884,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         self.config_layer_id = int(
             layer_id if config_layer_id is None else config_layer_id
         )
+        self.is_nextn = is_nextn
         self.hidden_size = config.hidden_size
         # Transformers v5 standardizes legacy rope_scaling into
         # rope_parameters and renames ``type`` to ``rope_type``. Keep the old
@@ -2059,6 +2060,11 @@ class Qwen2MoeDecoderLayer(nn.Module):
         tp_size = get_tensor_model_parallel_world_size()
         return (
             _is_npu
+            # This target-only fast path keeps prompt rows LOCAL between
+            # physical decoder layers. NextN has one physical layer and its
+            # input has already been restored to FULL by the target model;
+            # its first-layer residual is therefore legitimately None.
+            and not self.is_nextn
             and get_moe_a2a_backend().is_deepep()
             and forward_batch.forward_mode.is_extend_without_speculative()
             and not is_dp_attention_enabled()

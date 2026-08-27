@@ -90,10 +90,15 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         hf_config = self.model_runner.model_config.hf_config
         if not (is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)):
             seq_lens_for_each_draft_step = []
-            for speculative_step_id in range(self.speculative_num_steps - 1):
-                seq_lens_cpu = (
-                    forward_batch.seq_lens_cpu[: self.raw_bs] + speculative_step_id + 1
+            frozen_welm_kv = bool(
+                getattr(
+                    forward_batch.spec_info, "welmv4_mtp_frozen_kv", False
                 )
+            )
+            for speculative_step_id in range(self.speculative_num_steps - 1):
+                seq_lens_cpu = forward_batch.seq_lens_cpu[: self.raw_bs]
+                if not frozen_welm_kv:
+                    seq_lens_cpu = seq_lens_cpu + speculative_step_id + 1
                 seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
                 seq_lens_for_each_draft_step.append(seq_lens)
             attr_name = self._get_update_attr_name()

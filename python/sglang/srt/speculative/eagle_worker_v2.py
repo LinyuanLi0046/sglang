@@ -195,6 +195,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
+        draft_ngram = self.draft_runner.ngram_embedding_manager
+        target_ngram = self.target_worker.model_runner.ngram_embedding_manager
+        if draft_ngram.enabled:
+            self.draft_runner.ngram_embedding_manager = draft_ngram.share_table_from(
+                target_ngram
+            )
         self.init_token_map()
         self.init_lm_head()
 
@@ -575,6 +581,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Forward multiple steps
         scores = None
+        welm_prev1_tokens = spec_info.bonus_tokens
+        welm_prev2_tokens = None
         if self.index_share_for_mtp_iteration:
             forward_batch.reuse_dsa_topk_indices = True
             # Keep the draft-extend seed so step 0 reuses it; else recompute it.
@@ -600,6 +608,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
             # Set inputs
             forward_batch.input_ids = input_ids
+            if spec_info.welmv4_mtp_frozen_kv:
+                spec_info.welmv4_mtp_prev1_tokens = welm_prev1_tokens
+                spec_info.welmv4_mtp_prev2_tokens = welm_prev2_tokens
             # Qwen3-MoE MTP uses a fused RoPE + KV-store path whose cache_loc
             # argument must be contiguous.
             if (
@@ -635,7 +646,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     forward_batch.sampling_info.temperatures,
                 )
                 draft_probs_list.append(probs)
-                forward_batch.positions.add_(1)
+                if not spec_info.welmv4_mtp_frozen_kv:
+                    forward_batch.positions.add_(1)
             elif self.topk == 1 and not _is_hip:
                 if _is_cuda:
                     # The positions advance is fused into the kernel.
@@ -650,7 +662,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         logits_output.next_token_logits, dim=-1, keepdim=True
                     )
                     topk_p = torch.ones_like(topk_index, dtype=torch.float32)
-                    forward_batch.positions.add_(1)
+                    if not spec_info.welmv4_mtp_frozen_kv:
+                        forward_batch.positions.add_(1)
             else:
                 probs = renorm_draft_probs(
                     logits_output.next_token_logits,
@@ -658,7 +671,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     get_spec().speculative_use_rejection_sampling,
                 )
                 topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-                forward_batch.positions.add_(1)
+                if not spec_info.welmv4_mtp_frozen_kv:
+                    forward_batch.positions.add_(1)
             maybe_detect_oob(
                 topk_index,
                 0,
@@ -668,6 +682,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
+            if spec_info.welmv4_mtp_frozen_kv:
+                welm_prev2_tokens = welm_prev1_tokens
+                welm_prev1_tokens = input_ids
+
+        if spec_info.welmv4_mtp_frozen_kv:
+            spec_info.welmv4_mtp_prev1_tokens = None
+            spec_info.welmv4_mtp_prev2_tokens = None
 
         if self.index_share_for_mtp_iteration:
             spec_info.dsa_topk_indices = None
@@ -708,6 +729,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         target_hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
         mm_input_embeds: Optional[torch.Tensor] = None,
+        model_specific_states=None,
     ):
         """
         Run draft model extend to correctly fill the KV cache.
@@ -736,6 +758,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # hidden_states + shape info.
         batch.spec_info = EagleDraftExtendInput(
             hidden_states=target_hidden_states,
+            model_specific_states=model_specific_states,
             # draft mode is same with decode mode, only 1 token per req
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
@@ -814,6 +837,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
             dsa_topk_indices=prefill_dsa_topk,
+            welmv4_mtp_frozen_kv=self._is_welmv4_nextn(),
+        )
+
+    def _is_welmv4_nextn(self) -> bool:
+        return "WeLMV4MoeForCausalLMNextN" in (
+            self.draft_runner.model_config.hf_config.architectures or []
         )
 
     def _get_dsa_extend_topk_buf(self, num_tokens: int) -> torch.Tensor:
@@ -835,6 +864,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # Batch 2: Draft extend
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
+            model_specific_states=(
+                batch_result.logits_output.model_specific_states
+            ),
+            mirrored_kv_indices=(
+                batch_result.next_draft_input.mirrored_kv_indices
+            ),
             # accept_lens includes the bonus token; correct drafts exclude it.
             num_correct_drafts=batch_result.accept_lens - 1,
             num_accept_tokens=batch_result.accept_lens,
@@ -975,6 +1010,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ret_topk_index,
             ret_hidden_states,
         )
+        next_draft_input.welmv4_mtp_frozen_kv = self._is_welmv4_nextn()
+        next_draft_input.model_specific_states = None
+        next_draft_input.mirrored_kv_indices = None
         if get_spec().speculative_use_rejection_sampling:
             next_draft_input.draft_probs = ret_draft_probs
         if self.seed_dsa_topk_from_draft_extend:
@@ -1112,6 +1150,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         batch_output.logits_output.hidden_states,
                         batch_output.next_token_ids,
                         batch_output.logits_output.mm_input_embeds,
+                        batch_output.logits_output.model_specific_states,
                     )
                 )
                 return batch_output

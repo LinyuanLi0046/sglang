@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.configs.model_config import (
+    ModelConfig,
     get_hybrid_layer_ids,
     get_welmv4_layerwise_sliding_windows,
     is_embedding_gemma,
@@ -16,6 +17,39 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestHybridLayerIds(CustomTestCase):
+    def test_welm_draft_reuses_num_target_hidden_layers(self):
+        model_config = object.__new__(ModelConfig)
+        model_config.is_draft_model = True
+        model_config.hf_config = SimpleNamespace(
+            architectures=["WeLMV4MoeForCausalLM"],
+            num_hidden_layers=48,
+            num_nextn_predict_layers=1,
+        )
+
+        model_config._config_draft_model()
+
+        self.assertEqual(
+            model_config.hf_config.architectures,
+            ["WeLMV4MoeForCausalLMNextN"],
+        )
+        self.assertEqual(model_config.hf_config.num_target_hidden_layers, 48)
+        self.assertEqual(model_config.hf_config.num_hidden_layers, 1)
+
+    def test_welm_draft_preserves_existing_num_target_hidden_layers(self):
+        model_config = object.__new__(ModelConfig)
+        model_config.is_draft_model = True
+        model_config.hf_config = SimpleNamespace(
+            architectures=["WeLMV4MoeForCausalLM"],
+            num_hidden_layers=49,
+            num_target_hidden_layers=48,
+            num_nextn_predict_layers=1,
+        )
+
+        model_config._config_draft_model()
+
+        self.assertEqual(model_config.hf_config.num_target_hidden_layers, 48)
+        self.assertEqual(model_config.hf_config.num_hidden_layers, 1)
+
     def test_layer_type_architectures(self):
         config = SimpleNamespace(
             num_hidden_layers=4,
@@ -118,6 +152,24 @@ class TestHybridLayerIds(CustomTestCase):
             get_hybrid_layer_ids(
                 ["WeLMV4MoeForCausalLM"], config, context_len=1024
             )
+
+    def test_welm_nextn_uses_logical_layer48_config_with_physical_layer0(self):
+        config = SimpleNamespace(
+            num_hidden_layers=1,
+            num_target_hidden_layers=48,
+            sliding_window_size_layerwise=[1024] * 48 + [512],
+            sliding_window=1024,
+            max_position_embeddings=4096,
+        )
+
+        # The returned IDs belong to the one-layer draft KV pool, but the
+        # window decision comes from logical/checkpoint layer 48.
+        self.assertEqual(
+            get_hybrid_layer_ids(
+                ["WeLMV4MoeForCausalLMNextN"], config, context_len=1024
+            ),
+            ([0], []),
+        )
 
 
 class TestEmbeddingGemmaConfig(CustomTestCase):

@@ -1,4 +1,4 @@
-"""Utilities for updating LongCat ngram embedding token tables."""
+"""Utilities for LongCat/WeLM ngram embedding token tables."""
 
 from __future__ import annotations
 
@@ -25,6 +25,78 @@ class NgramEmbeddingManager:
     table: Optional[torch.Tensor]
     n: int
     k: int
+
+    def share_table_from(
+        self, owner: "NgramEmbeddingManager"
+    ) -> "NgramEmbeddingManager":
+        """Return a manager view that uses the canonical owner's token table."""
+        if not self.enabled:
+            return self
+        if not owner.enabled or owner.table is None:
+            raise RuntimeError("Cannot share ngram state from a disabled owner")
+        if (self.n, self.k) != (owner.n, owner.k):
+            raise RuntimeError(
+                "Target/draft ngram configurations differ: "
+                f"target={(owner.n, owner.k)} vs draft={(self.n, self.k)}."
+            )
+        if self.table is not None and self.table.shape != owner.table.shape:
+            raise RuntimeError(
+                "Target/draft ngram token-table shapes differ: "
+                f"{owner.table.shape} vs {self.table.shape}."
+            )
+        if self.table is not None and (
+            self.table.dtype != owner.table.dtype
+            or self.table.device != owner.table.device
+        ):
+            raise RuntimeError(
+                "Target/draft ngram token tables must share dtype/device: "
+                f"target={owner.table.dtype}/{owner.table.device}, "
+                f"draft={self.table.dtype}/{self.table.device}."
+            )
+        return NgramEmbeddingManager(
+            enabled=True,
+            table=owner.table,
+            n=self.n,
+            k=self.k,
+        )
+
+    def commit_speculative_accepts(
+        self,
+        *,
+        predict: torch.Tensor,
+        accept_index: torch.Tensor,
+        accept_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        old_seq_lens: torch.Tensor,
+    ) -> None:
+        """Commit accepted predictions after the incoming bonus/root column."""
+        if not self.enabled or self.table is None or accept_index.numel() == 0:
+            return
+        if is_npu():
+            from sglang.srt.layers.welmv4_npu_op import (
+                welmv4_token_table_spec_accept_update_npu,
+            )
+
+            welmv4_token_table_spec_accept_update_npu(
+                self.table,
+                predict,
+                accept_index,
+                accept_lens,
+                req_pool_indices,
+                old_seq_lens,
+            )
+            return
+
+        width = accept_index.shape[1]
+        step = torch.arange(width, device=accept_index.device).view(1, -1)
+        valid = step < accept_lens.view(-1, 1)
+        safe = accept_index.to(torch.int64).clamp(min=0)
+        values = predict[safe]
+        rows = req_pool_indices.to(torch.int64).view(-1, 1).expand_as(safe)
+        # old_seq_lens points at the incoming bonus/root b0. Accepted target
+        # predictions begin at the following column, hence the required +1.
+        columns = old_seq_lens.to(torch.int64).view(-1, 1) + 1 + step
+        self.table[rows[valid], columns[valid]] = values[valid].to(self.table.dtype)
 
     @classmethod
     def from_model(

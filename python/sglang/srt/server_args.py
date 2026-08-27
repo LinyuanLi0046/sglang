@@ -5108,12 +5108,6 @@ class ServerArgs:
                     "rebase does not transfer them across pipeline stages. "
                     "Use --pp-size 1; tensor parallel and attention DP remain supported."
                 )
-            if self.speculative_algorithm is not None:
-                raise ValueError(
-                    "Speculative decoding is not supported by the rebased "
-                    "WeLMv4 path because draft/verify ngram history has not "
-                    "been ported. Disable speculative decoding."
-                )
             if self.enable_torch_compile:
                 logger.warning(
                     "Torch Compile is disabled for WeLMv4 on the rebased "
@@ -5137,8 +5131,8 @@ class ServerArgs:
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
             if is_npu() and self.cuda_graph_config.decode.backend != Backend.DISABLED:
                 logger.info(
-                    "Decode NPU Graph is enabled for WeLMv4 and uses FIA v2 "
-                    "with dynamic actual_seq_kvlen updates. Torch Compile and "
+                    "Decode NPU Graph is enabled for WeLMv4. Spec V2 MTP "
+                    "uses the WeLM Triton attention path. Torch Compile and "
                     "Prefill NPU Graph remain disabled."
                 )
             if self.disaggregation_mode != "null":

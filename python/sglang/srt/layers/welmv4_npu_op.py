@@ -1716,6 +1716,66 @@ def _welmv4_oe_hash_decode_4way_kernel(
         )
 
 
+@triton.jit(do_not_specialize=["batch_size", "num_tasks"])
+def _welmv4_oe_hash_explicit_history_4way_kernel(
+    current_ptr,
+    previous1_ptr,
+    previous2_ptr,
+    hashed_out_ptr,
+    batch_size,
+    num_tasks,
+    VOCAB_SIZE: tl.constexpr,
+    OE_V0: tl.constexpr,
+    OE_V1: tl.constexpr,
+    OE_V2: tl.constexpr,
+    OE_V3: tl.constexpr,
+    HASH_MUL: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+):
+    """Hash one draft token per request using draft-local history."""
+    pid = tl.program_id(0)
+    program_count = tl.num_programs(0)
+    tasks_per_program = (num_tasks + program_count - 1) // program_count
+    task_start = pid * tasks_per_program
+    task_end = tl.minimum(task_start + tasks_per_program, num_tasks)
+    base_offsets = tl.arange(0, BLOCK_B)
+
+    for task_idx in range(task_start, task_end):
+        indices = task_idx * BLOCK_B + base_offsets
+        mask = indices.to(tl.float32) < batch_size
+        current = tl.load(current_ptr + indices, mask=mask, other=0).to(tl.uint32)
+        previous1 = tl.load(previous1_ptr + indices, mask=mask, other=0).to(
+            tl.uint32
+        )
+        previous2 = tl.load(previous2_ptr + indices, mask=mask, other=0).to(
+            tl.uint32
+        )
+        packed2 = current + previous1 * VOCAB_SIZE
+        packed3 = packed2 + previous2 * VOCAB_SIZE * VOCAB_SIZE
+        hash2 = (packed2 * HASH_MUL).to(tl.uint32)
+        hash3 = (packed3 * HASH_MUL).to(tl.uint32)
+        tl.store(
+            hashed_out_ptr + indices,
+            _welmv4_u32_remainder(hash2, OE_V0).to(tl.int32),
+            mask=mask,
+        )
+        tl.store(
+            hashed_out_ptr + batch_size + indices,
+            _welmv4_u32_remainder(hash2, OE_V1).to(tl.int32),
+            mask=mask,
+        )
+        tl.store(
+            hashed_out_ptr + 2 * batch_size + indices,
+            _welmv4_u32_remainder(hash3, OE_V2).to(tl.int32),
+            mask=mask,
+        )
+        tl.store(
+            hashed_out_ptr + 3 * batch_size + indices,
+            _welmv4_u32_remainder(hash3, OE_V3).to(tl.int32),
+            mask=mask,
+        )
+
+
 @triton.jit(
     do_not_specialize=["num_tokens", "num_token_tiles", "num_tasks"]
 )
@@ -1804,6 +1864,48 @@ def _welmv4_token_table_decode_update_kernel(
             values,
             mask=update_mask,
         )
+
+
+@triton.jit(do_not_specialize=["batch_size", "width"])
+def _welmv4_token_table_spec_accept_update_kernel(
+    token_table_ptr,
+    predict_ptr,
+    accept_index_ptr,
+    accept_lens_ptr,
+    req_pool_indices_ptr,
+    old_seq_lens_ptr,
+    batch_size,
+    width,
+    context_len: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+):
+    """Commit accepted predictions after each request's incoming root."""
+    req_idx = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_W)
+    request_mask = req_idx < batch_size
+    accept_len = tl.load(
+        accept_lens_ptr + req_idx, mask=request_mask, other=0
+    ).to(tl.int32)
+    valid = request_mask & (offsets < width) & (offsets < accept_len)
+    flat_index = req_idx * width + offsets
+    source = tl.load(
+        accept_index_ptr + flat_index, mask=valid, other=0
+    ).to(tl.int64)
+    source = tl.maximum(source, 0)
+    values = tl.load(predict_ptr + source, mask=valid, other=0)
+    row = tl.load(
+        req_pool_indices_ptr + req_idx, mask=request_mask, other=0
+    ).to(tl.int64)
+    old_len = tl.load(
+        old_seq_lens_ptr + req_idx, mask=request_mask, other=0
+    ).to(tl.int64)
+    columns = old_len + 1 + offsets
+    valid = valid & (columns < context_len)
+    tl.store(
+        token_table_ptr + row * context_len + columns,
+        values,
+        mask=valid,
+    )
 
 
 def _welmv4_vector_core_count(device: torch.device) -> int:
@@ -1939,6 +2041,50 @@ def welmv4_oe_hash_decode_4way_npu(
     return output
 
 
+def welmv4_oe_hash_explicit_history_4way_npu(
+    current: torch.Tensor,
+    previous1: torch.Tensor,
+    previous2: torch.Tensor,
+    *,
+    vocab_size: int,
+    oe_vocab_sizes: Sequence[int],
+    block_b: int = 128,
+) -> torch.Tensor:
+    """Return [4, B] hashes for recurrent draft-local token history."""
+    oe_v0, oe_v1, oe_v2, oe_v3 = _validate_welmv4_oe_vocab_sizes(
+        oe_vocab_sizes
+    )
+    batch_size = current.numel()
+    if previous1.numel() != batch_size or previous2.numel() != batch_size:
+        raise ValueError("draft-local OE history must have one row per token")
+    output = torch.empty(
+        (_WELMV4_OE_BRANCHES, batch_size),
+        dtype=torch.int32,
+        device=current.device,
+    )
+    if batch_size == 0:
+        return output
+    num_tasks = triton.cdiv(batch_size, block_b)
+    _welmv4_oe_hash_explicit_history_4way_kernel[
+        _welmv4_1d_grid(num_tasks, current.device)
+    ](
+        current,
+        previous1,
+        previous2,
+        output,
+        batch_size,
+        num_tasks,
+        VOCAB_SIZE=int(vocab_size),
+        OE_V0=oe_v0,
+        OE_V1=oe_v1,
+        OE_V2=oe_v2,
+        OE_V3=oe_v3,
+        HASH_MUL=_WELMV4_OE_HASH_MULTIPLIER,
+        BLOCK_B=block_b,
+    )
+    return output
+
+
 def welmv4_token_table_ragged_update_npu(
     token_table: torch.Tensor,
     tokens: torch.Tensor,
@@ -2003,6 +2149,33 @@ def welmv4_token_table_decode_update_npu(
         num_tasks,
         HAS_SKIP_MASK=skip_mask is not None,
         BLOCK_B=block_b,
+    )
+
+
+def welmv4_token_table_spec_accept_update_npu(
+    token_table: torch.Tensor,
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    old_seq_lens: torch.Tensor,
+) -> None:
+    """Commit Spec V2 topk1 accepts at old_seq_lens + 1 + j."""
+    batch_size, width = accept_index.shape
+    if batch_size == 0 or width == 0:
+        return
+    block_w = triton.next_power_of_2(width)
+    _welmv4_token_table_spec_accept_update_kernel[(batch_size,)](
+        token_table,
+        predict,
+        accept_index,
+        accept_lens,
+        req_pool_indices,
+        old_seq_lens,
+        batch_size,
+        width,
+        token_table.shape[1],
+        BLOCK_W=block_w,
     )
 
 def sigmoid_mul_ref(

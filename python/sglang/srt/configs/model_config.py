@@ -48,7 +48,10 @@ MIMO_V2_MODEL_ARCHS = (
     "MiMoV2FlashForCausalLM",
 )
 MIMO_V2_MULTIMODAL_ARCHS = ("MiMoV2ForCausalLM",)
-WELMV4_MODEL_ARCHS = ("WeLMV4MoeForCausalLM",)
+WELMV4_MODEL_ARCHS = (
+    "WeLMV4MoeForCausalLM",
+    "WeLMV4MoeForCausalLMNextN",
+)
 
 
 def get_mimo_v2_fused_qkv_expected_tp_size(hf_config):
@@ -586,6 +589,26 @@ class ModelConfig:
     def _config_draft_model(self):
         is_draft_model = self.is_draft_model
 
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "WeLMV4MoeForCausalLM"
+        ):
+            num_target_hidden_layers = getattr(
+                self.hf_config, "num_target_hidden_layers", None
+            )
+            if num_target_hidden_layers is None:
+                num_target_hidden_layers = self.hf_config.num_hidden_layers
+            self.hf_config.num_target_hidden_layers = int(
+                num_target_hidden_layers
+            )
+            self.hf_config.architectures[0] = "WeLMV4MoeForCausalLMNextN"
+            self.hf_config.num_nextn_predict_layers = int(
+                getattr(self.hf_config, "num_nextn_predict_layers", None) or 1
+            )
+            self.hf_config.num_hidden_layers = (
+                self.hf_config.num_nextn_predict_layers
+            )
+
         if is_draft_model and self.hf_config.architectures[0] in [
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
@@ -787,7 +810,7 @@ class ModelConfig:
                 self.hf_text_config, "add_swa_attention_sink_bias", False
             ) or getattr(self.hf_text_config, "add_full_attention_sink_bias", False)
 
-        if "WeLMV4MoeForCausalLM" in archs:
+        if any(arch in WELMV4_MODEL_ARCHS for arch in archs):
             sink_flags = (
                 getattr(self.hf_text_config, "enable_attn_sink_layerwise", []) or []
             )
@@ -2241,10 +2264,17 @@ def get_hybrid_layer_ids(
         swa_attention_layer_ids = list(range(num_hidden_layers))
         full_attention_layer_ids = []
     elif any(arch in WELMV4_MODEL_ARCHS for arch in model_architectures):
+        is_nextn = "WeLMV4MoeForCausalLMNextN" in model_architectures
+        layer_offset = (
+            int(getattr(hf_text_config, "num_target_hidden_layers", 0) or 0)
+            if is_nextn
+            else 0
+        )
         normalized_windows = get_welmv4_layerwise_sliding_windows(
             hf_text_config,
             context_len=context_len,
             num_layers=num_hidden_layers,
+            layer_offset=layer_offset,
         )
         swa_attention_layer_ids = [
             layer_id

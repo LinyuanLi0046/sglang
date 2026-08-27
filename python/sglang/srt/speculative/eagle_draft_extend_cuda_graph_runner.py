@@ -17,6 +17,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    NgramEmbeddingInfo,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
@@ -68,6 +69,7 @@ class EagleDraftExtendInputBuffers(ForwardInputBuffers):
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
+    ngram_column_starts: Optional[torch.Tensor] = None
 
 
 class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
@@ -143,6 +145,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             self.draft_extend_attn_backend.get_cuda_graph_seq_len_fill_value()
         )
         self.extend_seq_lens_cpu = [self.captured_req_width] * self.max_bs
+        self._is_welmv4_nextn = "WeLMV4MoeForCausalLMNextN" in (
+            model_runner.model_config.hf_config.architectures or []
+        )
 
         if self.enable_torch_compile:
             set_torch_compile_config()
@@ -176,8 +181,19 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             self.seq_len_fill_value = (
                 self.draft_extend_attn_backend.get_cuda_graph_seq_len_fill_value()
             )
+            # A WeLM draft-extend capture represents prefix_len=0 plus the
+            # fixed D-row MTP window. kv_len=0 with q_len=D is invalid for the
+            # Triton prefill kernels; replay still zero-fills padded requests.
+            capture_seq_len = (
+                self.captured_req_width
+                if self._is_welmv4_nextn
+                else self.seq_len_fill_value
+            )
             seq_lens = torch.full(
-                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64
+                (self.max_bs,), capture_seq_len, dtype=torch.int64
+            )
+            ngram_column_starts = torch.zeros(
+                (self.max_bs,), dtype=torch.int32
             )
             extend_seq_lens = torch.full(
                 (self.max_bs,), self.captured_req_width, dtype=torch.int32
@@ -230,7 +246,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             )
 
         seq_lens_cpu = torch.full(
-            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64, device="cpu"
+            (self.max_bs,), capture_seq_len, dtype=torch.int64, device="cpu"
         )
 
         dsa_seed_topk_capture = (
@@ -260,8 +276,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             dsa_seed_topk_capture=dsa_seed_topk_capture,
+            ngram_column_starts=ngram_column_starts,
         )
         self.buffers.share_buffers()
+        self._init_model_specific_buffers()
 
         self.backend = resolve_decode_backend(self)
 
@@ -278,6 +296,24 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
     def _cache_loc_dtype(self):
         return torch.int64
+
+    def _init_model_specific_buffers(self) -> None:
+        pass
+
+    def _bind_model_specific_capture_inputs(
+        self, spec_info: EagleDraftExtendInput, num_tokens: int
+    ) -> None:
+        pass
+
+    def _load_model_specific_replay_inputs(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        raw_bs: int,
+        padded_bs: int,
+        num_tokens: int,
+    ) -> None:
+        pass
 
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
         return ShapeKey(size=bs)
@@ -377,6 +413,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             # Padded tree width per req; drives the constant qo layout.
             num_tokens_per_req=self.captured_req_width,
         )
+        self._bind_model_specific_capture_inputs(spec_info, num_tokens)
 
         forward_batch = ForwardBatch(
             forward_mode=self.forward_mode,
@@ -401,6 +438,14 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             spec_info=spec_info,
             capture_hidden_mode=CaptureHiddenMode.LAST,
         )
+        if self.model_runner.ngram_embedding_manager.enabled:
+            forward_batch.ngram_embedding_info = NgramEmbeddingInfo.create(
+                self.model_runner.ngram_embedding_manager.table,
+                bs,
+                self.device,
+                column_starts=buffers.ngram_column_starts[:bs],
+                req_lens=extend_seq_lens,
+            )
 
         if self.buffers.dsa_seed_topk_capture is not None:
             spec_info.dsa_seed_topk_capture = self.buffers.dsa_seed_topk_capture[
@@ -523,6 +568,26 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             copy_dsts.append(buffers.num_accept_tokens[:raw_bs])
             copy_srcs.append(forward_batch.spec_info.num_accept_tokens)
         _grouped_foreach_copy_(copy_dsts, copy_srcs)
+        if self.model_runner.ngram_embedding_manager.enabled:
+            if bs != raw_bs:
+                buffers.ngram_column_starts.zero_()
+            ngram_info = forward_batch.ngram_embedding_info
+            if ngram_info is not None:
+                buffers.ngram_column_starts[:raw_bs].copy_(
+                    ngram_info.column_starts[:raw_bs]
+                )
+            else:
+                # DRAFT_EXTEND_V2 seq_lens is post-write; its ngram logical
+                # start is the pre-window prefix. The model adds the required
+                # shift by one token when hashing the NextN inputs.
+                buffers.ngram_column_starts[:raw_bs].copy_(
+                    (forward_batch.seq_lens[:raw_bs] - self.captured_req_width).to(
+                        torch.int32
+                    )
+                )
+        self._load_model_specific_replay_inputs(
+            forward_batch, raw_bs=raw_bs, padded_bs=bs, num_tokens=num_tokens
+        )
 
         # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync
         # DMA engine; foreach would force the ~3x slower compute-kernel copy.

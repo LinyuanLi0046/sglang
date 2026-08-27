@@ -16,6 +16,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    NgramEmbeddingInfo,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
@@ -71,6 +72,7 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
     dsa_seed_topk: Optional[torch.Tensor] = None
+    bonus_tokens: Optional[torch.Tensor] = None
 
 
 class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
@@ -183,12 +185,23 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get()
                 else None
             )
+            is_welmv4_nextn = "WeLMV4MoeForCausalLMNextN" in (
+                model_runner.model_config.hf_config.architectures or []
+            )
+            capture_seq_len = (
+                max(1, self.seq_len_fill_value)
+                if is_welmv4_nextn
+                else self.seq_len_fill_value
+            )
             seq_lens = torch.full(
-                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64
+                (self.max_bs,),
+                capture_seq_len,
+                dtype=torch.int64,
             )
             extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
             topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
             topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
+            bonus_tokens = torch.zeros((self.max_bs,), dtype=torch.int64)
             draft_probs = (
                 torch.zeros(
                     (self.max_bs, self.model_runner.model_config.vocab_size),
@@ -230,7 +243,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 global_num_tokens_for_logprob_gpu = None
 
         seq_lens_cpu = torch.full(
-            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64, device="cpu"
+            (self.max_bs,), capture_seq_len, dtype=torch.int64, device="cpu"
         )
 
         dsa_seed_topk = (
@@ -261,6 +274,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             dsa_seed_topk=dsa_seed_topk,
+            bonus_tokens=bonus_tokens,
         )
         self.buffers.share_buffers()
 
@@ -394,6 +408,11 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             draft_probs=draft_probs,
             hidden_states=hidden_states,
             capture_hidden_mode=capture_mode,
+            bonus_tokens=buffers.bonus_tokens[:num_seqs],
+            welmv4_mtp_frozen_kv=(
+                "WeLMV4MoeForCausalLMNextN"
+                in (self.model_runner.model_config.hf_config.architectures or [])
+            ),
         )
         if self.buffers.dsa_seed_topk is not None:
             spec_info.dsa_topk_indices = self.buffers.dsa_seed_topk[:num_seqs]
@@ -438,6 +457,14 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             ),
         )
+        if self.model_runner.ngram_embedding_manager.enabled:
+            forward_batch.ngram_embedding_info = NgramEmbeddingInfo.create(
+                self.model_runner.ngram_embedding_manager.table,
+                num_seqs,
+                self.device,
+                column_starts=seq_lens.to(torch.int32),
+                req_lens=torch.ones_like(seq_lens, dtype=torch.int32),
+            )
 
         def run_once():
             self.draft_attn_backend.init_forward_metadata_in_graph(forward_batch)
@@ -460,7 +487,10 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
             forward_batch.spec_info.dsa_topk_indices = dsa_topk_indices_backup
-            forward_batch.positions.sub_(self.eagle_worker.speculative_num_steps - 1)
+            if not forward_batch.spec_info.welmv4_mtp_frozen_kv:
+                forward_batch.positions.sub_(
+                    self.eagle_worker.speculative_num_steps - 1
+                )
             return ret
 
         with forward_context(ForwardContext(attn_backend=self.draft_attn_backend)):
@@ -535,6 +565,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             if buffers.dsa_seed_topk is not None:
                 buffers.dsa_seed_topk.zero_()
             buffers.req_pool_indices.zero_()
+            buffers.bonus_tokens.zero_()
 
         num_tokens = bs * self.captured_req_width
 
@@ -561,6 +592,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             buffers.topk_p[:raw_bs],
             buffers.topk_index[:raw_bs],
             buffers.req_pool_indices[:raw_bs],
+            buffers.bonus_tokens[:raw_bs],
         ]
         copy_srcs = [
             forward_batch.seq_lens,
@@ -569,6 +601,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.spec_info.topk_p,
             forward_batch.spec_info.topk_index,
             forward_batch.req_pool_indices,
+            forward_batch.spec_info.bonus_tokens,
         ]
         if buffers.rids_int is not None and forward_batch.rids_int is not None:
             copy_dsts.append(buffers.rids_int[:raw_bs])

@@ -34,6 +34,86 @@ class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int32
 
+    def _init_model_specific_buffers(self) -> None:
+        self._is_welmv4_nextn = "WeLMV4MoeForCausalLMNextN" in (
+            self.model_runner.model_config.hf_config.architectures or []
+        )
+        if not self._is_welmv4_nextn:
+            return
+        attention = self.model_runner.model.model.decoder_layers[0].self_attn
+        kv_width = int(attention.kv_size)
+        device = self.model_runner.device
+        dtype = self.model_runner.model_config.dtype
+        self._welm_mirror_k = torch.zeros(
+            (self.max_num_token, kv_width), device=device, dtype=dtype
+        )
+        self._welm_mirror_v = torch.zeros_like(self._welm_mirror_k)
+        self._welm_mirror_indices = torch.zeros(
+            (self.max_num_token,), device=device, dtype=torch.int64
+        )
+
+    def _bind_model_specific_capture_inputs(self, spec_info, num_tokens: int) -> None:
+        if not self._is_welmv4_nextn:
+            return
+        from sglang.srt.models.welmv4 import WELMV4_MTP_MIRROR_STATES_KEY
+
+        logical_layer_id = int(
+            self.model_runner.model_config.hf_config.num_target_hidden_layers
+        )
+        spec_info.model_specific_states = {
+            WELMV4_MTP_MIRROR_STATES_KEY: {
+                logical_layer_id: (
+                    self._welm_mirror_k[:num_tokens],
+                    self._welm_mirror_v[:num_tokens],
+                )
+            }
+        }
+        spec_info.mirrored_kv_indices = self._welm_mirror_indices[:num_tokens]
+
+    def _load_model_specific_replay_inputs(
+        self,
+        forward_batch,
+        *,
+        raw_bs: int,
+        padded_bs: int,
+        num_tokens: int,
+    ) -> None:
+        if not self._is_welmv4_nextn:
+            return
+        from sglang.srt.models.welmv4 import WELMV4_MTP_MIRROR_STATES_KEY
+
+        logical_layer_id = int(
+            self.model_runner.model_config.hf_config.num_target_hidden_layers
+        )
+        states = forward_batch.spec_info.model_specific_states or {}
+        mirror_states = states.get(WELMV4_MTP_MIRROR_STATES_KEY, {})
+        if logical_layer_id not in mirror_states:
+            raise RuntimeError(
+                f"WeLMV4 draft-extend is missing mirror K/V for layer {logical_layer_id}"
+            )
+        mirror_k, mirror_v = mirror_states[logical_layer_id]
+        if mirror_k.shape[0] != num_tokens or mirror_v.shape[0] != num_tokens:
+            raise RuntimeError(
+                "WeLMV4 target mirror rows do not match draft-extend rows: "
+                f"{mirror_k.shape[0]}/{mirror_v.shape[0]} vs {num_tokens}."
+            )
+        self._welm_mirror_k[:num_tokens].copy_(mirror_k)
+        self._welm_mirror_v[:num_tokens].copy_(mirror_v)
+        indices = forward_batch.spec_info.mirrored_kv_indices
+        if indices is None:
+            self._welm_mirror_indices[:num_tokens].copy_(
+                torch.arange(num_tokens, device=self._welm_mirror_indices.device)
+            )
+        else:
+            self._welm_mirror_indices[:num_tokens].copy_(
+                indices.to(torch.int64).clamp(min=0)
+            )
+        padded_tokens = padded_bs * self.captured_req_width
+        if padded_tokens > num_tokens:
+            self._welm_mirror_k[num_tokens:padded_tokens].zero_()
+            self._welm_mirror_v[num_tokens:padded_tokens].zero_()
+            self._welm_mirror_indices[num_tokens:padded_tokens].zero_()
+
     def _replay_graph(self, shape_key, forward_batch):
         hf_config = self.model_runner.model_config.hf_config
         if not (is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)):

@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -175,6 +175,15 @@ class EagleDraftInput(SpecInput):
     future_indices: Optional[torch.Tensor] = None
     future_dsa_topk_indices_available: bool = False
 
+    # WeLMV4 uses one mirror-filled draft KV snapshot for every recurrent MTP
+    # step in the current decode round. Attention positions/KV lengths therefore
+    # stay frozen while OE logical columns advance independently.
+    welmv4_mtp_frozen_kv: bool = False
+    model_specific_states: Optional[Dict[str, Any]] = None
+    mirrored_kv_indices: Optional[torch.Tensor] = None
+    welmv4_mtp_prev1_tokens: Optional[torch.Tensor] = None
+    welmv4_mtp_prev2_tokens: Optional[torch.Tensor] = None
+
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
 
@@ -322,6 +331,12 @@ class EagleDraftExtendInput(SpecInput):
     # None for draft-extend's idle batch; attention backends fall back to
     # rebuilding plain metadata from seq_lens when this is None.
     kv_indptr: torch.Tensor = None
+
+    # Target-produced, model-owned tensors handed to the assistant extend.
+    model_specific_states: Optional[Dict[str, Any]] = None
+    # Flat target-row gather map. Negative padded indices are made safe by the
+    # consumer; validity is controlled by num_accept_tokens.
+    mirrored_kv_indices: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT_EXTEND)

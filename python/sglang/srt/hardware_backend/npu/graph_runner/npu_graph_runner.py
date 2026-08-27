@@ -65,6 +65,22 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 
 
+def _slice_welm_mirror_states(states, num_rows: int):
+    if not states:
+        return states
+    from sglang.srt.models.welmv4 import WELMV4_MTP_MIRROR_STATES_KEY
+
+    mirror_states = states.get(WELMV4_MTP_MIRROR_STATES_KEY)
+    if mirror_states is None:
+        return states
+    sliced = dict(states)
+    sliced[WELMV4_MTP_MIRROR_STATES_KEY] = {
+        layer_id: (k[:num_rows], v[:num_rows])
+        for layer_id, (k, v) in mirror_states.items()
+    }
+    return sliced
+
+
 @contextmanager
 def patch_model_npu(
     model: torch.nn.Module,
@@ -118,6 +134,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 "MiMoV2FlashForCausalLM",
                 "Step3p5ForCausalLM",
                 "WeLMV4MoeForCausalLM",
+                "WeLMV4MoeForCausalLMNextN",
             )
             for arch in (model_runner.model_config.hf_config.architectures or [])
         )
@@ -282,6 +299,9 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                     output.hidden_states[: self.raw_num_token]
                     if output.hidden_states is not None
                     else None
+                ),
+                model_specific_states=_slice_welm_mirror_states(
+                    output.model_specific_states, self.raw_num_token
                 ),
             )
         else:

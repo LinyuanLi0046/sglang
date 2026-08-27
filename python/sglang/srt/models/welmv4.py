@@ -107,6 +107,7 @@ if is_npu():
         inplace_sigmoid_mul_npu,
         mmq_style_router_linear_npu,
         welmv4_oe_hash_decode_4way_npu,
+        welmv4_oe_hash_explicit_history_4way_npu,
         welmv4_oe_hash_prefill_4way_npu,
     )
 
@@ -174,14 +175,45 @@ class KVMirrorManager:
         return kv_activation
 
 
+WELMV4_MTP_MIRROR_STATES_KEY = "welmv4_mtp_mirror_states"
+
+
+def _set_welm_mtp_mirror_state(
+    forward_batch: ForwardBatch,
+    consumer_layer_id: int,
+    mirror_k: torch.Tensor,
+    mirror_v: torch.Tensor,
+) -> None:
+    states = forward_batch.model_specific_states
+    if states is None:
+        states = {}
+        forward_batch.model_specific_states = states
+    mirror_states = states.setdefault(WELMV4_MTP_MIRROR_STATES_KEY, {})
+    mirror_states[int(consumer_layer_id)] = (mirror_k, mirror_v)
+
+
+def _get_welm_mtp_mirror_state(
+    forward_batch: ForwardBatch, consumer_layer_id: int
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    spec_info = getattr(forward_batch, "spec_info", None)
+    states = getattr(spec_info, "model_specific_states", None)
+    if states is None:
+        states = forward_batch.model_specific_states
+    if not states:
+        return None
+    return states.get(WELMV4_MTP_MIRROR_STATES_KEY, {}).get(
+        int(consumer_layer_id)
+    )
+
+
 class _WelmDerivedMXFP8Linear(nn.Module):
     """A load-time derived projection that reuses an existing MXFP8 method.
 
     Target-model source and mirror layers can rewrite their existing qkv_proj in
-    place.  A NextN mirror consumer is the sole exception: extend needs Q only,
-    while decode/verify still needs its original full QKV projection.  This
-    small holder keeps the Q-only weights for that second execution mode without
-    introducing another quantization implementation.
+    place. A separately loaded NextN consumer instead keeps its loader-owned
+    full module and exposes this derived Q-only projection to both mirror-fill
+    and frozen-draft runtime paths, without introducing another quantization
+    implementation.
     """
 
     def __init__(
@@ -214,6 +246,11 @@ class LayerManager:
     num_nextn_predict_layers: int = 0
     num_target_layers: int = 0
     num_nextn_predict_layer_idx: List[int] = []
+    # Cross-model pairs are first prepared while the target loader still owns
+    # raw checkpoint-layout weights. The later NextN load then only has to
+    # reduce its consumer projection to Q; the target source may already have
+    # undergone ModelSlim runtime relayout and must not be rewritten again.
+    prepared_cross_model_pairs = set()
 
     @staticmethod
     def set_decoder_layer(layer_idx, decoder_layer):
@@ -263,6 +300,42 @@ class LayerManager:
         ]
 
     @staticmethod
+    def _prepare_already_paired_nextn_consumer(mirror_layer_attn) -> None:
+        """Make a freshly loaded NextN consumer Q-only without touching source."""
+        mirror_quant_kind = LayerManager._qkv_quant_kind(
+            mirror_layer_attn.qkv_proj
+        )
+        if mirror_quant_kind == "modelslim_mxfp8":
+            mirror_qkv_proj = mirror_layer_attn.qkv_proj
+            if not hasattr(mirror_qkv_proj, "weight_scale"):
+                raise RuntimeError(
+                    "WeLMv4 ModelSlim NextN Q extraction must run before "
+                    "consumer weight post-processing."
+                )
+            q_size = mirror_layer_attn.q_size
+            bias = getattr(mirror_qkv_proj, "bias", None)
+            mirror_layer_attn.kv_mirror_query_proj = _WelmDerivedMXFP8Linear(
+                mirror_qkv_proj,
+                mirror_qkv_proj.weight[:q_size, :],
+                mirror_qkv_proj.weight_scale[:q_size, :],
+                bias[:q_size] if bias is not None else None,
+            )
+            return
+        if mirror_quant_kind != "unquantized":
+            raise NotImplementedError(
+                "WeLMv4 cross-model NextN projection rewriting supports only "
+                "unquantized or ModelSlim W8A8_MXFP8 QKV weights."
+            )
+
+        q_size = mirror_layer_attn.q_size
+        qkv_proj = mirror_layer_attn.qkv_proj
+        mirror_layer_attn.qkv_proj_weight = qkv_proj.weight[:q_size, :].clone()
+        bias = getattr(qkv_proj, "bias", None)
+        mirror_layer_attn.qkv_proj_bias = (
+            bias[:q_size].clone() if bias is not None else None
+        )
+
+    @staticmethod
     def post_init(kv_mirror_layers, kv_mirror_imitated_layers, is_nextn=False):
 
         if is_nextn:
@@ -277,6 +350,13 @@ class LayerManager:
             imitated_layer_attn = LayerManager.decoder_layer[
                 imitated_layer_id
             ].self_attn
+
+            pair = (int(imitated_layer_id), int(mirror_layer_id))
+            if is_nextn and pair in LayerManager.prepared_cross_model_pairs:
+                LayerManager._prepare_already_paired_nextn_consumer(
+                    mirror_layer_attn
+                )
+                continue
 
             mirror_quant_kind = LayerManager._qkv_quant_kind(
                 mirror_layer_attn.qkv_proj
@@ -374,8 +454,9 @@ class LayerManager:
                 imitated_layer_attn._kv_mirror_mxfp8_source_projection = True
 
                 if mirror_layer_attn.is_nextn:
-                    # NextN decode/verify still needs the original full QKV;
-                    # extend uses this additional Q-only projection.
+                    # NextN active draft and mirror-fill forwards are Q-only.
+                    # Keep the original module for loader ownership and expose
+                    # a derived Q projection for every runtime path.
                     mirror_layer_attn.kv_mirror_query_proj = (
                         _WelmDerivedMXFP8Linear(
                             mirror_qkv_proj,
@@ -393,6 +474,8 @@ class LayerManager:
                         [mirror_layer_attn.q_size],
                     )
                     mirror_layer_attn._kv_mirror_mxfp8_query_projection = True
+                if mirror_layer_id >= LayerManager.num_target_layers:
+                    LayerManager.prepared_cross_model_pairs.add(pair)
                 continue
 
             mirror_weight_data = mirror_qkv_proj_weight[
@@ -443,7 +526,72 @@ class LayerManager:
                 imitated_layer_attn.qkv_proj_bias = None
                 mirror_layer_attn.qkv_proj_bias = None
 
+            if mirror_layer_id >= LayerManager.num_target_layers:
+                LayerManager.prepared_cross_model_pairs.add(pair)
+
         torch.get_device_module().empty_cache()
+
+
+class _WelmMTPMirrorStagingAttention(nn.Module):
+    """Load a cross-model consumer QKV while target weights are still raw.
+
+    ModelSlim rewrites QKV storage immediately after ``model.load_weights``.
+    A small target-owned staging projection lets source0 absorb layer48 K/V
+    before that rewrite. It is released before serving and the real draft layer
+    later loads its own layer48 weights normally.
+    """
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        logical_layer_id: int,
+        quant_config: Optional[QuantizationConfig],
+        prefix: str,
+    ) -> None:
+        super().__init__()
+        attn_tp_size = get_parallel().attn_tp_size
+        num_heads = int(config.num_attention_heads)
+        num_kv_heads = int(config.num_key_value_heads)
+        head_dim = int(
+            getattr(config, "head_dim", config.hidden_size // num_heads)
+        )
+        self.q_size = (num_heads // attn_tp_size) * head_dim
+        self.kv_size = max(1, num_kv_heads // attn_tp_size) * head_dim
+        self.is_nextn = True
+        self.loaded_qkv_parts = set()
+        if getattr(config, "qkv_bias", None) is not None:
+            qkv_bias = getattr(config, "qkv_bias")
+        elif getattr(config, "qkv_proj_bias", None) is not None:
+            qkv_bias = getattr(config, "qkv_proj_bias")
+        else:
+            qkv_bias = True
+        self.qkv_proj = QKVParallelLinear(
+            config.hidden_size,
+            head_dim,
+            num_heads,
+            num_kv_heads,
+            bias=qkv_bias,
+            quant_config=quant_config,
+            tp_rank=get_parallel().attn_tp_rank,
+            tp_size=attn_tp_size,
+            prefix=add_prefix(
+                f"layers.{logical_layer_id}.self_attn.qkv_proj", prefix
+            ),
+        )
+
+
+class _WelmMTPMirrorStagingLayer(nn.Module):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        logical_layer_id: int,
+        quant_config: Optional[QuantizationConfig],
+        prefix: str,
+    ) -> None:
+        super().__init__()
+        self.self_attn = _WelmMTPMirrorStagingAttention(
+            config, logical_layer_id, quant_config, prefix
+        )
 
 
 class Qwen2MoeMLP(nn.Module):
@@ -579,7 +727,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             torch.zeros((config.num_experts), dtype=torch.float32)
         )
         self.layer_id = layer_id
-        self.num_hidden_layers = config.num_hidden_layers
+        self.num_hidden_layers = int(
+            getattr(config, "num_target_hidden_layers", 0)
+        ) + int(config.num_hidden_layers)
         self.last_final_experts_output: Optional[torch.Tensor] = None
         self.last_final_shared_output: Optional[torch.Tensor] = None
         self.alt_stream = alt_stream
@@ -1359,9 +1509,9 @@ class Qwen2MoeAttention(nn.Module):
                 tp_size=attn_tp_size,
             )
         self.attn.is_kv_mirror = self.layer_idx in self.kv_mirror_layers
-        self.kv_mirror_layer_idx = (
-            layer_idx if not is_nextn else layer_idx + len(LayerManager.decoder_layer)
-        )
+        # `layer_id` is the physical/cache slot. `layer_idx` is the checkpoint
+        # and layerwise-config id. They differ for NextN: physical 0, logical 48.
+        self.kv_mirror_layer_idx = layer_idx
         if get_global_server_args().speculative_algorithm is not None:
             self.need_clear_kv_cache = (
                 self.layer_idx == LayerManager.num_nextn_predict_layers - 1
@@ -1378,6 +1528,8 @@ class Qwen2MoeAttention(nn.Module):
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         tensors = [projection.weight]
         weight_scale = getattr(projection, "weight_scale_inv", None)
+        if weight_scale is None:
+            weight_scale = getattr(projection, "weight_scale", None)
         if weight_scale is not None:
             tensors.append(weight_scale)
         return tensors if len(tensors) > 1 else tensors[0]
@@ -1385,6 +1537,21 @@ class Qwen2MoeAttention(nn.Module):
     def get_qkv_prefetch_weight(
         self, forward_batch: ForwardBatch
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        external_mirror = (
+            _get_welm_mtp_mirror_state(forward_batch, self.kv_mirror_layer_idx)
+            if self.is_nextn
+            else None
+        )
+        frozen_mtp_decode = (
+            self.is_nextn
+            and forward_batch.forward_mode.is_decode()
+            and bool(getattr(forward_batch.spec_info, "welmv4_mtp_frozen_kv", False))
+        )
+        if self.is_nextn and (external_mirror is not None or frozen_mtp_decode):
+            if hasattr(self, "kv_mirror_query_proj"):
+                return self._linear_prefetch_tensors(self.kv_mirror_query_proj)
+            if hasattr(self, "qkv_proj_weight"):
+                return self.qkv_proj_weight
         use_full_qkv = (
             self.kv_mirror_layer_idx in self.kv_mirror_layers
             and self.kv_mirror_layer_idx
@@ -1436,7 +1603,52 @@ class Qwen2MoeAttention(nn.Module):
         skip_o_proj_all_reduce: bool = False,
         use_o_proj_matmul_reduce_scatter: bool = False,
     ) -> torch.Tensor:
-        if self.kv_mirror_layer_idx in self.kv_mirror_imitated_layers:
+        external_mirror = (
+            _get_welm_mtp_mirror_state(forward_batch, self.kv_mirror_layer_idx)
+            if self.is_nextn
+            else None
+        )
+        frozen_mtp_decode = (
+            self.is_nextn
+            and forward_batch.forward_mode.is_decode()
+            and bool(getattr(forward_batch.spec_info, "welmv4_mtp_frozen_kv", False))
+        )
+        if (
+            self.is_nextn
+            and hidden_states.shape[0] > 0
+            and external_mirror is None
+            and not frozen_mtp_decode
+        ):
+            raise RuntimeError(
+                "WeLMV4 NextN requires external source0 mirror K/V during "
+                "draft-extend, or an explicitly frozen KV snapshot during "
+                "active draft decode."
+            )
+
+        if frozen_mtp_decode:
+            if hasattr(self, "kv_mirror_query_proj"):
+                q, _ = self.kv_mirror_query_proj(hidden_states)
+            elif getattr(self, "_kv_mirror_mxfp8_query_projection", False):
+                q, _ = self.qkv_proj(hidden_states)
+            else:
+                q = F.linear(hidden_states, self.qkv_proj_weight, self.qkv_proj_bias)
+            k = v = None
+        elif external_mirror is not None:
+            k, v = external_mirror
+            mirror_indices = getattr(
+                forward_batch.spec_info, "mirrored_kv_indices", None
+            )
+            if mirror_indices is not None:
+                safe_indices = mirror_indices.to(torch.int64).clamp(min=0)
+                k = k[safe_indices]
+                v = v[safe_indices]
+            if hasattr(self, "kv_mirror_query_proj"):
+                q, _ = self.kv_mirror_query_proj(hidden_states)
+            elif getattr(self, "_kv_mirror_mxfp8_query_projection", False):
+                q, _ = self.qkv_proj(hidden_states)
+            else:
+                q = F.linear(hidden_states, self.qkv_proj_weight, self.qkv_proj_bias)
+        elif self.kv_mirror_layer_idx in self.kv_mirror_imitated_layers:
             if getattr(self, "_kv_mirror_mxfp8_source_projection", False):
                 qkv, _ = self.qkv_proj(hidden_states)
                 q, k, v, mirror_k, mirror_v = qkv.split(
@@ -1449,9 +1661,17 @@ class Qwen2MoeAttention(nn.Module):
                     ],
                     dim=-1,
                 )
-                KVMirrorManager.set_kv_activation(
-                    self.kv_mirror_layer_idx, (mirror_k, mirror_v)
-                )
+                consumer_layer_id = self.kv_mirror_layers[
+                    self.kv_mirror_imitated_layers.index(self.kv_mirror_layer_idx)
+                ]
+                if consumer_layer_id >= LayerManager.num_target_layers:
+                    _set_welm_mtp_mirror_state(
+                        forward_batch, consumer_layer_id, mirror_k, mirror_v
+                    )
+                else:
+                    KVMirrorManager.set_kv_activation(
+                        self.kv_mirror_layer_idx, (mirror_k, mirror_v)
+                    )
             elif hasattr(self, "qkv_proj_weight"):
                 qkv = F.linear(hidden_states, self.qkv_proj_weight, self.qkv_proj_bias)
                 q, k, v, mirror_k, mirror_v = qkv.split(
@@ -1464,9 +1684,17 @@ class Qwen2MoeAttention(nn.Module):
                     ],
                     dim=-1,
                 )
-                KVMirrorManager.set_kv_activation(
-                    self.kv_mirror_layer_idx, (mirror_k, mirror_v)
-                )
+                consumer_layer_id = self.kv_mirror_layers[
+                    self.kv_mirror_imitated_layers.index(self.kv_mirror_layer_idx)
+                ]
+                if consumer_layer_id >= LayerManager.num_target_layers:
+                    _set_welm_mtp_mirror_state(
+                        forward_batch, consumer_layer_id, mirror_k, mirror_v
+                    )
+                else:
+                    KVMirrorManager.set_kv_activation(
+                        self.kv_mirror_layer_idx, (mirror_k, mirror_v)
+                    )
             else:
                 qkv, _ = self.qkv_proj(hidden_states)
                 q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -1519,7 +1747,7 @@ class Qwen2MoeAttention(nn.Module):
                 gate = self.gate_proj(hidden_states)[0].unsqueeze(-1)
 
         q_shape = q.shape
-        k_shape = k.shape
+        k_shape = None if k is None else k.shape
 
         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
         if self.q_norm is not None:
@@ -1529,14 +1757,17 @@ class Qwen2MoeAttention(nn.Module):
         # layout before RoPE and let downstream contiguous() calls be no-ops.
         q = q_by_head.view(q.shape).contiguous()
 
-        k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
-        if self.k_norm is not None:
-            k_by_head = mmq_style_k_rms_norm(
-                k_by_head.contiguous(),
-                self.k_norm.weight,
-                self.k_norm.eps,
+        if k is not None:
+            k_by_head = k.view(
+                *k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim
             )
-        k = k_by_head.view(k.shape)
+            if self.k_norm is not None:
+                k_by_head = mmq_style_k_rms_norm(
+                    k_by_head.contiguous(),
+                    self.k_norm.weight,
+                    self.k_norm.eps,
+                )
+            k = k_by_head.view(k.shape)
 
         # A single non-speculative extend request is globally contiguous;
         # ordinary multi-request prefill carries independently contiguous
@@ -1551,7 +1782,19 @@ class Qwen2MoeAttention(nn.Module):
         )
 
         qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
-        if qk_nope_head_dim > 0:
+        if k is None:
+            # WeLM RoPE updates Q and K in place. They must not alias: passing
+            # Q as both operands would rotate the same storage twice on NPU.
+            unused_key = q.clone()
+            q, _ = self.rotary_emb(
+                positions,
+                q,
+                unused_key,
+                positions_are_contiguous=positions_are_contiguous,
+                segment_tile_starts=segment_tile_starts,
+            )
+            q = q.view(q_shape)
+        elif qk_nope_head_dim > 0:
             if (
                 forward_batch.enable_kv_mirror
                 and forward_batch.forward_mode.is_extend_without_speculative()
@@ -1587,7 +1830,14 @@ class Qwen2MoeAttention(nn.Module):
         attn_kwargs = {}
         if self.attn_sink is not None:
             attn_kwargs["sinks"] = self.attn_sink
-        attn_output = self.attn(q, k, v, forward_batch, **attn_kwargs)
+        attn_output = self.attn(
+            q,
+            k,
+            v,
+            forward_batch,
+            save_kv_cache=not frozen_mtp_decode,
+            **attn_kwargs,
+        )
         if self.gated_self_attention_headwise:
             attn_shape = attn_output.shape
             if gate is None:
@@ -1626,9 +1876,14 @@ class Qwen2MoeDecoderLayer(nn.Module):
         prefix: str = "",
         alt_stream: Optional[Any] = None,
         is_nextn: bool = False,
+        config_layer_id: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.config = config
+        self.physical_layer_id = int(layer_id)
+        self.config_layer_id = int(
+            layer_id if config_layer_id is None else config_layer_id
+        )
         self.hidden_size = config.hidden_size
         # Transformers v5 standardizes legacy rope_scaling into
         # rope_parameters and renames ``type`` to ``rope_type``. Keep the old
@@ -1676,9 +1931,9 @@ class Qwen2MoeDecoderLayer(nn.Module):
         # suffix, so every later layer also obtains full K/V from its source.
         self.first_target_kv_mirror_layer = min(
             (
-                int(layer_id)
-                for layer_id in self.kv_mirror_layers
-                if 0 <= int(layer_id) < int(config.num_hidden_layers)
+                int(mirror_layer_id)
+                for mirror_layer_id in self.kv_mirror_layers
+                if 0 <= int(mirror_layer_id) < int(config.num_hidden_layers)
             ),
             default=None,
         )
@@ -1686,7 +1941,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             config,
             context_len=getattr(config, "context_len", None),
             num_layers=1,
-            layer_offset=layer_id,
+            layer_offset=self.config_layer_id,
         )[0]
         self.enable_attn_sink_layerwise = getattr(
             config, "enable_attn_sink_layerwise", []
@@ -1696,7 +1951,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         self.prenorm_layer_idx = getattr(config, "prenorm_layer_idx", [])
         logger.debug(
             "WeLMv4 layer %s: ppln=%s, o_norm=%s, prenorm_layer_idx=%s",
-            layer_id,
+            self.config_layer_id,
             self.ppln,
             o_norm,
             self.prenorm_layer_idx,
@@ -1708,7 +1963,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             head_dim=head_dim,
-            layer_id=layer_id,
+            layer_id=self.physical_layer_id,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
@@ -1724,8 +1979,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
             kv_mirror_imitated_layers=self.kv_mirror_imitated_layers,
             sliding_window_size=self.sliding_window_size,
             enable_attn_sink_layerwise=self.enable_attn_sink_layerwise,
-            layer_idx=layer_id,
-            o_norm=o_norm and layer_id not in self.prenorm_layer_idx,
+            layer_idx=self.config_layer_id,
+            o_norm=o_norm and self.config_layer_id not in self.prenorm_layer_idx,
             rms_norm_eps=config.rms_norm_eps,
             total_layer_num=total_layer_num,
             is_nextn=is_nextn,
@@ -1734,8 +1989,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
         LayerManager.num_nextn_predict_layers = getattr(
             config, "num_nextn_predict_layers", 0
         )
-        self.layer_id = layer_id
-        self.is_final_layer = layer_id == total_layer_num - 1 or is_nextn
+        self.layer_id = self.config_layer_id
+        self.is_final_layer = self.physical_layer_id == total_layer_num - 1 or is_nextn
 
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
@@ -1745,7 +2000,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         is_previous_layer_sparse = True
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
+            layer_id=self.physical_layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
@@ -1754,7 +2009,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
 
         if self.is_layer_sparse:
             self.mlp = Qwen2MoeSparseMoeBlock(
-                layer_id=layer_id,
+                layer_id=self.config_layer_id,
                 config=config,
                 quant_config=quant_config,
                 alt_stream=alt_stream,
@@ -2596,6 +2851,27 @@ class Qwen2MoeModel(nn.Module):
             pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
+        self.mtp_mirror_staging_layers = nn.ModuleDict()
+        if get_global_server_args().speculative_algorithm is not None:
+            for consumer_layer_id, _source_layer_id in zip(
+                getattr(config, "kv_mirror_layers", []) or [],
+                getattr(config, "kv_mirror_imitated_layers", []) or [],
+            ):
+                consumer_layer_id = int(consumer_layer_id)
+                if consumer_layer_id < int(config.num_hidden_layers):
+                    continue
+                staging_layer = _WelmMTPMirrorStagingLayer(
+                    config,
+                    consumer_layer_id,
+                    quant_config,
+                    prefix,
+                )
+                self.mtp_mirror_staging_layers[str(consumer_layer_id)] = (
+                    staging_layer
+                )
+                LayerManager.set_decoder_layer(
+                    consumer_layer_id, staging_layer
+                )
         if self.pp_group.is_last_rank:
             self.norm = WelmV4FusedRMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
@@ -2655,36 +2931,88 @@ class Qwen2MoeModel(nn.Module):
             return base_hidden_states
         oe_input_ids = input_ids[:history_num_tokens]
         req_lens = ngram_embedding_info.req_lens
+        is_nextn_model = bool(getattr(self, "is_nextn_model", False))
+        is_frozen_mtp_decode = (
+            is_nextn_model
+            and forward_batch.forward_mode.is_decode()
+            and bool(
+                getattr(forward_batch.spec_info, "welmv4_mtp_frozen_kv", False)
+            )
+        )
         # Decode CUDA graphs round the batch size up and leave initialized
         # one-token rows behind the real requests. Only the first
         # ``history_num_tokens`` rows are real in non-speculative decode.
         # Eager extend/DP-attention metadata already contains one row per real
         # request, whose lengths sum to ``history_num_tokens``.
-        if forward_batch.forward_mode.is_decode():
+        if forward_batch.forward_mode.is_target_verify():
+            real_req_count = min(
+                forward_batch.batch_size,
+                forward_batch.req_pool_indices.shape[0],
+            )
+            verify_width = int(forward_batch.spec_info.draft_token_num)
+            req_lens = torch.full(
+                (real_req_count,),
+                verify_width,
+                dtype=torch.int32,
+                device=input_ids.device,
+            )
+            column_starts = forward_batch.seq_lens[:real_req_count].to(torch.int32)
+        elif forward_batch.forward_mode.is_decode():
             real_req_count = min(
                 history_num_tokens,
                 req_lens.shape[0],
                 forward_batch.req_pool_indices.shape[0],
             )
+            req_lens = req_lens[:real_req_count]
+            column_starts = ngram_embedding_info.column_starts[:real_req_count]
         else:
             real_req_count = min(
                 forward_batch.batch_size,
                 req_lens.shape[0],
                 forward_batch.req_pool_indices.shape[0],
             )
-        req_lens = req_lens[:real_req_count]
-        column_starts = ngram_embedding_info.column_starts[:real_req_count]
+            req_lens = req_lens[:real_req_count]
+            column_starts = ngram_embedding_info.column_starts[:real_req_count]
+            if is_nextn_model:
+                # NextN inputs are shifted by one target row for both prompt
+                # draft-extend and DRAFT_EXTEND_V2.
+                column_starts = column_starts + 1
         use_npu_fused_hash = (
             _is_npu
             and tuple(self.oe_grams) == (2, 2, 3, 3)
             and len(self.oe_vocab_sizes) == 4
             and (
                 forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
                 or forward_batch.extend_start_loc is not None
             )
         )
         npu_hashed_ids = None
-        if use_npu_fused_hash:
+        if is_frozen_mtp_decode and use_npu_fused_hash:
+            previous1 = forward_batch.spec_info.welmv4_mtp_prev1_tokens
+            previous2 = forward_batch.spec_info.welmv4_mtp_prev2_tokens
+            if previous1 is None:
+                raise RuntimeError("WeLMV4 MTP draft is missing previous token state")
+            if previous2 is None:
+                rows = forward_batch.req_pool_indices[:real_req_count].to(torch.int64)
+                previous_columns = (
+                    forward_batch.seq_lens[:real_req_count].to(torch.int64) - 1
+                )
+                valid = previous_columns >= 0
+                previous2 = ngram_embedding_info.token_table[
+                    rows, previous_columns.clamp_min(0)
+                ]
+                previous2 = torch.where(
+                    valid, previous2, torch.zeros_like(previous2)
+                )
+            npu_hashed_ids = welmv4_oe_hash_explicit_history_4way_npu(
+                oe_input_ids,
+                previous1[:history_num_tokens],
+                previous2[:history_num_tokens],
+                vocab_size=self.vocab_size,
+                oe_vocab_sizes=self.oe_vocab_sizes,
+            )
+        elif use_npu_fused_hash:
             req_pool_indices = forward_batch.req_pool_indices[:real_req_count]
             if forward_batch.forward_mode.is_decode():
                 npu_hashed_ids = welmv4_oe_hash_decode_4way_npu(
@@ -2700,13 +3028,27 @@ class Qwen2MoeModel(nn.Module):
                 max_req_len = (
                     max(extend_seq_lens_cpu[:real_req_count], default=0)
                     if extend_seq_lens_cpu is not None
-                    else history_num_tokens
+                    else (
+                        int(forward_batch.spec_info.draft_token_num)
+                        if forward_batch.forward_mode.is_target_verify()
+                        else history_num_tokens
+                    )
                 )
+                token_offsets = forward_batch.extend_start_loc
+                if token_offsets is None:
+                    token_offsets = (
+                        torch.arange(
+                            real_req_count,
+                            dtype=torch.int32,
+                            device=input_ids.device,
+                        )
+                        * int(forward_batch.spec_info.draft_token_num)
+                    )
                 npu_hashed_ids = welmv4_oe_hash_prefill_4way_npu(
                     oe_input_ids,
                     ngram_embedding_info.token_table,
                     req_pool_indices,
-                    forward_batch.extend_start_loc[:real_req_count],
+                    token_offsets[:real_req_count],
                     req_lens,
                     column_starts,
                     max_req_len=max_req_len,
@@ -3038,6 +3380,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
         # model instance is constructed so stale state cannot survive reloads.
         KVMirrorManager.activations_dict_kv.clear()
         LayerManager.decoder_layer.clear()
+        LayerManager.prepared_cross_model_pairs.clear()
         if _is_cuda:
             alt_stream = torch.cuda.Stream(device=torch.cuda.current_device())
         elif _is_npu:
@@ -3087,9 +3430,11 @@ class WeLMV4MoeForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         # Every supported top-level forward is serial (TBO/PDMux/speculative
-        # are rejected at startup).  Clearing here also recovers cleanly if a
-        # previous eager forward failed between a mirror source and consumer.
+        # Clearing here also recovers cleanly if a previous eager forward
+        # failed between an in-model mirror source and consumer. Cross-model
+        # MTP mirror tensors live in this forward's model_specific_states.
         KVMirrorManager.activations_dict_kv.clear()
+        forward_batch.model_specific_states = None
         model_output = self.model(
             input_ids,
             positions,
@@ -3141,13 +3486,15 @@ class WeLMV4MoeForCausalLM(nn.Module):
                         forward_batch.extend_num_tokens // scale
                     )
 
-            return self.logits_processor(
+            logits_output = self.logits_processor(
                 input_ids,
                 hidden_states,
                 self.lm_head,
                 forward_batch,
                 aux_hidden_states,
             )
+            logits_output.model_specific_states = forward_batch.model_specific_states
+            return logits_output
         else:
             return hidden_states
 
@@ -3252,7 +3599,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
-                num_target_layers = LayerManager.num_target_layers
+                num_target_layers = int(self.config.num_target_hidden_layers)
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
@@ -3295,7 +3642,50 @@ class WeLMV4MoeForCausalLM(nn.Module):
                             len(name_list) >= 3
                             and int(name_list[2]) >= self.config.num_hidden_layers
                         ):
-                            continue
+                            logical_layer_id = int(name_list[2])
+                            staging_layers = getattr(
+                                self.model, "mtp_mirror_staging_layers", {}
+                            )
+                            is_staged_qkv = (
+                                str(logical_layer_id) in staging_layers
+                                and any(
+                                    f".self_attn.{proj_name}." in name
+                                    for proj_name in (
+                                        "q_proj",
+                                        "k_proj",
+                                        "v_proj",
+                                        "qkv_proj",
+                                    )
+                                )
+                            )
+                            if not is_staged_qkv:
+                                continue
+                            if name.endswith(".weight"):
+                                staging_attn = staging_layers[
+                                    str(logical_layer_id)
+                                ].self_attn
+                                if ".self_attn.qkv_proj." in name:
+                                    staging_attn.loaded_qkv_parts.update(
+                                        ("q", "k", "v")
+                                    )
+                                else:
+                                    for projection_name, part in (
+                                        ("q_proj", "q"),
+                                        ("k_proj", "k"),
+                                        ("v_proj", "v"),
+                                    ):
+                                        if (
+                                            f".self_attn.{projection_name}."
+                                            in name
+                                        ):
+                                            staging_attn.loaded_qkv_parts.add(part)
+                                            break
+                            name = name.replace(
+                                f"model.layers.{logical_layer_id}.self_attn",
+                                "model.mtp_mirror_staging_layers."
+                                f"{logical_layer_id}.self_attn",
+                                1,
+                            )
             else:
                 flag = False
                 matched_prefix = None
@@ -3442,10 +3832,26 @@ class WeLMV4MoeForCausalLM(nn.Module):
                 for decoder in self.model.decoder_layers
             }
         else:
+            for logical_layer_id, staging_layer in getattr(
+                self.model, "mtp_mirror_staging_layers", {}
+            ).items():
+                loaded_parts = staging_layer.self_attn.loaded_qkv_parts
+                if loaded_parts != {"q", "k", "v"}:
+                    raise RuntimeError(
+                        "WeLMV4 target load is missing layer "
+                        f"{logical_layer_id} mirror QKV weights; loaded "
+                        f"parts={sorted(loaded_parts)}."
+                    )
             local_layer_ids = {
                 decoder_layer.self_attn.kv_mirror_layer_idx
                 for decoder_layer in self.model.layers
             }
+            local_layer_ids.update(
+                int(layer_id)
+                for layer_id in getattr(
+                    self.model, "mtp_mirror_staging_layers", {}
+                ).keys()
+            )
         if _is_npu:
             router_decoder_layers = (
                 self.model.decoder_layers if is_nextn else self.model.layers
@@ -3469,6 +3875,17 @@ class WeLMV4MoeForCausalLM(nn.Module):
         LayerManager.post_init(
             kv_mirror_layer_ids, kv_mirror_imitated_layers, is_nextn=is_nextn
         )
+        if not is_nextn and hasattr(self.model, "mtp_mirror_staging_layers"):
+            for logical_layer_id, staging_layer in list(
+                self.model.mtp_mirror_staging_layers.items()
+            ):
+                layer_id = int(logical_layer_id)
+                if LayerManager.decoder_layer.get(layer_id) is staging_layer:
+                    LayerManager.decoder_layer.pop(layer_id)
+            # Do not carry a second layer48 QKV through quant post-processing
+            # or serving; the target source has already absorbed its K/V.
+            self.model.mtp_mirror_staging_layers = nn.ModuleDict()
+            torch.get_device_module().empty_cache()
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
         """Run KV-mirror fixups for loaders that bypass ``load_weights``."""

@@ -372,7 +372,10 @@ class AscendAttnBackend(AttentionBackend):
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         architectures = model_runner.model_config.hf_config.architectures or []
-        self.is_welm_v4 = "WeLMV4MoeForCausalLM" in architectures
+        self.is_welm_v4 = any(
+            arch in ("WeLMV4MoeForCausalLM", "WeLMV4MoeForCausalLMNextN")
+            for arch in architectures
+        )
         self.enable_welm_fia_sink_lse = get_bool_env_var(
             "ASCEND_USE_FIA_SINK_LSE", "False"
         )
@@ -384,6 +387,8 @@ class AscendAttnBackend(AttentionBackend):
         self.force_fia_v2_decode_graph = self.is_welm_v4
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
+        self.speculative_num_steps = get_spec().speculative_num_steps
+        self.speculative_eagle_topk = get_spec().speculative_eagle_topk
         self.ascend_attn_mask_builder = AscendAttnMaskBuilder(
             model_runner, self.device, self.use_fia, self.use_mla
         )
@@ -593,6 +598,78 @@ class AscendAttnBackend(AttentionBackend):
                 f"count: q={q.shape[0]}, real={real_q_tokens}."
             )
         return cu_q_lens
+
+    def _prepare_welm_mtp_triton_metadata(
+        self, q: torch.Tensor, forward_batch: ForwardBatch
+    ) -> None:
+        """Materialize the linear Spec-V2 MTP lengths used by WeLM Triton.
+
+        Spec V2 stores ``seq_lens`` before the verify window for
+        TARGET_VERIFY, but after the fixed-width window for DRAFT_EXTEND_V2.
+        The sink prefill kernels consume post-write KV lengths in both cases.
+        ``init_forward_metadata`` already normalizes the KV side; this helper
+        supplies the missing per-request Q lengths without changing that
+        convention.
+        """
+        if not (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            raise RuntimeError(
+                "WeLM MTP Triton only supports TARGET_VERIFY and "
+                "DRAFT_EXTEND_V2 forwards."
+            )
+
+        draft_token_num = int(self.speculative_num_draft_tokens or 0)
+        if draft_token_num < 1:
+            raise RuntimeError(
+                "WeLM MTP Triton requires a positive fixed verify width."
+            )
+        if int(self.speculative_eagle_topk or 0) != 1:
+            raise RuntimeError(
+                "WeLM MTP Triton requires the topk=1 linear Spec-V2 tree."
+            )
+        if draft_token_num != int(self.speculative_num_steps or 0) + 1:
+            raise RuntimeError(
+                "WeLM MTP Triton requires verify width D=S+1; got "
+                f"D={draft_token_num}, S={self.speculative_num_steps}."
+            )
+
+        metadata = self.forward_metadata
+        if metadata.extend_seq_lens_cpu_int is None:
+            batch_size = int(metadata.seq_lens.shape[0])
+            metadata.extend_seq_lens_cpu_int = torch.full(
+                (batch_size,),
+                draft_token_num,
+                dtype=torch.int32,
+                device="cpu",
+            )
+        else:
+            q_lens_cpu = metadata.extend_seq_lens_cpu_int.to(
+                dtype=torch.int32, device="cpu"
+            )
+            if q_lens_cpu.numel() == 0 or not bool(
+                torch.all(q_lens_cpu == draft_token_num)
+            ):
+                raise RuntimeError(
+                    "WeLM Spec-V2 MTP requires the fixed linear query width "
+                    f"D={draft_token_num} for every real request; got "
+                    f"{q_lens_cpu.tolist()}."
+                )
+            metadata.extend_seq_lens_cpu_int = q_lens_cpu
+
+        real_q_tokens = int(metadata.extend_seq_lens_cpu_int.sum().item())
+        if q.shape[0] < real_q_tokens:
+            raise RuntimeError(
+                "WeLM MTP query buffer is shorter than the fixed Spec-V2 "
+                f"window: q={q.shape[0]}, required={real_q_tokens}."
+            )
+
+        # These objects are per-forward/capture metadata. Never reuse a normal
+        # prefill schedule whose query/KV convention is different from MTP.
+        if metadata.full_sink_prefill_cu_q_lens is None:
+            metadata.full_sink_prefill_schedule = None
+            metadata.full_sink_prefill_schedule_key = None
 
     def _get_welm_full_sink_prefill_mask(self, device: torch.device) -> torch.Tensor:
         mask = getattr(self, "_welm_full_sink_prefill_mask", None)
@@ -1004,6 +1081,11 @@ class AscendAttnBackend(AttentionBackend):
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is not None
+            and not bool(
+                getattr(
+                    forward_batch.spec_info, "welmv4_mtp_frozen_kv", False
+                )
+            )
         ):
             seq_lens_max += self.speculative_step_id + 1
         self.forward_metadata.block_tables = (
@@ -1052,6 +1134,11 @@ class AscendAttnBackend(AttentionBackend):
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is not None
+            and not bool(
+                getattr(
+                    forward_batch.spec_info, "welmv4_mtp_frozen_kv", False
+                )
+            )
         ):
             self.forward_metadata.seq_lens_cpu_int += self.speculative_step_id + 1
 
@@ -1183,6 +1270,25 @@ class AscendAttnBackend(AttentionBackend):
             metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[:num_tokens]
         metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
         metadata.seq_lens = seq_lens
+        if self.is_welm_v4 and (
+            forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
+        ):
+            # Graph capture has a fixed B x D query buffer. Replay updates the
+            # device-side cumulative lengths so padded request rows become
+            # zero-width, while these CPU values describe the capture bucket.
+            draft_token_num = int(self.speculative_num_draft_tokens or 0)
+            if draft_token_num < 1:
+                raise RuntimeError(
+                    "WeLM MTP graph capture requires a positive verify width."
+                )
+            metadata.extend_seq_lens_cpu_int = torch.full(
+                (bs,), draft_token_num, dtype=torch.int32, device="cpu"
+            )
+            metadata.seq_lens_cpu_int = seq_lens.cpu().int()
+            if forward_mode.is_target_verify():
+                metadata.seq_lens_cpu_int = (
+                    metadata.seq_lens_cpu_int + draft_token_num
+                )
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             metadata.actual_seq_lengths_q = torch.arange(
                 self.speculative_num_draft_tokens,
@@ -1251,6 +1357,15 @@ class AscendAttnBackend(AttentionBackend):
         """
         metadata = self.graph_metadata[bs]
 
+        # Keep a copy of the pre-normalized lengths. TARGET_VERIFY below adds
+        # D to the live KV lengths, so this mask must be formed first. Capture
+        # buckets place real requests first and zero-fill padding requests.
+        welm_mtp_real_rows = None
+        if self.is_welm_v4 and (
+            forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
+        ):
+            welm_mtp_real_rows = seq_lens[:bs] > 0
+
         # refill the captured SWA write-target buffer in place from the live loc
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             n = out_cache_loc.shape[0]
@@ -1261,7 +1376,11 @@ class AscendAttnBackend(AttentionBackend):
         max_len = seq_lens_cpu[:bs].max().item()
         if forward_mode.is_target_verify() and not _is_dflash_verify(spec_info):
             max_len += self.speculative_num_draft_tokens
-        elif forward_mode.is_decode_or_idle() and spec_info is not None:
+        elif (
+            forward_mode.is_decode_or_idle()
+            and spec_info is not None
+            and not bool(getattr(spec_info, "welmv4_mtp_frozen_kv", False))
+        ):
             max_len += self.speculative_step_id + 1
         max_seq_pages = (max_len + self.page_size - 1) // self.page_size
 
@@ -1296,9 +1415,26 @@ class AscendAttnBackend(AttentionBackend):
 
         if forward_mode.is_target_verify():
             seq_lens = seq_lens + self.speculative_num_draft_tokens
-        elif forward_mode.is_decode_or_idle() and spec_info is not None:
+        elif (
+            forward_mode.is_decode_or_idle()
+            and spec_info is not None
+            and not bool(getattr(spec_info, "welmv4_mtp_frozen_kv", False))
+        ):
             seq_lens = seq_lens + self.speculative_step_offset_npu
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
+
+        if (
+            welm_mtp_real_rows is not None
+            and metadata.full_sink_prefill_cu_q_lens is not None
+        ):
+            # The captured Triton kernels keep this storage address. Updating
+            # it before replay lets a larger bucket safely execute a smaller
+            # real batch: real rows contribute D, padding rows contribute 0.
+            draft_token_num = int(self.speculative_num_draft_tokens)
+            q_lens = welm_mtp_real_rows.to(torch.int32) * draft_token_num
+            cu_q_lens = metadata.full_sink_prefill_cu_q_lens
+            cu_q_lens.zero_()
+            torch.cumsum(q_lens, dim=0, out=cu_q_lens[1 : bs + 1])
 
         self.forward_metadata = metadata
 
@@ -2779,6 +2915,44 @@ class AscendAttnBackend(AttentionBackend):
             )
             query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
 
+            is_swa_layer = self._has_layerwise_sliding_window(layer)
+            if is_swa_layer and self.is_hybrid_swa:
+                block_table = self.forward_metadata.block_tables_swa
+            else:
+                block_table = self.forward_metadata.block_tables
+
+            if self.is_welm_v4:
+                # WeLM's configured sink is part of the attention definition,
+                # not an optional optimization. Top-k=1 Spec V2 produces a
+                # linear causal B x D window, so both Full and SWA layers reuse
+                # the existing Triton prefill kernels. Never silently fall back
+                # to FIA here: it would make TARGET_VERIFY/DRAFT_EXTEND differ
+                # from WeLM's eager/decode Triton semantics.
+                if sinks is None:
+                    raise RuntimeError(
+                        "WeLM MTP requires the configured per-head attention "
+                        "sink on every physical target/draft layer."
+                    )
+                self._prepare_welm_mtp_triton_metadata(query, forward_batch)
+                if is_swa_layer:
+                    return self._forward_welm_swa_sink_prefill(
+                        q=query,
+                        k_cache=k_cache,
+                        v_cache=v_cache,
+                        layer=layer,
+                        block_tables=block_table,
+                        sinks=sinks,
+                    )
+                return self._forward_welm_full_sink_prefill(
+                    q=query,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    layer=layer,
+                    forward_batch=forward_batch,
+                    block_tables=block_table,
+                    sinks=sinks,
+                )
+
             if not self.graph_mode:
                 num_token_padding = query.shape[0]
                 query = query[: forward_batch.num_token_non_padded_cpu]
@@ -2802,14 +2976,6 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
             is_swa_layer = layer.sliding_window_size != -1
-            if (
-                is_swa_layer
-                and self.is_hybrid_swa
-                and hasattr(self.forward_metadata, "block_tables_swa")
-            ):
-                block_table = self.forward_metadata.block_tables_swa
-            else:
-                block_table = self.forward_metadata.block_tables
 
             if layer.attn_type == AttentionType.ENCODER_ONLY:
                 mask = None

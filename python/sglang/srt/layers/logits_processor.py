@@ -163,6 +163,10 @@ class LogitsProcessorOutput:
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
+    # Model-owned tensors that must follow this forward result through eager or
+    # graph execution.  WeLMV4 uses this for target-layer mirror K/V consumed by
+    # the subsequent MTP draft-extend pass.
+    model_specific_states: Optional[Dict[str, Any]] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.

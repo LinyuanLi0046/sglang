@@ -301,6 +301,8 @@ def prepare_for_draft(
         else CaptureHiddenMode.LAST
     )
     draft_input.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
+    if draft_input.welmv4_mtp_frozen_kv:
+        draft_input.positions.sub_(1)
     forward_batch = ForwardBatch.init_new(
         batch,
         draft_model_runner,
@@ -642,6 +644,19 @@ def run_eagle_verify(
         )
 
     next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
+    next_draft_input.model_specific_states = logits_output.model_specific_states
+    next_draft_input.mirrored_kv_indices = accept_index.reshape(-1)
+
+    # The canonical table already contains the incoming root at old_seq_lens.
+    # Commit d1..outgoing-bonus at old_seq_lens + 1 + j before draft-extend
+    # hashes the shifted inputs on the same forward stream.
+    target_worker.model_runner.ngram_embedding_manager.commit_speculative_accepts(
+        predict=predict,
+        accept_index=accept_index,
+        accept_lens=accept_lens,
+        req_pool_indices=batch.req_pool_indices,
+        old_seq_lens=batch.seq_lens,
+    )
 
     # verify_forward_batch transitively holds verify-time GPU tensors
     # (draft_token / out_cache_loc / ...) that must outlive the imminent

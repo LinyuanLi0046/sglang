@@ -235,6 +235,11 @@ def paged_prefill_kernel(
         q_start_loc = tl.load(cu_q_lens_ptr + b_id).to(tl.int32)
         q_end_loc = tl.load(cu_q_lens_ptr + b_id + 1).to(tl.int32)
         q_seq_len = q_end_loc - q_start_loc
+        # Graph replay keeps a bucket-sized static task schedule. Padding
+        # requests advertise q_len=0 through cu_q_lens and must not construct
+        # zero-shaped block pointers from those otherwise-valid static tasks.
+        if q_seq_len <= 0:
+            continue
 
         if seqlens_kv_ptr is None:
             kv_seq_len = q_seq_len
@@ -457,6 +462,8 @@ def paged_prefill_page_aggregation_kernel(
         q_start_loc = tl.load(cu_q_lens_ptr + b_id).to(tl.int32)
         q_end_loc = tl.load(cu_q_lens_ptr + b_id + 1).to(tl.int32)
         q_seq_len = q_end_loc - q_start_loc
+        if q_seq_len <= 0:
+            continue
 
         if seqlens_kv_ptr is None:
             kv_seq_len = q_seq_len
@@ -676,7 +683,11 @@ def paged_attention_prefill_impl(
         )
     sinks_pass = sinks if sink_enabled else torch.empty(1, dtype=q.dtype, device=q.device)
 
-    o = torch.empty_like(q)
+    # A captured bucket may replay with fewer real requests.  The static task
+    # schedule then skips zero-width padding rows, so initialize their output
+    # deterministically instead of exposing stale graph-buffer contents to the
+    # following projection/MoE layers.
+    o = torch.zeros_like(q)
     block_tables_i32 = block_tables.to(dtype=torch.int32).contiguous()
 
     CHUNK_SIZE = 128

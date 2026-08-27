@@ -1539,6 +1539,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 spec_info.num_accept_tokens = self._pad_tensor_to_size(
                     spec_info.num_accept_tokens, bs
                 )
+            # WeLM NextN gathers target-produced mirror K/V with this nested
+            # token-row map. MLP-sync pads the top-level input/out_cache_loc to
+            # ``num_tokens``; pad the map as well so the gathered K/V rows stay
+            # aligned with Q and the KV-cache slot mapping. Index 0 is a safe
+            # source for dummy rows, whose per-request query length is zero.
+            if getattr(spec_info, "mirrored_kv_indices", None) is not None:
+                spec_info.mirrored_kv_indices = self._pad_tensor_to_size(
+                    spec_info.mirrored_kv_indices, num_tokens, value=0
+                )
             spec_info.hidden_states = self._pad_tensor_to_size(
                 spec_info.hidden_states, num_tokens
             )

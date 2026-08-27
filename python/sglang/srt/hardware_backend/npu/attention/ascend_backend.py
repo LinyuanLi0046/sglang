@@ -605,11 +605,11 @@ class AscendAttnBackend(AttentionBackend):
         """Materialize the linear Spec-V2 MTP lengths used by WeLM Triton.
 
         Spec V2 stores ``seq_lens`` before the verify window for
-        TARGET_VERIFY, but after the fixed-width window for DRAFT_EXTEND_V2.
-        The sink prefill kernels consume post-write KV lengths in both cases.
+        TARGET_VERIFY, but after the window for DRAFT_EXTEND_V2. The sink
+        prefill kernels consume post-write KV lengths in both cases.
         ``init_forward_metadata`` already normalizes the KV side; this helper
-        supplies the missing per-request Q lengths without changing that
-        convention.
+        supplies and validates the per-request Q lengths without changing that
+        convention. Eager MLP-sync padding is represented by zero-length rows.
         """
         if not (
             forward_batch.forward_mode.is_target_verify()
@@ -638,22 +638,36 @@ class AscendAttnBackend(AttentionBackend):
         metadata = self.forward_metadata
         if metadata.extend_seq_lens_cpu_int is None:
             batch_size = int(metadata.seq_lens.shape[0])
-            metadata.extend_seq_lens_cpu_int = torch.full(
-                (batch_size,),
-                draft_token_num,
-                dtype=torch.int32,
-                device="cpu",
+            original_num_tokens = int(
+                getattr(forward_batch, "_original_num_tokens", q.shape[0])
             )
+            if original_num_tokens % draft_token_num != 0:
+                raise RuntimeError(
+                    "WeLM TARGET_VERIFY token count is not divisible by the "
+                    f"fixed width D={draft_token_num}: {original_num_tokens}."
+                )
+            real_batch_size = original_num_tokens // draft_token_num
+            if real_batch_size > batch_size:
+                raise RuntimeError(
+                    "WeLM TARGET_VERIFY real request count exceeds the padded "
+                    f"batch: real={real_batch_size}, padded={batch_size}."
+                )
+            q_lens_cpu = torch.zeros(
+                (batch_size,), dtype=torch.int32, device="cpu"
+            )
+            q_lens_cpu[:real_batch_size].fill_(draft_token_num)
+            metadata.extend_seq_lens_cpu_int = q_lens_cpu
         else:
             q_lens_cpu = metadata.extend_seq_lens_cpu_int.to(
                 dtype=torch.int32, device="cpu"
             )
-            if q_lens_cpu.numel() == 0 or not bool(
-                torch.all(q_lens_cpu == draft_token_num)
-            ):
+            valid_q_lens = (q_lens_cpu >= 0) & (
+                q_lens_cpu <= draft_token_num
+            )
+            if q_lens_cpu.numel() == 0 or not bool(torch.all(valid_q_lens)):
                 raise RuntimeError(
-                    "WeLM Spec-V2 MTP requires the fixed linear query width "
-                    f"D={draft_token_num} for every real request; got "
+                    "WeLM Spec-V2 MTP query lengths must be in the linear "
+                    f"window [0, D={draft_token_num}]; got "
                     f"{q_lens_cpu.tolist()}."
                 )
             metadata.extend_seq_lens_cpu_int = q_lens_cpu

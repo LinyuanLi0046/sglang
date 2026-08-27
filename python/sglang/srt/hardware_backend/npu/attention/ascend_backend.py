@@ -636,13 +636,7 @@ class AscendAttnBackend(AttentionBackend):
             )
 
         metadata = self.forward_metadata
-        if forward_batch.forward_mode.is_target_verify():
-            # TARGET_VERIFY is a dense linear B x D window.  ForwardBatch may
-            # still carry ScheduleBatch.extend_lens from the preceding decode
-            # round (typically one token), so it is not a valid source of Q
-            # lengths here.  Derive the real request count from the actual
-            # verify token buffer and explicitly leave MLP-sync padding rows at
-            # zero width.
+        if metadata.extend_seq_lens_cpu_int is None:
             batch_size = int(metadata.seq_lens.shape[0])
             original_num_tokens = int(
                 getattr(forward_batch, "_original_num_tokens", q.shape[0])
@@ -664,11 +658,6 @@ class AscendAttnBackend(AttentionBackend):
             q_lens_cpu[:real_batch_size].fill_(draft_token_num)
             metadata.extend_seq_lens_cpu_int = q_lens_cpu
         else:
-            if metadata.extend_seq_lens_cpu_int is None:
-                raise RuntimeError(
-                    "WeLM DRAFT_EXTEND_V2 requires explicit ragged query "
-                    "lengths."
-                )
             q_lens_cpu = metadata.extend_seq_lens_cpu_int.to(
                 dtype=torch.int32, device="cpu"
             )
@@ -916,87 +905,6 @@ class AscendAttnBackend(AttentionBackend):
             )
         return output.reshape(output.shape[0], -1)
 
-    def _forward_welm_linear_target_verify(
-        self,
-        q: torch.Tensor,
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
-        layer: RadixAttention,
-        forward_batch: ForwardBatch,
-        block_tables: torch.Tensor,
-        sinks: torch.Tensor,
-        *,
-        is_swa_layer: bool,
-    ) -> torch.Tensor:
-        """Verify a top-k=1 linear tree with the proven Triton decode path.
-
-        For request prefix length ``L`` and verify width ``D``, row ``j`` is
-        exactly an ordinary decode query with post-write KV length
-        ``L + j + 1``.  Running those fixed-depth rows through the existing
-        Full/SWA decode kernels preserves the key Spec-V2 invariant that row
-        zero is numerically identical to normal target decode.  The Python
-        loop is capture-stable because ``D`` is a launch-time constant.
-        """
-        if not forward_batch.forward_mode.is_target_verify():
-            raise RuntimeError(
-                "WeLM linear target verify can only run in TARGET_VERIFY mode."
-            )
-
-        draft_token_num = int(self.speculative_num_draft_tokens or 0)
-        batch_size = int(self.forward_metadata.seq_lens.shape[0])
-        expected_tokens = batch_size * draft_token_num
-        if q.shape[0] != expected_tokens:
-            raise RuntimeError(
-                "WeLM TARGET_VERIFY query layout must be dense B x D; got "
-                f"q={q.shape[0]}, B={batch_size}, D={draft_token_num}."
-            )
-
-        # init_forward_metadata/_apply_cuda_graph_metadata expose post-window
-        # lengths here.  Padding rows are kept at zero rather than being
-        # fabricated as length D, so their decode reads can use a safe length
-        # and their outputs can be zeroed deterministically inside the graph.
-        post_window_seq_lens = self.forward_metadata.seq_lens[:batch_size]
-        real_rows = post_window_seq_lens > 0
-        prefix_seq_lens = post_window_seq_lens - draft_token_num
-        q_by_request = q.reshape(batch_size, draft_token_num, -1)
-        outputs = []
-        for depth in range(draft_token_num):
-            depth_seq_lens = prefix_seq_lens + depth + 1
-            depth_seq_lens = torch.where(
-                real_rows,
-                depth_seq_lens,
-                torch.ones_like(depth_seq_lens),
-            )
-            depth_q = q_by_request[:, depth, :].contiguous()
-            if is_swa_layer:
-                depth_output = self._forward_welm_swa_sink_decode(
-                    q=depth_q,
-                    k_cache=k_cache,
-                    v_cache=v_cache,
-                    layer=layer,
-                    block_tables=block_tables,
-                    seq_lens=depth_seq_lens,
-                    sinks=sinks,
-                )
-            else:
-                depth_output = self._forward_welm_full_sink_decode(
-                    q=depth_q,
-                    k_cache=k_cache,
-                    v_cache=v_cache,
-                    layer=layer,
-                    block_tables=block_tables,
-                    seq_lens=depth_seq_lens,
-                    sinks=sinks,
-                )
-            depth_output = torch.where(
-                real_rows[:, None],
-                depth_output,
-                torch.zeros_like(depth_output),
-            )
-            outputs.append(depth_output)
-
-        return torch.stack(outputs, dim=1).reshape(expected_tokens, -1)
-
     def _forward_welm_full_sink_decode(
         self,
         q: torch.Tensor,
@@ -1235,16 +1143,12 @@ class AscendAttnBackend(AttentionBackend):
             and forward_batch.forward_mode.is_target_verify()
             and not _is_dflash_verify(forward_batch.spec_info)
         ):
-            pre_verify_seq_lens = self.forward_metadata.seq_lens
-            self.forward_metadata.seq_lens = torch.where(
-                pre_verify_seq_lens > 0,
-                pre_verify_seq_lens + self.speculative_num_draft_tokens,
-                torch.zeros_like(pre_verify_seq_lens),
+            self.forward_metadata.seq_lens = (
+                self.forward_metadata.seq_lens
+                + self.speculative_num_draft_tokens
             )
 
-        self.forward_metadata.seq_lens_cpu_int = (
-            forward_batch.seq_lens_cpu.to(dtype=torch.int32, device="cpu").clone()
-        )
+        self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
         if (
             not forward_batch.forward_mode.is_draft_extend_v2()
             and not forward_batch.forward_mode.is_target_verify()
@@ -1255,12 +1159,7 @@ class AscendAttnBackend(AttentionBackend):
         if forward_batch.forward_mode.is_target_verify() and not _is_dflash_verify(
             forward_batch.spec_info
         ):
-            pre_verify_seq_lens_cpu = self.forward_metadata.seq_lens_cpu_int
-            self.forward_metadata.seq_lens_cpu_int = torch.where(
-                pre_verify_seq_lens_cpu > 0,
-                pre_verify_seq_lens_cpu + self.speculative_num_draft_tokens,
-                torch.zeros_like(pre_verify_seq_lens_cpu),
-            )
+            self.forward_metadata.seq_lens_cpu_int += self.speculative_num_draft_tokens
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is not None
@@ -1550,10 +1449,8 @@ class AscendAttnBackend(AttentionBackend):
 
         attention_seq_lens = seq_lens
         if forward_mode.is_target_verify():
-            attention_seq_lens = torch.where(
-                welm_mtp_real_rows,
-                seq_lens + self.speculative_num_draft_tokens,
-                torch.zeros_like(seq_lens),
+            attention_seq_lens = (
+                seq_lens + self.speculative_num_draft_tokens
             )
         elif (
             forward_mode.is_decode_or_idle()
@@ -3074,17 +2971,6 @@ class AscendAttnBackend(AttentionBackend):
                         "sink on every physical target/draft layer."
                     )
                 self._prepare_welm_mtp_triton_metadata(query, forward_batch)
-                if forward_batch.forward_mode.is_target_verify():
-                    return self._forward_welm_linear_target_verify(
-                        q=query,
-                        k_cache=k_cache,
-                        v_cache=v_cache,
-                        layer=layer,
-                        forward_batch=forward_batch,
-                        block_tables=block_table,
-                        sinks=sinks,
-                        is_swa_layer=is_swa_layer,
-                    )
                 if is_swa_layer:
                     return self._forward_welm_swa_sink_prefill(
                         q=query,

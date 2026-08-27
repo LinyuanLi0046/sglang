@@ -638,9 +638,21 @@ class AscendAttnBackend(AttentionBackend):
         metadata = self.forward_metadata
         if metadata.extend_seq_lens_cpu_int is None:
             batch_size = int(metadata.seq_lens.shape[0])
-            original_num_tokens = int(
-                getattr(forward_batch, "_original_num_tokens", q.shape[0])
+            # ``_original_num_tokens`` is a dataclass field, so ``getattr``'s
+            # default is not used when an unpadded eager batch leaves it as
+            # None.  EP/MLP-sync padding normally fills one of the first two
+            # counters, while pure-TP eager execution legitimately fills
+            # neither; in that case every row in Q is real.
+            original_num_tokens = getattr(
+                forward_batch, "_original_num_tokens", None
             )
+            if original_num_tokens is None:
+                original_num_tokens = getattr(
+                    forward_batch, "num_token_non_padded_cpu", None
+                )
+            if original_num_tokens is None:
+                original_num_tokens = q.shape[0]
+            original_num_tokens = int(original_num_tokens)
             if original_num_tokens % draft_token_num != 0:
                 raise RuntimeError(
                     "WeLM TARGET_VERIFY token count is not divisible by the "

@@ -133,6 +133,123 @@ class WeLMV4ModelNextN(nn.Module):
         main_hidden_states = forward_batch.spec_info.hidden_states
         if main_hidden_states is None:
             raise RuntimeError("WeLMV4 NextN requires target hidden states.")
+
+        # With KV-mirror query pruning, source0 still provides K/V for every
+        # shifted prompt token, but the physical MTP layer evaluates only the
+        # final query of each request.  Build the full token + OE embedding
+        # first so the final row keeps the correct n-gram history, then contract
+        # both inputs to the same B-row query layout.  ``positions`` deliberately
+        # stays in the full T-row layout: RoPE uses ``custom_last_index`` for Q
+        # while rotating the external source0 K rows at all T positions.
+        is_kv_mirror_prefill = (
+            forward_batch.enable_kv_mirror
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        )
+        if is_kv_mirror_prefill:
+            if forward_batch.extend_seq_lens is None:
+                raise RuntimeError(
+                    "WeLMV4 NextN KV-mirror prefill requires extend_seq_lens."
+                )
+            custom_last_index = getattr(forward_batch, "custom_last_index", None)
+            if custom_last_index is None:
+                custom_last_index = (
+                    torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+                )
+                forward_batch.custom_last_index = custom_last_index
+
+            query_rows = custom_last_index.numel()
+            full_rows = input_ids.numel()
+            real_batch_rows = getattr(
+                forward_batch, "_original_batch_size", None
+            )
+            if real_batch_rows is None:
+                real_batch_rows = forward_batch.batch_size
+            if query_rows != real_batch_rows:
+                raise RuntimeError(
+                    "WeLMV4 NextN KV-mirror tail index count must match the "
+                    f"real request count, got {query_rows} vs {real_batch_rows}."
+                )
+            last_index = custom_last_index.to(
+                device=hidden_states.device, dtype=torch.long
+            )
+
+            if hidden_states.shape[0] == full_rows:
+                hidden_states = hidden_states.index_select(0, last_index)
+            elif hidden_states.shape[0] != query_rows:
+                raise RuntimeError(
+                    "WeLMV4 NextN KV-mirror token embedding must have either "
+                    f"full-token or request rows, got {hidden_states.shape[0]} "
+                    f"for T={full_rows}, B={query_rows}."
+                )
+
+            # MLP-sync padding saves the original draft hidden tensor before
+            # expanding it to the padded token count.  For a mirror-pruned
+            # target that original tensor is already B rows; selecting the
+            # prompt-tail indices from its padded copy would pick dummy zeros.
+            unpadded_main_hidden_states = getattr(
+                forward_batch, "hidden_states_backup", None
+            )
+            if unpadded_main_hidden_states is not None:
+                main_hidden_states = unpadded_main_hidden_states
+
+            original_token_rows = getattr(
+                forward_batch, "_original_num_tokens", None
+            )
+            main_hidden_has_token_rows = main_hidden_states.shape[0] == full_rows or (
+                original_token_rows is not None
+                and main_hidden_states.shape[0] == original_token_rows
+            )
+            if main_hidden_has_token_rows:
+                main_hidden_states = main_hidden_states.index_select(
+                    0,
+                    custom_last_index.to(
+                        device=main_hidden_states.device, dtype=torch.long
+                    ),
+                )
+            elif main_hidden_states.shape[0] != query_rows:
+                raise RuntimeError(
+                    "WeLMV4 NextN KV-mirror target hidden states must have either "
+                    f"full-token or request rows, got {main_hidden_states.shape[0]} "
+                    f"for T={full_rows}, B={query_rows}."
+                )
+
+            # ``prepare_mlp_sync_batch`` localized this scalar for the old
+            # T-row token layout.  The NextN MoE now receives a replicated
+            # B-row last-query layout, so every one of those rows is real on
+            # every EP rank.  Leaving the T-local count in place would mask
+            # valid requests (and may mask all rows on a high TP/EP rank).
+            if forward_batch.num_token_non_padded is not None:
+                forward_batch.num_token_non_padded.fill_(query_rows)
+            forward_batch.num_token_non_padded_cpu = query_rows
+
+        # Eager MLP-sync localizes this scalar as if DRAFT_EXTEND_V2 rows were
+        # sequence-sharded across attention-TP ranks.  The NextN decoder does
+        # not enter WeLM's target-only scattered-prefill path, so every rank in
+        # fact owns the same complete row set.  Restore the global real count
+        # before routing; unlike disabling the mask entirely, eager execution
+        # still keeps suffix rows added for TP alignment inactive. Graph replay
+        # uses its fixed bucket width and slices dummy results afterwards.
+        if (
+            is_npu()
+            and forward_batch.forward_mode.is_draft_extend_v2()
+            and forward_batch.num_token_non_padded is not None
+        ):
+            num_real_rows = forward_batch.num_token_non_padded_cpu
+            if num_real_rows is None:
+                num_real_rows = getattr(
+                    forward_batch, "_original_num_tokens", None
+                )
+            if num_real_rows is None:
+                num_real_rows = hidden_states.shape[0]
+            num_real_rows = int(num_real_rows)
+            if not 0 <= num_real_rows <= hidden_states.shape[0]:
+                raise RuntimeError(
+                    "WeLMV4 NextN DRAFT_EXTEND_V2 real row count is outside "
+                    f"the full input layout: {num_real_rows} vs "
+                    f"{hidden_states.shape[0]}."
+                )
+            forward_batch.num_token_non_padded.fill_(num_real_rows)
+
         if hidden_states.shape[0] != main_hidden_states.shape[0]:
             raise RuntimeError(
                 "WeLMV4 NextN token/target-hidden row mismatch: "

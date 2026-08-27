@@ -938,21 +938,25 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             if forward_batch is not None
             else None
         )
-        # Decode keeps the legacy FULL replicated token layout when the
-        # WeLMv4 DeepEP scattered path is disabled.  The generic gathered-
-        # buffer metadata above is TP-localized, so applying it to FULL rows
-        # would incorrectly mask real requests after the first local shard.
-        # Leave padding unmasked in this layout, matching the pre-scattered
-        # decode behavior; prefill/scattered paths continue to use the local
-        # count and mask their padded suffix.
-        is_full_deepep_decode = (
+        # Decode and Spec-V2 target verify keep the legacy FULL replicated
+        # token layout when the WeLMv4 DeepEP scattered path is disabled.  The
+        # generic gathered-buffer metadata above is TP-localized, so applying
+        # it to these FULL rows would incorrectly mask real requests after the
+        # first local shard.  Leave padding unmasked in this layout. Ordinary
+        # scattered prefill keeps the localized count; the explicitly NORMAL
+        # NextN DRAFT_EXTEND_V2 path restores its full-layout real count before
+        # entering this block, so it can still mask only the padded suffix.
+        is_full_deepep_decode_like = (
             _is_npu
             and moe_a2a_backend.is_deepep()
             and forward_batch is not None
-            and forward_batch.forward_mode.is_decode()
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+            )
             and not forward_batch.welmv4_npu_deepep_scattered
         )
-        if is_full_deepep_decode:
+        if is_full_deepep_decode_like:
             num_token_non_padded = None
         if moe_a2a_backend.is_deepep() and hidden_states.shape[0] == 0:
             topk_output = self.topk.empty_topk_output(
@@ -1795,21 +1799,38 @@ class Qwen2MoeAttention(nn.Module):
             )
             q = q.view(q_shape)
         elif qk_nope_head_dim > 0:
-            if (
+            is_kv_mirror_last_query = (
                 forward_batch.enable_kv_mirror
                 and forward_batch.forward_mode.is_extend_without_speculative()
                 and self.kv_mirror_layer_idx in self.kv_mirror_layers
-                # Target mirror consumers contract a prompt to one query row
-                # per request and need custom_last_index. NextN instead gets
-                # row-aligned external source0 K/V for the entire draft-extend
-                # input, so applying target contraction here is incorrect.
-                and not self.is_nextn
-            ):
+            )
+            if is_kv_mirror_last_query:
+                custom_last_index = getattr(
+                    forward_batch, "custom_last_index", None
+                )
+                if custom_last_index is None:
+                    raise RuntimeError(
+                        "WeLMv4 KV-mirror last-query RoPE requires "
+                        "custom_last_index."
+                    )
+                if (
+                    q.shape[0] != custom_last_index.numel()
+                    or k.shape[0] != positions.numel()
+                ):
+                    raise RuntimeError(
+                        "WeLMv4 KV-mirror RoPE requires Q=B and K/positions=T, "
+                        f"got Q={q.shape[0]}, B={custom_last_index.numel()}, "
+                        f"K={k.shape[0]}, T={positions.numel()}."
+                    )
+                # Both target mirror consumers and the physical NextN layer
+                # keep full prompt K/V but contract Q to one row per request.
+                # Rotate Q at the request-tail positions and K at every
+                # original prompt position.
                 q, k = self.rotary_emb(
                     positions,
                     q,
                     k,
-                    last_index=forward_batch.custom_last_index,
+                    last_index=custom_last_index,
                     positions_are_contiguous=positions_are_contiguous,
                     segment_tile_starts=segment_tile_starts,
                 )
@@ -2973,11 +2994,23 @@ class Qwen2MoeModel(nn.Module):
         # Eager extend/DP-attention metadata already contains one row per real
         # request, whose lengths sum to ``history_num_tokens``.
         if forward_batch.forward_mode.is_target_verify():
-            real_req_count = min(
-                forward_batch.batch_size,
-                forward_batch.req_pool_indices.shape[0],
-            )
             verify_width = int(forward_batch.spec_info.draft_token_num)
+            if verify_width <= 0 or history_num_tokens % verify_width != 0:
+                raise RuntimeError(
+                    "WeLMv4 TARGET_VERIFY ngram input must contain a positive "
+                    "fixed-width row group per request, got "
+                    f"tokens={history_num_tokens}, width={verify_width}."
+                )
+            original_batch_size = getattr(
+                forward_batch, "_original_batch_size", None
+            )
+            if original_batch_size is None:
+                original_batch_size = forward_batch.batch_size
+            real_req_count = min(
+                original_batch_size,
+                forward_batch.req_pool_indices.shape[0],
+                history_num_tokens // verify_width,
+            )
             req_lens = torch.full(
                 (real_req_count,),
                 verify_width,

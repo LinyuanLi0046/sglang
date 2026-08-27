@@ -3981,6 +3981,49 @@ class AscendAttnMultiStepDraftBackend:
         for i in range(self.speculative_num_steps - 1):
             call_fn(i, forward_batch)
 
+    def _step_out_cache_loc(self, forward_batch: ForwardBatch, step_id: int):
+        """Return the write locations owned by one draft-decode step.
+
+        EAGLE stores all steps in request-major layout
+        ``[batch, topk, step]``.  A single inner attention backend must only
+        receive its ``[batch * topk]`` slice; passing the complete flattened
+        buffer makes SWA graph metadata try to copy ``num_steps`` times more
+        locations than its per-step graph buffer can hold.
+        """
+        out_cache_loc = forward_batch.out_cache_loc
+        if out_cache_loc is None:
+            return None
+
+        single_step_width = forward_batch.batch_size * self.topk
+        if out_cache_loc.numel() <= single_step_width:
+            return out_cache_loc
+
+        step_layout_width = self.topk * self.speculative_num_steps
+        if step_layout_width == 0 or out_cache_loc.numel() % step_layout_width != 0:
+            return out_cache_loc
+
+        from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
+
+        batch_size = out_cache_loc.numel() // step_layout_width
+        return per_step_draft_out_cache_loc(
+            out_cache_loc,
+            batch_size,
+            self.topk,
+            self.speculative_num_steps,
+        )[step_id]
+
+    def _with_step_out_cache_loc(
+        self, forward_batch: ForwardBatch, step_id: int, call_fn
+    ):
+        original_out_cache_loc = forward_batch.out_cache_loc
+        step_out_cache_loc = self._step_out_cache_loc(forward_batch, step_id)
+        if step_out_cache_loc is not None:
+            forward_batch.out_cache_loc = step_out_cache_loc
+        try:
+            return call_fn()
+        finally:
+            forward_batch.out_cache_loc = original_out_cache_loc
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -3995,8 +4038,10 @@ class AscendAttnMultiStepDraftBackend:
         )
 
         def call_fn(i, _forward_batch):
+            step_fb = type(inner_fb)(**vars(inner_fb))
+            step_fb.out_cache_loc = self._step_out_cache_loc(forward_batch, i)
             self.attn_backends[i].init_forward_metadata_out_graph(
-                inner_fb, in_capture=in_capture
+                step_fb, in_capture=in_capture
             )
 
         self.common_template(forward_batch, call_fn)
@@ -4010,7 +4055,11 @@ class AscendAttnMultiStepDraftBackend:
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         def call_fn(i, forward_batch):
             assert forward_batch.spec_info is not None
-            self.attn_backends[i].init_forward_metadata(forward_batch)
+            self._with_step_out_cache_loc(
+                forward_batch,
+                i,
+                lambda: self.attn_backends[i].init_forward_metadata(forward_batch),
+            )
 
         self.common_template(forward_batch, call_fn)
 

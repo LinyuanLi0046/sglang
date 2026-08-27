@@ -1799,6 +1799,11 @@ class Qwen2MoeAttention(nn.Module):
                 forward_batch.enable_kv_mirror
                 and forward_batch.forward_mode.is_extend_without_speculative()
                 and self.kv_mirror_layer_idx in self.kv_mirror_layers
+                # Target mirror consumers contract a prompt to one query row
+                # per request and need custom_last_index. NextN instead gets
+                # row-aligned external source0 K/V for the entire draft-extend
+                # input, so applying target contraction here is incorrect.
+                and not self.is_nextn
             ):
                 q, k = self.rotary_emb(
                     positions,

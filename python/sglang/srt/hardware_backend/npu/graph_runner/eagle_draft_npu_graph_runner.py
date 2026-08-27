@@ -23,6 +23,9 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_deepseek_v4,
 )
+from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import (
+    welmv4_graph_uses_only_triton_sink,
+)
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
@@ -36,6 +39,9 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
     def __init__(self, eagle_worker: EagleDraftWorker):
         self._init_arch_map()
         super().__init__(eagle_worker)
+        self._welmv4_triton_sink_only = welmv4_graph_uses_only_triton_sink(
+            self.model_runner
+        )
 
     def _init_arch_map(self):
         self.attr_name: Dict[str, str] = {
@@ -88,13 +94,15 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
 
     def _replay_graph(self, shape_key, forward_batch):
         hf_config = self.model_runner.model_config.hf_config
+        frozen_welm_kv = bool(
+            getattr(forward_batch.spec_info, "welmv4_mtp_frozen_kv", False)
+        )
+        if frozen_welm_kv and self._welmv4_triton_sink_only:
+            # Triton sink attention consumes the device metadata refreshed by
+            # init_forward_metadata_out_graph; no CPU graph attribute exists.
+            return self.backend.replay(shape_key, forward_batch)
         if not (is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)):
             seq_lens_for_each_draft_step = []
-            frozen_welm_kv = bool(
-                getattr(
-                    forward_batch.spec_info, "welmv4_mtp_frozen_kv", False
-                )
-            )
             for speculative_step_id in range(self.speculative_num_steps - 1):
                 seq_lens_cpu = forward_batch.seq_lens_cpu[: self.raw_bs]
                 if not frozen_welm_kv:

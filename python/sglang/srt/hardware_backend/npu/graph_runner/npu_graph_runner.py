@@ -20,7 +20,7 @@ capture/replay mechanics live in the backend. This class adds:
     torch.compile path.
   - Profile context override (NPU profiler emits to disk, not in-mem).
   - Replay override that issues an async NPUGraph.update for
-    seq_lens before replay (skipped for deepseek-nsa).
+    seq_lens before replay (skipped when metadata is device-side only).
   - Smaller cache_loc dtype (int32 instead of int64).
 """
 
@@ -81,6 +81,38 @@ def _slice_welm_mirror_states(states, num_rows: int):
     return sliced
 
 
+def welmv4_graph_uses_only_triton_sink(model_runner: ModelRunner) -> bool:
+    """Whether every WeLM layer in this runner uses Triton sink attention.
+
+    Such graphs have no host-side FIA sequence-length attribute for
+    ``NPUGraph.update``. Their replay metadata is instead refreshed through the
+    fixed device buffers owned by ``AscendAttnBackend`` before graph replay.
+    """
+    hf_config = model_runner.model_config.hf_config
+    architectures = hf_config.architectures or []
+    is_nextn = "WeLMV4MoeForCausalLMNextN" in architectures
+    if not (is_nextn or "WeLMV4MoeForCausalLM" in architectures):
+        return False
+    if get_bool_env_var("ASCEND_USE_FIA_SINK_LSE", "False"):
+        return False
+
+    num_layers = int(getattr(hf_config, "num_hidden_layers", 0) or 0)
+    layer_offset = (
+        int(getattr(hf_config, "num_target_hidden_layers", 0) or 0)
+        if is_nextn
+        else 0
+    )
+    sink_flags = list(
+        getattr(hf_config, "enable_attn_sink_layerwise", []) or []
+    )
+    layer_end = layer_offset + num_layers
+    return (
+        num_layers > 0
+        and layer_end <= len(sink_flags)
+        and all(bool(flag) for flag in sink_flags[layer_offset:layer_end])
+    )
+
+
 @contextmanager
 def patch_model_npu(
     model: torch.nn.Module,
@@ -137,6 +169,9 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 "WeLMV4MoeForCausalLMNextN",
             )
             for arch in (model_runner.model_config.hf_config.architectures or [])
+        )
+        self.welmv4_triton_sink_only = welmv4_graph_uses_only_triton_sink(
+            model_runner
         )
 
     def _init_arch_map(self):
@@ -257,7 +292,9 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
 
         graph_key = self._make_graph_key(self.bs)
 
-        if not (
+        if self.welmv4_triton_sink_only:
+            output = self.backend.replay(graph_key, forward_batch)
+        elif not (
             is_deepseek_dsa(self.model_runner.model_config.hf_config)
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):

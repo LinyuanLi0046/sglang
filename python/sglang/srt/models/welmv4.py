@@ -32,6 +32,9 @@ from sglang.srt.distributed import (
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.distributed.communication_op import (
+    moe_expert_parallel_all_reduce,
+)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -781,6 +784,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             custom_routing_function=self.custom_routing_function,
         )
 
+        self.supports_welm_local_ep_moe = (
+            _is_npu
+            and get_moe_a2a_backend().is_deepep()
+            and get_parallel().moe_ep_size > 1
+            and get_parallel().moe_ep_size == self.tp_size
+            and get_parallel().moe_tp_size == 1
+            and not is_dp_attention_enabled()
+        )
+
         if get_bool_env_var("SGLANG_WELMV4_MMQ_SCORE_ON_SWIGLU", "false"):
             logger.warning(
                 "SGLANG_WELMV4_MMQ_SCORE_ON_SWIGLU is not supported by the "
@@ -798,6 +810,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # In latest main this is the cross-platform gemm1 clamp contract;
             # swiglu_limit is a different, DSV4-specific CUDA/HIP path.
             gemm1_clamp_limit=moe_clamp_limit,
+            enable_local_ep_dispatcher=self.supports_welm_local_ep_moe,
         )
 
         self.gate = ReplicatedLinear(
@@ -914,6 +927,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         use_reduce_scatter: bool = False,
         return_components: bool = False,
         skip_component_output: bool = False,
+        use_welm_local_ep_moe: bool = False,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -1033,7 +1047,26 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 num_token_non_padded,
                 preserve_padded_ids=preserve_padded_ids,
             )
-        experts_output = self.experts(hidden_states, topk_output)
+        if use_welm_local_ep_moe:
+            if not self.supports_welm_local_ep_moe:
+                raise RuntimeError(
+                    "WeLMv4 local EP MoE was selected for an unsupported "
+                    "parallel configuration."
+                )
+            if use_reduce_scatter:
+                raise RuntimeError(
+                    "WeLMv4 local EP MoE requires a FULL replicated token "
+                    "layout, but use_reduce_scatter is enabled."
+                )
+            experts_output = self.experts.forward_local_ep_partial(
+                hidden_states, topk_output
+            )
+            # Only routed experts are partial across EP ranks. The shared
+            # expert below is fully replicated under DeepEP and must be added
+            # after this sum, otherwise it would be multiplied by EP size.
+            experts_output = moe_expert_parallel_all_reduce(experts_output)
+        else:
+            experts_output = self.experts(hidden_states, topk_output)
         if return_components and skip_component_output:
             if enable_npu_dual_stream:
                 # This early return hands shared_output to the caller, so it is
@@ -2666,9 +2699,30 @@ class Qwen2MoeDecoderLayer(nn.Module):
         )
         self.final_mlp_experts_output = None
         self.final_mlp_shared_output = None
+        has_full_replicated_moe_input = (
+            forward_batch.welmv4_npu_deepep_full_mirror
+            or forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+            or (
+                self.is_nextn
+                and (
+                    forward_batch.forward_mode.is_extend_without_speculative()
+                    or forward_batch.forward_mode.is_draft_extend_v2()
+                )
+            )
+        )
+        use_welm_local_ep_moe = (
+            self.mlp.supports_welm_local_ep_moe
+            and has_full_replicated_moe_input
+        )
+        if use_welm_local_ep_moe and output_hidden_is_scattered:
+            raise RuntimeError(
+                "WeLMv4 local EP MoE cannot consume a scattered token layout."
+            )
         use_kv_mirror_prefill_ll = (
             use_full_mirror_layout
             and forward_batch.welmv4_npu_deepep_full_mirror
+            and not use_welm_local_ep_moe
         )
         # Spec-V2 DRAFT_EXTEND_V2 is a multi-token extend even though it is
         # launched from a decode ScheduleBatch.  In the eager path the copied
@@ -2676,8 +2730,9 @@ class Qwen2MoeDecoderLayer(nn.Module):
         # disagrees with both the padded-row routing above (normal mode uses
         # expert id -1 for dummy rows) and the draft-extend graph adapter,
         # which captures DeepEP as an extend batch.  Keep the correction local
-        # to the WeLM NextN physical MTP layer: recurrent draft DECODE remains
-        # LL and the target model's mirror-prefill override below remains LL.
+        # to the WeLM NextN physical MTP layer. The local-EP path does not
+        # dispatch through DeepEP, but retains this override because TopK uses
+        # it to select the correct graph-padding id rule.
         use_nextn_draft_extend_normal = (
             _is_npu
             and self.is_nextn
@@ -2707,6 +2762,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 hidden_states_fp32,
                 forward_batch,
                 use_reduce_scatter,
+                use_welm_local_ep_moe=use_welm_local_ep_moe,
                 return_components=self.is_final_layer,
                 skip_component_output=(
                     self.is_final_layer
@@ -3372,7 +3428,9 @@ class Qwen2MoeModel(nn.Module):
                     final_shared_output = getattr(
                         last_layer, "final_mlp_shared_output", None
                     )
-                    # In TP>1, component tensors are still pre-all-reduce.
+                    # Component-wise FP32 rebuild remains restricted to the
+                    # single-rank path. TP/EP>1 consumes the layer's already
+                    # assembled hidden_states instead.
                     can_rebuild_final_mlp = (
                         final_experts_output is not None
                         and getattr(last_layer.mlp, "tp_size", 1) == 1

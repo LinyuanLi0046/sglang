@@ -35,6 +35,7 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
 )
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
+    AscendLocalEPDispatcher,
     AscendTPDispatcher,
 )
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
@@ -251,6 +252,7 @@ class FusedMoE(torch.nn.Module):
         routing_method_type: Optional[RoutingMethodType] = None,
         is_gated: bool = True,
         gate_up_interleaved: bool = True,
+        enable_local_ep_dispatcher: bool = False,
     ):
         super().__init__()
         if params_dtype is None:
@@ -403,6 +405,14 @@ class FusedMoE(torch.nn.Module):
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
+        self.local_ep_dispatcher: Optional[AscendLocalEPDispatcher] = None
+        if enable_local_ep_dispatcher:
+            first_expert_idx = self._expert_storage_rank * self._num_local_routed
+            self.local_ep_dispatcher = AscendLocalEPDispatcher(
+                self.moe_runner_config,
+                first_expert_idx=first_expert_idx,
+                last_expert_idx=first_expert_idx + self._num_local_routed,
+            )
         self._use_ascend_fuseep = get_moe_a2a_backend().is_ascend_fuseep()
 
         if (
@@ -1467,6 +1477,42 @@ class FusedMoE(torch.nn.Module):
             combine_input = self.run_moe_core(dispatch_output=dispatch_output)
 
         return self.dispatcher.combine(combine_input=combine_input)
+
+    def forward_local_ep_partial(
+        self, hidden_states: torch.Tensor, topk_output: TopKOutput
+    ) -> torch.Tensor:
+        """Run locally owned experts for an already-replicated token layout.
+
+        This deliberately returns only this EP rank's routed-expert partial.
+        The caller must sum it over the MoE EP group before consuming it or
+        adding a replicated shared-expert output.
+        """
+        if self.local_ep_dispatcher is None:
+            raise RuntimeError(
+                "Local EP MoE was requested without an initialized local EP "
+                "dispatcher."
+            )
+
+        origin_hidden_states_dim = hidden_states.shape[-1]
+        assert self.quant_method is not None
+
+        if self._dwdp_bound:
+            dwdp_mgr = get_global_dwdp_manager()
+            dwdp_mgr.wait_prefetch(self.layer_id)
+
+        dispatch_output = self.local_ep_dispatcher.dispatch(
+            hidden_states=hidden_states,
+            topk_output=topk_output,
+        )
+        combine_input = self.run_moe_core(dispatch_output=dispatch_output)
+
+        if self._dwdp_bound:
+            dwdp_mgr.record_compute_and_prefetch_next(self.layer_id)
+
+        final_hidden_states = self.local_ep_dispatcher.combine(
+            combine_input=combine_input
+        )
+        return final_hidden_states[..., :origin_hidden_states_dim].contiguous()
 
     def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
         # TODO: consider using symmetric memory

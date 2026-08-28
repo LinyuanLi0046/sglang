@@ -88,9 +88,15 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
     Uses ``npu_moe_init_routing_v2``, which integrates expert token counting.
     """
 
-    def __init__(self, quant_mode: int = -1, expert_tokens_num_type: int = 1):
+    def __init__(
+        self,
+        quant_mode: int = -1,
+        expert_tokens_num_type: int = 1,
+        active_expert_range: Optional[Tuple[int, int]] = None,
+    ):
         self.quant_mode = quant_mode
         self.expert_tokens_num_type = expert_tokens_num_type
+        self.active_expert_range = active_expert_range
 
     def _init_routing(
         self,
@@ -100,6 +106,24 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
         top_k: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         num_tokens = hidden_states.shape[0]
+        if self.active_expert_range is None:
+            # Preserve the original full-range path exactly for existing
+            # dispatchers. Only the opt-in local-EP dispatcher supplies a
+            # narrower range.
+            active_expert_range = [0, num_experts]
+        else:
+            active_expert_range = list(self.active_expert_range)
+            if not (
+                0
+                <= active_expert_range[0]
+                < active_expert_range[1]
+                <= num_experts
+            ):
+                raise ValueError(
+                    "active_expert_range must be a non-empty sub-range of "
+                    f"[0, {num_experts}], got {active_expert_range}"
+                )
+
         hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
             torch.ops.npu.npu_moe_init_routing_v2(
                 hidden_states,
@@ -108,7 +132,7 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
                 expert_num=num_experts,
                 expert_tokens_num_type=self.expert_tokens_num_type,
                 expert_tokens_num_flag=True,
-                active_expert_range=[0, num_experts],
+                active_expert_range=active_expert_range,
                 quant_mode=self.quant_mode,
             )
         )

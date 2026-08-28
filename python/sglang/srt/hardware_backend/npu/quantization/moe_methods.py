@@ -159,9 +159,13 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
 
     @staticmethod
     def _set_dispatcher_output_dtype(layer: torch.nn.Module, dtype) -> None:
-        """Set dispatcher output dtype if the layer has a dispatcher."""
+        """Set the output dtype on every dispatcher owned by the layer."""
+        quant_config = {"dispatcher_output_dtype": dtype}
         if hasattr(layer, "dispatcher"):
-            layer.dispatcher.set_quant_config({"dispatcher_output_dtype": dtype})
+            layer.dispatcher.set_quant_config(quant_config)
+        local_ep_dispatcher = getattr(layer, "local_ep_dispatcher", None)
+        if local_ep_dispatcher is not None:
+            local_ep_dispatcher.set_quant_config(quant_config)
 
     @staticmethod
     def _validate_weight_prefix(layer: torch.nn.Module, weight_prefix: str) -> None:

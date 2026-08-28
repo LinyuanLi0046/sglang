@@ -1,4 +1,7 @@
 from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
+    AscendLocalEPCombineInput,
+    AscendLocalEPDispatcher,
+    AscendLocalEPDispatchOutput,
     AscendTPCombineInput,
     AscendTPDispatcher,
     AscendTPDispatchOutput,
@@ -90,4 +93,7 @@ __all__ = [
     "AscendTPDispatcher",
     "AscendTPDispatchOutput",
     "AscendTPCombineInput",
+    "AscendLocalEPDispatcher",
+    "AscendLocalEPDispatchOutput",
+    "AscendLocalEPCombineInput",
 ]

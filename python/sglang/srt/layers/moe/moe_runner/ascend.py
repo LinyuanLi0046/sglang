@@ -39,6 +39,8 @@ if TYPE_CHECKING:
         DeepEPNormalDispatchOutput,
     )
     from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
+        AscendLocalEPCombineInput,
+        AscendLocalEPDispatchOutput,
         AscendTPDispatchOutput,
         AscendTPCombineInput,
     )
@@ -233,6 +235,23 @@ def pre_permute_ascend_tp_to_ascend(
     )
 
 
+@register_pre_permute("ascend_local_ep", "ascend")
+def pre_permute_ascend_local_ep_to_ascend(
+    dispatch_output: AscendLocalEPDispatchOutput,
+    quant_info: AscendQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> AscendRunnerInput:
+    running_state["local_ep_topk_weights"] = dispatch_output.topk_weights
+    running_state["local_ep_expanded_row_idx"] = dispatch_output.expanded_row_idx
+    return AscendRunnerInput(
+        hidden_states=dispatch_output.hidden_states,
+        hidden_states_scale=dispatch_output.hidden_states_scale,
+        expert_tokens=dispatch_output.expert_tokens,
+        group_list_type=dispatch_output.group_list_type,
+    )
+
+
 @register_pre_permute("deepep_normal", "ascend")
 def pre_permute_deepep_normal_to_ascend(
     dispatch_output: DeepEPNormalDispatchOutput,
@@ -299,6 +318,24 @@ def post_permute_ascend_to_ascend_tp(
     from sglang.srt.layers.moe.token_dispatcher.ascend_tp import AscendTPCombineInput
 
     return AscendTPCombineInput(hidden_states=runner_output.hidden_states)
+
+
+@register_post_permute("ascend", "ascend_local_ep")
+def post_permute_ascend_to_ascend_local_ep(
+    runner_output: AscendRunnerOutput,
+    quant_info: AscendQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> AscendLocalEPCombineInput:
+    from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
+        AscendLocalEPCombineInput,
+    )
+
+    return AscendLocalEPCombineInput(
+        hidden_states=runner_output.hidden_states,
+        topk_weights=running_state["local_ep_topk_weights"],
+        expanded_row_idx=running_state["local_ep_expanded_row_idx"],
+    )
 
 
 @register_post_permute("ascend", "deepep_normal")

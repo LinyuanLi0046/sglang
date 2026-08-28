@@ -684,19 +684,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else None
         )
 
-        # Adjust for attention TP if needed (matching replay path in
-        # populate_from_forward_batch).
-        buffers.num_token_non_padded[...] = num_tokens
-        if (
-            enable_num_token_non_padded()
-            and self.require_gathered_buffer
-            and not self.enable_prefill_cp
-        ):
-            local = compute_local_num_token_non_padded(
-                global_num_token_non_padded=buffers.num_token_non_padded,
-                num_tokens_per_dp=num_tokens,
-            )
-            buffers.num_token_non_padded.copy_(local)
+        # Match eager ForwardBatch semantics: the effective-row scalar exists
+        # only when that metadata is enabled (currently EP). In pure TP it is
+        # not a replay input, so capturing the shared scratch tensor would
+        # leave every graph shape reading the final capture's value.
+        num_token_non_padded = None
+        if enable_num_token_non_padded():
+            buffers.num_token_non_padded[...] = num_tokens
+            if self.require_gathered_buffer and not self.enable_prefill_cp:
+                local = compute_local_num_token_non_padded(
+                    global_num_token_non_padded=buffers.num_token_non_padded,
+                    num_tokens_per_dp=num_tokens,
+                )
+                buffers.num_token_non_padded.copy_(local)
+            num_token_non_padded = buffers.num_token_non_padded
 
         pp_proxy_tensors = None
         # pipeline parallelism
@@ -777,7 +778,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
-            num_token_non_padded=buffers.num_token_non_padded,
+            num_token_non_padded=num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
             rids_int=rids_int,

@@ -446,11 +446,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         ):
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            draft_extend_capture_bs, _ = get_batch_sizes_to_capture(
+                self.draft_runner, self.speculative_num_draft_tokens
+            )
             log_info_on_rank0(
                 logger,
                 f"Capture draft extend CUDA graph begin. backend={decode_backend}, "
                 f"num_tokens_per_req={self.speculative_num_draft_tokens}, "
-                f"bs={capture_bs}, avail mem={before_mem:.2f} GB",
+                f"bs={draft_extend_capture_bs}, avail mem={before_mem:.2f} GB",
             )
             self.cuda_graph_runner_for_draft_extend = Device2ExtendCudaGraphRunner[
                 self.target_worker.device

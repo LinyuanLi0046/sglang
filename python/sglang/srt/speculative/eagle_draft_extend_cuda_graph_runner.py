@@ -63,6 +63,7 @@ class EagleDraftExtendInputBuffers(ForwardInputBuffers):
     seq_lens: torch.Tensor
     seq_lens_cpu: torch.Tensor
     extend_seq_lens: torch.Tensor
+    extend_start_loc: torch.Tensor
     num_correct_drafts: torch.Tensor
     num_accept_tokens: torch.Tensor
     next_token_logits_buffer: torch.Tensor
@@ -198,6 +199,16 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             extend_seq_lens = torch.full(
                 (self.max_bs,), self.captured_req_width, dtype=torch.int32
             )
+            # DRAFT_EXTEND_V2 always uses a fixed-width, request-major layout
+            # inside this graph runner. Keep the starts in runner-owned storage
+            # so every captured graph retains a stable data_ptr and observes the
+            # same metadata semantics as ForwardBatch.init_new() in eager mode.
+            extend_start_loc = torch.arange(
+                0,
+                self.max_num_token,
+                step=self.captured_req_width,
+                dtype=torch.int32,
+            )
             num_correct_drafts = torch.full(
                 (self.max_bs,), self.captured_req_width, dtype=torch.int32
             )
@@ -270,6 +281,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             extend_seq_lens=extend_seq_lens,
+            extend_start_loc=extend_start_loc,
             num_correct_drafts=num_correct_drafts,
             num_accept_tokens=num_accept_tokens,
             next_token_logits_buffer=next_token_logits_buffer,
@@ -279,6 +291,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             ngram_column_starts=ngram_column_starts,
         )
         self.buffers.share_buffers()
+        # Unlike ordinary replay inputs, these values encode this runner's
+        # captured request width. Do not let the cross-runner CUDA buffer pool
+        # alias them with a same-sized runner configured with a different D.
+        self.buffers.extend_start_loc = extend_start_loc
         self._init_model_specific_buffers()
 
         self.backend = resolve_decode_backend(self)
@@ -364,6 +380,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         seq_lens = buffers.seq_lens[:bs]
         seq_lens_cpu = buffers.seq_lens_cpu[:bs]
         extend_seq_lens = buffers.extend_seq_lens[:bs]
+        extend_start_loc = buffers.extend_start_loc[:bs]
         extend_seq_lens_cpu = self.extend_seq_lens_cpu[:bs]
         out_cache_loc = buffers.out_cache_loc[:num_tokens]
         positions = buffers.positions[:num_tokens]
@@ -425,6 +442,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             next_token_logits_buffer=next_token_logits_buffer,
             extend_seq_lens=extend_seq_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
+            extend_start_loc=extend_start_loc,
+            extend_num_tokens=num_tokens,
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum().item(),
             return_logprob=False,
@@ -439,13 +458,20 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             capture_hidden_mode=CaptureHiddenMode.LAST,
         )
         if self.model_runner.ngram_embedding_manager.enabled:
-            forward_batch.ngram_embedding_info = NgramEmbeddingInfo.create(
+            ngram_embedding_info = NgramEmbeddingInfo.create(
                 self.model_runner.ngram_embedding_manager.table,
                 bs,
                 self.device,
                 column_starts=buffers.ngram_column_starts[:bs],
                 req_lens=extend_seq_lens,
             )
+            # create() allocates and copies these fields, which is correct for
+            # eager batches but would freeze their capture-time values in a
+            # graph. Rebind them to the persistent replay-updated buffers so the
+            # captured ngram hash reads the current request lengths/columns.
+            ngram_embedding_info.column_starts = buffers.ngram_column_starts[:bs]
+            ngram_embedding_info.req_lens = extend_seq_lens
+            forward_batch.ngram_embedding_info = ngram_embedding_info
 
         if self.buffers.dsa_seed_topk_capture is not None:
             spec_info.dsa_seed_topk_capture = self.buffers.dsa_seed_topk_capture[

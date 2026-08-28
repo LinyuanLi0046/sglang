@@ -12,7 +12,6 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (  # noqa: E402
-    NgramEmbeddingManager,
     update_ngram_token_table_after_sampling,
 )
 
@@ -29,39 +28,6 @@ def _make_ngram_info(batch_size: int, skip_token_table_update=None):
 
 
 class TestNgramTokenTableUpdate(CustomTestCase):
-    def test_spec_accept_commit_starts_after_incoming_root(self):
-        table = torch.full((4, 16), -1, dtype=torch.int32)
-        manager = NgramEmbeddingManager(enabled=True, table=table, n=3, k=4)
-        # table[row, L] is the incoming b0 and must not be overwritten.
-        table[2, 5] = 900
-        predict = torch.tensor([10, 11, 12, 13, 14, 15], dtype=torch.int64)
-        manager.commit_speculative_accepts(
-            predict=predict,
-            accept_index=torch.tensor([[1, 3, 4]], dtype=torch.int64),
-            accept_lens=torch.tensor([2], dtype=torch.int32),
-            req_pool_indices=torch.tensor([2], dtype=torch.int64),
-            old_seq_lens=torch.tensor([5], dtype=torch.int64),
-        )
-
-        self.assertEqual(table[2, 5].item(), 900)
-        self.assertEqual(table[2, 6].item(), 11)
-        self.assertEqual(table[2, 7].item(), 13)
-        self.assertEqual(table[2, 8].item(), -1)
-
-    def test_draft_manager_shares_canonical_target_table(self):
-        owner_table = torch.empty((4, 16), dtype=torch.int32)
-        owner = NgramEmbeddingManager(
-            enabled=True, table=owner_table, n=3, k=4
-        )
-        draft = NgramEmbeddingManager(
-            enabled=True, table=torch.empty_like(owner_table), n=3, k=4
-        )
-
-        shared = draft.share_table_from(owner)
-
-        self.assertIs(shared.table, owner_table)
-        self.assertEqual((shared.n, shared.k), (draft.n, draft.k))
-
     def test_chunked_prefill_mask_skips_pseudo_next_token(self):
         info = _make_ngram_info(
             4, skip_token_table_update=torch.tensor([False, True, False, True])

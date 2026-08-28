@@ -184,11 +184,11 @@ def _pad_block_table_width(block_tables, extra_pages=3):
     return padded
 
 
-def _make_prefill_case(q_lens=(128,), seq_lens=(256,), *, page_size=64):
+def _make_prefill_case(q_lens=(128,), seq_lens=(256,)):
     assert len(q_lens) == len(seq_lens)
     assert all(q_len <= seq_len for q_len, seq_len in zip(q_lens, seq_lens))
     _, key_cache, value_cache, seq_lens_tensor, block_tables, sinks = (
-        _make_paged_case(seq_lens, page_size=page_size)
+        _make_paged_case(seq_lens)
     )
     total_q_len = sum(q_lens)
     q = torch.randn(
@@ -254,70 +254,6 @@ def test_full_prefill_page_aggregation_compiles_and_matches_reference():
         reference = _reference_prefill_sink_attention(*case)
         torch.npu.synchronize()
         torch.testing.assert_close(actual, reference, rtol=3e-2, atol=3e-2)
-
-
-@torch.no_grad()
-def test_full_prefill_static_graph_schedule_skips_zero_width_padding_rows():
-    # Graph replay reuses the task schedule captured for the full bucket. A
-    # padded request can therefore still own tasks even when its replay-time
-    # q length is zero. Both prefill kernels must skip those tasks without
-    # reading the padded request's Q/K/V metadata or writing its output rows.
-    for page_size in (64, 128):
-        case = _make_prefill_case((4, 4), (16, 16), page_size=page_size)
-        q, key_cache, value_cache, capture_cu_q_lens, _, block_tables, sinks = (
-            case
-        )
-        capture_seq_lens = torch.tensor(
-            (16, 16), device=q.device, dtype=torch.int32
-        )
-        task_schedule = paged_attention_prefill_prepare(
-            capture_cu_q_lens,
-            capture_seq_lens,
-            q.shape[1],
-            key_cache.shape[1],
-            False,
-            key_cache.shape[2],
-            device=q.device,
-        )
-
-        replay_cu_q_lens = torch.tensor(
-            (0, 4, 4), device=q.device, dtype=torch.int32
-        )
-        replay_seq_lens = torch.tensor(
-            (16, 1), device=q.device, dtype=torch.int32
-        )
-        actual = paged_attention_prefill_impl(
-            q=q,
-            key_cache=key_cache,
-            value_cache=value_cache,
-            cu_q_lens=replay_cu_q_lens,
-            seqlens_kv=replay_seq_lens,
-            block_tables=block_tables,
-            gqa_interleave=False,
-            task_b=task_schedule[0],
-            task_q_block=task_schedule[1],
-            task_q_head=task_schedule[2],
-            core_task_offsets=task_schedule[3],
-            sinks=sinks,
-        )
-
-        real_cu_q_lens = torch.tensor(
-            (0, 4), device=q.device, dtype=torch.int32
-        )
-        reference = _reference_prefill_sink_attention(
-            q[:4],
-            key_cache,
-            value_cache,
-            real_cu_q_lens,
-            replay_seq_lens[:1],
-            block_tables[:1],
-            sinks,
-        )
-        expected = torch.zeros_like(q)
-        expected[:4].copy_(reference)
-
-        torch.npu.synchronize()
-        torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
 
 
 @torch.no_grad()

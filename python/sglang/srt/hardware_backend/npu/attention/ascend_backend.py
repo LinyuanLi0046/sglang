@@ -52,6 +52,8 @@ def _load_welm_full_sink_attention_ops():
     """
     from sglang.srt.hardware_backend.npu.attention.sink_full_attention import (
         paged_attention_decode_impl,
+    )
+    from sglang.srt.hardware_backend.npu.attention.welmv4_sink_prefill_attention import (
         paged_attention_prefill_impl,
         paged_attention_prefill_prepare,
     )
@@ -67,6 +69,8 @@ def _load_welm_swa_sink_attention_ops():
     """Load the dedicated paged SWA+Sink Triton wrappers lazily."""
     from sglang.srt.hardware_backend.npu.attention.sink_full_attention import (
         swa_paged_decode_impl,
+    )
+    from sglang.srt.hardware_backend.npu.attention.welmv4_sink_prefill_attention import (
         swa_paged_prefill_impl,
     )
 
@@ -599,6 +603,36 @@ class AscendAttnBackend(AttentionBackend):
             )
         return cu_q_lens
 
+    def _get_welm_sink_prefill_max_q_len(
+        self, forward_batch: ForwardBatch
+    ) -> int:
+        """Return a stable dispatch width without inferring it from padded Q."""
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            max_q_len = int(self.speculative_num_draft_tokens or 0)
+            if max_q_len < 1:
+                raise RuntimeError(
+                    "WeLM Spec-V2 prefill requires a positive fixed query width."
+                )
+            return max_q_len
+
+        extend_lens_cpu = self.forward_metadata.extend_seq_lens_cpu_int
+        if extend_lens_cpu is None:
+            raise RuntimeError(
+                "WeLM prefill dispatch requires CPU extend sequence lengths."
+            )
+        if extend_lens_cpu.numel() == 0:
+            return 0
+        max_q_len = int(extend_lens_cpu.max().item())
+        if max_q_len < 0:
+            raise RuntimeError(
+                "WeLM prefill dispatch received a negative query length: "
+                f"{max_q_len}."
+            )
+        return max_q_len
+
     def _prepare_welm_mtp_triton_metadata(
         self, q: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:
@@ -810,6 +844,7 @@ class AscendAttnBackend(AttentionBackend):
                 (q_3d.shape[0], layer.tp_q_head_num * layer.v_head_dim)
             )
 
+        max_q_len = self._get_welm_sink_prefill_max_q_len(forward_batch)
         cu_q_lens, task_b, task_q_block, task_q_head, core_task_offsets = (
             self._get_welm_full_sink_prefill_schedule(q_3d, layer, forward_batch)
         )
@@ -830,6 +865,7 @@ class AscendAttnBackend(AttentionBackend):
             core_task_offsets=core_task_offsets,
             softmax_scale=layer.scaling,
             aux_mask=self._get_welm_full_sink_prefill_mask(q.device),
+            max_q_len=max_q_len,
             sinks=sinks,
         )
         if real_q_tokens != q_3d.shape[0]:
@@ -852,6 +888,7 @@ class AscendAttnBackend(AttentionBackend):
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         layer: RadixAttention,
+        forward_batch: ForwardBatch,
         block_tables: torch.Tensor,
         sinks: torch.Tensor,
     ) -> torch.Tensor:
@@ -888,6 +925,7 @@ class AscendAttnBackend(AttentionBackend):
                 (q_3d.shape[0], layer.tp_q_head_num * layer.v_head_dim)
             )
 
+        max_q_len = self._get_welm_sink_prefill_max_q_len(forward_batch)
         output = prefill(
             # Attention-DP padding rows are not represented by cu_q_lens.
             q=q_3d[:real_q_tokens],
@@ -902,6 +940,7 @@ class AscendAttnBackend(AttentionBackend):
             softmax_scale=layer.scaling,
             gqa_interleave=False,
             sinks=sinks,
+            max_q_len=max_q_len,
         )
         if real_q_tokens != q_3d.shape[0]:
             output = torch.cat(
@@ -2326,6 +2365,7 @@ class AscendAttnBackend(AttentionBackend):
                             k_cache=k_cache,
                             v_cache=v_cache,
                             layer=layer,
+                            forward_batch=forward_batch,
                             block_tables=block_tables,
                             sinks=sinks,
                         )
@@ -2996,6 +3036,7 @@ class AscendAttnBackend(AttentionBackend):
                         k_cache=k_cache,
                         v_cache=v_cache,
                         layer=layer,
+                        forward_batch=forward_batch,
                         block_tables=block_table,
                         sinks=sinks,
                     )

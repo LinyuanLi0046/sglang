@@ -847,6 +847,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )  # default to true since qwen2_moe always has it
         if has_shared_expert_gate:
             self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
+        self.is_kv_mirror_consumer = self.layer_id in set(
+            getattr(config, "kv_mirror_layers", []) or []
+        )
 
     def _forward_shared_expert(
         self, hidden_states: torch.Tensor
@@ -939,13 +942,43 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 include_draft_extend_v2=True
             )
         )
-        enable_npu_dual_stream = (
+        is_kv_mirror_prefill = (
+            forward_batch is not None
+            and forward_batch.enable_kv_mirror
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and self.is_kv_mirror_consumer
+        )
+        # Preserve the existing dual-stream policy for non-prefill modes and
+        # additionally let mirror prefill use that same policy.
+        use_decode_like_stream_policy = (
+            not is_prefill_batch or is_kv_mirror_prefill
+        )
+        enable_npu_decode_like_dual_stream = (
             _is_npu
             and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             and self.shared_expert is not None
             and hidden_states.shape[0] > 0
             and (moe_a2a_backend.is_none() or moe_a2a_backend.is_deepep())
-            and not is_prefill_batch
+            and use_decode_like_stream_policy
+        )
+        enable_npu_prefill_normal_shared_overlap = (
+            _is_npu
+            and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            and envs.SGLANG_DEEPEP_NORMAL_USE_ALLGATHER.get()
+            and self.shared_expert is not None
+            and hidden_states.shape[0] > 0
+            and forward_batch is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and not is_kv_mirror_prefill
+            and moe_a2a_backend.is_deepep()
+            and get_parallel().moe_ep_size > 1
+            and forward_batch.welmv4_npu_deepep_scattered
+            and not forward_batch.welmv4_npu_deepep_full_mirror
+            and self._resolve_deepep_mode_for_topk(True) == DeepEPMode.NORMAL
+        )
+        enable_npu_shared_alt_stream = (
+            enable_npu_decode_like_dual_stream
+            or enable_npu_prefill_normal_shared_overlap
         )
         num_token_non_padded = (
             getattr(forward_batch, "num_token_non_padded", None)
@@ -977,7 +1010,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 hidden_states.device, layer_id=self.layer_id
             )
         else:
-            if self.shared_expert is not None and not enable_npu_dual_stream:
+            if self.shared_expert is not None and not enable_npu_shared_alt_stream:
                 shared_output = self._forward_shared_expert(hidden_states)
             if _is_npu:
                 # router_logits = mmq_style_router_linear_npu(
@@ -993,7 +1026,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 router_logits = mmq_style_router_linear(
                     hidden_states, self.gate.weight
                 )
-            if enable_npu_dual_stream:
+            if enable_npu_decode_like_dual_stream:
                 # Start after the router Cube GEMM. The shared expert overlaps
                 # routing, dispatch, and the routed-expert path until final add;
                 # both paths only read the original hidden_states storage.
@@ -1047,6 +1080,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 num_token_non_padded,
                 preserve_padded_ids=preserve_padded_ids,
             )
+        if enable_npu_prefill_normal_shared_overlap:
+            # Ordinary non-mirror prefill keeps LOCAL token rows and DeepEP
+            # NORMAL+AllGather starts with communication. Launch only after
+            # router/TopK work so the shared expert's primary overlap window
+            # begins at dispatch. The existing final-add wait remains the
+            # consumption boundary, matching decode/mirror behavior.
+            shared_output = process_shared_expert(
+                hidden_states, self._forward_shared_expert
+            )
         if use_welm_local_ep_moe:
             if not self.supports_welm_local_ep_moe:
                 raise RuntimeError(
@@ -1068,7 +1110,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         else:
             experts_output = self.experts(hidden_states, topk_output)
         if return_components and skip_component_output:
-            if enable_npu_dual_stream:
+            if enable_npu_shared_alt_stream:
                 # This early return hands shared_output to the caller, so it is
                 # the consumption boundary.
                 wait_share_stream()
@@ -1090,7 +1132,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             ):
                 self.last_final_experts_output = experts_output
                 self.last_final_shared_output = shared_output
-            if enable_npu_dual_stream:
+            if enable_npu_shared_alt_stream:
                 # Normal inference first consumes shared_output in this add.
                 wait_share_stream()
             final_hidden_states = final_hidden_states + shared_output
@@ -1768,13 +1810,24 @@ class Qwen2MoeAttention(nn.Module):
                 include_draft_extend_v2=True
             )
         )
+        is_kv_mirror_prefill = (
+            forward_batch is not None
+            and forward_batch.enable_kv_mirror
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and self.kv_mirror_layer_idx in self.kv_mirror_layers
+        )
+        # Preserve the existing gate stream policy for non-prefill modes and
+        # additionally let mirror prefill use that same policy.
+        use_decode_like_stream_policy = (
+            not is_prefill_batch or is_kv_mirror_prefill
+        )
         enable_npu_gate_alt_stream = (
             _is_npu
             and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             and self.alt_stream is not None
             and self.gated_self_attention_headwise
             and hidden_states.shape[0] > 0
-            and not is_prefill_batch
+            and use_decode_like_stream_policy
         )
         if enable_npu_gate_alt_stream:
             device_module = torch.get_device_module()

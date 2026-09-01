@@ -1078,10 +1078,16 @@ class WelmDpAttentionExecutor:
         if is_local_prefill:
             row_indices = getattr(forward_batch, "custom_last_index", None)
             if row_indices is None:
-                raise RuntimeError(
-                    "WeLMv4 first mirror prefill consumer requires "
-                    "custom_last_index"
+                # Match the established non-DP WeLM path: ordinary prefill
+                # does not publish this model-private T->B map when building
+                # ForwardBatch, so derive it lazily at the first mirror
+                # consumer.  extend_seq_lens contains only real request
+                # lengths; any DP/Graph slot padding is a suffix and must not
+                # participate in the cumulative tail positions.
+                row_indices = (
+                    torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
                 )
+                forward_batch.custom_last_index = row_indices
         else:
             # In a non-Spec mixed round, another DP shard may contain
             # ordinary prefill while this shard contains decode.  Transport

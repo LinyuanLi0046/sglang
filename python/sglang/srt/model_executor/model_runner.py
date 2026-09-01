@@ -20,7 +20,7 @@ import inspect
 import logging
 import time
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -218,6 +218,9 @@ from sglang.srt.utils.profile_utils import build_step_span_name
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_checker import WeightChecker
 
+if TYPE_CHECKING:
+    from sglang.srt.models.welmv4_dp_attention import WelmRunnerParallelPlan
+
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
@@ -270,6 +273,7 @@ class ModelRunner:
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         draft_model_idx: Optional[int] = None,
+        runner_parallel_plan: Optional["WelmRunnerParallelPlan"] = None,
     ):
         # Parse args
         self.mem_fraction_static = mem_fraction_static
@@ -286,6 +290,7 @@ class ModelRunner:
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
+        self.runner_parallel_plan = runner_parallel_plan
         self.is_generation = model_config.is_generation
         self.device_timer = None
         self.is_multimodal = model_config.is_multimodal
@@ -359,6 +364,8 @@ class ModelRunner:
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().
         self.init_torch_distributed()
+        if self.runner_parallel_plan is None:
+            self.runner_parallel_plan = self._maybe_build_welm_target_runner_plan()
 
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
@@ -390,6 +397,7 @@ class ModelRunner:
 
         # Load model weights and configure
         self.initialize()
+        self.finalize_welm_runner_plan()
         self.check_quantized_moe_compatibility()
 
         self._initialize_elastic_ep_joiner()
@@ -962,7 +970,134 @@ class ModelRunner:
             tp_size=self.ps.tp_size,
             moe_ep_size=self.ps.moe_ep_size,
             moe_dp_size=self.ps.moe_dp_size,
+            resolved_moe_tp_size=(
+                None
+                if self.runner_parallel_plan is None
+                else self.runner_parallel_plan.moe_tp_size
+            ),
         )
+
+    def _maybe_build_welm_target_runner_plan(self):
+        """Build the target topology plan after distributed groups exist."""
+        architectures = self.model_config.hf_config.architectures or []
+        if (
+            self.is_draft_worker
+            or self.device != "npu"
+            or not self.server_args.enable_dp_attention
+            or "WeLMV4MoeForCausalLM" not in architectures
+        ):
+            return None
+
+        from sglang.srt.models.welmv4_dp_attention import (
+            build_welm_target_runner_plan,
+        )
+
+        parallel = get_parallel()
+        moe_ep_group = parallel.moe_ep_group if self.ps.moe_ep_size > 1 else None
+        moe_ep_normal_group = None
+        if moe_ep_group is not None:
+            from sglang.srt.distributed import get_moe_ep_normal_comm_group
+
+            moe_ep_normal_group = get_moe_ep_normal_comm_group()
+
+        hf_config = self.model_config.hf_config
+        num_target_layers = int(
+            getattr(hf_config, "num_target_hidden_layers", hf_config.num_hidden_layers)
+        )
+        target_mirror_layers = [
+            int(layer_id)
+            for layer_id in (getattr(hf_config, "kv_mirror_layers", None) or [])
+            if 0 <= int(layer_id) < num_target_layers
+        ]
+        return build_welm_target_runner_plan(
+            parallel_state=self.ps,
+            attn_tp_group=self.attention_tp_group,
+            moe_tp_group=parallel.moe_tp_group,
+            moe_ep_group=moe_ep_group,
+            moe_ep_normal_group=moe_ep_normal_group,
+            normal_allgather_enabled=(
+                envs.SGLANG_DEEPEP_NORMAL_USE_ALLGATHER.get()
+                and not envs.SGLANG_DEEPEP_NORMAL_USE_ALLTOALL.get()
+            ),
+            # Module-backed facts are finalized exactly once after load.
+            local_ep_kernel_available=False,
+            shared_expert_ep_replicated=False,
+            o_proj_returns_partial=self.ps.attn_tp_size > 1,
+            first_mirror_consumer=(
+                min(target_mirror_layers) if target_mirror_layers else None
+            ),
+        )
+
+    def finalize_welm_runner_plan(self) -> None:
+        """Freeze one representative layer's capabilities, then bind the plan."""
+        plan = self.runner_parallel_plan
+        if plan is None:
+            return
+
+        inner_model = getattr(self.model, "model", None)
+        layers = None
+        if inner_model is not None:
+            layers = getattr(inner_model, "layers", None)
+            if layers is None:
+                layers = getattr(inner_model, "decoder_layers", None)
+        if layers is None:
+            raise RuntimeError(
+                "WeLMv4 runner plan cannot find the model's decoder layers."
+            )
+        layers = list(layers)
+        if not layers:
+            raise RuntimeError("WeLMv4 runner plan found no decoder layer.")
+        representative_layer = next(
+            (
+                layer
+                for layer in layers
+                if hasattr(getattr(layer, "mlp", None), "experts")
+            ),
+            None,
+        )
+        if representative_layer is None:
+            raise RuntimeError(
+                "WeLMv4 runner plan found no representative sparse decoder layer."
+            )
+
+        if (
+            getattr(plan.role, "name", None) == "DRAFT"
+            and plan.has_moe_ep
+        ):
+            from sglang.srt.layers.moe.utils import (
+                get_speculative_moe_a2a_backend,
+            )
+
+            speculative_a2a = get_speculative_moe_a2a_backend()
+            if not speculative_a2a.is_deepep():
+                raise RuntimeError(
+                    "WeLMv4 physical MTP EP requires the speculative DeepEP "
+                    f"transport, got {speculative_a2a.value!r}."
+                )
+
+        from sglang.srt.models.welmv4_dp_attention import (
+            finalize_welm_runner_plan,
+            inspect_welm_layer_capabilities,
+        )
+
+        capabilities = inspect_welm_layer_capabilities(
+            representative_layer, plan
+        )
+        final_plan = finalize_welm_runner_plan(
+            plan,
+            local_ep_kernel_available=capabilities.local_ep_kernel_available,
+            shared_expert_ep_replicated=(
+                capabilities.shared_expert_ep_replicated
+            ),
+            o_proj_returns_partial=capabilities.o_proj_returns_partial,
+        )
+        bind = getattr(self.model, "bind_finalized_runner_plan", None)
+        if bind is None:
+            raise RuntimeError(
+                "WeLMv4 model does not expose finalized runner-plan binding."
+            )
+        bind(final_plan)
+        self.runner_parallel_plan = final_plan
 
     def init_torch_distributed(self):
         result = bootstrap.init_torch_distributed(
@@ -1029,15 +1164,26 @@ class ModelRunner:
             server_args=self.server_args, tp_rank=self.ps.tp_rank
         )
 
-        loaded = load_model_with_memory_saver(
-            server_args=self.server_args,
-            model_config=self.model_config,
-            load_config=self.load_config,
-            device=self.device,
-            gpu_id=self.gpu_id,
-            memory_saver_adapter=self.memory_saver_adapter,
-            is_draft_worker=self.is_draft_worker,
-        )
+        if self.runner_parallel_plan is None:
+            build_plan_context = contextlib.nullcontext()
+        else:
+            from sglang.srt.models.welmv4_dp_attention import (
+                welm_runner_build_plan_context,
+            )
+
+            build_plan_context = welm_runner_build_plan_context(
+                self.runner_parallel_plan
+            )
+        with build_plan_context:
+            loaded = load_model_with_memory_saver(
+                server_args=self.server_args,
+                model_config=self.model_config,
+                load_config=self.load_config,
+                device=self.device,
+                gpu_id=self.gpu_id,
+                memory_saver_adapter=self.memory_saver_adapter,
+                is_draft_worker=self.is_draft_worker,
+            )
         self.loader = loaded.loader
         self.model = loaded.model
         if loaded.remote_instance_weight_info is not None:

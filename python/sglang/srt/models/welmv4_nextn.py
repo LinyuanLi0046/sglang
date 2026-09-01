@@ -21,6 +21,10 @@ from sglang.srt.models.welmv4 import (
     WelmV4FusedRMSNorm,
     WeLMV4MoeForCausalLM,
 )
+from sglang.srt.models.welmv4_dp_attention import (
+    DraftSharedModulePlan,
+    WelmRunnerParallelPlan,
+)
 from sglang.srt.utils import add_prefix, is_npu
 
 
@@ -100,6 +104,16 @@ class WeLMV4ModelNextN(nn.Module):
                 )
             ]
         )
+        self.runner_parallel_plan = getattr(
+            self.decoder_layers[0], "_welm_runner_plan", None
+        )
+
+    def bind_finalized_runner_plan(
+        self, runner_plan: WelmRunnerParallelPlan
+    ) -> None:
+        for layer in self.decoder_layers:
+            layer.bind_finalized_runner_plan(runner_plan)
+        self.runner_parallel_plan = runner_plan
 
     def _compute_oe_embedding(
         self,
@@ -222,6 +236,41 @@ class WeLMV4ModelNextN(nn.Module):
                 forward_batch.num_token_non_padded.fill_(query_rows)
             forward_batch.num_token_non_padded_cpu = query_rows
 
+        # A DRAFT+EP runner consumes the request view only after the token/OE
+        # history has been contracted above.  Eager tensors may carry either
+        # exactly the real rows or their fixed slot padding; graph capture uses
+        # the latter and replay relies on the view's segmented valid-row mask.
+        runner_plan = self.runner_parallel_plan
+        uses_draft_ep_bridge = bool(
+            runner_plan is not None
+            and getattr(runner_plan.role, "name", None) == "DRAFT"
+            and runner_plan.has_moe_ep
+        )
+        if uses_draft_ep_bridge:
+            row_layout = forward_batch.welm_dp_moe_row_layout
+            if row_layout is None:
+                raise RuntimeError(
+                    "WeLMV4 NextN DRAFT+EP requires outer-DP row metadata."
+                )
+            active_view = row_layout.current
+            if is_kv_mirror_prefill:
+                if row_layout.request is None:
+                    raise RuntimeError(
+                        "WeLMV4 NextN prefill seed requires request-row metadata."
+                    )
+                active_view = row_layout.request
+            actual_rows = int(hidden_states.shape[0])
+            if not (
+                int(active_view.local_real_rows)
+                <= actual_rows
+                <= int(active_view.local_slot_rows)
+            ):
+                raise RuntimeError(
+                    "WeLMV4 NextN rows do not fit the active DP slot: "
+                    f"actual={actual_rows}, real={active_view.local_real_rows}, "
+                    f"capacity={active_view.local_slot_rows}."
+                )
+
         # Eager MLP-sync localizes this scalar as if DRAFT_EXTEND_V2 rows were
         # sequence-sharded across attention-TP ranks.  The NextN decoder does
         # not enter WeLM's target-only scattered-prefill path, so every rank in
@@ -255,7 +304,7 @@ class WeLMV4ModelNextN(nn.Module):
                 "WeLMV4 NextN token/target-hidden row mismatch: "
                 f"{hidden_states.shape[0]} vs {main_hidden_states.shape[0]}."
             )
-        if hidden_states.shape[0] == 0:
+        if hidden_states.shape[0] == 0 and not uses_draft_ep_bridge:
             return hidden_states, hidden_states
         if hidden_states.shape[0] > 0:
             hidden_states = self.eh_proj(
@@ -266,10 +315,25 @@ class WeLMV4ModelNextN(nn.Module):
             )
 
         residual = None
+        dp_executor = getattr(
+            self.decoder_layers[0], "_welm_dp_executor", None
+        )
+        if dp_executor is not None:
+            dp_executor.prepare_forward_scratch(
+                forward_batch=forward_batch,
+                hidden_states=hidden_states,
+            )
         with get_global_expert_distribution_recorder().disable_this_region():
             hidden_states, residual = self.decoder_layers[0](
                 positions, hidden_states, forward_batch, residual
             )
+
+        # A locally idle DRAFT+EP rank must enter the layer above so its
+        # bridge/EP collective order matches active peers.  Once those
+        # collectives have completed, a SUM_LEN slot can still be genuinely
+        # zero-row; do not launch the NPU RMSNorm with a zero grid.
+        if hidden_states.shape[0] == 0:
+            return hidden_states, hidden_states
 
         if residual is None:
             hidden_states_for_next_mtp = hidden_states.to(
@@ -349,10 +413,33 @@ class WeLMV4MoeForCausalLMNextN(WeLMV4MoeForCausalLM):
     def post_load_weights(self, is_nextn=True, weight_names=None):
         super().post_load_weights(is_nextn=True, weight_names=weight_names)
 
-    def set_embed_and_head(self, embed, head):
-        self.model.embed_tokens = embed[0]
-        self.model.oe_embed = embed[1]
-        self.model.oe_gate_up_proj = embed[2]
+    def set_embed_and_head(self, shared, head=None):
+        if isinstance(shared, DraftSharedModulePlan):
+            if head is not None:
+                raise TypeError(
+                    "A DraftSharedModulePlan already owns the LM head; do not "
+                    "pass a second head object."
+                )
+            self.model.embed_tokens = shared.embed_tokens
+            self.model.oe_embed = shared.oe_embed
+            self.model.oe_gate_up_proj = shared.oe_gate_up_proj
+            self.lm_head = shared.lm_head
+            return
+
+        # Preserve the established non-DP WeLM MTP binding path.  A DP draft
+        # always has a runner plan and must use the validated shared-module
+        # plan above instead of blindly binding target objects.
+        runner_plan = getattr(self.model, "runner_parallel_plan", None)
+        if runner_plan is not None:
+            raise TypeError(
+                "WeLMV4 DP NextN set_embed_and_head requires "
+                "DraftSharedModulePlan."
+            )
+        if head is None:
+            raise TypeError("The legacy WeLMV4 NextN binding requires an LM head.")
+        self.model.embed_tokens = shared[0]
+        self.model.oe_embed = shared[1]
+        self.model.oe_gate_up_proj = shared[2]
         self.lm_head = head
 
 

@@ -3577,6 +3577,11 @@ class ServerArgs:
 
         handle_speculative_decoding(self)
 
+        # All DP/MoE/speculative aliases are resolved at this point.  Keep the
+        # WeLM-specific transport contract in one late validator rather than
+        # scattering equivalent checks across parsing and model forward.
+        self._validate_welm_dp_attention_capabilities()
+
         # Needs the draft-token count derived just above.
 
         # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
@@ -5067,6 +5072,25 @@ class ServerArgs:
         model_arch = hf_config.architectures[0]
 
         if model_arch == "WeLMV4MoeForCausalLM":
+            raw_spec_algorithm = (self.speculative_algorithm or "").upper()
+            if (
+                is_npu()
+                and self.enable_dp_attention
+                and raw_spec_algorithm in ("EAGLE", "NEXTN")
+                and self._uses_welm_physical_nextn_draft()
+                and not self.enable_dp_lm_head
+            ):
+                # This must be resolved before target vocab modules are
+                # constructed.  The draft shares the target attn-TP vocab
+                # group; an outer-TP lm_head would expose only a partial vocab
+                # to a smaller NextN replica.
+                self.enable_dp_lm_head = True
+                logger.info(
+                    "WeLMv4 NPU DP Attention with EAGLE/NEXTN enables "
+                    "--enable-dp-lm-head so target and draft vocab shards use "
+                    "the same attention-TP group."
+                )
+
             sink_flags = (
                 getattr(hf_config, "enable_attn_sink_layerwise", []) or []
             )
@@ -5777,6 +5801,94 @@ class ServerArgs:
                     view.chunked_prefill_size,
                     self.mamba_cache_chunk_size,
                 )
+
+    def _uses_welm_physical_nextn_draft(self) -> bool:
+        """Whether the configured draft is WeLM's physical layer-48 model."""
+
+        # ``ModelConfig.from_server_args(..., is_draft_model=True)`` falls
+        # back to the target checkpoint when no separate draft path is given;
+        # mirror that exact ownership rule here.
+        draft_path = self.speculative_draft_model_path or self.model_path
+
+        from sglang.srt.utils.hf_transformers_utils import get_config
+
+        kwargs = {}
+        if (
+            self.decrypted_draft_config_file
+            and self.decrypted_draft_config_file.strip()
+        ):
+            kwargs["_configuration_file"] = self.decrypted_draft_config_file.strip()
+        draft_config = get_config(
+            draft_path,
+            trust_remote_code=self.trust_remote_code,
+            revision=(
+                self.speculative_draft_model_revision
+                or self.revision
+                or "main"
+            ),
+            model_override_args=json.loads(self.json_model_override_args),
+            model_config_parser=self.model_config_parser,
+            **kwargs,
+        )
+        return bool(
+            {"WeLMV4MoeForCausalLM", "WeLMV4MoeForCausalLMNextN"}
+            & set(getattr(draft_config, "architectures", None) or [])
+        )
+
+    def _validate_welm_dp_attention_capabilities(self) -> None:
+        """Validate only startup facts needed by the WeLM NPU DP executor.
+
+        Group coverage, local-EP kernels, module sharding, and OProj reduction
+        are runner/model facts and are deliberately left to plan finalization.
+        This validator contains no TP/DP/EP numeric topology whitelist.
+        """
+        if (
+            not is_npu()
+            or parse_connector_type(self.model_path) == ConnectorType.INSTANCE
+        ):
+            return
+
+        hf_config = self.get_model_config().hf_config
+        architectures = getattr(hf_config, "architectures", None) or []
+        if not architectures or architectures[0] != "WeLMV4MoeForCausalLM":
+            return
+
+        view = resolved_view(self)
+        if not view.enable_dp_attention:
+            return
+
+        if view.ep_size > 1:
+            if view.moe_a2a_backend != "deepep":
+                raise ValueError(
+                    "WeLMv4 NPU DP Attention with expert parallelism requires "
+                    "the DeepEP MoE transport; got "
+                    f"moe_a2a_backend={view.moe_a2a_backend!r}."
+                )
+
+            use_allgather = envs.SGLANG_DEEPEP_NORMAL_USE_ALLGATHER.get()
+            use_alltoall = envs.SGLANG_DEEPEP_NORMAL_USE_ALLTOALL.get()
+            if not use_allgather or use_alltoall:
+                raise ValueError(
+                    "WeLMv4 NPU DP Attention with expert parallelism requires "
+                    "DeepEP ordinary prefill to use the NORMAL AllGather "
+                    "strategy (SGLANG_DEEPEP_NORMAL_USE_ALLGATHER=1 and "
+                    "SGLANG_DEEPEP_NORMAL_USE_ALLTOALL=0); got "
+                    f"allgather={use_allgather}, alltoall={use_alltoall}."
+                )
+
+        # NEXTN is normalized to EAGLE by handle_speculative_decoding().  The
+        # check is intentionally scoped to WeLM DP Spec V2; without MTP the
+        # generic flag retains its existing behavior.
+        if (
+            view.speculative_algorithm == "EAGLE"
+            and view.speculative_skip_dp_mlp_sync
+            and self._uses_welm_physical_nextn_draft()
+        ):
+            raise ValueError(
+                "WeLMv4 NPU DP Attention with physical NextN MTP requires "
+                "scheduler DP MLP synchronization; disable "
+                "--speculative-skip-dp-mlp-sync."
+            )
 
     def _handle_mamba_radix_cache(self, model_arch: str):
         # Resolution moved to the resolution pipeline (arg_groups/overrides.py:

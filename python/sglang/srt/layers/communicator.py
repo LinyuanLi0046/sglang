@@ -854,6 +854,93 @@ class LayerCommunicator:
         )
 
 
+def welm_attn_all_gather_rows(
+    local_tensor: torch.Tensor,
+    *,
+    attn_tp_group,
+) -> torch.Tensor:
+    """Restore one DP shard's complete rows from attn-TP scattered rows.
+
+    The group is explicit so a physical NextN runner cannot accidentally use
+    the outer target TP group through a process-global getter.
+    """
+
+    if attn_tp_group.world_size == 1 or local_tensor.shape[0] == 0:
+        return local_tensor
+    output = local_tensor.new_empty(
+        (local_tensor.shape[0] * attn_tp_group.world_size, *local_tensor.shape[1:])
+    )
+    attn_tp_group.all_gather_into_tensor(output, local_tensor.contiguous())
+    return output
+
+
+def reduce_attn_partial_to_scattered(
+    hidden_states: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    *,
+    attn_tp_group,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Sum OProj partials while removing duplicate attn-TP row replicas.
+
+    Residual is never reduced.  A FULL residual is sliced to the identical
+    contiguous row shard; an already-scattered FP32 residual is preserved.
+    """
+
+    tp_size = int(attn_tp_group.world_size)
+    tp_rank = int(attn_tp_group.rank_in_group)
+    if tp_size == 1:
+        local_hidden = hidden_states
+    else:
+        if hidden_states.shape[0] % tp_size != 0:
+            raise RuntimeError(
+                "WeLMv4 attention rows are not divisible by attention-TP: "
+                f"{hidden_states.shape[0]} % {tp_size}"
+            )
+        local_rows = hidden_states.shape[0] // tp_size
+        local_hidden = hidden_states.new_empty(
+            (local_rows, *hidden_states.shape[1:])
+        )
+        attn_tp_group.reduce_scatter_tensor(
+            local_hidden, hidden_states.contiguous()
+        )
+
+    if residual is None:
+        return local_hidden, None
+    if residual.dtype != torch.float32:
+        raise RuntimeError(
+            f"WeLMv4 DP residual must remain FP32, got {residual.dtype}"
+        )
+    if residual.shape[0] == hidden_states.shape[0]:
+        if tp_size == 1:
+            local_residual = residual
+        else:
+            local_rows = hidden_states.shape[0] // tp_size
+            local_residual = residual.narrow(
+                0, tp_rank * local_rows, local_rows
+            ).contiguous()
+    elif residual.shape[0] == local_hidden.shape[0]:
+        local_residual = residual
+    else:
+        raise RuntimeError(
+            "WeLMv4 residual rows match neither FULL nor scattered attention "
+            f"layout: residual={residual.shape[0]}, full={hidden_states.shape[0]}, "
+            f"scattered={local_hidden.shape[0]}"
+        )
+    return local_hidden, local_residual
+
+
+def finish_welm_attn_partial_full(
+    hidden_states: torch.Tensor,
+    *,
+    attn_tp_group,
+) -> torch.Tensor:
+    """Finish an OProj partial without changing its DP-local row layout."""
+
+    if attn_tp_group.world_size == 1:
+        return hidden_states
+    return attn_tp_group.all_reduce(hidden_states)
+
+
 @dataclass
 class CommunicateContext:
     process_group_sizes: Dict[ScatterMode, int]

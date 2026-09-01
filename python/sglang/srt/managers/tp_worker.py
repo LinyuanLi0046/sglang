@@ -59,9 +59,11 @@ from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
 if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+    from sglang.srt.models.welmv4_dp_attention import WelmRunnerParallelPlan
 
 logger = logging.getLogger(__name__)
 
@@ -289,6 +291,8 @@ class TpModelWorker(BaseTpWorker):
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         is_multi_layer_eagle: bool = False,
         context_length: Optional[int] = None,
+        runner_parallel_plan: Optional["WelmRunnerParallelPlan"] = None,
+        model_config: Optional["ModelConfig"] = None,
     ):
         # Parse args
         self.server_args = server_args
@@ -304,6 +308,8 @@ class TpModelWorker(BaseTpWorker):
         # Draft worker: target's effective context length; the draft runs at
         # absolute target positions. None keeps server_args.context_length.
         self.context_length = context_length
+        self.runner_parallel_plan = runner_parallel_plan
+        self._prebuilt_model_config = model_config
 
         # MTP model runners
         self.model_runner_list: List[ModelRunner] = []
@@ -350,9 +356,18 @@ class TpModelWorker(BaseTpWorker):
         if server_args.is_ep_joiner:
             self.random_seed = server_args.random_seed
         else:
+            is_welm_draft_plan = (
+                self.runner_parallel_plan is not None
+                and getattr(self.runner_parallel_plan.role, "name", None) == "DRAFT"
+            )
+            caller_rank = (
+                self.world_group.rank_in_group
+                if is_welm_draft_plan
+                else self.ps.tp_size * self.ps.pp_rank + self.ps.tp_rank
+            )
             self.random_seed = broadcast_pyobj(
                 [server_args.random_seed],
-                self.ps.tp_size * self.ps.pp_rank + self.ps.tp_rank,
+                caller_rank,
                 self.world_group.cpu_group,
                 src=self.world_group.ranks[0],
             )[0]
@@ -404,6 +419,10 @@ class TpModelWorker(BaseTpWorker):
             mr.init_cuda_graphs(capture_decode_cuda_graph=capture_decode_cuda_graph)
 
     def _init_model_config(self):
+        if self._prebuilt_model_config is not None:
+            self.model_config = self._prebuilt_model_config
+            return
+
         from sglang.srt.configs.model_config import ModelConfig
 
         self.model_config = ModelConfig.from_server_args(
@@ -437,6 +456,7 @@ class TpModelWorker(BaseTpWorker):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
             draft_model_idx=0 if self.is_multi_layer_eagle else None,
+            runner_parallel_plan=self.runner_parallel_plan,
         )
 
     def _init_multi_layer_eagle_model_runners(self):
@@ -457,6 +477,7 @@ class TpModelWorker(BaseTpWorker):
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     memory_pool_config=self.memory_pool_config,
                     draft_model_idx=i,
+                    runner_parallel_plan=self.runner_parallel_plan,
                 )
             )
 

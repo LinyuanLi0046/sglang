@@ -110,6 +110,7 @@ def check_quantized_moe_compatibility(
     tp_size: int,
     moe_ep_size: int,
     moe_dp_size: int,
+    resolved_moe_tp_size: int | None = None,
 ) -> None:
     if (
         quantization_config := getattr(
@@ -120,11 +121,28 @@ def check_quantized_moe_compatibility(
     ) is not None:
         weight_block_size_n = weight_block_size[0]
 
-        if tp_size % moe_ep_size != 0:
-            raise ValueError(
-                f"tp_size {tp_size} must be divisible by ep_size {moe_ep_size}"
+        if resolved_moe_tp_size is None:
+            # Preserve the legacy derivation for every existing caller.  A
+            # runner plan supplies an explicit size only when its live MoE-TP
+            # group intentionally differs from the process' outer TP layout
+            # (notably a WeLM NextN draft replica).
+            if tp_size % moe_ep_size != 0:
+                raise ValueError(
+                    f"tp_size {tp_size} must be divisible by ep_size {moe_ep_size}"
+                )
+            moe_tp_size = tp_size // moe_ep_size // moe_dp_size
+            moe_tp_size_source = (
+                f"tp_size ({tp_size}) divided by moe_ep_size ({moe_ep_size}) "
+                f"and moe_dp_size ({moe_dp_size})"
             )
-        moe_tp_size = tp_size // moe_ep_size // moe_dp_size
+        else:
+            moe_tp_size = int(resolved_moe_tp_size)
+            if moe_tp_size <= 0:
+                raise ValueError(
+                    "resolved_moe_tp_size must be positive, got "
+                    f"{resolved_moe_tp_size}."
+                )
+            moe_tp_size_source = "the resolved runner MoE-TP group"
 
         moe_intermediate_size = getattr(
             model_config.hf_text_config, "moe_intermediate_size", None
@@ -134,7 +152,9 @@ def check_quantized_moe_compatibility(
 
         if moe_intermediate_size % moe_tp_size != 0:
             raise ValueError(
-                f"moe_intermediate_size {moe_intermediate_size} must be divisible by moe_tp_size ({moe_tp_size}) which is tp_size ({tp_size}) divided by moe_ep_size ({moe_ep_size})."
+                f"moe_intermediate_size {moe_intermediate_size} must be "
+                f"divisible by moe_tp_size ({moe_tp_size}) resolved from "
+                f"{moe_tp_size_source}."
             )
 
         if (
@@ -144,6 +164,6 @@ def check_quantized_moe_compatibility(
         ):
             raise ValueError(
                 f"For quantized MoE models, please make sure ({moe_intermediate_size=} / {moe_tp_size=}) % {weight_block_size_n=} == 0 "
-                f"where moe_tp_size is equal to tp_size ({tp_size}) divided by ep_size ({moe_ep_size}). "
+                f"where moe_tp_size comes from {moe_tp_size_source}. "
                 f"You can fix this by setting arguments `--tp` and `--ep` correctly."
             )

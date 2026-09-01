@@ -2663,6 +2663,8 @@ def model_parallel_is_initialized():
 
 
 _TP_STATE_PATCHED = False
+_DRAFT_PARALLEL_GROUPS_PATCH_PLAN = None
+_DRAFT_PARALLEL_GROUPS_PATCH_DEPTH = 0
 
 
 @contextmanager
@@ -2688,6 +2690,77 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
         # restore the original state
         _TP_STATE_PATCHED = False
         _TP = old_tp_group
+
+
+@contextmanager
+def patch_draft_parallel_groups(draft_plan: Any):
+    """Temporarily publish a draft runner's model-parallel groups.
+
+    All groups are created before entering this scope and are carried by the
+    immutable WeLM runner plan.  WORLD and the outer target bridge are never
+    patched: they represent physical process identity, not draft model
+    sharding.  Same-plan nesting is allowed because initialization helpers can
+    share one runtime scope; nesting different plans is rejected.
+    """
+
+    global _TP_STATE_PATCHED
+    global _DRAFT_PARALLEL_GROUPS_PATCH_PLAN
+    global _DRAFT_PARALLEL_GROUPS_PATCH_DEPTH
+    global _TP, _MOE_TP, _MOE_EP
+
+    if _DRAFT_PARALLEL_GROUPS_PATCH_DEPTH:
+        if _DRAFT_PARALLEL_GROUPS_PATCH_PLAN is not draft_plan:
+            raise RuntimeError(
+                "Cannot nest draft parallel contexts for different runner plans."
+            )
+        _DRAFT_PARALLEL_GROUPS_PATCH_DEPTH += 1
+        try:
+            yield
+        finally:
+            _DRAFT_PARALLEL_GROUPS_PATCH_DEPTH -= 1
+        return
+
+    if _TP_STATE_PATCHED:
+        raise RuntimeError(
+            "Cannot enter the WeLM draft parallel context while the legacy TP "
+            "group patch is active."
+        )
+
+    draft_tp_group = draft_plan.attn_tp_group
+    draft_moe_tp_group = draft_plan.moe_tp_group
+    draft_moe_ep_group = draft_plan.moe_ep_group
+    if draft_tp_group is None or draft_moe_tp_group is None:
+        raise ValueError("The draft runner plan is missing its TP or MoE-TP group.")
+    if _ATTN_TP is not draft_tp_group:
+        raise ValueError(
+            "The draft attention-TP group must reuse the initialized target "
+            "attention-TP group handle."
+        )
+
+    # Snapshot every mutable global before the first write so an exception
+    # cannot leave a half-patched topology.
+    old_tp_group = _TP
+    old_moe_tp_group = _MOE_TP
+    old_moe_ep_group = _MOE_EP
+    if old_tp_group is None or old_moe_tp_group is None or old_moe_ep_group is None:
+        raise RuntimeError("Model-parallel groups must be initialized first.")
+
+    _TP_STATE_PATCHED = True
+    _DRAFT_PARALLEL_GROUPS_PATCH_PLAN = draft_plan
+    _DRAFT_PARALLEL_GROUPS_PATCH_DEPTH = 1
+    _TP = draft_tp_group
+    _MOE_TP = draft_moe_tp_group
+    if draft_moe_ep_group is not None:
+        _MOE_EP = draft_moe_ep_group
+    try:
+        yield
+    finally:
+        _MOE_EP = old_moe_ep_group
+        _MOE_TP = old_moe_tp_group
+        _TP = old_tp_group
+        _DRAFT_PARALLEL_GROUPS_PATCH_DEPTH = 0
+        _DRAFT_PARALLEL_GROUPS_PATCH_PLAN = None
+        _TP_STATE_PATCHED = False
 
 
 def get_world_size():

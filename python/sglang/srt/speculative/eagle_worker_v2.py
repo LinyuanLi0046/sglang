@@ -153,24 +153,95 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self._rebuild_topk1_chain_buffers()
 
         # Load draft model weights only.
-        if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
-            ctx = draft_tp_context(get_parallel().attn_tp_group)
-        else:
-            ctx = empty_context()
-        with (
-            ctx
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        target_plan = getattr(target_worker.model_runner, "runner_parallel_plan", None)
+        target_role = getattr(getattr(target_plan, "role", None), "name", None)
+        self.draft_parallel_plan = None
+        draft_model_config = None
+        draft_ps = replace(ps, pp_rank=0)
+        if target_role == "TARGET_DP":
+            if not target_plan.finalized:
+                raise RuntimeError(
+                    "WeLMv4 target runner plan must be finalized before the "
+                    "physical NextN runner is constructed."
+                )
+            from sglang.srt.configs.model_config import ModelConfig
+
+            draft_model_config = ModelConfig.from_server_args(
+                server_args,
+                model_path=get_spec().speculative_draft_model_path,
+                model_revision=get_spec().speculative_draft_model_revision,
+                is_draft_model=True,
+            )
+            draft_architectures = (
+                draft_model_config.hf_config.architectures or []
+            )
+            if "WeLMV4MoeForCausalLMNextN" in draft_architectures:
+                draft_ps, self.draft_parallel_plan = (
+                    self._build_welm_draft_parallel_plan(
+                        target_plan,
+                        ps,
+                        outer_dp_bridge_group=target_worker.model_runner.tp_group,
+                    )
+                )
+                self._apply_welm_draft_server_args(
+                    server_args, draft_ps=draft_ps
+                )
+                # Rebuild after publishing the draft-private topology.  The
+                # first instance above is only the architecture probe; the
+                # worker must cache config derived from the same args/plan it
+                # uses for module construction.
+                draft_model_config = ModelConfig.from_server_args(
+                    server_args,
+                    model_path=get_spec().speculative_draft_model_path,
+                    model_revision=get_spec().speculative_draft_model_revision,
+                    is_draft_model=True,
+                )
+            else:
+                # The probe exists only to decide whether this is WeLM's
+                # physical layer-48 draft.  Do not let it alter the legacy
+                # construction timing/config ownership of an external EAGLE
+                # draft: TpModelWorker must build that ModelConfig exactly as
+                # before, inside its established draft TP scope.
+                draft_model_config = None
+
+        with contextlib.ExitStack() as stack:
+            if self.draft_parallel_plan is not None:
+                stack.enter_context(draft_tp_context(self.draft_parallel_plan))
+            else:
+                if (
+                    server_args.enable_dp_attention
+                    and self.speculative_algorithm.is_eagle3()
+                ):
+                    stack.enter_context(
+                        draft_tp_context(get_parallel().attn_tp_group)
+                    )
+                stack.enter_context(speculative_moe_backend_context())
+                stack.enter_context(speculative_moe_a2a_backend_context())
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
                 # spec workers don't support pipeline parallelism
-                ps=replace(ps, pp_rank=0),
+                ps=draft_ps,
                 nccl_port=nccl_port,
                 is_draft_worker=True,
+                runner_parallel_plan=self.draft_parallel_plan,
+                model_config=draft_model_config,
             )
 
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
+        if self.draft_parallel_plan is not None:
+            finalized_plan = self.draft_runner.runner_parallel_plan
+            if (
+                getattr(getattr(finalized_plan, "role", None), "name", None)
+                != "DRAFT"
+                or not finalized_plan.finalized
+            ):
+                raise RuntimeError(
+                    "WeLMv4 draft runner did not publish a finalized DRAFT plan."
+                )
+            self.draft_parallel_plan = finalized_plan
+            self.draft_worker.runner_parallel_plan = finalized_plan
         self._init_dsa_index_share_state()
         # Eager draft-extend seed buffer (graph paths use their own static ones).
         self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
@@ -181,6 +252,151 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
+    @staticmethod
+    def _build_welm_draft_parallel_plan(
+        target_plan,
+        outer_ps: ParallelState,
+        *,
+        outer_dp_bridge_group,
+    ):
+        """Derive the physical NextN topology from target-owned groups."""
+
+        from sglang.srt.models.welmv4_dp_attention import (
+            build_provisional_welm_draft_runner_plan,
+        )
+
+        draft_attn_tp_group = target_plan.attn_tp_group
+        has_moe_ep = target_plan.has_moe_ep
+        draft_moe_tp_group = (
+            target_plan.moe_tp_group if has_moe_ep else draft_attn_tp_group
+        )
+        draft_moe_ep_group = target_plan.moe_ep_group if has_moe_ep else None
+        # Keep the physical outer-TP communicator explicit.  It spans every
+        # target-DP replica; ``attn_tp_rank == 0`` is the unique contributor
+        # within each replica, so the gather de-duplicates attention-TP peers.
+        outer_dp_bridge_group = outer_dp_bridge_group if has_moe_ep else None
+        if outer_dp_bridge_group is not None:
+            expected_bridge_size = (
+                int(target_plan.outer_target_dp_size)
+                * int(target_plan.attn_tp_size)
+            )
+            if int(outer_dp_bridge_group.world_size) != expected_bridge_size:
+                raise RuntimeError(
+                    "WeLMv4 draft EP bridge does not cover every outer DP "
+                    "replica and its attention-TP peers: "
+                    f"bridge={outer_dp_bridge_group.world_size}, "
+                    f"dp={target_plan.outer_target_dp_size}, "
+                    f"attn_tp={target_plan.attn_tp_size}."
+                )
+            bridge_dp_rank = (
+                int(outer_dp_bridge_group.rank_in_group)
+                // int(target_plan.attn_tp_size)
+            )
+            if bridge_dp_rank != int(target_plan.outer_target_dp_rank):
+                raise RuntimeError(
+                    "WeLMv4 draft EP bridge rank ordering does not match the "
+                    "target DP identity: "
+                    f"bridge_dp_rank={bridge_dp_rank}, "
+                    f"target_dp_rank={target_plan.outer_target_dp_rank}."
+                )
+
+        draft_ps = replace(
+            outer_ps,
+            tp_rank=int(draft_attn_tp_group.rank_in_group),
+            tp_size=int(draft_attn_tp_group.world_size),
+            pp_rank=0,
+            pp_size=1,
+            dp_rank=0,
+            dp_size=1,
+            attn_tp_rank=int(draft_attn_tp_group.rank_in_group),
+            attn_tp_size=int(draft_attn_tp_group.world_size),
+            attn_cp_rank=0,
+            attn_cp_size=1,
+            attn_dp_rank=0,
+            attn_dp_size=1,
+            moe_ep_rank=(
+                int(draft_moe_ep_group.rank_in_group)
+                if draft_moe_ep_group is not None
+                else 0
+            ),
+            moe_ep_size=(
+                int(draft_moe_ep_group.world_size)
+                if draft_moe_ep_group is not None
+                else 1
+            ),
+            moe_dp_rank=0,
+            moe_dp_size=1,
+            dcp_size=1,
+        )
+        plan = build_provisional_welm_draft_runner_plan(
+            draft_parallel_state=draft_ps,
+            draft_attn_tp_group=draft_attn_tp_group,
+            draft_moe_tp_group=draft_moe_tp_group,
+            draft_moe_ep_group=draft_moe_ep_group,
+            outer_dp_bridge_group=outer_dp_bridge_group,
+            outer_target_dp_rank=target_plan.outer_target_dp_rank,
+            outer_target_dp_size=target_plan.outer_target_dp_size,
+            # Module-backed capabilities are finalized after model loading.
+            local_ep_kernel_available=False,
+            shared_expert_ep_replicated=False,
+            o_proj_returns_partial=False,
+        )
+        return draft_ps, plan
+
+    @staticmethod
+    def _apply_welm_draft_server_args(
+        server_args: ServerArgs, *, draft_ps: ParallelState
+    ) -> None:
+        """Resolve the existing scheduler-owned draft copy for this runner."""
+
+        runtime = get_context()
+        if runtime.server_args is not server_args:
+            raise RuntimeError(
+                "WeLMv4 draft construction must reuse the scheduler-published "
+                "draft ServerArgs copy."
+            )
+        overrides = dict(
+            tp_size=draft_ps.tp_size,
+            pp_size=1,
+            dp_size=1,
+            enable_dp_attention=False,
+            enable_dp_lm_head=True,
+            attn_cp_size=1,
+            dcp_size=1,
+            ep_size=draft_ps.moe_ep_size,
+            moe_dp_size=1,
+            moe_runner_backend=(
+                server_args.speculative_moe_runner_backend
+                or server_args.moe_runner_backend
+            ),
+            moe_a2a_backend=(
+                server_args.speculative_moe_a2a_backend
+                or server_args.moe_a2a_backend
+            ),
+        )
+        # The object and its already-published config bags are separate
+        # read tiers.  Update both through their audited mutation points; do
+        # not create another copy or nested publish scope.
+        server_args.override("welmv4_draft.build", **overrides)
+        runtime.override("welmv4_draft.build", **overrides)
+
+    @contextlib.contextmanager
+    def draft_runtime_context(self):
+        """Enter the complete runtime view for this draft runner."""
+
+        draft_parallel_plan = getattr(self, "draft_parallel_plan", None)
+        if draft_parallel_plan is not None:
+            with draft_tp_context(draft_parallel_plan):
+                yield
+            return
+
+        with (
+            self.draft_tp_context(self.draft_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
+            yield
+
     def alloc_memory_pool(
         self,
         memory_pool_config=None,
@@ -190,19 +406,25 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         """Allocate draft KV cache pools (called by scheduler)."""
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.draft_worker.alloc_memory_pool(
-            memory_pool_config=memory_pool_config,
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        runtime_context = (
+            self.draft_runtime_context()
+            if self.draft_parallel_plan is not None
+            else contextlib.nullcontext()
         )
-        draft_ngram = self.draft_runner.ngram_embedding_manager
-        target_ngram = self.target_worker.model_runner.ngram_embedding_manager
-        if draft_ngram.enabled:
-            self.draft_runner.ngram_embedding_manager = draft_ngram.share_table_from(
-                target_ngram
+        with runtime_context:
+            self.draft_worker.alloc_memory_pool(
+                memory_pool_config=memory_pool_config,
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             )
-        self.init_token_map()
-        self.init_lm_head()
+            draft_ngram = self.draft_runner.ngram_embedding_manager
+            target_ngram = self.target_worker.model_runner.ngram_embedding_manager
+            if draft_ngram.enabled:
+                self.draft_runner.ngram_embedding_manager = (
+                    draft_ngram.share_table_from(target_ngram)
+                )
+            self.init_token_map()
+            self.init_lm_head()
 
         if get_spec().speculative_use_rejection_sampling:
             target_vocab_size = self.target_worker.model_config.vocab_size
@@ -221,20 +443,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 )
 
     def init_attention_backends(self):
-        with (
-            self.draft_tp_context(self.draft_runner.tp_group),
-            speculative_moe_backend_context(),
-            speculative_moe_a2a_backend_context(),
-        ):
+        with self.draft_runtime_context():
             self.draft_worker.init_attention_backends()
             self.init_attention_backend()
 
     def init_cuda_graphs(self):
-        with (
-            self.draft_tp_context(self.draft_runner.tp_group),
-            speculative_moe_backend_context(),
-            speculative_moe_a2a_backend_context(),
-        ):
+        with self.draft_runtime_context():
             self.draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
             if check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE):
                 self.draft_runner.init_prefill_cuda_graph(force_for_draft_worker=True)
@@ -276,6 +490,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def init_lm_head(self):
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
         target_lm_head = getattr(self.target_worker.model_runner.model, "lm_head", None)
+
+        if self.draft_parallel_plan is not None:
+            from sglang.srt.models.welmv4_dp_attention import DraftSharedModulePlan
+
+            shared_plan = DraftSharedModulePlan.build(
+                embed,
+                head,
+                vocab_group=self.draft_parallel_plan.attn_tp_group,
+                logits_processor=self.draft_runner.model.logits_processor,
+            )
+            self.draft_runner.model.set_embed_and_head(shared_plan)
+            self.hot_token_id = None
+            return
 
         def maybe_share_target_lm_head():
             if (
@@ -1069,6 +1296,61 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
+    @contextlib.contextmanager
+    def _draft_runtime_context(self):
+        """Use the WeLM full context or preserve another worker's legacy one."""
+
+        unified_context = getattr(self._draft_worker, "draft_runtime_context", None)
+        if unified_context is not None:
+            with unified_context():
+                yield
+            return
+
+        with (
+            self._draft_worker.draft_tp_context(
+                self._draft_worker.draft_runner.tp_group
+            ),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
+            yield
+
+    def _snapshot_welm_draft_ep_rows(
+        self, batch: ScheduleBatch
+    ) -> Optional[tuple[list[int], list[int]]]:
+        """Freeze the target's synchronized request counts for all draft phases."""
+
+        plan = getattr(self._draft_worker, "draft_parallel_plan", None)
+        if plan is None or not plan.has_moe_ep:
+            return None
+
+        raw_rows = batch.welm_dp_raw_rows
+        request_rows = batch.global_num_requests
+        if raw_rows is None or request_rows is None:
+            raise RuntimeError(
+                "WeLMv4 DRAFT+EP requires the target scheduler's synchronized "
+                "row and request counts."
+            )
+        expected = int(plan.outer_target_dp_size)
+        if len(raw_rows) != expected or len(request_rows) != expected:
+            raise RuntimeError(
+                "WeLMv4 DRAFT+EP synchronized count coverage is incomplete: "
+                f"rows={len(raw_rows)}, requests={len(request_rows)}, "
+                f"outer_dp={expected}."
+            )
+        return list(raw_rows), list(request_rows)
+
+    @staticmethod
+    def _restore_welm_draft_ep_rows(
+        batch: ScheduleBatch,
+        metadata: Optional[tuple[list[int], list[int]]],
+    ) -> None:
+        if metadata is None:
+            return
+        raw_rows, request_rows = metadata
+        batch.welm_dp_raw_rows = list(raw_rows)
+        batch.global_num_requests = list(request_rows)
+
     @property
     def war_fastpath_runner(self):
         # Per the base contract: the step's last shared-buffer-reading phase is
@@ -1090,13 +1372,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         super().init_cuda_graphs()
         # Build adaptive runtime states after target and draft backends exist.
         if self.adaptive_controller is not None:
-            with (
-                self._draft_worker.draft_tp_context(
-                    self._draft_worker.draft_runner.tp_group
-                ),
-                speculative_moe_backend_context(),
-                speculative_moe_a2a_backend_context(),
-            ):
+            def initialize_adaptive_states():
                 self.adaptive_controller.register(
                     SpecRuntimeState(
                         speculative_num_steps=self.speculative_num_steps,
@@ -1117,9 +1393,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     ),
                 )
 
+            if getattr(self._draft_worker, "draft_parallel_plan", None) is not None:
+                # Each WeLM adaptive build scopes only its draft half; target
+                # graph construction must see the restored target topology.
+                initialize_adaptive_states()
+            else:
+                # Preserve every existing worker's historical outer scope.
+                with self._draft_runtime_context():
+                    initialize_adaptive_states()
+
     def forward_batch_generation(
         self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
     ):
+        draft_ep_rows = self._snapshot_welm_draft_ep_rows(batch)
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
             target_capture_mode = (
@@ -1139,12 +1425,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 on_publish(batch_output.new_seq_lens)
 
             # Draft prefill
+            self._restore_welm_draft_ep_rows(batch, draft_ep_rows)
             with (
-                self.draft_worker.draft_tp_context(
-                    self.draft_worker.draft_runner.tp_group
-                ),
-                speculative_moe_backend_context(),
-                speculative_moe_a2a_backend_context(),
+                self._draft_runtime_context(),
                 spec_stage_span("draft_extend"),
             ):
                 batch_output.next_draft_input = (
@@ -1182,12 +1465,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # runs, keeping draft KV warm for when the batch shrinks.
                 verify_input = self._build_trivial_verify_input(batch)
             else:
+                self._restore_welm_draft_ep_rows(batch, draft_ep_rows)
                 with (
-                    self.draft_worker.draft_tp_context(
-                        self.draft_worker.draft_runner.tp_group
-                    ),
-                    speculative_moe_backend_context(),
-                    speculative_moe_a2a_backend_context(),
+                    self._draft_runtime_context(),
                     spec_stage_span("draft"),
                 ):
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
@@ -1203,12 +1483,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             ):
                 self._stub_skipped_draft_extend(batch, batch_output)
             else:
+                self._restore_welm_draft_ep_rows(batch, draft_ep_rows)
                 with (
-                    self.draft_worker.draft_tp_context(
-                        self.draft_worker.draft_runner.tp_group
-                    ),
-                    speculative_moe_backend_context(),
-                    speculative_moe_a2a_backend_context(),
+                    self._draft_runtime_context(),
                     spec_stage_span("draft_extend"),
                 ):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
@@ -1329,8 +1606,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens,
             cuda_graph_bs=cuda_graph_bs,
         ):
-            self._draft_worker.init_attention_backend()
-            self._draft_worker._capture_cuda_graphs()
+            if getattr(self._draft_worker, "draft_parallel_plan", None) is not None:
+                with self._draft_runtime_context():
+                    self._draft_worker.init_attention_backend()
+                    self._draft_worker._capture_cuda_graphs()
+            else:
+                # Legacy adaptive initialization owns one outer draft context
+                # in init_cuda_graphs(); keep this call free of nested TP patch.
+                self._draft_worker.init_attention_backend()
+                self._draft_worker._capture_cuda_graphs()
 
             # Build target attention backend and CUDA graph runner
             target_model_runner = self._target_worker.model_runner

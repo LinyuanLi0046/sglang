@@ -84,6 +84,7 @@ class MLPSyncBatchInfo:
 
     num_tokens: int
     num_tokens_for_logprob: int
+    num_requests: int
     can_run_decode_cuda_graph: bool
     can_run_prefill_cuda_graph: bool
     is_extend_in_batch: bool
@@ -94,6 +95,7 @@ class MLPSyncBatchInfo:
     tp0_info: torch.Tensor = None
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
+    global_num_requests: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
@@ -108,6 +110,7 @@ class MLPSyncBatchInfo:
                 int(self.local_can_run_tbo),
                 self.local_forward_mode,
                 int(self.can_run_prefill_cuda_graph),
+                self.num_requests,
             ],
             device=device,
             dtype=dtype,
@@ -123,6 +126,7 @@ class MLPSyncBatchInfo:
                 1,  # local_can_run_tbo
                 ForwardMode.IDLE.value,  # local_forward_mode
                 0,  # can_run_prefill_cuda_graph
+                0,  # num_requests
             ],
             device=device,
             dtype=dtype,
@@ -182,14 +186,21 @@ class MLPSyncBatchInfo:
         tp0_info = global_info_tensor[:, 0, :]
         self.tp0_info = tp0_info
         # Perform only one Device-to-Host (D2H) memory copy
-        cpu_data = tp0_info[:, :2].cpu()
+        # Keep the pre-existing payload columns stable. Request counts are
+        # appended at column 7. Copy this tiny fixed-width record once and do
+        # the non-contiguous column selection on CPU; an NPU advanced-index
+        # kernel here would add no value and is outside the model graph.
+        cpu_data = tp0_info.cpu()
         self.global_num_tokens = cpu_data[:, 0].tolist()
         self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
-        self.can_run_decode_cuda_graph = bool(tp0_info[:, 2].min().item())
-        self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
-        self.can_run_prefill_cuda_graph = bool(tp0_info[:, 6].min().item())
+        self.global_num_requests = cpu_data[:, 7].tolist()
+        self.can_run_decode_cuda_graph = bool(cpu_data[:, 2].min().item())
+        self.is_extend_in_batch = bool(cpu_data[:, 3].max().item())
+        self.can_run_prefill_cuda_graph = bool(cpu_data[:, 6].min().item())
         if _ENABLE_METRICS_DP_ATTENTION:
-            self.dp_cooperation_info = DPCooperationInfo.create(tp0_info[:, 5].tolist())
+            self.dp_cooperation_info = DPCooperationInfo.create(
+                cpu_data[:, 5].tolist()
+            )
 
 
 def _update_gather_batch(
@@ -239,11 +250,14 @@ def prepare_mlp_sync_batch_raw(
     ):
         num_tokens = 0
         num_tokens_for_logprob = 0
+        num_requests = 0
     elif local_batch.forward_mode.is_decode():
         num_tokens = local_batch.batch_size()
         num_tokens_for_logprob = num_tokens
+        num_requests = local_batch.batch_size()
     else:
         num_tokens = local_batch.extend_num_tokens
+        num_requests = local_batch.batch_size()
         num_tokens_for_logprob = sum(
             # We should have at least 1 token for sample in every case.
             max(extend_len - logprob_start_len, 1)
@@ -328,6 +342,7 @@ def prepare_mlp_sync_batch_raw(
         cp_size=attn_cp_size,
         num_tokens=num_tokens,
         num_tokens_for_logprob=num_tokens_for_logprob,
+        num_requests=num_requests,
         can_run_decode_cuda_graph=can_run_decode_cuda_graph,
         can_run_prefill_cuda_graph=can_run_prefill_cuda_graph,
         is_extend_in_batch=is_extend_in_batch,
@@ -367,6 +382,20 @@ def prepare_mlp_sync_batch_raw(
         _update_gather_batch(
             batch_to_gather, mlp_sync_info, require_mlp_tp_gather, skip_all_gather
         )
+        # WeLM DP attention needs the complete, untruncated per-DP row and
+        # request counts even when the generic require_mlp_tp_gather predicate
+        # is false.  Preserve them from this same MLP-sync collective without
+        # changing the generic global_num_tokens contract.
+        runner_plan = getattr(model_runner, "runner_parallel_plan", None)
+        runner_role = getattr(runner_plan, "role", None)
+        runner_role_name = getattr(runner_role, "name", str(runner_role))
+        if runner_role_name == "TARGET_DP" and not skip_all_gather:
+            batch_to_gather.welm_dp_raw_rows = list(
+                mlp_sync_info.global_num_tokens
+            )
+            batch_to_gather.global_num_requests = list(
+                mlp_sync_info.global_num_requests
+            )
 
     # Set on `local_batch`, not `batch_to_gather`: for PREBUILT batches the
     # scheduler's `last_batch` is the prebuilt batch, not its inner idle batch.

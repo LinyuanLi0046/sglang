@@ -29,9 +29,10 @@ from __future__ import annotations
 
 import hashlib
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum, auto
 from functools import total_ordering
+from math import lcm
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import torch
@@ -74,6 +75,365 @@ if TYPE_CHECKING:
 _skip_attn_backend_init_warned = False
 
 _is_npu = is_npu()
+
+
+@dataclass
+class WelmDpRowView:
+    """Per-DP real-row and fixed-slot metadata for one WeLM row domain.
+
+    ``real_rows_gpu`` is intentionally independent from the generic
+    ``global_num_tokens_gpu`` buffer.  In CUDA/NPU graph mode it may be a
+    runner-owned fixed-address tensor updated before replay.
+    """
+
+    real_rows_cpu: List[int]
+    real_rows_gpu: torch.Tensor
+    slot_rows_cpu: List[int]
+    slot_offsets_cpu: List[int]
+    local_real_rows: int
+    local_slot_rows: int
+    global_slot_rows: int
+    slot_stride: Optional[int]
+    padding_mode: DpPaddingMode
+
+    # ForwardBatch-owned transport scratch.  It is allocated once before the
+    # decoder-layer loop and then reused by every layer.  Keeping it on the row
+    # view makes eager overlap batch-private, while Graph capture keeps the
+    # buffers alive with the runner-owned ForwardBatch.  Mask tensors are
+    # refreshed on every model forward so replay observes the latest contents
+    # of the fixed-address ``real_rows_gpu`` vector.
+    _segmented_positions: Optional[torch.Tensor] = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _segmented_valid_mask: Optional[torch.Tensor] = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _segmented_invalid_mask: Optional[torch.Tensor] = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _attn_scattered_key: Optional[Tuple[int, int, int, int, torch.device]] = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _attn_scattered_positions: Optional[torch.Tensor] = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _attn_scattered_valid_mask: Optional[torch.Tensor] = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _attn_scattered_invalid_mask: Optional[torch.Tensor] = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _replicate_gather_buffer: Optional[torch.Tensor] = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _idle_hidden_buffer: Optional[torch.Tensor] = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _idle_residual_buffer: Optional[torch.Tensor] = field(
+        default=None, init=False, repr=False, compare=False
+    )
+
+
+@dataclass
+class WelmDpMoeRowLayout:
+    """The two row views consumed by WeLM DP-MoE transitions."""
+
+    current: WelmDpRowView
+    request: Optional[WelmDpRowView] = None
+
+    def for_layer(
+        self,
+        layer_id: int,
+        *,
+        first_mirror_consumer: int,
+        is_extend_in_batch: bool,
+    ) -> WelmDpRowView:
+        """Select the already-built view for a target decoder layer.
+
+        Ordinary-prefill/mixed rounds contract token rows to request rows at
+        the first mirror consumer.  Decode and target-verify remain on the
+        current view for every layer.
+        """
+
+        if is_extend_in_batch and layer_id >= first_mirror_consumer:
+            if self.request is None:
+                raise RuntimeError(
+                    "WeLM DP mirror consumer requires request-row metadata"
+                )
+            return self.request
+        return self.current
+
+
+def _welm_slot_rows(
+    real_rows: List[int],
+    padding_mode: DpPaddingMode,
+) -> List[int]:
+    if not real_rows:
+        return []
+    if padding_mode.is_max_len():
+        slot_rows = max(real_rows)
+        return [slot_rows] * len(real_rows)
+    return list(real_rows)
+
+
+def _welm_build_row_view(
+    *,
+    real_rows_cpu: List[int],
+    local_dp_rank: int,
+    device: Union[str, torch.device],
+    padding_mode: DpPaddingMode,
+    real_rows_gpu: Optional[torch.Tensor] = None,
+    slot_rows_cpu: Optional[List[int]] = None,
+) -> WelmDpRowView:
+    rows = [int(x) for x in real_rows_cpu]
+    if not rows:
+        raise ValueError("WeLM DP row metadata must contain at least one DP slot")
+    if any(x < 0 for x in rows):
+        raise ValueError(f"WeLM DP row counts must be non-negative, got {rows}")
+    if not 0 <= local_dp_rank < len(rows):
+        raise ValueError(
+            f"WeLM DP local rank {local_dp_rank} is outside {len(rows)} slots"
+        )
+
+    slots = (
+        _welm_slot_rows(rows, padding_mode)
+        if slot_rows_cpu is None
+        else [int(x) for x in slot_rows_cpu]
+    )
+    if len(slots) != len(rows) or any(slot < real for slot, real in zip(slots, rows)):
+        raise ValueError(
+            "WeLM DP slot rows must match the DP size and cover every real row: "
+            f"real={rows}, slots={slots}"
+        )
+
+    offsets: List[int] = []
+    cursor = 0
+    for slot in slots:
+        offsets.append(cursor)
+        cursor += slot
+
+    if real_rows_gpu is None:
+        real_rows_gpu = torch.tensor(rows, dtype=torch.int32, device=device)
+    else:
+        if real_rows_gpu.numel() != len(rows):
+            raise ValueError(
+                "WeLM DP fixed real-row buffer has the wrong capacity: "
+                f"{real_rows_gpu.numel()} != {len(rows)}"
+            )
+        real_rows_gpu.copy_(
+            torch.tensor(rows, dtype=real_rows_gpu.dtype, device=real_rows_gpu.device)
+        )
+
+    slot_stride = slots[0] if all(x == slots[0] for x in slots) else None
+    return WelmDpRowView(
+        real_rows_cpu=rows,
+        real_rows_gpu=real_rows_gpu,
+        slot_rows_cpu=slots,
+        slot_offsets_cpu=offsets,
+        local_real_rows=rows[local_dp_rank],
+        local_slot_rows=slots[local_dp_rank],
+        global_slot_rows=cursor,
+        slot_stride=slot_stride,
+        padding_mode=padding_mode,
+    )
+
+
+def build_welm_dp_moe_row_layout(
+    *,
+    raw_rows_cpu: List[int],
+    request_rows_cpu: Optional[List[int]],
+    local_dp_rank: int,
+    device: Union[str, torch.device],
+    padding_mode: DpPaddingMode,
+    current_width: int = 1,
+    current_real_rows_gpu: Optional[torch.Tensor] = None,
+    current_slot_rows_cpu: Optional[List[int]] = None,
+    current_slot_alignment: int = 1,
+    request_slot_alignment: int = 1,
+) -> WelmDpMoeRowLayout:
+    """Build WeLM row metadata without touching generic DP token counts.
+
+    ``raw_rows_cpu`` preserves the scheduler's ``num_tokens`` unit: ordinary
+    prefill already reports physical token rows, while decode-shaped Spec V2
+    rounds report request rows.  Accordingly ``current_width`` is 1 for
+    ordinary prefill and expands only the latter into verify/draft physical
+    rows. ``request_rows_cpu`` is always one row per request and is never
+    width-scaled. This one-way scaling prevents the B*K*K failure mode.
+    """
+
+    if current_width < 1:
+        raise ValueError(f"WeLM DP current width must be >= 1, got {current_width}")
+    if current_slot_alignment < 1:
+        raise ValueError(
+            "WeLM DP current slot alignment must be >= 1, got "
+            f"{current_slot_alignment}"
+        )
+    if request_slot_alignment < 1:
+        raise ValueError(
+            "WeLM DP request slot alignment must be >= 1, got "
+            f"{request_slot_alignment}"
+        )
+    current_rows = [int(x) * current_width for x in raw_rows_cpu]
+    current_slot_basis = (
+        _welm_slot_rows(current_rows, padding_mode)
+        if current_slot_rows_cpu is None
+        else [int(x) * current_width for x in current_slot_rows_cpu]
+    )
+    current_slots = [
+        ceil_align(x, current_slot_alignment) for x in current_slot_basis
+    ]
+    current = _welm_build_row_view(
+        real_rows_cpu=current_rows,
+        local_dp_rank=local_dp_rank,
+        device=device,
+        padding_mode=padding_mode,
+        real_rows_gpu=current_real_rows_gpu,
+        slot_rows_cpu=current_slots,
+    )
+
+    request = None
+    if request_rows_cpu is not None:
+        if len(request_rows_cpu) != len(raw_rows_cpu):
+            raise ValueError(
+                "WeLM DP raw/request row metadata must have the same DP size"
+            )
+        request_slot_basis = _welm_slot_rows(request_rows_cpu, padding_mode)
+        request = _welm_build_row_view(
+            real_rows_cpu=request_rows_cpu,
+            local_dp_rank=local_dp_rank,
+            device=device,
+            padding_mode=padding_mode,
+            slot_rows_cpu=[
+                ceil_align(x, request_slot_alignment)
+                for x in request_slot_basis
+            ],
+        )
+    return WelmDpMoeRowLayout(current=current, request=request)
+
+
+def _welm_runner_local_dp_rank(model_runner: ModelRunner, dp_size: int) -> int:
+    """Resolve target/outer DP identity without importing the model plan."""
+
+    plan = getattr(model_runner, "runner_parallel_plan", None)
+    for name in (
+        "outer_target_dp_rank",
+        "outer_dp_rank",
+        "target_dp_rank",
+        "attn_dp_rank",
+    ):
+        value = getattr(plan, name, None)
+        if value is not None:
+            return int(value)
+    rank = int(get_parallel().attn_dp_rank)
+    return rank if rank < dp_size else 0
+
+
+def _welm_runner_uses_dp_row_layout(model_runner: ModelRunner) -> bool:
+    """Return whether this runner owns a WeLM DP row-layout consumer."""
+
+    plan = getattr(model_runner, "runner_parallel_plan", None)
+    role = getattr(plan, "role", None)
+    role_name = getattr(role, "name", str(role)) if role is not None else None
+    return role_name == "TARGET_DP" or (
+        role_name == "DRAFT"
+        and getattr(plan, "outer_dp_bridge_group", None) is not None
+    )
+
+
+def _welm_request_rows_for_batch(
+    model_runner: ModelRunner,
+    forward_batch: Any,
+) -> Optional[List[int]]:
+    """Return request rows only for a real prompt-token to request consumer.
+
+    ``is_extend_in_batch`` is group-wide, so idle ranks in an ordinary-prefill
+    round make the same choice as active ranks and enter collectives with the
+    same request-slot geometry.  Decode, target verify, and fixed-width draft
+    extend stay entirely on ``current`` and avoid an unused device tensor.
+    """
+
+    request_rows = forward_batch.global_num_requests_cpu
+    if (
+        request_rows is None
+        or not forward_batch.is_extend_in_batch
+        or not forward_batch.enable_kv_mirror
+    ):
+        return None
+
+    plan = getattr(model_runner, "runner_parallel_plan", None)
+    role = getattr(plan, "role", None)
+    role_name = getattr(role, "name", str(role)) if role is not None else None
+    if role_name == "TARGET_DP":
+        return (
+            list(request_rows)
+            if getattr(plan, "first_mirror_consumer", None) is not None
+            else None
+        )
+    if (
+        role_name == "DRAFT"
+        and getattr(plan, "outer_dp_bridge_group", None) is not None
+    ):
+        return list(request_rows)
+    return None
+
+
+def _welm_current_slot_alignment(
+    model_runner: ModelRunner,
+    *,
+    current_width: int,
+) -> int:
+    """Return the eager token-slot alignment used by generic MLP sync.
+
+    The slot must be divisible by attention-TP *and* remain an integer number
+    of fixed-width requests.  For example, verify width D=3 with attnTP=2 pads
+    3 physical rows to 6, not 4; the latter would fabricate a partial request
+    that the speculative metadata cannot describe.
+    """
+
+    plan = getattr(model_runner, "runner_parallel_plan", None)
+    attn_tp_size = int(
+        getattr(plan, "attn_tp_size", get_parallel().attn_tp_size)
+    )
+    return lcm(attn_tp_size, int(current_width))
+
+
+def _welm_dp_padding_mode(
+    *,
+    real_rows_cpu: List[int],
+    is_extend_in_batch: bool,
+    domain_size: int,
+    require_equal_slots: bool = False,
+) -> DpPaddingMode:
+    """Resolve slot packing in the explicit WeLM row-collective domain.
+
+    Draft execution deliberately exposes attention-DP size 1 to generic model
+    code, while its EP bridge still spans the outer target-DP replicas.  Using
+    ``DpPaddingMode.get_dp_padding_mode`` here would therefore consult the
+    wrong canonical domain.  This is the same SUM/MAX policy for the supported
+    WeLM transports, parameterized by the immutable plan's outer domain size.
+    Graph capture bypasses it and supplies its fixed mode explicitly.
+    """
+
+    if domain_size < 1 or len(real_rows_cpu) != domain_size:
+        raise ValueError(
+            "WeLM DP row domain does not match synchronized counts: "
+            f"domain_size={domain_size}, rows={len(real_rows_cpu)}"
+        )
+    # Ascend DeepEP's NORMAL AllGather strategy uses equal-shape
+    # all_gather_into_tensor/reduce_scatter_tensor.  The WeLM target DP+EP
+    # ordinary-prefill transport therefore needs one common physical slot even
+    # though real token counts remain ragged and are masked independently.
+    if require_equal_slots:
+        return DpPaddingMode.MAX_LEN
+    if is_extend_in_batch and domain_size > 1:
+        return DpPaddingMode.SUM_LEN
+    max_rows = max(real_rows_cpu)
+    sum_rows = sum(real_rows_cpu)
+    return (
+        DpPaddingMode.MAX_LEN
+        if sum_rows * 2 >= max_rows * domain_size
+        else DpPaddingMode.SUM_LEN
+    )
 
 
 def _elastic_should_preserve_local_token_counts(
@@ -564,6 +924,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
 
+    # WeLM DP attention: exact full-group rows retained from the scheduler's
+    # existing MLP-sync collective.  They never replace the generic fields
+    # above.  The row-layout object is built before the idle early return.
+    welm_dp_raw_rows_cpu: Optional[List[int]] = None
+    global_num_requests_cpu: Optional[List[int]] = None
+    welm_dp_moe_row_layout: Optional[WelmDpMoeRowLayout] = None
+
     # For padding
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
     num_token_non_padded_cpu: int = None
@@ -776,6 +1143,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if batch.seq_lens_sum is None and seq_lens_cpu is not None:
             batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
+        use_welm_dp_row_layout = _welm_runner_uses_dp_row_layout(model_runner)
+
         ret = cls(
             # Required core inputs
             forward_mode=batch.forward_mode,
@@ -823,6 +1192,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
             enable_kv_mirror=getattr(model_runner.server_args, "enable_kv_mirror", False),
+            welm_dp_raw_rows_cpu=(
+                list(batch.welm_dp_raw_rows)
+                if use_welm_dp_row_layout and batch.welm_dp_raw_rows is not None
+                else None
+            ),
+            global_num_requests_cpu=(
+                list(batch.global_num_requests)
+                if use_welm_dp_row_layout and batch.global_num_requests is not None
+                else None
+            ),
         )
 
         ret._maybe_init_non_generation_fields(batch)
@@ -891,6 +1270,59 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.global_num_tokens_for_logprob_gpu = torch.tensor(
                 global_num_tokens_for_logprob, dtype=torch.int64
             ).to(device, non_blocking=True)
+
+        # Build WeLM's independent row metadata before the idle return. Raw
+        # scheduler counts are already physical tokens for ordinary prefill,
+        # but are request-unit values on speculative decode rounds; only the
+        # latter therefore carries a uniform physical width greater than one.
+        if ret.welm_dp_raw_rows_cpu is not None:
+            current_width = 1
+            if (
+                ret.spec_info is not None
+                and getattr(ret.spec_info, "num_tokens_per_req", -1) > 0
+            ):
+                current_width = int(ret.spec_info.num_tokens_per_req)
+            current_rows = [x * current_width for x in ret.welm_dp_raw_rows_cpu]
+            runner_plan = getattr(model_runner, "runner_parallel_plan", None)
+            row_domain_size = int(
+                getattr(
+                    runner_plan,
+                    "outer_target_dp_size",
+                    len(ret.welm_dp_raw_rows_cpu),
+                )
+            )
+            padding_mode = _welm_dp_padding_mode(
+                real_rows_cpu=current_rows,
+                is_extend_in_batch=ret.is_extend_in_batch,
+                domain_size=row_domain_size,
+                require_equal_slots=bool(
+                    runner_plan is not None
+                    and getattr(getattr(runner_plan, "role", None), "name", None)
+                    == "TARGET_DP"
+                    and getattr(runner_plan, "has_moe_ep", False)
+                    and ret.is_extend_in_batch
+                    and not ret.forward_mode.is_target_verify()
+                ),
+            )
+            current_slot_alignment = _welm_current_slot_alignment(
+                model_runner,
+                current_width=current_width,
+            )
+            ret.welm_dp_moe_row_layout = build_welm_dp_moe_row_layout(
+                raw_rows_cpu=ret.welm_dp_raw_rows_cpu,
+                request_rows_cpu=_welm_request_rows_for_batch(model_runner, ret),
+                local_dp_rank=_welm_runner_local_dp_rank(
+                    model_runner, len(ret.welm_dp_raw_rows_cpu)
+                ),
+                device=device,
+                padding_mode=padding_mode,
+                current_width=current_width,
+                current_slot_alignment=current_slot_alignment,
+                request_slot_alignment=_welm_current_slot_alignment(
+                    model_runner,
+                    current_width=1,
+                ),
+            )
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
@@ -1260,6 +1692,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_parallel().attn_tp_size
 
+        # WeLM DP target/draft runners own an explicit row layout in the
+        # target's outer-DP domain.  It is built before generic padding and is
+        # the source of truth only for the physical input slot on this runner.
+        # Keep the generic MLP-sync counts untouched: enable-dp-lm-head and the
+        # physical draft runner may intentionally publish a different domain
+        # (including a one-element list), and logits/other generic consumers
+        # must continue to see that original contract.
+        welm_current_view = (
+            self.welm_dp_moe_row_layout.current
+            if self.welm_dp_moe_row_layout is not None
+            else None
+        )
         for i in range(sync_group_size):
             # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
@@ -1319,19 +1763,35 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             buffer_len = sum(global_num_tokens)
 
         if len(global_num_tokens) > 1:
-            num_tokens = global_num_tokens[get_parallel().attn_dp_rank]
+            mlp_sync_num_tokens = global_num_tokens[get_parallel().attn_dp_rank]
         else:
-            num_tokens = global_num_tokens[0]
+            mlp_sync_num_tokens = global_num_tokens[0]
 
         self.global_dp_buffer_len = buffer_len
         set_dp_buffer_len(
             buffer_len,
-            num_tokens,
+            mlp_sync_num_tokens,
             dp_padding_mode.is_max_len(),
             global_num_tokens,
             self.global_num_tokens_gpu,
         )
         set_is_extend_in_batch(self.is_extend_in_batch)
+
+        # The explicit WeLM row executor has its own outer-DP slots.  Use its
+        # local slot only to pad the model inputs; do not publish it through
+        # the generic MLP-sync fields above.  Its padding mode is nevertheless
+        # needed below to fabricate complete dummy requests on an idle local
+        # shard, exactly as the generic MAX_LEN path does.
+        num_tokens = (
+            int(welm_current_view.local_slot_rows)
+            if welm_current_view is not None
+            else mlp_sync_num_tokens
+        )
+        input_padding_mode = (
+            welm_current_view.padding_mode
+            if welm_current_view is not None
+            else dp_padding_mode
+        )
 
         bs = self.batch_size
 
@@ -1363,7 +1823,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     self.forward_mode = ForwardMode.TARGET_VERIFY
                 # Invert the spec_scale_global_num_tokens scaling.
                 bs = self.batch_size = num_tokens // self.spec_info.num_tokens_per_req
-            elif self.is_extend_in_batch and dp_padding_mode.is_max_len():
+            elif self.is_extend_in_batch and input_padding_mode.is_max_len():
                 self._original_forward_mode = self.forward_mode
                 self.forward_mode = ForwardMode.EXTEND
                 # Fabricate a single dummy request covering num_tokens for an

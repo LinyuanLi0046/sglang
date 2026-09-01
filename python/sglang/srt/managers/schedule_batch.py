@@ -2089,6 +2089,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
     global_spec_verify_tier_num_tokens: Optional[List[int]] = None
+    # WeLM DP attention keeps the full, untruncated rows from the same MLP-sync
+    # collective.  These are deliberately separate from global_num_tokens,
+    # whose generic require_mlp_tp_gather-dependent semantics stay unchanged.
+    welm_dp_raw_rows: Optional[List[int]] = None
+    global_num_requests: Optional[List[int]] = None
 
     # === Compound crossing to ForwardBatch (carry their own device tensors) ===
     # Sampling info

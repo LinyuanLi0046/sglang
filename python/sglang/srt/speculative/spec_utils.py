@@ -4,7 +4,7 @@ import contextlib
 import logging
 import os
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Tuple
 
 import torch
@@ -73,6 +73,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.server_args import ServerArgs
+    from sglang.srt.models.welmv4_dp_attention import WelmRunnerParallelPlan
 
 
 if _is_cuda:
@@ -670,10 +671,44 @@ def load_token_map(token_map_path: str) -> List[int]:
 
 
 @contextmanager
-def draft_tp_context(tp_group: GroupCoordinator):
-    # Draft model doesn't use dp and has its own tp group.
-    # We disable mscclpp now because it doesn't support 2 comm groups.
-    with patch_tensor_parallel_group(tp_group):
+def draft_tp_context(
+    draft_parallel: "GroupCoordinator | WelmRunnerParallelPlan",
+):
+    """Publish the topology used by one draft runner.
+
+    Existing callers keep the original TP-only behavior when they pass a
+    ``GroupCoordinator``.  A WeLM runner plan owns every differing live fact,
+    so its scope additionally publishes draft MoE groups, disables target
+    DP-attention semantics, and selects the already-initialized speculative
+    MoE backends.  WORLD is deliberately never patched.
+    """
+
+    if isinstance(draft_parallel, GroupCoordinator):
+        # Legacy path: preserve the exact TP-only contract.  Its callers own
+        # any speculative-MoE contexts just as they did before this overload.
+        with patch_tensor_parallel_group(draft_parallel):
+            yield
+        return
+
+    from sglang.srt.distributed.parallel_state import patch_draft_parallel_groups
+    from sglang.srt.layers.dp_attention import draft_dp_attention_context
+    from sglang.srt.layers.moe.utils import (
+        speculative_moe_a2a_backend_context,
+        speculative_moe_backend_context,
+    )
+
+    role_name = getattr(getattr(draft_parallel, "role", None), "name", None)
+    if role_name != "DRAFT":
+        raise ValueError(
+            "draft_tp_context requires a DRAFT WeLM runner plan, got "
+            f"{role_name!r}."
+        )
+
+    with ExitStack() as stack:
+        stack.enter_context(patch_draft_parallel_groups(draft_parallel))
+        stack.enter_context(draft_dp_attention_context(enabled=False, rank=0, size=1))
+        stack.enter_context(speculative_moe_backend_context())
+        stack.enter_context(speculative_moe_a2a_backend_context())
         yield
 
 

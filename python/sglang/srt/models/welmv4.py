@@ -26,7 +26,6 @@ from transformers import PretrainedConfig
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.configs.model_config import get_welmv4_layerwise_sliding_windows
 from sglang.srt.distributed import (
-    attention_tensor_model_parallel_all_reduce,
     get_pp_group,
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -88,6 +87,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.welmv4_dp_attention import (
+    WelmDpAttentionExecutor,
+    WelmRunnerParallelPlan,
+    WelmRunnerRole,
+    get_welm_runner_build_plan_for_init,
+)
 from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.server_args import get_global_server_args
 
@@ -784,14 +789,30 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             custom_routing_function=self.custom_routing_function,
         )
 
-        self.supports_welm_local_ep_moe = (
+        runner_plan = get_welm_runner_build_plan_for_init()
+        self.welm_runner_plan = runner_plan
+        legacy_local_ep_kernel_available = (
             _is_npu
             and get_moe_a2a_backend().is_deepep()
             and get_parallel().moe_ep_size > 1
             and get_parallel().moe_ep_size == self.tp_size
             and get_parallel().moe_tp_size == 1
-            and not is_dp_attention_enabled()
         )
+        planned_local_ep_kernel_available = (
+            _is_npu
+            and runner_plan is not None
+            and runner_plan.has_moe_ep
+            and get_moe_a2a_backend().is_deepep()
+            and runner_plan.moe_ep_size > 1
+            and runner_plan.moe_tp_size == 1
+        )
+        self.welm_local_ep_kernel_available = (
+            legacy_local_ep_kernel_available
+            or planned_local_ep_kernel_available
+        )
+        # The non-DP path consumes this selector.  DP execution selects the
+        # separately named kernel capability through its immutable plan.
+        self.supports_welm_local_ep_moe = legacy_local_ep_kernel_available
 
         if get_bool_env_var("SGLANG_WELMV4_MMQ_SCORE_ON_SWIGLU", "false"):
             logger.warning(
@@ -810,7 +831,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # In latest main this is the cross-platform gemm1 clamp contract;
             # swiglu_limit is a different, DSV4-specific CUDA/HIP path.
             gemm1_clamp_limit=moe_clamp_limit,
-            enable_local_ep_dispatcher=self.supports_welm_local_ep_moe,
+            enable_local_ep_dispatcher=self.welm_local_ep_kernel_available,
         )
 
         self.gate = ReplicatedLinear(
@@ -824,6 +845,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.register_buffer("_npu_router_compute_weight", None, persistent=False)
         self.register_buffer("_npu_router_compute_weight_t", None, persistent=False)
         if config.shared_expert_intermediate_size > 0:
+            use_ep_replicated_shared_expert = (
+                get_moe_a2a_backend().is_deepep()
+                and (runner_plan is None or runner_plan.has_moe_ep)
+            )
             self.shared_expert = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.shared_expert_intermediate_size,
@@ -834,7 +859,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 swiglu_clamp_limit=shared_clamp_limit,
                 **(
                     dict(tp_rank=0, tp_size=1)
-                    if get_moe_a2a_backend().is_deepep()
+                    if use_ep_replicated_shared_expert
                     else {}
                 ),
             )
@@ -885,14 +910,60 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     @staticmethod
     def _mask_npu_padded_topk(
         topk_output: StandardTopKOutput,
-        num_token_non_padded: torch.Tensor,
+        num_token_non_padded: Optional[torch.Tensor] = None,
         preserve_padded_ids: bool = False,
+        valid_row_mask: Optional[torch.Tensor] = None,
+        invalid_row_mask: Optional[torch.Tensor] = None,
+        invalid_topk_id: Optional[int] = None,
     ) -> StandardTopKOutput:
-        padded_rows = torch.arange(
-            topk_output.topk_ids.shape[0], device=topk_output.topk_ids.device
-        ) >= num_token_non_padded
+        if valid_row_mask is not None:
+            if (
+                valid_row_mask.dim() != 1
+                or valid_row_mask.shape[0] != topk_output.topk_ids.shape[0]
+            ):
+                raise RuntimeError(
+                    "WeLMv4 segmented MoE mask must have one entry per row: "
+                    f"{tuple(valid_row_mask.shape)} vs {topk_output.topk_ids.shape[0]}"
+                )
+            if invalid_row_mask is None:
+                raise RuntimeError(
+                    "WeLMv4 segmented MoE masking requires its preallocated "
+                    "invalid-row mask"
+                )
+            if (
+                invalid_row_mask.dim() != 1
+                or invalid_row_mask.shape != valid_row_mask.shape
+            ):
+                raise RuntimeError(
+                    "WeLMv4 invalid-row mask must match the valid-row mask"
+                )
+            padded_rows = invalid_row_mask
+            if invalid_topk_id is not None:
+                topk_output.topk_ids.masked_fill_(
+                    padded_rows[:, None], int(invalid_topk_id)
+                )
+            elif not preserve_padded_ids:
+                topk_output.topk_ids.masked_fill_(padded_rows[:, None], -1)
+            topk_output.topk_weights.masked_fill_(padded_rows[:, None], 0)
+            return topk_output
+        else:
+            if invalid_row_mask is not None:
+                raise RuntimeError(
+                    "WeLMv4 invalid-row mask requires a valid-row mask"
+                )
+            if num_token_non_padded is None:
+                raise RuntimeError("WeLMv4 padded TopK requires row validity metadata")
+            padded_rows = torch.arange(
+                topk_output.topk_ids.shape[0], device=topk_output.topk_ids.device
+            ) >= num_token_non_padded
         topk_ids = topk_output.topk_ids
-        if not preserve_padded_ids:
+        if invalid_topk_id is not None:
+            topk_ids = torch.where(
+                padded_rows[:, None],
+                torch.full_like(topk_output.topk_ids, int(invalid_topk_id)),
+                topk_output.topk_ids,
+            )
+        elif not preserve_padded_ids:
             topk_ids = torch.where(
                 padded_rows[:, None],
                 torch.full_like(topk_output.topk_ids, -1),
@@ -931,7 +1002,20 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         return_components: bool = False,
         skip_component_output: bool = False,
         use_welm_local_ep_moe: bool = False,
+        use_welm_decode_like_stream_policy: bool = False,
+        use_welm_prefill_normal_stream_policy: bool = False,
+        valid_row_mask: Optional[torch.Tensor] = None,
+        invalid_row_mask: Optional[torch.Tensor] = None,
+        invalid_topk_id: Optional[int] = None,
+        allow_inplace_expert_shared_merge: bool = False,
+        resolved_moe_tp_group=None,
+        resolved_moe_ep_group=None,
     ) -> torch.Tensor:
+        if allow_inplace_expert_shared_merge and return_components:
+            raise RuntimeError(
+                "WeLMv4 in-place expert/shared merge cannot publish separate "
+                "MLP components"
+            )
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         shared_output = None
@@ -951,7 +1035,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # Preserve the existing dual-stream policy for non-prefill modes and
         # additionally let mirror prefill use that same policy.
         use_decode_like_stream_policy = (
-            not is_prefill_batch or is_kv_mirror_prefill
+            not is_prefill_batch
+            or is_kv_mirror_prefill
+            or use_welm_decode_like_stream_policy
         )
         enable_npu_decode_like_dual_stream = (
             _is_npu
@@ -972,8 +1058,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and not is_kv_mirror_prefill
             and moe_a2a_backend.is_deepep()
             and get_parallel().moe_ep_size > 1
-            and forward_batch.welmv4_npu_deepep_scattered
-            and not forward_batch.welmv4_npu_deepep_full_mirror
+            and (
+                use_welm_prefill_normal_stream_policy
+                or (
+                    forward_batch.welmv4_npu_deepep_scattered
+                    and not forward_batch.welmv4_npu_deepep_full_mirror
+                )
+            )
             and self._resolve_deepep_mode_for_topk(True) == DeepEPMode.NORMAL
         )
         enable_npu_shared_alt_stream = (
@@ -985,6 +1076,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             if forward_batch is not None
             else None
         )
+        if valid_row_mask is not None:
+            # A scalar cannot describe holes between fixed DP graph slots.
+            num_token_non_padded = None
         # Decode and Spec-V2 target verify keep the legacy FULL replicated
         # token layout when the WeLMv4 DeepEP scattered path is disabled.  The
         # generic gathered-buffer metadata above is TP-localized, so applying
@@ -1013,10 +1107,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             if self.shared_expert is not None and not enable_npu_shared_alt_stream:
                 shared_output = self._forward_shared_expert(hidden_states)
             if _is_npu:
-                # router_logits = mmq_style_router_linear_npu(
-                #     hidden_states,
-                #     self.get_npu_router_compute_weight(hidden_states.dtype),
-                # )
                 router_logits = torch.mm(
                     hidden_states,
                     self.get_npu_router_compute_weight_t(),
@@ -1060,7 +1150,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     router_logits,
                     num_token_non_padded=num_token_non_padded,
                 )
-        if _is_npu and num_token_non_padded is not None:
+        if _is_npu and (num_token_non_padded is not None or valid_row_mask is not None):
             if not isinstance(topk_output, StandardTopKOutput):
                 raise RuntimeError(
                     "WeLMv4 NPU padding requires StandardTopKOutput, got "
@@ -1079,6 +1169,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 topk_output,
                 num_token_non_padded,
                 preserve_padded_ids=preserve_padded_ids,
+                valid_row_mask=valid_row_mask,
+                invalid_row_mask=invalid_row_mask,
+                invalid_topk_id=invalid_topk_id,
             )
         if enable_npu_prefill_normal_shared_overlap:
             # Ordinary non-mirror prefill keeps LOCAL token rows and DeepEP
@@ -1090,7 +1183,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 hidden_states, self._forward_shared_expert
             )
         if use_welm_local_ep_moe:
-            if not self.supports_welm_local_ep_moe:
+            if not self.welm_local_ep_kernel_available:
                 raise RuntimeError(
                     "WeLMv4 local EP MoE was selected for an unsupported "
                     "parallel configuration."
@@ -1106,7 +1199,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # Only routed experts are partial across EP ranks. The shared
             # expert below is fully replicated under DeepEP and must be added
             # after this sum, otherwise it would be multiplied by EP size.
-            experts_output = moe_expert_parallel_all_reduce(experts_output)
+            experts_output = (
+                resolved_moe_ep_group.all_reduce(experts_output)
+                if resolved_moe_ep_group is not None
+                else moe_expert_parallel_all_reduce(experts_output)
+            )
         else:
             experts_output = self.experts(hidden_states, topk_output)
         if return_components and skip_component_output:
@@ -1129,19 +1226,33 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 self.layer_id == self.num_hidden_layers - 1
                 and self.tp_size == 1
                 and not use_reduce_scatter
+                and not allow_inplace_expert_shared_merge
             ):
                 self.last_final_experts_output = experts_output
                 self.last_final_shared_output = shared_output
             if enable_npu_shared_alt_stream:
                 # Normal inference first consumes shared_output in this add.
                 wait_share_stream()
-            final_hidden_states = final_hidden_states + shared_output
+            if allow_inplace_expert_shared_merge:
+                final_hidden_states.add_(shared_output)
+            else:
+                final_hidden_states = final_hidden_states + shared_output
         if (
             self.tp_size > 1
             and not use_reduce_scatter
-            and not get_moe_a2a_backend().is_deepep()
+            and (
+                (
+                    self.welm_runner_plan is not None
+                    and not self.welm_runner_plan.has_moe_ep
+                )
+                or not get_moe_a2a_backend().is_deepep()
+            )
         ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            final_hidden_states = (
+                resolved_moe_tp_group.all_reduce(final_hidden_states)
+                if resolved_moe_tp_group is not None
+                else tensor_model_parallel_all_reduce(final_hidden_states)
+            )
 
         final_hidden_states = final_hidden_states.view(num_tokens, hidden_dim)
         if return_components:
@@ -2152,42 +2263,57 @@ class Qwen2MoeDecoderLayer(nn.Module):
             allow_reduce_scatter=True,
             is_last_layer=self.is_final_layer,
         )
-        if (
-            is_dp_attention_enabled()
-            and self.self_attn.use_o_norm
-            and self.layer_scatter_modes.mlp_mode != ScatterMode.FULL
-        ):
-            raise NotImplementedError(
-                "WeLMv4 attention DP with o_norm currently requires the FULL "
-                "MoE input layout; EP/A2A or context-parallel MOE_FULL layouts "
-                "need a dedicated o_norm-aware communicator path."
-            )
+        self._welm_runner_plan = get_welm_runner_build_plan_for_init()
+        self._welm_dp_executor = None
+        if self._welm_runner_plan is not None:
+            if self._welm_runner_plan.role is WelmRunnerRole.TARGET_DP or (
+                self._welm_runner_plan.role is WelmRunnerRole.DRAFT
+                and self._welm_runner_plan.has_moe_ep
+            ):
+                self._welm_dp_executor = WelmDpAttentionExecutor(
+                    self._welm_runner_plan
+                )
         LayerManager.set_decoder_layer(self.self_attn.kv_mirror_layer_idx, self)
+
+    def bind_finalized_runner_plan(
+        self, runner_plan: WelmRunnerParallelPlan
+    ) -> None:
+        """Publish the finalized immutable plan before forward/Graph capture."""
+
+        if self._welm_runner_plan is None:
+            raise RuntimeError(
+                "Cannot bind a WeLMv4 DP plan to a layer constructed without one"
+            )
+        if self._welm_dp_executor is None:
+            # DRAFT without physical MTP EP intentionally stays on the exact
+            # non-DP implementation.
+            if runner_plan.role is not WelmRunnerRole.DRAFT or runner_plan.has_moe_ep:
+                raise RuntimeError("WeLMv4 finalized plan requires a missing executor")
+        else:
+            self._welm_dp_executor.bind_finalized_runner_plan(runner_plan)
+        self.mlp.welm_runner_plan = runner_plan
+        self._welm_runner_plan = runner_plan
 
     def _use_npu_prefill_deepep_scattered(
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> bool:
+        # This target-only fast path keeps prompt rows LOCAL between
+        # physical decoder layers. NextN has one physical layer and its
+        # input has already been restored to FULL by the target model;
+        # its first-layer residual is therefore legitimately None.
         tp_size = get_tensor_model_parallel_world_size()
         return (
             _is_npu
-            # This target-only fast path keeps prompt rows LOCAL between
-            # physical decoder layers. NextN has one physical layer and its
-            # input has already been restored to FULL by the target model;
-            # its first-layer residual is therefore legitimately None.
             and not self.is_nextn
             and get_moe_a2a_backend().is_deepep()
             and forward_batch.forward_mode.is_extend_without_speculative()
-            and not is_dp_attention_enabled()
             and tp_size > 1
             and get_parallel().moe_ep_size == tp_size
             and self.attn_tp_size == tp_size
             and getattr(self.self_attn.o_proj, "tp_size", tp_size) == tp_size
-            and hidden_states.dim() == 2
             and hidden_states.shape[0] > 0
-            and hidden_states.dtype == torch.bfloat16
-            and not forward_batch.can_run_tbo
         )
 
     @staticmethod
@@ -2382,7 +2508,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         return residual_partial
 
     @staticmethod
-    def _update_kv_mirror_full_metadata(
+    def _update_pure_tp_kv_mirror_full_metadata(
         forward_batch: ForwardBatch,
         *,
         mirror_num_real_rows: int,
@@ -2428,10 +2554,35 @@ class Qwen2MoeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self._welm_dp_executor is None:
+            return self._forward_non_dp(
+                positions, hidden_states, forward_batch, residual
+            )
+        return self._welm_dp_executor.forward(
+            layer=self,
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            residual=residual,
+        )
+
+    def _forward_non_dp(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Execute the DP-disabled WeLM path.
+
+        Enabling DP attention requires a ``WelmDpAttentionExecutor`` and is
+        handled by the static dispatch in ``forward``.  Keep this function free
+        of DP layout inference, collectives, and metadata mutation.
+        """
+
         residual_after_layernorm = (
             self.ppln and self.layer_id not in self.prenorm_layer_idx
         )
-        use_dp_layer_communicator = is_dp_attention_enabled()
         use_npu_prefill_deepep_scattered = (
             self._use_npu_prefill_deepep_scattered(hidden_states, forward_batch)
         )
@@ -2491,12 +2642,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 residual,
                 residual_after_layernorm=residual_after_layernorm,
             )
-        elif use_dp_layer_communicator:
-            hidden_states, residual = self.layer_communicator.prepare_attn(
-                hidden_states, residual, forward_batch
-            )
-            if residual_after_layernorm:
-                residual = hidden_states.to(torch.float32)
         elif residual_after_layernorm:
             # 纯TP layer0 layer2-47
             hidden_states, _, residual = self.input_layernorm(
@@ -2520,9 +2665,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
             wait_cmo_stream()
         # use_mmq_norm_after_attn 纯TP 0+2-47 layer 为True
         use_mmq_norm_after_attn = residual_after_layernorm and self.self_attn.use_o_norm
-        use_dp_o_norm_after_attn = (
-            is_dp_attention_enabled() and self.self_attn.use_o_norm
-        )
 
         prompt_num_padded_rows = None
         if is_first_kv_mirror_consumer:
@@ -2548,12 +2690,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
-                # o_norm is nonlinear and must see the attn-TP sum.  The
-                # decoder performs it after the explicit all-reduce on DP
-                # paths; the MMQ branch additionally fuses residual+rnorm.
                 skip_o_norm=(
                     use_mmq_norm_after_attn
-                    or use_dp_o_norm_after_attn
                     or output_hidden_is_scattered
                 ),
                 skip_o_proj_all_reduce=output_hidden_is_scattered,
@@ -2586,57 +2724,13 @@ class Qwen2MoeDecoderLayer(nn.Module):
                         "KV Mirror FULL attention rows do not match request count: "
                         f"{hidden_states.shape[0]} != {mirror_num_real_rows}"
                     )
-                self._update_kv_mirror_full_metadata(
+                self._update_pure_tp_kv_mirror_full_metadata(
                     forward_batch,
                     mirror_num_real_rows=mirror_num_real_rows,
                 )
             else:
                 residual = residual.index_select(
                     0, forward_batch.custom_last_index.to(torch.long)
-                )
-            if is_dp_attention_enabled():
-                from sglang.srt.layers.dp_attention import (
-                    get_attention_dp_rank,
-                    set_dp_buffer_len,
-                )
-
-                dp_rank = get_attention_dp_rank()
-                new_local_num_tokens = hidden_states.shape[0]
-                scale = max(getattr(forward_batch, "scale_seq_factor", 1), 1)
-                if scale > 1:
-                    new_global_num_tokens_gpu = (
-                        forward_batch.global_num_tokens_gpu // scale
-                    )
-                    forward_batch.global_num_tokens_gpu.copy_(
-                        new_global_num_tokens_gpu
-                    )
-                    new_global_num_tokens = [
-                        int(x) for x in new_global_num_tokens_gpu.tolist()
-                    ]
-                    if forward_batch.global_num_tokens_cpu is not None:
-                        forward_batch.global_num_tokens_cpu = new_global_num_tokens
-                else:
-                    forward_batch.global_num_tokens_gpu[dp_rank] = (
-                        new_local_num_tokens
-                    )
-                    new_global_num_tokens = None
-                forward_batch.dp_local_start_pos = None
-                forward_batch.dp_local_num_tokens = None
-                if new_global_num_tokens is not None:
-                    if forward_batch.dp_padding_mode.is_max_len():
-                        global_dp_buffer_len = max(new_global_num_tokens) * len(
-                            new_global_num_tokens
-                        )
-                    else:
-                        global_dp_buffer_len = sum(new_global_num_tokens)
-                    forward_batch.global_dp_buffer_len = global_dp_buffer_len
-                else:
-                    global_dp_buffer_len = forward_batch.global_dp_buffer_len
-                set_dp_buffer_len(
-                    global_dp_buffer_len,
-                    new_local_num_tokens,
-                    forward_batch.dp_padding_mode.is_max_len(),
-                    new_global_num_tokens,
                 )
 
         router_prefetch_started = False
@@ -2656,15 +2750,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 )
             )
         elif use_mmq_norm_after_attn:
-            # With attention DP, RowParallelLinear deliberately leaves the
-            # output projection as an attn-TP partial.  WeLM applies o_norm
-            # before adding the residual, so summing the partials *after* the
-            # nonlinear norm would be mathematically wrong.  Reconstruct the
-            # full attention output first.
-            if is_dp_attention_enabled() and self.attn_tp_size > 1:
-                hidden_states = attention_tensor_model_parallel_all_reduce(
-                    hidden_states
-                )
             hidden_states, residual, hidden_states_fp32 = mmq_style_norm_after_attn(
                 hidden_states,
                 residual,
@@ -2673,37 +2758,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 self.post_attention_layernorm.eps,
                 return_fp32_out=False,
             )
-            if (
-                is_dp_attention_enabled()
-                and self.layer_scatter_modes.mlp_mode == ScatterMode.FULL
-            ):
-                from sglang.srt.layers.dp_attention import (
-                    dp_gather_replicate,
-                    get_attention_dp_size,
-                    get_global_dp_buffer,
-                )
-
-                if get_attention_dp_size() != 1:
-                    local_hidden_states = hidden_states
-                    hidden_states = get_global_dp_buffer(get_tp_group())
-                    # The attn-TP all-reduce above made the normalized local
-                    # result identical inside each attention-TP group.  Gather
-                    # one replica per DP shard; treating every replica as a
-                    # partial would multiply the value by attn_tp_size.
-                    dp_gather_replicate(
-                        hidden_states, local_hidden_states, forward_batch
-                    )
-        elif use_dp_o_norm_after_attn:
-            # ppln=False checkpoints still may carry o_norm.  Applying it in
-            # Attention.forward would normalize each RowParallel partial.
-            # Reconstruct the full o_proj result, then perform o_norm,
-            # residual addition, post-attention norm, and the DP gather in
-            # exactly that order.
-            if self.attn_tp_size > 1:
-                hidden_states = attention_tensor_model_parallel_all_reduce(
-                    hidden_states
-                )
-            hidden_states, _ = self.self_attn.o_norm(hidden_states)
+        else:
             (
                 hidden_states,
                 residual,
@@ -2711,34 +2766,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
             ) = self.post_attention_layernorm(
                 hidden_states, residual, clone_fp32_out=True
             )
-
-            from sglang.srt.layers.dp_attention import (
-                dp_gather_replicate,
-                get_attention_dp_size,
-                get_global_dp_buffer,
-            )
-
-            if get_attention_dp_size() != 1:
-                local_hidden_states = hidden_states
-                hidden_states = get_global_dp_buffer(get_tp_group())
-                dp_gather_replicate(
-                    hidden_states, local_hidden_states, forward_batch
-                )
-                hidden_states_fp32 = hidden_states.to(torch.float32)
-        else:
-            if use_dp_layer_communicator:
-                hidden_states, residual = self.layer_communicator.prepare_mlp(
-                    hidden_states, residual, forward_batch
-                )
-                hidden_states_fp32 = hidden_states.to(torch.float32)
-            else:
-                (
-                    hidden_states,
-                    residual,
-                    hidden_states_fp32,
-                ) = self.post_attention_layernorm(
-                    hidden_states, residual, clone_fp32_out=True
-                )
         if router_prefetch_started:
             # Keep CMO overlap bounded to post-attention RMSNorm.
             wait_cmo_stream()
@@ -2821,7 +2848,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     self.is_final_layer
                     and residual is not None
                     and getattr(self.mlp, "tp_size", 1) == 1
-                    and not is_dp_attention_enabled()
                 ),
             )
         experts_output = None
@@ -2830,11 +2856,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
             hidden_states, experts_output, shared_output = mlp_output
         else:
             hidden_states = mlp_output
-
-        if use_dp_layer_communicator:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
 
         if self.is_final_layer:
             self.final_mlp_experts_output = experts_output
@@ -3040,6 +3061,14 @@ class Qwen2MoeModel(nn.Module):
         # For EAGLE3 support
         self.layers_to_capture = []
 
+    def bind_finalized_runner_plan(
+        self, runner_plan: WelmRunnerParallelPlan
+    ) -> None:
+        for layer in self.layers:
+            bind = getattr(layer, "bind_finalized_runner_plan", None)
+            if bind is not None:
+                bind(runner_plan)
+
     def set_eagle3_layers_to_capture(self, layers_to_capture: List[int]):
         self.layers_to_capture = layers_to_capture
         for layer_id in self.layers_to_capture:
@@ -3076,9 +3105,31 @@ class Qwen2MoeModel(nn.Module):
         if getattr(forward_batch, "_original_batch_size", None) == 0:
             return base_hidden_states
 
+        is_nextn_model = bool(getattr(self, "is_nextn_model", False))
+        is_frozen_mtp_decode = (
+            is_nextn_model
+            and forward_batch.forward_mode.is_decode()
+            and bool(
+                getattr(forward_batch.spec_info, "welmv4_mtp_frozen_kv", False)
+            )
+        )
         num_token_non_padded = getattr(
             forward_batch, "num_token_non_padded_cpu", None
         )
+        if is_frozen_mtp_decode:
+            # prepare_for_draft builds ForwardBatch while ScheduleBatch still
+            # carries the preceding TARGET_VERIFY B*D input. draft_forward
+            # replaces input_ids with the actual B*topk rows only afterwards.
+            # Eager DP padding records that actual pre-pad width here; using
+            # the stale generic scalar would include aligned dummy requests in
+            # the explicit-history ngram hash. Direct Graph capture leaves the
+            # field unset and therefore keeps the full fixed bucket; replay
+            # padding is discarded by the later device real-row mask.
+            draft_input_rows = getattr(
+                forward_batch, "_original_num_tokens", None
+            )
+            if draft_input_rows is not None:
+                num_token_non_padded = int(draft_input_rows)
         history_num_tokens = min(
             num_tokens,
             num_tokens
@@ -3089,14 +3140,6 @@ class Qwen2MoeModel(nn.Module):
             return base_hidden_states
         oe_input_ids = input_ids[:history_num_tokens]
         req_lens = ngram_embedding_info.req_lens
-        is_nextn_model = bool(getattr(self, "is_nextn_model", False))
-        is_frozen_mtp_decode = (
-            is_nextn_model
-            and forward_batch.forward_mode.is_decode()
-            and bool(
-                getattr(forward_batch.spec_info, "welmv4_mtp_frozen_kv", False)
-            )
-        )
         # Decode CUDA graphs round the batch size up and leave initialized
         # one-token rows behind the real requests. Only the first
         # ``history_num_tokens`` rows are real in non-speculative decode.
@@ -3436,6 +3479,18 @@ class Qwen2MoeModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        if self.start_layer < self.end_layer:
+            first_local_layer = self.layers[self.start_layer]
+            dp_executor = getattr(first_local_layer, "_welm_dp_executor", None)
+            if dp_executor is not None:
+                # Allocate batch-owned gather/mask scratch during eager setup
+                # (or Graph warmup), then refresh dynamic masks on every real
+                # model forward so the refresh operations are captured.
+                dp_executor.prepare_forward_scratch(
+                    forward_batch=forward_batch,
+                    hidden_states=hidden_states,
+                )
+
         aux_hidden_states = []
         if forward_batch.can_run_tbo:
             hidden_states, residual = model_forward_maybe_tbo(
@@ -3575,6 +3630,11 @@ class WeLMV4MoeForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
+
+    def bind_finalized_runner_plan(
+        self, runner_plan: WelmRunnerParallelPlan
+    ) -> None:
+        self.model.bind_finalized_runner_plan(runner_plan)
 
     def get_attention_sliding_window_size(self) -> Optional[int]:
         """Return the largest real SWA left-history window for cache metadata.

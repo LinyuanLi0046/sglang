@@ -32,6 +32,7 @@ from sglang.srt.utils import get_bool_env_var, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.model_executor.forward_batch_info import WelmDpRowView
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -403,6 +404,33 @@ def disable_dp_size():
         yield
     finally:
         _ATTN_DP_SIZE = old_dp_size
+
+
+@contextmanager
+def draft_dp_attention_context(
+    *, enabled: bool = False, rank: int = 0, size: int = 1
+):
+    """Temporarily publish the draft model's DP-attention identity.
+
+    The canonical getters stay unchanged.  This scoped mutation is used only
+    around draft construction/launch and is always restored, including when a
+    draft call raises.
+    """
+
+    global _ATTN_DP_RANK, _ATTN_DP_SIZE
+    dp = get_flags().dp
+    old_enabled = dp.enabled
+    old_rank = _ATTN_DP_RANK
+    old_size = _ATTN_DP_SIZE
+    dp.enabled = bool(enabled)
+    _ATTN_DP_RANK = int(rank)
+    _ATTN_DP_SIZE = int(size)
+    try:
+        yield
+    finally:
+        _ATTN_DP_SIZE = old_size
+        _ATTN_DP_RANK = old_rank
+        dp.enabled = old_enabled
 
 
 def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -992,3 +1020,466 @@ def moe_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
     return get_attn_tp_group().all_gather(input, output_tensor_list=output_list)
+
+
+# ---------------------------------------------------------------------------
+# WeLMv4 explicit row-layout collectives.
+#
+# These APIs intentionally do not read _DpGatheredBufferWrapper.  Their row
+# metadata belongs to one ForwardBatch (or one graph runner's private static
+# buffers), so scheduler overlap cannot make a later batch overwrite it.
+# ---------------------------------------------------------------------------
+
+
+def _welm_validate_scratch_tensor(
+    tensor: torch.Tensor,
+    *,
+    shape: Tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+    name: str,
+) -> None:
+    if (
+        tuple(tensor.shape) != tuple(shape)
+        or tensor.dtype != dtype
+        or tensor.device != device
+    ):
+        raise RuntimeError(
+            f"WeLMv4 {name} scratch changed after allocation: "
+            f"got shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+            f"device={tensor.device}; expected shape={tuple(shape)}, "
+            f"dtype={dtype}, device={device}"
+        )
+
+
+def _welm_prepare_idle_buffers(
+    row_view: "WelmDpRowView",
+    like: torch.Tensor,
+    *,
+    rows: int,
+) -> None:
+    """Allocate the eager-idle tensors once per ForwardBatch row view."""
+
+    shape = (int(rows), *like.shape[1:])
+    if row_view._idle_hidden_buffer is None:
+        row_view._idle_hidden_buffer = like.new_zeros(shape)
+        row_view._idle_residual_buffer = like.new_zeros(
+            shape, dtype=torch.float32
+        )
+        return
+    _welm_validate_scratch_tensor(
+        row_view._idle_hidden_buffer,
+        shape=shape,
+        dtype=like.dtype,
+        device=like.device,
+        name="idle hidden",
+    )
+    assert row_view._idle_residual_buffer is not None
+    _welm_validate_scratch_tensor(
+        row_view._idle_residual_buffer,
+        shape=shape,
+        dtype=torch.float32,
+        device=like.device,
+        name="idle residual",
+    )
+
+
+def welm_dp_prepare_full_transport_scratch(
+    row_view: "WelmDpRowView",
+    like: torch.Tensor,
+) -> None:
+    """Prepare and refresh FULL/local-EP transport scratch before layers.
+
+    This function must run once on every model forward.  Graph warmup may have
+    allocated the buffers already, but the comparisons below still execute in
+    the real capture so replay recomputes masks from ``real_rows_gpu``.
+    """
+
+    device = like.device
+    counts = row_view.real_rows_gpu
+    if counts.device != device:
+        raise RuntimeError(
+            "WeLMv4 real-row metadata and hidden states are on different devices"
+        )
+    global_rows = int(row_view.global_slot_rows)
+    gather_shape = (global_rows, *like.shape[1:])
+    if row_view._replicate_gather_buffer is None:
+        row_view._replicate_gather_buffer = like.new_empty(gather_shape)
+    else:
+        _welm_validate_scratch_tensor(
+            row_view._replicate_gather_buffer,
+            shape=gather_shape,
+            dtype=like.dtype,
+            device=device,
+            name="replicate-gather",
+        )
+
+    if row_view._segmented_positions is None:
+        row_view._segmented_positions = torch.empty(
+            (global_rows,), dtype=torch.int32, device=device
+        )
+        for start, slot_rows in zip(
+            row_view.slot_offsets_cpu, row_view.slot_rows_cpu
+        ):
+            slot_rows = int(slot_rows)
+            if slot_rows > 0:
+                torch.arange(
+                    slot_rows,
+                    dtype=torch.int32,
+                    device=device,
+                    out=row_view._segmented_positions.narrow(
+                        0, int(start), slot_rows
+                    ),
+                )
+        row_view._segmented_valid_mask = torch.empty(
+            (global_rows,), dtype=torch.bool, device=device
+        )
+        row_view._segmented_invalid_mask = torch.empty(
+            (global_rows,), dtype=torch.bool, device=device
+        )
+    else:
+        _welm_validate_scratch_tensor(
+            row_view._segmented_positions,
+            shape=(global_rows,),
+            dtype=torch.int32,
+            device=device,
+            name="segmented positions",
+        )
+    assert row_view._segmented_valid_mask is not None
+    assert row_view._segmented_invalid_mask is not None
+    _welm_validate_scratch_tensor(
+        row_view._segmented_valid_mask,
+        shape=(global_rows,),
+        dtype=torch.bool,
+        device=device,
+        name="segmented valid mask",
+    )
+    _welm_validate_scratch_tensor(
+        row_view._segmented_invalid_mask,
+        shape=(global_rows,),
+        dtype=torch.bool,
+        device=device,
+        name="segmented invalid mask",
+    )
+    for dp_id, (start, slot_rows) in enumerate(
+        zip(row_view.slot_offsets_cpu, row_view.slot_rows_cpu)
+    ):
+        slot_rows = int(slot_rows)
+        if slot_rows > 0:
+            torch.lt(
+                row_view._segmented_positions.narrow(
+                    0, int(start), slot_rows
+                ),
+                counts[dp_id],
+                out=row_view._segmented_valid_mask.narrow(
+                    0, int(start), slot_rows
+                ),
+            )
+    torch.logical_not(
+        row_view._segmented_valid_mask,
+        out=row_view._segmented_invalid_mask,
+    )
+    if int(row_view.local_real_rows) == 0:
+        _welm_prepare_idle_buffers(
+            row_view, like, rows=int(row_view.local_slot_rows)
+        )
+
+
+def welm_dp_prepare_attn_scattered_transport_scratch(
+    row_view: "WelmDpRowView",
+    like: torch.Tensor,
+    *,
+    dp_rank: int,
+    attn_tp_rank: int,
+    attn_tp_size: int,
+) -> None:
+    """Prepare and refresh NORMAL-AG scattered masks before the layer loop."""
+
+    full_slot_rows = int(row_view.local_slot_rows)
+    if attn_tp_size < 1 or full_slot_rows % int(attn_tp_size) != 0:
+        raise RuntimeError(
+            "WeLMv4 DP attention slot must be divisible by attention-TP: "
+            f"slot={full_slot_rows}, attn_tp={attn_tp_size}"
+        )
+    shard_rows = full_slot_rows // int(attn_tp_size)
+    device = like.device
+    counts = row_view.real_rows_gpu
+    if counts.device != device:
+        raise RuntimeError(
+            "WeLMv4 real-row metadata and hidden states are on different devices"
+        )
+    key = (
+        int(dp_rank),
+        int(attn_tp_rank),
+        int(attn_tp_size),
+        int(shard_rows),
+        device,
+    )
+    if row_view._attn_scattered_positions is None:
+        row_view._attn_scattered_key = key
+        row_view._attn_scattered_positions = torch.empty(
+            (shard_rows,), dtype=torch.int32, device=device
+        )
+        if shard_rows > 0:
+            start = int(attn_tp_rank) * shard_rows
+            torch.arange(
+                start,
+                start + shard_rows,
+                dtype=torch.int32,
+                device=device,
+                out=row_view._attn_scattered_positions,
+            )
+        row_view._attn_scattered_valid_mask = torch.empty(
+            (shard_rows,), dtype=torch.bool, device=device
+        )
+        row_view._attn_scattered_invalid_mask = torch.empty(
+            (shard_rows,), dtype=torch.bool, device=device
+        )
+    elif row_view._attn_scattered_key != key:
+        raise RuntimeError(
+            "WeLMv4 attention-scattered scratch topology changed after allocation"
+        )
+    assert row_view._attn_scattered_valid_mask is not None
+    assert row_view._attn_scattered_invalid_mask is not None
+    torch.lt(
+        row_view._attn_scattered_positions,
+        counts[int(dp_rank)],
+        out=row_view._attn_scattered_valid_mask,
+    )
+    torch.logical_not(
+        row_view._attn_scattered_valid_mask,
+        out=row_view._attn_scattered_invalid_mask,
+    )
+    if int(row_view.local_real_rows) == 0:
+        _welm_prepare_idle_buffers(row_view, like, rows=shard_rows)
+
+
+def welm_dp_idle_buffers(
+    row_view: "WelmDpRowView",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    hidden = row_view._idle_hidden_buffer
+    residual = row_view._idle_residual_buffer
+    if hidden is None or residual is None:
+        raise RuntimeError(
+            "WeLMv4 eager-idle transport scratch was not prepared before layers"
+        )
+    return hidden, residual
+
+
+def welm_dp_segmented_valid_mask(
+    row_view: "WelmDpRowView",
+    *,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """Return validity for ``[dp0 slot, dp1 slot, ...]`` gathered rows."""
+
+    mask = row_view._segmented_valid_mask
+    if mask is None:
+        raise RuntimeError(
+            "WeLMv4 FULL transport scratch was not prepared before layers"
+        )
+    if device is not None and mask.device != device:
+        raise RuntimeError("WeLMv4 segmented mask is on the wrong device")
+    return mask
+
+
+def welm_dp_segmented_invalid_mask(
+    row_view: "WelmDpRowView",
+) -> torch.Tensor:
+    mask = row_view._segmented_invalid_mask
+    if mask is None:
+        raise RuntimeError(
+            "WeLMv4 FULL transport scratch was not prepared before layers"
+        )
+    return mask
+
+
+def welm_dp_attn_scattered_valid_mask(
+    row_view: "WelmDpRowView",
+    *,
+    dp_rank: int,
+    attn_tp_rank: int,
+    attn_tp_size: int,
+    local_rows: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Validity for the contiguous attn-TP shard produced by ReduceScatter."""
+
+    full_slot_rows = int(row_view.local_slot_rows)
+    if attn_tp_size < 1 or full_slot_rows % attn_tp_size != 0:
+        raise RuntimeError(
+            "WeLMv4 DP attention slot must be divisible by attention-TP: "
+            f"slot={full_slot_rows}, attn_tp={attn_tp_size}"
+        )
+    shard_rows = full_slot_rows // attn_tp_size
+    if int(local_rows) != shard_rows:
+        raise RuntimeError(
+            "WeLMv4 scattered tensor does not match its row-layout shard: "
+            f"tensor={local_rows}, expected={shard_rows}"
+        )
+    key = (
+        int(dp_rank),
+        int(attn_tp_rank),
+        int(attn_tp_size),
+        int(shard_rows),
+        device,
+    )
+    if row_view._attn_scattered_key != key:
+        raise RuntimeError(
+            "WeLMv4 NORMAL transport scratch was not prepared for this shard"
+        )
+    mask = row_view._attn_scattered_valid_mask
+    if mask is None:
+        raise RuntimeError(
+            "WeLMv4 NORMAL transport scratch was not prepared before layers"
+        )
+    return mask
+
+
+def welm_dp_attn_scattered_invalid_mask(
+    row_view: "WelmDpRowView",
+) -> torch.Tensor:
+    mask = row_view._attn_scattered_invalid_mask
+    if mask is None:
+        raise RuntimeError(
+            "WeLMv4 NORMAL transport scratch was not prepared before layers"
+        )
+    return mask
+
+
+def welm_dp_replicate_gather(
+    local_tokens: torch.Tensor,
+    row_view: "WelmDpRowView",
+    *,
+    group: GroupCoordinator,
+    dp_rank: int,
+    contribute: bool,
+    output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Gather one replica per DP shard into fixed segmented slots.
+
+    A zero staging tensor plus SUM is used intentionally: it supports unequal
+    eager rows, fixed graph slots, and attention-TP replica de-duplication with
+    one rank-uniform collective sequence.
+    """
+
+    if local_tokens.dim() < 1:
+        raise RuntimeError("WeLMv4 DP gather requires a row-major tensor")
+    dp_rank = int(dp_rank)
+    if not 0 <= dp_rank < len(row_view.slot_rows_cpu):
+        raise RuntimeError("WeLMv4 DP rank is outside the row-layout")
+    global_rows = int(row_view.global_slot_rows)
+    expected_shape = (global_rows, *local_tokens.shape[1:])
+    if output is None:
+        output = row_view._replicate_gather_buffer
+        if output is None:
+            raise RuntimeError(
+                "WeLMv4 replicate-gather scratch was not prepared before layers"
+            )
+        if tuple(output.shape) != expected_shape:
+            raise RuntimeError(
+                "WeLMv4 cached gather output shape mismatch: "
+                f"{tuple(output.shape)} != {expected_shape}"
+            )
+        if output.dtype != local_tokens.dtype or output.device != local_tokens.device:
+            raise RuntimeError(
+                "WeLMv4 cached gather output dtype/device does not match input"
+            )
+        output.zero_()
+    else:
+        if tuple(output.shape) != expected_shape:
+            raise RuntimeError(
+                "WeLMv4 DP gather output shape mismatch: "
+                f"{tuple(output.shape)} != {expected_shape}"
+            )
+        output.zero_()
+
+    local_slot_rows = int(row_view.local_slot_rows)
+    if local_tokens.shape[0] > local_slot_rows:
+        raise RuntimeError(
+            "WeLMv4 local tensor exceeds its DP slot: "
+            f"{local_tokens.shape[0]} > {local_slot_rows}"
+        )
+    if contribute and local_tokens.shape[0] > 0:
+        start = int(row_view.slot_offsets_cpu[dp_rank])
+        output.narrow(0, start, local_tokens.shape[0]).copy_(local_tokens)
+    if global_rows == 0:
+        # Every rank sees the same empty layout, so there is no peer payload
+        # to exchange.  Avoid issuing a zero-element HCCL collective.
+        return output
+    return group.all_reduce(output)
+
+
+def welm_dp_local_slot_slice(
+    global_tokens: torch.Tensor,
+    row_view: "WelmDpRowView",
+    *,
+    dp_rank: int,
+) -> torch.Tensor:
+    """Restore this rank's complete fixed DP slot after MoE combine."""
+
+    dp_rank = int(dp_rank)
+    start = int(row_view.slot_offsets_cpu[dp_rank])
+    rows = int(row_view.local_slot_rows)
+    if start < 0 or start + rows > global_tokens.shape[0]:
+        raise RuntimeError(
+            "WeLMv4 local DP slot is outside the gathered tensor: "
+            f"[{start}, {start + rows}) vs {global_tokens.shape[0]}"
+        )
+    # A row-prefix/slice of the contiguous [rows, hidden] MoE output is already
+    # contiguous.  Return the view so the DP combine path does not allocate a
+    # fresh local tensor on every decoder layer.
+    return global_tokens.narrow(0, start, rows)
+
+
+def welm_reconstruct_attn_scattered_residual_rows(
+    residual: torch.Tensor,
+    custom_last_index: torch.Tensor,
+    prompt_view: "WelmDpRowView",
+    request_view: "WelmDpRowView",
+    *,
+    group: GroupCoordinator,
+    dp_rank: int,
+    attn_tp_rank: int,
+    attn_tp_size: int,
+) -> torch.Tensor:
+    """Rebuild FP32 T->B residual rows from their unique attn-TP owners."""
+
+    if residual.dtype != torch.float32:
+        raise RuntimeError(
+            f"WeLMv4 mirror residual must be FP32, got {residual.dtype}"
+        )
+    prompt_slot_rows = int(prompt_view.local_slot_rows)
+    if prompt_slot_rows % int(attn_tp_size) != 0:
+        raise RuntimeError(
+            "WeLMv4 prompt slot is not divisible by attention-TP"
+        )
+    shard_rows = prompt_slot_rows // int(attn_tp_size)
+    if residual.shape[0] != shard_rows:
+        raise RuntimeError(
+            "WeLMv4 mirror residual shard shape mismatch: "
+            f"{residual.shape[0]} != {shard_rows}"
+        )
+
+    request_real_rows = int(request_view.local_real_rows)
+    request_slot_rows = int(request_view.local_slot_rows)
+    if custom_last_index.numel() != request_real_rows:
+        raise RuntimeError(
+            "WeLMv4 mirror request rows do not match custom_last_index: "
+            f"{request_real_rows} != {custom_last_index.numel()}"
+        )
+    indices = custom_last_index.to(torch.int64)
+    owner = torch.div(indices, shard_rows, rounding_mode="floor")
+    local_offset = indices - int(attn_tp_rank) * shard_rows
+    owned = owner == int(attn_tp_rank)
+    safe_offset = torch.where(owned, local_offset, torch.zeros_like(local_offset))
+    selected = residual.index_select(0, safe_offset.to(torch.long))
+    selected = torch.where(owned[:, None], selected, torch.zeros_like(selected))
+    partial = residual.new_zeros((request_slot_rows, *residual.shape[1:]))
+    if request_real_rows > 0:
+        partial.narrow(0, 0, request_real_rows).copy_(selected)
+    combined = group.all_reduce(partial)
+    # The fixed slot is required only for the rank-uniform collective.  Keep
+    # subsequent mirror attention/norm on the real B-row prefix; the FULL
+    # transport stages it back into its slot without a per-layer pad tensor.
+    return combined.narrow(0, 0, request_real_rows)

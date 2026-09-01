@@ -25,7 +25,7 @@ from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import Any, Deque, Dict, List, Optional, Tuple, Union
+from typing import Any, Deque, Dict, List, Literal, Optional, Tuple, Union
 
 from sglang.srt.runtime_context import (
     get_device,
@@ -303,6 +303,13 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
+from sglang.srt.utils.npu_affinity import (
+    NpuAffinityError,
+    apply_npu_cpu_affinity,
+    format_cpu_list,
+    format_npu_affinity_error,
+    resolve_npu_affinity_assignment,
+)
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -4871,16 +4878,115 @@ def configure_scheduler_process(
     suppress_other_loggers()
 
     # Set cpu affinity to this gpu process
-    if envs.SGLANG_SET_CPU_AFFINITY.get():
-        set_gpu_proc_affinity(
-            server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
-        )
+    _maybe_apply_scheduler_cpu_affinity(
+        server_args=server_args,
+        gpu_id=gpu_id,
+        phase="final",
+    )
     if not envs.SGLANG_NUMA_BIND_V2.get():
         numa_node = get_numa_node_if_available(server_args, gpu_id)
         if numa_node is not None:
+            before_affinity = (
+                set(os.sched_getaffinity(0))
+                if hasattr(os, "sched_getaffinity")
+                else None
+            )
             numa_bind_to_node(numa_node)
+            if before_affinity is not None:
+                after_affinity = set(os.sched_getaffinity(0))
+                if after_affinity != before_affinity:
+                    logger.info(
+                        "Late NUMA binding adjusted scheduler CPU affinity: "
+                        "gpu_id=%s numa=%s before=%s after=%s",
+                        gpu_id,
+                        numa_node,
+                        sorted(before_affinity),
+                        sorted(after_affinity),
+                    )
 
     return dp_rank
+
+
+def _maybe_apply_scheduler_cpu_affinity(
+    *,
+    server_args: ServerArgs,
+    gpu_id: int,
+    phase: Literal["early", "final"],
+) -> None:
+    if not envs.SGLANG_SET_CPU_AFFINITY.get():
+        if phase == "early" and envs.SGLANG_NPU_AFFINITY_EARLY_BIND.get():
+            logger.warning(
+                "SGLANG_NPU_AFFINITY_EARLY_BIND=1 has no effect because "
+                "SGLANG_SET_CPU_AFFINITY is disabled"
+            )
+        return
+
+    if not _is_npu:
+        if phase == "final":
+            set_gpu_proc_affinity(
+                server_args.pp_size,
+                server_args.tp_size,
+                server_args.nnodes,
+                gpu_id,
+            )
+        return
+
+    if phase == "early" and not envs.SGLANG_NPU_AFFINITY_EARLY_BIND.get():
+        return
+
+    try:
+        assignment = resolve_npu_affinity_assignment(
+            logical_npu_id=gpu_id,
+            emit_topology_log=False,
+        )
+        if server_args.numa_node is not None:
+            configured_numa_node = server_args.numa_node[gpu_id]
+            if configured_numa_node != assignment.numa_node:
+                raise RuntimeError(
+                    "Configured NUMA node conflicts with NPU topology: "
+                    f"runtime_npu={assignment.logical_npu_id}, "
+                    f"physical_npu={assignment.physical_npu_id}, "
+                    f"npu_smi_numa_node={assignment.numa_node}, "
+                    f"configured_numa_node={configured_numa_node}"
+                )
+        logger.info(
+            "NPU affinity assignment: pid=%s phase=%s runtime_npu=%s "
+            "physical_npu=%s numa=%s slot=%s/%s requested_pcores=%s "
+            "effective_pcores=%s physical_cores=%s requested_logical_cpus=%s "
+            "smt_siblings_included=True",
+            os.getpid(),
+            phase,
+            assignment.logical_npu_id,
+            assignment.physical_npu_id,
+            assignment.numa_node,
+            assignment.slot_index,
+            assignment.slots_on_node,
+            assignment.requested_pcores,
+            assignment.effective_pcores,
+            assignment.physical_core_keys,
+            format_cpu_list(assignment.logical_cpu_ids),
+        )
+        apply_npu_cpu_affinity(
+            assignment,
+            phase=phase,
+            bind_all_threads=(
+                phase == "final"
+                and envs.SGLANG_NPU_AFFINITY_EARLY_BIND.get()
+            ),
+        )
+    except NpuAffinityError as exc:
+        fallback = "legacy_gpu_affinity" if phase == "final" else "defer_to_final"
+        logger.warning(
+            "NPU scheduler CPU affinity failed: %s",
+            format_npu_affinity_error(exc, fallback=fallback),
+        )
+        if phase == "final":
+            set_gpu_proc_affinity(
+                server_args.pp_size,
+                server_args.tp_size,
+                server_args.nnodes,
+                gpu_id,
+            )
 
 
 def run_scheduler_process(
@@ -4898,6 +5004,12 @@ def run_scheduler_process(
     display_dp_rank: Optional[int] = None,
     display_moe_ep_rank: Optional[int] = None,
 ):
+    _maybe_apply_scheduler_cpu_affinity(
+        server_args=server_args,
+        gpu_id=gpu_id,
+        phase="early",
+    )
+
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
     dp_rank = configure_scheduler_process(

@@ -311,6 +311,11 @@ class Envs:
     SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS = EnvInt(0)
     IS_H200 = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
+    # On NPU, early bind also enables the final all-thread affinity pass.
+    SGLANG_NPU_AFFINITY_EARLY_BIND = EnvBool(False)
+    # Zero means evenly divide the NPU-local physical cores across local NPUs.
+    SGLANG_NPU_AFFINITY_PCORES_PER_PROC = EnvInt(0)
+    SGLANG_NPU_MEMORY_PREFERRED_BIND = EnvBool(False)
     SGLANG_ENABLE_CP_V2 = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)

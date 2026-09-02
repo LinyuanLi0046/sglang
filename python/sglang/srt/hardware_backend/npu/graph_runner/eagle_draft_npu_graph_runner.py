@@ -97,9 +97,12 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         frozen_welm_kv = bool(
             getattr(forward_batch.spec_info, "welmv4_mtp_frozen_kv", False)
         )
-        if frozen_welm_kv and self._welmv4_triton_sink_only:
+        if self._welmv4_triton_sink_only:
             # Triton sink attention consumes the device metadata refreshed by
             # init_forward_metadata_out_graph; no CPU graph attribute exists.
+            # This is a static property of the captured graph and therefore
+            # also applies to an idle replay whose runtime spec stub carries
+            # no live KV snapshot.
             return self.backend.replay(shape_key, forward_batch)
         if not (is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)):
             seq_lens_for_each_draft_step = []

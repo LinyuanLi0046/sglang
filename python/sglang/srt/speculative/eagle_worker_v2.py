@@ -1460,6 +1460,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     capture_hidden_mode=capture_mode,
                     vocab_size=self.target_worker.model_config.vocab_size,
                 )
+                # The captured WeLM NextN draft graph keeps one frozen mirror
+                # KV snapshot across its recurrent steps.  An idle DP rank is
+                # only a padded collective participant, but its device-side
+                # attention metadata must retain that same frozen-KV geometry.
+                batch.spec_info.welmv4_mtp_frozen_kv = (
+                    self.draft_worker._is_welmv4_nextn()
+                )
             if self.speculative_num_steps == 0:
                 # Drafting disabled (high batch size). _draft_extend below still
                 # runs, keeping draft KV warm for when the batch shrinks.

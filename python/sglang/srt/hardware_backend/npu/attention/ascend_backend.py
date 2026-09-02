@@ -380,7 +380,6 @@ class AscendAttnBackend(AttentionBackend):
             arch in ("WeLMV4MoeForCausalLM", "WeLMV4MoeForCausalLMNextN")
             for arch in architectures
         )
-        self.is_welm_v4_nextn = "WeLMV4MoeForCausalLMNextN" in architectures
         self.enable_welm_fia_sink_lse = get_bool_env_var(
             "ASCEND_USE_FIA_SINK_LSE", "False"
         )
@@ -471,32 +470,24 @@ class AscendAttnBackend(AttentionBackend):
         )
 
     def _use_welm_sink_triton(self, sinks: Optional[torch.Tensor]) -> bool:
-        """Whether a WeLMv4 sink layer uses its NPU Triton implementation.
+        """Route WeLMv4 layers enabled by config to the NPU Triton kernel.
 
         ``welmv4.py`` materializes ``enable_attn_sink_layerwise[layer_id]`` as
         either a per-head sink tensor or ``None``, so this test is exactly the
-        layerwise config decision without indexing the config again here.  The
-        only exception is selected explicitly at the ordinary, non-mirror
-        prefill call site: a Full layer may use FIA plus LSE compensation.
-        """
-        return self.is_welm_v4 and sinks is not None
-
-    def _use_welm_non_mirror_full_prefill_fia_sink_lse(
-        self, layer: RadixAttention, sinks: Optional[torch.Tensor]
-    ) -> bool:
-        """Use FIA+LSE only for an ordinary target Full-prefill layer.
-
-        This helper is intentionally called only after the KV-mirror prefill
-        early return.  NextN is excluded as well, so draft prefill/decode,
-        TARGET_VERIFY and DRAFT_EXTEND_V2 retain their Triton sink kernels.
+        layerwise config decision without indexing the config again here.
         """
         return (
-            self.use_fia
-            and self.is_welm_v4
-            and not self.is_welm_v4_nextn
+            self.is_welm_v4
+            and sinks is not None
+            and not self.enable_welm_fia_sink_lse
+        )
+
+    def _use_welm_fia_sink_lse(self, sinks: Optional[torch.Tensor]) -> bool:
+        """Use FIA without native sinks and restore sink semantics from LSE."""
+        return (
+            self.is_welm_v4
             and sinks is not None
             and self.enable_welm_fia_sink_lse
-            and not self._has_layerwise_sliding_window(layer)
         )
 
     @staticmethod
@@ -2042,8 +2033,7 @@ class AscendAttnBackend(AttentionBackend):
             self.page_size,
             layer.tp_v_head_num * layer.v_head_dim,
         )
-        # KV-mirror prefill always keeps WeLM's Triton sink implementation.
-        use_sink_lse = False
+        use_sink_lse = self._use_welm_fia_sink_lse(sinks)
 
         if self._can_use_tnd(layer):
             attn_out, softmax_lse = torch_npu.npu_fused_infer_attention_score_v2(
@@ -2229,14 +2219,8 @@ class AscendAttnBackend(AttentionBackend):
                     block_tables = self.forward_metadata.block_tables_swa
                 else:
                     block_tables = self.forward_metadata.block_tables
-                use_sink_lse = (
-                    self._use_welm_non_mirror_full_prefill_fia_sink_lse(
-                        layer, sinks
-                    )
-                )
-                if use_sink_lse or (
-                    self.use_fia and not self._use_welm_sink_triton(sinks)
-                ):
+                if self.use_fia and not self._use_welm_sink_triton(sinks):
+                    use_sink_lse = self._use_welm_fia_sink_lse(sinks)
                     if self._can_use_tnd(layer):
                         num_token_padding = q.shape[0]
                         if num_token_padding > forward_batch.num_token_non_padded_cpu:
@@ -3371,10 +3355,7 @@ class AscendAttnBackend(AttentionBackend):
                 else:
                     sparse_mode = 3
 
-                # Decode (including recurrent MTP draft decode) remains Triton
-                # for every WeLM sink layer. This FIA branch is for non-WeLM
-                # or non-sink layers only.
-                use_sink_lse = False
+                use_sink_lse = self._use_welm_fia_sink_lse(sinks)
                 attn_output, softmax_lse = torch_npu.npu_fused_infer_attention_score_v2(
                     query,
                     k_cache,
@@ -3692,9 +3673,7 @@ class AscendAttnBackend(AttentionBackend):
                 else:
                     block_tables = self.forward_metadata.block_tables
                 if self.use_fia and not self._use_welm_sink_triton(sinks):
-                    # Decode remains on the WeLM Triton sink kernels. This FIA
-                    # branch is retained for non-WeLM or non-sink layers.
-                    use_sink_lse = False
+                    use_sink_lse = self._use_welm_fia_sink_lse(sinks)
                     if self.forward_metadata.seq_lens_cpu_int is None:
                         actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
                     else:

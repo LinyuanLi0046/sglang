@@ -93,9 +93,6 @@ def welmv4_graph_uses_only_triton_sink(model_runner: ModelRunner) -> bool:
     is_nextn = "WeLMV4MoeForCausalLMNextN" in architectures
     if not (is_nextn or "WeLMV4MoeForCausalLM" in architectures):
         return False
-    if get_bool_env_var("ASCEND_USE_FIA_SINK_LSE", "False"):
-        return False
-
     num_layers = int(getattr(hf_config, "num_hidden_layers", 0) or 0)
     layer_offset = (
         int(getattr(hf_config, "num_target_hidden_layers", 0) or 0)

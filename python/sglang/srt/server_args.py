@@ -5121,11 +5121,6 @@ class ServerArgs:
                     "interleave decode work while KV-mirror activations are held "
                     "in process-local layer state. Disable PDMux."
                 )
-            if self.ep_num_redundant_experts != 0 or self.enable_eplb:
-                raise ValueError(
-                    "WeLMv4 redundant experts/EPLB are not supported by this "
-                    "rebase. Use --ep-num-redundant-experts 0 and disable EPLB."
-                )
             if self.pp_size != 1:
                 raise ValueError(
                     "WeLMv4 KV-mirror activations are process-local and this "

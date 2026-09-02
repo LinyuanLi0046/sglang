@@ -37,6 +37,7 @@ from sglang.srt.distributed.communication_op import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -728,6 +729,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         alt_stream: Optional[Any] = None,
         prefix: str = "",
+        is_nextn: bool = False,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -735,6 +737,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             torch.zeros((config.num_experts), dtype=torch.float32)
         )
         self.layer_id = layer_id
+        self.is_nextn = is_nextn
         self.num_hidden_layers = int(
             getattr(config, "num_target_hidden_layers", 0)
         ) + int(config.num_hidden_layers)
@@ -1135,6 +1138,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         hidden_states,
                         router_logits,
                         num_token_non_padded=num_token_non_padded,
+                        expert_location_dispatch_info=(
+                            ExpertLocationDispatchInfo.init_new(
+                                layer_id=self.layer_id
+                            )
+                            if not self.is_nextn
+                            else None
+                        ),
                         expert_bias=self.expert_bias,
                         scoring_func_override=self.router_score_func,
                     )
@@ -2263,6 +2273,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 alt_stream=alt_stream,
                 prefix=add_prefix("mlp", prefix),
+                is_nextn=self.is_nextn,
             )
         else:
             self.mlp = Qwen2MoeMLP(

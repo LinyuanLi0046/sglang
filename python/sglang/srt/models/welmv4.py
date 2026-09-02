@@ -1832,6 +1832,31 @@ class Qwen2MoeAttention(nn.Module):
                 safe_indices = mirror_indices.to(torch.int64).clamp(min=0)
                 k = k[safe_indices]
                 v = v[safe_indices]
+            elif forward_batch.forward_mode.is_extend_without_speculative():
+                # Target DP+EP ordinary prefill uses one group-wide MAX token
+                # slot for DeepEP NORMAL, so source0's exported mirror K/V may
+                # include a padding suffix that is not present in this draft
+                # replica's local prefill layout.  ``positions`` is the
+                # physical T-row contract for the draft attention/KV-cache
+                # write; discard only that target-owned suffix before RoPE.
+                # Decode/verify/draft-extend use mirrored_kv_indices (or a
+                # frozen snapshot) and must retain their existing geometry.
+                mirror_rows = int(k.shape[0])
+                position_rows = int(positions.numel())
+                if int(v.shape[0]) != mirror_rows:
+                    raise RuntimeError(
+                        "WeLMv4 external mirror K/V row mismatch: "
+                        f"K={mirror_rows}, V={v.shape[0]}."
+                    )
+                if mirror_rows < position_rows:
+                    raise RuntimeError(
+                        "WeLMv4 external mirror K/V has fewer rows than draft "
+                        f"prefill positions: K/V={mirror_rows}, "
+                        f"positions={position_rows}."
+                    )
+                if mirror_rows > position_rows:
+                    k = k.narrow(0, 0, position_rows)
+                    v = v.narrow(0, 0, position_rows)
             if hasattr(self, "kv_mirror_query_proj"):
                 q, _ = self.kv_mirror_query_proj(hidden_states)
             elif getattr(self, "_kv_mirror_mxfp8_query_projection", False):

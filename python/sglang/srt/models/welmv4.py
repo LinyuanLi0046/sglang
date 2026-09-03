@@ -3474,14 +3474,28 @@ class Qwen2MoeModel(nn.Module):
     ) -> Union[torch.Tensor, PPProxyTensors]:
         # Construct immutable request-segment metadata once per eager forward.
         # EXTEND/MIXED positions are independently contiguous per request;
-        # speculative modes are deliberately excluded.  Prefill NPU Graph is
-        # disabled for WeLMv4, so no captured buffer needs to own this tensor.
+        # speculative modes are deliberately excluded.  DP-attention may have
+        # appended a collective-only suffix to positions/K.  Segment metadata
+        # must describe only the original request rows: the suffix is ignored
+        # by attention and rotating it is both unnecessary and, because its
+        # positions are zero-filled, incompatible with contiguous 64-token
+        # tiles.  Prefill NPU Graph is disabled for WeLMv4, so no captured
+        # buffer needs to own this tensor.
         forward_batch.welmv4_rope_segment_tile_starts = None
         if _is_npu:
+            rope_num_position_tokens = positions.numel()
+            original_num_tokens = getattr(
+                forward_batch, "_original_num_tokens", None
+            )
+            if (
+                original_num_tokens is not None
+                and 0 <= int(original_num_tokens) <= rope_num_position_tokens
+            ):
+                rope_num_position_tokens = int(original_num_tokens)
             tile_starts = build_welmv4_rope_segment_tile_starts(
                 forward_batch.extend_seq_lens_cpu,
                 batch_size=forward_batch.batch_size,
-                num_position_tokens=positions.numel(),
+                num_position_tokens=rope_num_position_tokens,
                 ordinary_prefill=(
                     forward_batch.spec_info is None
                     and forward_batch.forward_mode

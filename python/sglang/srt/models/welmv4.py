@@ -107,6 +107,10 @@ if is_npu():
         prepare_weight_cache,
         wait_cmo_stream,
     )
+    from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+        NPUMXFP8LinearMethod,
+        _get_float8_e8m0fnu_dtype,
+    )
     from sglang.srt.hardware_backend.npu.utils import (
         process_shared_expert,
         wait_share_stream,
@@ -1705,8 +1709,10 @@ class Qwen2MoeAttention(nn.Module):
                 hidden_size,
                 self.total_num_heads,
                 bias=False,
+                quant_config=quant_config if _is_npu else None,
                 tp_rank=attn_tp_rank,
                 tp_size=attn_tp_size,
+                prefix=add_prefix("gate_proj", prefix),
             )
         self.attn.is_kv_mirror = self.layer_idx in self.kv_mirror_layers
         # `layer_id` is the physical/cache slot. `layer_idx` is the checkpoint
@@ -1794,6 +1800,126 @@ class Qwen2MoeAttention(nn.Module):
             comm_mode="ccu",
         )
 
+    @staticmethod
+    def _is_npu_mxfp8_projection(projection: nn.Module) -> bool:
+        quant_method = getattr(projection, "quant_method", None)
+        if isinstance(quant_method, NPUMXFP8LinearMethod):
+            return True
+        scheme = getattr(projection, "scheme", None)
+        return isinstance(getattr(scheme, "kernel", None), NPUMXFP8LinearMethod)
+
+    def can_reuse_prefill_mxfp8_input(self) -> bool:
+        return (
+            _is_npu
+            and self._is_npu_mxfp8_projection(self.qkv_proj)
+            and self._is_npu_mxfp8_projection(self.gate_proj)
+        )
+
+    @staticmethod
+    def _npu_all_gather_mxfp8_bytes(
+        tensor: torch.Tensor,
+        group: Any,
+        *,
+        scratch_name: str,
+    ) -> torch.Tensor:
+        if group.world_size == 1:
+            return tensor
+        send = tensor.contiguous()
+        # AllGather is bit-preserving.  Communicate both FP8 activations and
+        # E8M0 scales as bytes so this path does not depend on ProcessGroupHCCL
+        # exposing each torch float8 dtype through its Python frontend.
+        send_bytes = send.view(torch.uint8).reshape(-1)
+        required_bytes = send_bytes.numel() * group.world_size
+
+        # One attention-TP group is shared by all decoder layers, so keep the
+        # two grow-only communication buffers on that group instead of storing
+        # a full-size scratch allocation in every layer.  Ordinary prefill is
+        # eager-only and layers consume these buffers serially.
+        scratch = getattr(group, "_welmv4_mxfp8_ag_scratch", None)
+        if scratch is None:
+            scratch = {}
+            group._welmv4_mxfp8_ag_scratch = scratch
+        scratch_key = (
+            scratch_name,
+            send_bytes.device.type,
+            send_bytes.device.index,
+        )
+        gathered_storage = scratch.get(scratch_key)
+        if gathered_storage is None or gathered_storage.numel() < required_bytes:
+            # Geometric capacity avoids another allocation when the next
+            # ordinary-prefill batch is only slightly larger.
+            capacity = 1 << max(required_bytes - 1, 0).bit_length()
+            gathered_storage = torch.empty(
+                capacity,
+                dtype=torch.uint8,
+                device=send_bytes.device,
+            )
+            scratch[scratch_key] = gathered_storage
+
+        gathered_bytes = gathered_storage[:required_bytes]
+        group.all_gather_into_tensor(gathered_bytes, send_bytes)
+        gathered_shape = (
+            send.shape[0] * group.world_size,
+            *send.shape[1:],
+        )
+        return gathered_bytes.view(send.dtype).view(gathered_shape)
+
+    @staticmethod
+    def _npu_mxfp8_mm_from_quantized_input(
+        projection: nn.Module,
+        quantized_x: torch.Tensor,
+        x_scale: torch.Tensor,
+        *,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        bias = getattr(projection, "bias", None)
+        if bias is not None:
+            quant_bias = getattr(projection, "bias_fp32", None)
+            if quant_bias is None:
+                quant_bias = bias.to(torch.float32)
+        else:
+            quant_bias = None
+        e8m0_dtype = _get_float8_e8m0fnu_dtype()
+        return torch.ops.npu.npu_quant_matmul(
+            quantized_x,
+            projection.weight,
+            projection.weight_scale_inv,
+            scale_dtype=e8m0_dtype,
+            pertoken_scale=x_scale,
+            pertoken_scale_dtype=e8m0_dtype,
+            bias=quant_bias,
+            output_dtype=output_dtype,
+            group_sizes=[1, 1, 32],
+        )
+
+    def _npu_prepare_shared_prefill_mxfp8_input(
+        self,
+        hidden_states: torch.Tensor,
+        all_gather_group: Optional[Any],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.dtype]:
+        output_dtype = hidden_states.dtype
+        if output_dtype not in (torch.float16, torch.bfloat16):
+            hidden_states = hidden_states.to(torch.bfloat16)
+            output_dtype = torch.bfloat16
+        quantized_x, x_scale = torch.ops.npu.npu_dynamic_mx_quant(
+            hidden_states.reshape(-1, hidden_states.shape[-1]),
+            dst_type=torch.float8_e4m3fn,
+        )
+        if all_gather_group is not None:
+            # Keep the same rank-major row order as the replaced BF16
+            # AllGather.  QKV and gate then consume this one quantization.
+            quantized_x = self._npu_all_gather_mxfp8_bytes(
+                quantized_x,
+                all_gather_group,
+                scratch_name="activation",
+            )
+            x_scale = self._npu_all_gather_mxfp8_bytes(
+                x_scale,
+                all_gather_group,
+                scratch_name="scale",
+            )
+        return quantized_x, x_scale, output_dtype
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1802,7 +1928,10 @@ class Qwen2MoeAttention(nn.Module):
         skip_o_norm: bool = False,
         skip_o_proj_all_reduce: bool = False,
         use_o_proj_matmul_reduce_scatter: bool = False,
+        reuse_prefill_mxfp8_input: bool = False,
+        prefill_mxfp8_all_gather_group: Optional[Any] = None,
     ) -> torch.Tensor:
+        shared_prefill_mxfp8_input = None
         external_mirror = (
             _get_welm_mtp_mirror_state(forward_batch, self.kv_mirror_layer_idx)
             if self.is_nextn
@@ -1946,7 +2075,25 @@ class Qwen2MoeAttention(nn.Module):
                         hidden_states, self.qkv_proj_weight, self.qkv_proj_bias
                     )
         else:
-            qkv, _ = self.qkv_proj(hidden_states)
+            if reuse_prefill_mxfp8_input:
+                quantized_x, x_scale, output_dtype = (
+                    self._npu_prepare_shared_prefill_mxfp8_input(
+                        hidden_states, prefill_mxfp8_all_gather_group
+                    )
+                )
+                qkv = self._npu_mxfp8_mm_from_quantized_input(
+                    self.qkv_proj,
+                    quantized_x,
+                    x_scale,
+                    output_dtype=output_dtype,
+                )
+                shared_prefill_mxfp8_input = (
+                    quantized_x,
+                    x_scale,
+                    output_dtype,
+                )
+            else:
+                qkv, _ = self.qkv_proj(hidden_states)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         gate = None
@@ -2099,7 +2246,16 @@ class Qwen2MoeAttention(nn.Module):
         if self.gated_self_attention_headwise:
             attn_shape = attn_output.shape
             if gate is None:
-                gate = self.gate_proj(hidden_states)[0].unsqueeze(-1)
+                if shared_prefill_mxfp8_input is not None:
+                    quantized_x, x_scale, output_dtype = shared_prefill_mxfp8_input
+                    gate = self._npu_mxfp8_mm_from_quantized_input(
+                        self.gate_proj,
+                        quantized_x,
+                        x_scale,
+                        output_dtype=output_dtype,
+                    ).unsqueeze(-1)
+                else:
+                    gate = self.gate_proj(hidden_states)[0].unsqueeze(-1)
             # gate: (bs * seq_len, num_heads, 1)
             attn_output = attn_output.view(attn_shape[0], self.num_heads, -1)
             if enable_npu_gate_alt_stream:
@@ -2367,6 +2523,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         residual: torch.Tensor,
         *,
         residual_after_layernorm: bool,
+        defer_hidden_all_gather: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if residual is None or hidden_states.shape != residual.shape:
             raise RuntimeError(
@@ -2392,7 +2549,9 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 "WeLMv4 NPU DeepEP scattered residual must remain FP32, got "
                 f"{local_residual.dtype}"
             )
-        return self._all_gather_tp_rows(local_hidden_states), local_residual
+        if not defer_hidden_all_gather:
+            local_hidden_states = self._all_gather_tp_rows(local_hidden_states)
+        return local_hidden_states, local_residual
 
     def _npu_prefill_deepep_finish_attention(
         self,
@@ -2649,6 +2808,20 @@ class Qwen2MoeDecoderLayer(nn.Module):
             and not is_first_kv_mirror_consumer
             and not already_full_mirror
         )
+        is_non_mirror_attention_layer = (
+            self.layer_id not in self.kv_mirror_layers
+            and self.layer_id not in self.kv_mirror_imitated_layers
+        )
+        reuse_prefill_mxfp8_input = (
+            _is_npu
+            and not self.is_nextn
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and is_non_mirror_attention_layer
+            and self.self_attn.can_reuse_prefill_mxfp8_input()
+        )
+        defer_hidden_all_gather = (
+            input_hidden_is_scattered and reuse_prefill_mxfp8_input
+        )
         use_full_mirror_layout = (
             use_npu_prefill_deepep_scattered
             and is_kv_mirror_prefill
@@ -2677,6 +2850,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 hidden_states,
                 residual,
                 residual_after_layernorm=residual_after_layernorm,
+                defer_hidden_all_gather=defer_hidden_all_gather,
             )
         elif residual_after_layernorm:
             # 纯TP layer0 layer2-47
@@ -2714,11 +2888,16 @@ class Qwen2MoeDecoderLayer(nn.Module):
             hidden_states = hidden_states.index_select(
                 0, custom_last_index.to(torch.long)
             )
+        attention_num_rows = hidden_states.shape[0] * (
+            get_tensor_model_parallel_world_size()
+            if defer_hidden_all_gather
+            else 1
+        )
         use_npu_prefill_oproj_matmul_reduce_scatter = (
             envs.SGLANG_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER.get()
             and output_hidden_is_scattered
             and not use_full_mirror_layout
-            and hidden_states.shape[0] % get_tensor_model_parallel_world_size()
+            and attention_num_rows % get_tensor_model_parallel_world_size()
             == 0
         )
         if hidden_states.shape[0] != 0:
@@ -2733,6 +2912,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 skip_o_proj_all_reduce=output_hidden_is_scattered,
                 use_o_proj_matmul_reduce_scatter=(
                     use_npu_prefill_oproj_matmul_reduce_scatter
+                ),
+                reuse_prefill_mxfp8_input=reuse_prefill_mxfp8_input,
+                prefill_mxfp8_all_gather_group=(
+                    get_tp_group() if defer_hidden_all_gather else None
                 ),
             )
         if is_first_kv_mirror_consumer:

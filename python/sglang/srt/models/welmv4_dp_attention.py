@@ -805,6 +805,21 @@ class WelmDpAttentionExecutor:
             has_ordinary_prefill=has_ordinary_prefill,
             enable_kv_mirror=enable_kv_mirror,
         )
+        is_non_mirror_attention_layer = (
+            layer.layer_id not in layer.kv_mirror_layers
+            and layer.layer_id not in layer.kv_mirror_imitated_layers
+        )
+        reuse_prefill_mxfp8_input = bool(
+            plan.role is WelmRunnerRole.TARGET_DP
+            and has_ordinary_prefill
+            and is_non_mirror_attention_layer
+            and layer.self_attn.can_reuse_prefill_mxfp8_input()
+        )
+        defer_hidden_all_gather = bool(
+            input_is_scattered
+            and plan.attn_tp_size > 1
+            and reuse_prefill_mxfp8_input
+        )
         later_mirror_prefill = bool(
             plan.role is WelmRunnerRole.TARGET_DP
             and has_ordinary_prefill
@@ -835,6 +850,7 @@ class WelmDpAttentionExecutor:
                 hidden_states=hidden_states,
                 residual=residual,
                 input_is_scattered=input_is_scattered,
+                defer_hidden_all_gather=defer_hidden_all_gather,
             )
             state = WelmDpLayerState(
                 hidden_states=hidden_states,
@@ -860,6 +876,10 @@ class WelmDpAttentionExecutor:
                 forward_batch=forward_batch,
                 skip_o_norm=True,
                 skip_o_proj_all_reduce=plan.o_proj_returns_partial,
+                reuse_prefill_mxfp8_input=reuse_prefill_mxfp8_input,
+                prefill_mxfp8_all_gather_group=(
+                    plan.attn_tp_group if defer_hidden_all_gather else None
+                ),
             )
             state = self._finish_attention_and_norm(
                 layer=layer,
@@ -1033,11 +1053,12 @@ class WelmDpAttentionExecutor:
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         input_is_scattered: bool,
+        defer_hidden_all_gather: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_states, residual = self._normalize_input(
             layer=layer, hidden_states=hidden_states, residual=residual
         )
-        if input_is_scattered:
+        if input_is_scattered and not defer_hidden_all_gather:
             hidden_states = welm_attn_all_gather_rows(
                 hidden_states, attn_tp_group=self.runner_plan.attn_tp_group
             )

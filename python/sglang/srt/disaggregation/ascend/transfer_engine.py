@@ -83,13 +83,15 @@ class AscendTransferEngine(MooncakeTransferEngine):
                 output_tensor_list, tmp_tensor, group=get_world_group().device_group
             )
         """Initialize the ascend transfer instance."""
+        # Decode owns the store. Prefill must remain a client so that its first
+        # transfer lazily creates a connection to the Decode session.
         ret_value = self.engine.initialize(
             self.store_url,
             self.session_id,
             self.role,
             self.npu_id,
             trans_op_type,
-            self.role,
+            "Decode",
             hcom_url,
         )
         if ret_value != 0:
@@ -135,12 +137,11 @@ class AscendTransferEngine(MooncakeTransferEngine):
                 f"Invalid port in ASCEND_MF_HCOM_URL: {hcom_url!r}"
             ) from exc
 
-        # Each SGLang worker creates an independent MemFabric store and is rank
-        # zero in that store. Reserve one port for each role at every SGLang
-        # world rank so that colocated Prefill and Decode workers never bind the
-        # same HCOM service endpoint. DP-attention does not change world_rank.
-        role_slot = 0 if self.role == "Decode" else 1
-        worker_port = base_port + world_rank * 2 + role_slot
+        # Every Decode worker owns one MemFabric store. Its matching Prefill
+        # worker joins that store lazily and MemFabric assigns the two peers
+        # adjacent ranks, so reserve two ports for each SGLang world rank.
+        # DP-attention does not change world_rank.
+        worker_port = base_port + world_rank * 2
         if not 1024 <= worker_port <= 65535:
             raise ValueError(
                 "Resolved ASCEND_MF_HCOM_URL port is out of range: "

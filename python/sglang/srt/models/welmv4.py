@@ -1920,6 +1920,27 @@ class Qwen2MoeAttention(nn.Module):
             )
         return quantized_x, x_scale, output_dtype
 
+    def _npu_project_qkv_with_shared_prefill_mxfp8_input(
+        self,
+        hidden_states: torch.Tensor,
+        all_gather_group: Optional[Any],
+    ) -> Tuple[
+        torch.Tensor,
+        Tuple[torch.Tensor, torch.Tensor, torch.dtype],
+    ]:
+        quantized_x, x_scale, output_dtype = (
+            self._npu_prepare_shared_prefill_mxfp8_input(
+                hidden_states, all_gather_group
+            )
+        )
+        qkv = self._npu_mxfp8_mm_from_quantized_input(
+            self.qkv_proj,
+            quantized_x,
+            x_scale,
+            output_dtype=output_dtype,
+        )
+        return qkv, (quantized_x, x_scale, output_dtype)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -2004,7 +2025,14 @@ class Qwen2MoeAttention(nn.Module):
                 q = F.linear(hidden_states, self.qkv_proj_weight, self.qkv_proj_bias)
         elif self.kv_mirror_layer_idx in self.kv_mirror_imitated_layers:
             if getattr(self, "_kv_mirror_mxfp8_source_projection", False):
-                qkv, _ = self.qkv_proj(hidden_states)
+                if reuse_prefill_mxfp8_input:
+                    qkv, shared_prefill_mxfp8_input = (
+                        self._npu_project_qkv_with_shared_prefill_mxfp8_input(
+                            hidden_states, prefill_mxfp8_all_gather_group
+                        )
+                    )
+                else:
+                    qkv, _ = self.qkv_proj(hidden_states)
                 q, k, v, mirror_k, mirror_v = qkv.split(
                     [
                         self.q_size,
@@ -2076,21 +2104,10 @@ class Qwen2MoeAttention(nn.Module):
                     )
         else:
             if reuse_prefill_mxfp8_input:
-                quantized_x, x_scale, output_dtype = (
-                    self._npu_prepare_shared_prefill_mxfp8_input(
+                qkv, shared_prefill_mxfp8_input = (
+                    self._npu_project_qkv_with_shared_prefill_mxfp8_input(
                         hidden_states, prefill_mxfp8_all_gather_group
                     )
-                )
-                qkv = self._npu_mxfp8_mm_from_quantized_input(
-                    self.qkv_proj,
-                    quantized_x,
-                    x_scale,
-                    output_dtype=output_dtype,
-                )
-                shared_prefill_mxfp8_input = (
-                    quantized_x,
-                    x_scale,
-                    output_dtype,
                 )
             else:
                 qkv, _ = self.qkv_proj(hidden_states)
@@ -2808,15 +2825,15 @@ class Qwen2MoeDecoderLayer(nn.Module):
             and not is_first_kv_mirror_consumer
             and not already_full_mirror
         )
-        is_non_mirror_attention_layer = (
-            self.layer_id not in self.kv_mirror_layers
-            and self.layer_id not in self.kv_mirror_imitated_layers
-        )
+        # A source/imitated layer still runs ordinary full attention and only
+        # exports additional K/V for its consumer.  Only the consumer uses the
+        # mirror-specific query/layout path and must stay outside this fast path.
+        is_non_consumer_attention_layer = self.layer_id not in self.kv_mirror_layers
         reuse_prefill_mxfp8_input = (
             _is_npu
             and not self.is_nextn
             and forward_batch.forward_mode.is_extend_without_speculative()
-            and is_non_mirror_attention_layer
+            and is_non_consumer_attention_layer
             and self.self_attn.can_reuse_prefill_mxfp8_input()
         )
         defer_hidden_all_gather = (

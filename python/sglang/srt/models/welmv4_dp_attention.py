@@ -805,14 +805,16 @@ class WelmDpAttentionExecutor:
             has_ordinary_prefill=has_ordinary_prefill,
             enable_kv_mirror=enable_kv_mirror,
         )
-        is_non_mirror_attention_layer = (
+        # Source/imitated layers execute ordinary full attention and only
+        # publish extra K/V.  Consumer layers alone keep the mirror-specific
+        # query/layout path and are excluded from FP8 hidden-row transport.
+        is_non_consumer_attention_layer = (
             layer.layer_id not in layer.kv_mirror_layers
-            and layer.layer_id not in layer.kv_mirror_imitated_layers
         )
         reuse_prefill_mxfp8_input = bool(
             plan.role is WelmRunnerRole.TARGET_DP
             and has_ordinary_prefill
-            and is_non_mirror_attention_layer
+            and is_non_consumer_attention_layer
             and layer.self_attn.can_reuse_prefill_mxfp8_input()
         )
         defer_hidden_all_gather = bool(

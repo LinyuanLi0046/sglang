@@ -86,7 +86,7 @@ class AscendTransferEngine(MooncakeTransferEngine):
             self.role,
             self.npu_id,
             trans_op_type,
-            "Decode",
+            self.role,
             hcom_url,
         )
         if ret_value != 0:

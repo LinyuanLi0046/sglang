@@ -66,6 +66,9 @@ class AscendTransferEngine(MooncakeTransferEngine):
 
         if transfer_protocol == "host_rdma":
             trans_op_type = TransferEngine.TransDataOpType.HOST_RDMA
+            hcom_url = self._get_worker_hcom_url(
+                hcom_url, get_world_group().rank_in_group
+            )
         elif transfer_protocol is None or transfer_protocol == "sdma":
             trans_op_type = TransferEngine.TransDataOpType.SDMA
         else:
@@ -113,3 +116,45 @@ class AscendTransferEngine(MooncakeTransferEngine):
                 "Invalid or no transfer protocol specified, using default protocol."
             )
             return None
+
+    def _get_worker_hcom_url(self, hcom_url: str, world_rank: int) -> str:
+        if not hcom_url:
+            return hcom_url
+
+        address, separator, port_str = hcom_url.rpartition(":")
+        if not separator or not address.startswith("tcp://"):
+            raise ValueError(
+                "ASCEND_MF_HCOM_URL must use tcp://<IPv4>:<port> or "
+                "tcp://<IPv4>/<mask>:<port>"
+            )
+
+        try:
+            base_port = int(port_str)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid port in ASCEND_MF_HCOM_URL: {hcom_url!r}"
+            ) from exc
+
+        # Each SGLang worker creates an independent MemFabric store and is rank
+        # zero in that store. Reserve one port for each role at every SGLang
+        # world rank so that colocated Prefill and Decode workers never bind the
+        # same HCOM service endpoint. DP-attention does not change world_rank.
+        role_slot = 0 if self.role == "Decode" else 1
+        worker_port = base_port + world_rank * 2 + role_slot
+        if not 1024 <= worker_port <= 65535:
+            raise ValueError(
+                "Resolved ASCEND_MF_HCOM_URL port is out of range: "
+                f"base_port={base_port}, world_rank={world_rank}, "
+                f"role={self.role}, resolved_port={worker_port}"
+            )
+
+        worker_hcom_url = f"{address}:{worker_port}"
+        logger.info(
+            "Resolved Ascend Host RDMA endpoint: role=%s, world_rank=%d, "
+            "base=%s, endpoint=%s",
+            self.role,
+            world_rank,
+            hcom_url,
+            worker_hcom_url,
+        )
+        return worker_hcom_url

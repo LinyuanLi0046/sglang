@@ -1525,6 +1525,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             req_pool_indices is not None
         ), "req_pool_indices is full! There is a bug in memory estimation."
 
+        if self.scheduler.ngram_embedding_manager.enabled:
+            # A newly allocated decode request slot has no corresponding ngram
+            # history: PD transfers KV pages only. The flag is consumed after
+            # transfer completion, when origin_input_ids and the prefill
+            # handoff token are both present. Setting it here also covers local
+            # resume after retraction, where no new transfer commit occurs.
+            req.ngram_token_table_needs_init = True
+
         fill_len = self._pre_alloc_fill_len(req)
         req.kv_committed_len = fill_len
 

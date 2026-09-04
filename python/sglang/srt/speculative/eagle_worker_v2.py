@@ -1472,6 +1472,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # runs, keeping draft KV warm for when the batch shrinks.
                 verify_input = self._build_trivial_verify_input(batch)
             else:
+                # A disaggregated decode worker reconstructs the first draft
+                # input from the prefill payload, which does not carry this
+                # WeLM-local execution flag.  It matters only when the first
+                # proposal is recurrently consumed to produce another one;
+                # step=1 stops before that recurrent forward.
+                if (
+                    self.speculative_num_steps > 1
+                    and self.draft_worker._is_welmv4_nextn()
+                ):
+                    batch.spec_info.welmv4_mtp_frozen_kv = True
                 self._restore_welm_draft_ep_rows(batch, draft_ep_rows)
                 with (
                     self._draft_runtime_context(),

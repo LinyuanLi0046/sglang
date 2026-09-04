@@ -62,7 +62,11 @@ class AscendTransferEngine(MooncakeTransferEngine):
         )
 
         transfer_protocol = self._get_transfer_protocol()
-        if transfer_protocol is None or transfer_protocol == "sdma":
+        hcom_url = os.getenv("ASCEND_MF_HCOM_URL", "")
+
+        if transfer_protocol == "host_rdma":
+            trans_op_type = TransferEngine.TransDataOpType.HOST_RDMA
+        elif transfer_protocol is None or transfer_protocol == "sdma":
             trans_op_type = TransferEngine.TransDataOpType.SDMA
         else:
             trans_op_type = TransferEngine.TransDataOpType.DEVICE_RDMA
@@ -77,7 +81,13 @@ class AscendTransferEngine(MooncakeTransferEngine):
             )
         """Initialize the ascend transfer instance."""
         ret_value = self.engine.initialize(
-            self.store_url, self.session_id, self.role, self.npu_id, trans_op_type
+            self.store_url,
+            self.session_id,
+            self.role,
+            self.npu_id,
+            trans_op_type,
+            "Decode",
+            hcom_url,
         )
         if ret_value != 0:
             logger.error("Ascend Transfer Engine initialization failed.")
@@ -95,7 +105,7 @@ class AscendTransferEngine(MooncakeTransferEngine):
     @staticmethod
     def _get_transfer_protocol():
         protocol = os.getenv("ASCEND_MF_TRANSFER_PROTOCOL")
-        allowed_protocols = {"device_rdma", "sdma"}
+        allowed_protocols = {"device_rdma", "sdma", "host_rdma"}
         if protocol and protocol.lower() in allowed_protocols:
             return protocol.lower()
         else:

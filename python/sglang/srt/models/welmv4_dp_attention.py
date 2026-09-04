@@ -880,6 +880,10 @@ class WelmDpAttentionExecutor:
                 skip_o_proj_all_reduce=plan.o_proj_returns_partial,
                 reuse_prefill_mxfp8_input=reuse_prefill_mxfp8_input,
                 prefill_mxfp8_all_gather_group=(
+                    # A nontrivial attention-TP group enters the split
+                    # ordinary-prefill transport: FP8 activation/scale for
+                    # QKV plus original BF16 hidden rows for Gate.  DP=TP has
+                    # attn_tp_size=1, so it keeps the existing local path.
                     plan.attn_tp_group if defer_hidden_all_gather else None
                 ),
             )

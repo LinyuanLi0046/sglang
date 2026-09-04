@@ -1709,10 +1709,8 @@ class Qwen2MoeAttention(nn.Module):
                 hidden_size,
                 self.total_num_heads,
                 bias=False,
-                quant_config=quant_config if _is_npu else None,
                 tp_rank=attn_tp_rank,
                 tp_size=attn_tp_size,
-                prefix=add_prefix("gate_proj", prefix),
             )
         self.attn.is_kv_mirror = self.layer_idx in self.kv_mirror_layers
         # `layer_id` is the physical/cache slot. `layer_idx` is the checkpoint
@@ -1809,11 +1807,7 @@ class Qwen2MoeAttention(nn.Module):
         return isinstance(getattr(scheme, "kernel", None), NPUMXFP8LinearMethod)
 
     def can_reuse_prefill_mxfp8_input(self) -> bool:
-        return (
-            _is_npu
-            and self._is_npu_mxfp8_projection(self.qkv_proj)
-            and self._is_npu_mxfp8_projection(self.gate_proj)
-        )
+        return _is_npu and self._is_npu_mxfp8_projection(self.qkv_proj)
 
     @staticmethod
     def _npu_all_gather_mxfp8_bytes(
@@ -1832,8 +1826,8 @@ class Qwen2MoeAttention(nn.Module):
         required_bytes = send_bytes.numel() * group.world_size
 
         # One attention-TP group is shared by all decoder layers, so keep the
-        # two grow-only communication buffers on that group instead of storing
-        # a full-size scratch allocation in every layer.  Ordinary prefill is
+        # grow-only communication buffers on that group instead of storing a
+        # full-size scratch allocation in every layer.  Ordinary prefill is
         # eager-only and layers consume these buffers serially.
         scratch = getattr(group, "_welmv4_mxfp8_ag_scratch", None)
         if scratch is None:
@@ -1865,6 +1859,48 @@ class Qwen2MoeAttention(nn.Module):
         return gathered_bytes.view(send.dtype).view(gathered_shape)
 
     @staticmethod
+    def _npu_all_gather_bf16_gate_input(
+        hidden_states: torch.Tensor,
+        group: Any,
+    ) -> torch.Tensor:
+        """Gather the original Gate input without activation quantization."""
+        if group.world_size == 1:
+            return hidden_states
+
+        send = hidden_states.contiguous()
+        send_flat = send.reshape(-1)
+        required_elements = send_flat.numel() * group.world_size
+
+        scratch = getattr(group, "_welmv4_bf16_gate_ag_scratch", None)
+        scratch_key = (
+            send.device.type,
+            send.device.index,
+            send.dtype,
+        )
+        if scratch is None:
+            scratch = {}
+            group._welmv4_bf16_gate_ag_scratch = scratch
+        gathered_storage = scratch.get(scratch_key)
+        if (
+            gathered_storage is None
+            or gathered_storage.numel() < required_elements
+        ):
+            capacity = 1 << max(required_elements - 1, 0).bit_length()
+            gathered_storage = torch.empty(
+                capacity,
+                dtype=send.dtype,
+                device=send.device,
+            )
+            scratch[scratch_key] = gathered_storage
+
+        gathered_flat = gathered_storage[:required_elements]
+        group.all_gather_into_tensor(gathered_flat, send_flat)
+        return gathered_flat.view(
+            send.shape[0] * group.world_size,
+            *send.shape[1:],
+        )
+
+    @staticmethod
     def _npu_mxfp8_mm_from_quantized_input(
         projection: nn.Module,
         quantized_x: torch.Tensor,
@@ -1892,7 +1928,7 @@ class Qwen2MoeAttention(nn.Module):
             group_sizes=[1, 1, 32],
         )
 
-    def _npu_prepare_shared_prefill_mxfp8_input(
+    def _npu_prepare_prefill_mxfp8_qkv_input(
         self,
         hidden_states: torch.Tensor,
         all_gather_group: Optional[Any],
@@ -1907,7 +1943,8 @@ class Qwen2MoeAttention(nn.Module):
         )
         if all_gather_group is not None:
             # Keep the same rank-major row order as the replaced BF16
-            # AllGather.  QKV and gate then consume this one quantization.
+            # AllGather.  QKV consumes the gathered FP8 activation and scale;
+            # Gate independently gathers the original BF16 rows.
             quantized_x = self._npu_all_gather_mxfp8_bytes(
                 quantized_x,
                 all_gather_group,
@@ -1920,26 +1957,52 @@ class Qwen2MoeAttention(nn.Module):
             )
         return quantized_x, x_scale, output_dtype
 
-    def _npu_project_qkv_with_shared_prefill_mxfp8_input(
+    def _npu_project_qkv_with_prefill_mxfp8_input(
         self,
         hidden_states: torch.Tensor,
         all_gather_group: Optional[Any],
     ) -> Tuple[
         torch.Tensor,
-        Tuple[torch.Tensor, torch.Tensor, torch.dtype],
+        Optional[torch.Tensor],
+        bool,
     ]:
         quantized_x, x_scale, output_dtype = (
-            self._npu_prepare_shared_prefill_mxfp8_input(
+            self._npu_prepare_prefill_mxfp8_qkv_input(
                 hidden_states, all_gather_group
             )
         )
+
+        # The FP8 activation and scale collectives above stay on the current
+        # stream.  Only after both have been submitted do we enqueue the
+        # original BF16 hidden-row AllGather on the auxiliary stream.  QKV MM
+        # is submitted afterwards on the current stream, so the Gate input
+        # communication can overlap QKV/Norm/RoPE/attention.  Gate MM itself
+        # remains on the current stream and joins this communication only at
+        # its actual point of use.
+        gate_hidden_states = None
+        gate_all_gather_on_alt_stream = False
+        if all_gather_group is not None:
+            if self.alt_stream is not None:
+                device_module = torch.get_device_module()
+                current_stream = device_module.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                with device_module.stream(self.alt_stream):
+                    gate_hidden_states = self._npu_all_gather_bf16_gate_input(
+                        hidden_states, all_gather_group
+                    )
+                gate_all_gather_on_alt_stream = True
+            else:
+                gate_hidden_states = self._npu_all_gather_bf16_gate_input(
+                    hidden_states, all_gather_group
+                )
+
         qkv = self._npu_mxfp8_mm_from_quantized_input(
             self.qkv_proj,
             quantized_x,
             x_scale,
             output_dtype=output_dtype,
         )
-        return qkv, (quantized_x, x_scale, output_dtype)
+        return qkv, gate_hidden_states, gate_all_gather_on_alt_stream
 
     def forward(
         self,
@@ -1952,7 +2015,8 @@ class Qwen2MoeAttention(nn.Module):
         reuse_prefill_mxfp8_input: bool = False,
         prefill_mxfp8_all_gather_group: Optional[Any] = None,
     ) -> torch.Tensor:
-        shared_prefill_mxfp8_input = None
+        prefill_gate_hidden_states = None
+        prefill_gate_all_gather_on_alt_stream = False
         external_mirror = (
             _get_welm_mtp_mirror_state(forward_batch, self.kv_mirror_layer_idx)
             if self.is_nextn
@@ -2026,10 +2090,12 @@ class Qwen2MoeAttention(nn.Module):
         elif self.kv_mirror_layer_idx in self.kv_mirror_imitated_layers:
             if getattr(self, "_kv_mirror_mxfp8_source_projection", False):
                 if reuse_prefill_mxfp8_input:
-                    qkv, shared_prefill_mxfp8_input = (
-                        self._npu_project_qkv_with_shared_prefill_mxfp8_input(
-                            hidden_states, prefill_mxfp8_all_gather_group
-                        )
+                    (
+                        qkv,
+                        prefill_gate_hidden_states,
+                        prefill_gate_all_gather_on_alt_stream,
+                    ) = self._npu_project_qkv_with_prefill_mxfp8_input(
+                        hidden_states, prefill_mxfp8_all_gather_group
                     )
                 else:
                     qkv, _ = self.qkv_proj(hidden_states)
@@ -2104,10 +2170,12 @@ class Qwen2MoeAttention(nn.Module):
                     )
         else:
             if reuse_prefill_mxfp8_input:
-                qkv, shared_prefill_mxfp8_input = (
-                    self._npu_project_qkv_with_shared_prefill_mxfp8_input(
-                        hidden_states, prefill_mxfp8_all_gather_group
-                    )
+                (
+                    qkv,
+                    prefill_gate_hidden_states,
+                    prefill_gate_all_gather_on_alt_stream,
+                ) = self._npu_project_qkv_with_prefill_mxfp8_input(
+                    hidden_states, prefill_mxfp8_all_gather_group
                 )
             else:
                 qkv, _ = self.qkv_proj(hidden_states)
@@ -2263,16 +2331,14 @@ class Qwen2MoeAttention(nn.Module):
         if self.gated_self_attention_headwise:
             attn_shape = attn_output.shape
             if gate is None:
-                if shared_prefill_mxfp8_input is not None:
-                    quantized_x, x_scale, output_dtype = shared_prefill_mxfp8_input
-                    gate = self._npu_mxfp8_mm_from_quantized_input(
-                        self.gate_proj,
-                        quantized_x,
-                        x_scale,
-                        output_dtype=output_dtype,
-                    ).unsqueeze(-1)
-                else:
-                    gate = self.gate_proj(hidden_states)[0].unsqueeze(-1)
+                gate_input = hidden_states
+                if prefill_gate_hidden_states is not None:
+                    if prefill_gate_all_gather_on_alt_stream:
+                        torch.get_device_module().current_stream().wait_stream(
+                            self.alt_stream
+                        )
+                    gate_input = prefill_gate_hidden_states
+                gate = self.gate_proj(gate_input)[0].unsqueeze(-1)
             # gate: (bs * seq_len, num_heads, 1)
             attn_output = attn_output.view(attn_shape[0], self.num_heads, -1)
             if enable_npu_gate_alt_stream:
@@ -2852,8 +2918,15 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 )
             if output_hidden_is_scattered:
                 forward_batch.welmv4_npu_deepep_scattered = True
+        is_ordinary_prefill_non_consumer_layer = (
+            not self.is_nextn
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and is_non_consumer_attention_layer
+        )
         enable_npu_weight_prefetch = (
-            _is_npu and hidden_states.shape[0] > 0
+            _is_npu
+            and hidden_states.shape[0] > 0
+            and not is_ordinary_prefill_non_consumer_layer
         )
         qkv_prefetch_started = False
         if enable_npu_weight_prefetch:

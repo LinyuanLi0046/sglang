@@ -31,6 +31,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_deepseek_v4,
     is_minimax_sparse,
+    resolve_dsa_indexer_layer_ids,
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
@@ -53,10 +54,13 @@ from sglang.srt.utils.common import (
     ceil_div,
     is_float4_e2m1fn_x2,
     is_hip,
+    is_npu,
+    is_950_npu,
     spec_decode_alloc_len_per_request,
 )
 
 _is_hip = is_hip()
+_is_npu = is_npu()
 
 
 @dataclass
@@ -199,7 +203,33 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(num_layers) > 0
             ):
                 draft_num_layers = int(eagle_draft_num_layers)
-                if is_deepseek_dsa(kvc.model_config.hf_config):
+                if _is_npu and is_deepseek_dsa(kvc.model_config.hf_config):
+                    from sglang.srt.mem_cache.kv_cache_configurator import (
+                        calculate_mla_kv_cache_dim,
+                    )
+
+                    draft_dtype = kvc.spec_aux_config.eagle_draft_kv_cache_dtype
+                    model_config = kvc.model_config
+                    use_c8 = (
+                        draft_dtype == torch.float8_e4m3fn
+                        and is_950_npu(kvc.gpu_id)
+                    )
+                    draft_main_bytes = (
+                        calculate_mla_kv_cache_dim(
+                            model_config=model_config, kv_cache_dtype=draft_dtype
+                        )
+                        if use_c8
+                        else (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
+                        * torch._utils._element_size(draft_dtype)
+                    )
+                    self._cell_size += draft_num_layers * draft_main_bytes
+                    self._cell_size += self._compute_dsa_indexer_cell_size(
+                        kvc=kvc,
+                        num_layers=draft_num_layers,
+                        allocate_all_layers=True,
+                        kv_cache_dtype=draft_dtype,
+                    )
+                elif is_deepseek_dsa(kvc.model_config.hf_config):
                     target_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,
                         num_layers=num_layers,
@@ -255,6 +285,23 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # args to config cell size
         model_config = kvc.model_config
         kv_cache_dtype = kvc.kv_cache_dtype
+        if _is_npu and kvc.use_mla_backend and is_deepseek_dsa(model_config.hf_config):
+            from sglang.srt.mem_cache.kv_cache_configurator import (
+                calculate_mla_kv_cache_dim,
+            )
+
+            use_c8 = kv_cache_dtype == torch.float8_e4m3fn and is_950_npu(kvc.gpu_id)
+            main_bytes = (
+                calculate_mla_kv_cache_dim(
+                    model_config=model_config, kv_cache_dtype=kv_cache_dtype
+                )
+                if use_c8
+                else (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
+                * torch._utils._element_size(kv_cache_dtype)
+            )
+            return main_bytes * num_layers + self._compute_dsa_indexer_cell_size(
+                kvc=kvc, num_layers=num_layers
+            )
         from sglang.srt.layers.cp.utils import (
             get_glm_dsa_layer_split_effective_num_layers,
         )
@@ -372,8 +419,39 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         kvc: KVCacheConfigurator,
         num_layers: int,
         allocate_all_layers: bool = False,
+        kv_cache_dtype: Optional[torch.dtype] = None,
     ) -> int:
         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
+        if _is_npu:
+            from sglang.srt.mem_cache.kv_cache_configurator import (
+                _should_elide_dsa_index_k,
+            )
+
+            dtype = kvc.kv_cache_dtype if kv_cache_dtype is None else kv_cache_dtype
+            is_950 = is_950_npu(kvc.gpu_id)
+            use_c8 = dtype == torch.float8_e4m3fn and is_950
+            architectures = (
+                getattr(kvc.model_config.hf_config, "architectures", ()) or ()
+            )
+            primary_arch = architectures[0] if architectures else None
+            is_glm_compact_rollout = (
+                not allocate_all_layers
+                and primary_arch == "GlmMoeDsaForCausalLM"
+                and is_950
+                and _should_elide_dsa_index_k(is_draft_worker=kvc.is_draft_worker)
+            )
+            num_indexer_layers = (
+                len(resolve_dsa_indexer_layer_ids(
+                    kvc.model_config.hf_config,
+                    kvc.layer_info.start_layer,
+                    kvc.layer_info.end_layer,
+                ))
+                if is_glm_compact_rollout else num_layers
+            )
+            return num_indexer_layers * (
+                index_head_dim + 4 if use_c8
+                else index_head_dim * torch._utils._element_size(dtype)
+            )
         indexer_size_per_token = (
             index_head_dim + index_head_dim // DSATokenToKVPool.quant_block_size * 4
         )

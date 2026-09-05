@@ -759,7 +759,7 @@ def eagle_sample(
 
     # Sample tokens
     target_predict = None
-    if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_hip or _is_xpu:
+    if sampling_info.is_all_greedy or _is_cpu or _is_hip or _is_xpu:
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
@@ -788,6 +788,37 @@ def eagle_sample(
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)
+    elif _is_npu:
+        from sglang.srt.speculative.npu_sampling import sample_npu_target_tokens
+
+        target_predict = sample_npu_target_tokens(
+            next_token_logits=next_token_logits,
+            sampling_info=sampling_info,
+            positions=verify_input.positions,
+            tree_topk=verify_input.tree_topk,
+            num_draft_tokens=verify_input.draft_token_num,
+            max_tree_depth=verify_input.max_tree_depth,
+            retrieve_index_shape=tuple(verify_input.retrieve_index.shape),
+            batch_size=bs,
+        ).to(candidates.dtype).reshape(bs, verify_input.draft_token_num)
+        tp_group = (
+            get_parallel().attn_tp_group
+            if is_dp_attention_enabled()
+            else get_tp_group()
+        )
+        if tp_group.world_size > 1:
+            tp_group.broadcast(target_predict, src=0)
+        predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
+            predicts=predict,
+            accept_index=accept_index,
+            accept_token_num=num_correct_drafts,
+            candidates=candidates,
+            retrieve_index=verify_input.retrieve_index,
+            retrieve_next_token=verify_input.retrieve_next_token,
+            retrieve_next_sibling=verify_input.retrieve_next_sibling,
+            target_predict=target_predict,
+            topk=verify_input.tree_topk,
+        )
     elif _can_use_sparse_uno_tree_target_sampling(
         uno_target_max_top_k,
         sampling_info,

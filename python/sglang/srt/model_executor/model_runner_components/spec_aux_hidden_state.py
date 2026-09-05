@@ -36,6 +36,8 @@ def _map_muse_target_layer_ids(*, target_hf_config, draft_hf_config, layer_ids):
 class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     eagle_use_aux_hidden_state: bool = False
     eagle_draft_num_layers: Optional[int] = None
+    # Budget dtype only; the draft worker resolves its own runtime KV dtype.
+    eagle_draft_kv_cache_dtype: Any = None
     # Draft layers whose KV cache uses the target SWA pool capacity.
     eagle_draft_swa_num_layers: Optional[int] = None
     eagle_aux_hidden_state_layer_ids: Any = None
@@ -88,6 +90,21 @@ def _resolve_eagle_aux_hidden_state(
             model_path=get_spec().speculative_draft_model_path,
             model_revision=get_spec().speculative_draft_model_revision,
             is_draft_model=True,
+        )
+        from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
+
+        _, config.eagle_draft_kv_cache_dtype = configure_kv_cache_dtype(
+            server_args_kv_cache_dtype=get_model().kv_cache_dtype,
+            speculative_draft_kv_cache_dtype=(
+                get_spec().speculative_draft_kv_cache_dtype
+            ),
+            model=None,
+            model_dtype=draft_model_config.dtype,
+            is_draft_worker=True,
+            is_dflash=False,
+            speculative_draft_attention_backend=(
+                get_spec().speculative_draft_attention_backend
+            ),
         )
         num_nextn_predict_layers = draft_model_config.num_nextn_predict_layers
         if num_nextn_predict_layers is not None:

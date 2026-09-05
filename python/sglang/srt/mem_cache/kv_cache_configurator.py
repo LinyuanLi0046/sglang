@@ -25,6 +25,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_deepseek_v4,
     is_minimax_sparse,
+    resolve_dsa_indexer_layer_ids,
 )
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.distributed.utils import get_pp_indices
@@ -94,6 +95,7 @@ from sglang.srt.utils.common import (
     is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
+    is_950_npu,
 )
 
 logger = logging.getLogger(__name__)
@@ -1483,6 +1485,32 @@ class KVCacheConfigurator:
             NPUMLATokenToKVPool,
         )
 
+        architectures = getattr(self.model_config.hf_config, "architectures", ()) or ()
+        primary_arch = architectures[0] if architectures else None
+        is_950 = is_950_npu(self.gpu_id)
+        is_glm_compact_rollout = (
+            is_dsa_model
+            and primary_arch == "GlmMoeDsaForCausalLM"
+            and is_950
+            and _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker)
+        )
+        indexer_layer_ids = None
+        if is_glm_compact_rollout:
+            indexer_layer_ids = resolve_dsa_indexer_layer_ids(
+                self.model_config.hf_config,
+                self.layer_info.start_layer,
+                self.layer_info.end_layer,
+            )
+        use_dsa_fp8_kv_cache_storage = (
+            self.kv_cache_dtype == torch.float8_e4m3fn and is_950
+        )
+        if is_dsa_model:
+            logger.info(
+                "NPU DSA indexer layout: %s",
+                "compact physical indexer layout"
+                if indexer_layer_ids is not None
+                else "all-layer compatibility layout",
+            )
         token_to_kv_pool = NPUMLATokenToKVPool(
             max_total_num_tokens,
             page_size=self.pool_page_size,
@@ -1490,6 +1518,14 @@ class KVCacheConfigurator:
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
             index_head_dim=(self.model_config.index_head_dim if is_dsa_model else None),
+            indexer_layer_ids=indexer_layer_ids,
+            kv_cache_dim=(
+                calculate_mla_kv_cache_dim(
+                    model_config=self.model_config, kv_cache_dtype=self.kv_cache_dtype
+                )
+                if use_dsa_fp8_kv_cache_storage
+                else None
+            ),
             layer_num=self.layer_info.num_effective_layers,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,

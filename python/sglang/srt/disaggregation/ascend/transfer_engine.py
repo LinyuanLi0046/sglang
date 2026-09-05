@@ -1,5 +1,6 @@
 import logging
 import os
+import threading
 from typing import List
 
 import torch
@@ -38,6 +39,7 @@ class AscendTransferEngine(MooncakeTransferEngine):
         self.engine = TransferEngine()
         self.hostname = hostname
         self.npu_id = npu_id
+        self._host_rdma_batch_lock = threading.Lock()
 
         # Centralized storage address of the AscendTransferEngine
         self.store_url = os.getenv("ASCEND_MF_STORE_URL")
@@ -97,6 +99,26 @@ class AscendTransferEngine(MooncakeTransferEngine):
         if ret_value != 0:
             logger.error("Ascend Transfer Engine initialization failed.")
             raise RuntimeError("Ascend Transfer Engine initialization failed.")
+
+    def batch_transfer_sync(
+        self,
+        session_id: str,
+        buffers: List[int],
+        peer_buffer_addresses: List[int],
+        lengths: List[int],
+    ) -> int:
+        if os.getenv("ASCEND_MF_TRANSFER_PROTOCOL", "").lower() != "host_rdma":
+            return super().batch_transfer_sync(
+                session_id, buffers, peer_buffer_addresses, lengths
+            )
+
+        # Host HCOM lazily opens the RPC service on the first transfer. The
+        # heterogeneous-TP paths prepare tensors in parallel, but the same
+        # MemFabric engine must not enter OpenDevice concurrently.
+        with self._host_rdma_batch_lock:
+            return super().batch_transfer_sync(
+                session_id, buffers, peer_buffer_addresses, lengths
+            )
 
     def batch_register(self, ptrs: List[int], lengths: List[int]):
         try:

@@ -141,6 +141,16 @@ class SWAKVPool(BaseSWAKVPool):
 
         return swa_kv_data_ptrs, swa_kv_data_lens, swa_kv_item_lens
 
+    def get_state_dim_per_tensor(self) -> List[int]:
+        """Local KV-head dimension for each registered SWA K/V tensor."""
+        _, _, item_lens = self.get_state_buf_infos()
+        return [self.swa_kv_pool.head_num] * len(item_lens)
+
+    def get_state_slice_outer_counts(self) -> List[int]:
+        """Token rows preceding the KV-head dimension in one SWA page."""
+        _, _, item_lens = self.get_state_buf_infos()
+        return [self.swa_kv_pool.page_size] * len(item_lens)
+
     def get_key_buffer(self, layer_id: int):
         self._wait_for_layer(layer_id)
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]

@@ -1038,8 +1038,24 @@ def setup_state_kv_args(
         # DeepSeekV4TokenToKVPool inherits BaseSWAKVPool; its heterogeneous
         # state list is described per-entry via get_state_buf_infos.
         if isinstance(token_to_kv_pool, BaseSWAKVPool):
+            dim_per_tensor = (
+                token_to_kv_pool.get_state_dim_per_tensor()
+                if hasattr(token_to_kv_pool, "get_state_dim_per_tensor")
+                else None
+            )
+            slice_outer_counts = (
+                token_to_kv_pool.get_state_slice_outer_counts()
+                if hasattr(token_to_kv_pool, "get_state_slice_outer_counts")
+                else None
+            )
             append_state_component(
-                kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
+                kv_args,
+                StateType.SWA,
+                data_ptrs,
+                data_lens,
+                item_lens,
+                dim_per_tensor=dim_per_tensor,
+                slice_outer_counts=slice_outer_counts,
             )
             # unified_kv: the SWA ring lives in the unified buffers (no separate
             # swa_kv_pool) and is addressed per-row, so ship it as SWA_RING.

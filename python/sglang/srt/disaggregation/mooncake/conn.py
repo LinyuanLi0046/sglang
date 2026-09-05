@@ -1277,15 +1277,6 @@ class MooncakeKVManager(CommonKVManager):
                         or rc
                     )
             elif self._is_generic_kvcache_state_type(st):
-                if (
-                    target_rank_registration_info is not None
-                    and not self.is_mla_backend
-                    and self.attn_tp_size
-                    != target_rank_registration_info.dst_attn_tp_size
-                ):
-                    raise RuntimeError(
-                        f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
-                    )
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
                 if (
@@ -1311,19 +1302,57 @@ class MooncakeKVManager(CommonKVManager):
                         src_indices = src_indices[: len(dst_indices_local)]
                     else:
                         dst_indices_local = dst_indices_local[: len(src_indices)]
-                rc = (
-                    self._send_kvcache_generic(
-                        mooncake_session_id=req.mooncake_session_id,
-                        src_data_ptrs=src_data_ptrs,
-                        dst_data_ptrs=dst_data_ptrs,
-                        item_lens=src_item_lens,
-                        prefill_data_indices=np.array(src_indices, dtype=np.int32),
-                        dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
-                        executor=executor,
-                        state_type=st,
-                    )
-                    or rc
+
+                has_different_attn_tp = (
+                    target_rank_registration_info is not None
+                    and not self.is_mla_backend
+                    and self.attn_tp_size
+                    != target_rank_registration_info.dst_attn_tp_size
                 )
+                if has_different_attn_tp and st != StateType.SWA:
+                    raise RuntimeError(
+                        f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
+                    )
+
+                if has_different_attn_tp:
+                    rc = (
+                        self._send_swa_state_slice(
+                            req=req,
+                            prefill_swa_indices=src_indices,
+                            src_state_data_ptrs=src_data_ptrs,
+                            src_state_item_lens=src_item_lens,
+                            src_state_dim_per_tensor=src_dim_per_tensor,
+                            src_state_slice_outer_counts=src_slice_outer_counts,
+                            dst_state_data_ptrs=dst_data_ptrs,
+                            dst_swa_indices=dst_indices_local,
+                            dst_state_item_lens=dst_item_lens,
+                            dst_state_dim_per_tensor=dst_dim_per_tensor,
+                            dst_tp_rank=target_rank_registration_info.dst_tp_rank,
+                            dst_attn_tp_size=(
+                                target_rank_registration_info.dst_attn_tp_size
+                            ),
+                            executor=executor,
+                            src_layer_ids=src_state_layer_ids,
+                            dst_layer_ids=dst_state_layer_ids,
+                        )
+                        or rc
+                    )
+                else:
+                    rc = (
+                        self._send_kvcache_generic(
+                            mooncake_session_id=req.mooncake_session_id,
+                            src_data_ptrs=src_data_ptrs,
+                            dst_data_ptrs=dst_data_ptrs,
+                            item_lens=src_item_lens,
+                            prefill_data_indices=np.array(src_indices, dtype=np.int32),
+                            dst_data_indices=np.array(
+                                dst_indices_local, dtype=np.int32
+                            ),
+                            executor=executor,
+                            state_type=st,
+                        )
+                        or rc
+                    )
             elif st == StateType.MINIMAX_INDEX_K:
                 # Equal-TP / PP=1 only. Sub-pools are compacted sparse-layer
                 # lists, so PP>1 mis-slices and heterogeneous TP is unsupported.
@@ -1360,6 +1389,143 @@ class MooncakeKVManager(CommonKVManager):
                     or rc
                 )
         return rc
+
+    def _send_swa_state_slice(
+        self,
+        req: TransferInfo,
+        prefill_swa_indices: list[int],
+        src_state_data_ptrs: list[int],
+        src_state_item_lens: list[int],
+        src_state_dim_per_tensor: list[int],
+        src_state_slice_outer_counts: list[int],
+        dst_state_data_ptrs: list[int],
+        dst_swa_indices: list[int],
+        dst_state_item_lens: list[int],
+        dst_state_dim_per_tensor: list[int],
+        dst_tp_rank: int,
+        dst_attn_tp_size: int,
+        executor: concurrent.futures.ThreadPoolExecutor,
+        src_layer_ids: Optional[List[int]] = None,
+        dst_layer_ids: Optional[List[int]] = None,
+    ) -> int:
+        """Transfer paged SWA K/V while re-sharding its local KV-head axis."""
+        logger.warning_once(
+            "Using SWA state slice transfer for different TP sizes between "
+            f"prefill and decode: {self.attn_tp_size} -> {dst_attn_tp_size}."
+        )
+
+        if not src_state_dim_per_tensor or not dst_state_dim_per_tensor:
+            raise RuntimeError(
+                "SWA state slice transfer requires per-tensor KV-head metadata"
+            )
+        if not src_state_slice_outer_counts:
+            raise RuntimeError(
+                "SWA state slice transfer requires per-tensor page-row metadata"
+            )
+        if len(prefill_swa_indices) != len(dst_swa_indices):
+            raise RuntimeError(
+                "SWA state slice transfer requires matching source and destination "
+                f"page counts, got {len(prefill_swa_indices)} and "
+                f"{len(dst_swa_indices)}"
+            )
+
+        src_attn_tp_size = self.attn_tp_size
+        if not (
+            src_attn_tp_size % dst_attn_tp_size == 0
+            or dst_attn_tp_size % src_attn_tp_size == 0
+        ):
+            raise RuntimeError(
+                "SWA state slice transfer requires divisible attention TP sizes, "
+                f"got {src_attn_tp_size} and {dst_attn_tp_size}"
+            )
+
+        local_tp_rank_in_group = self.kv_args.engine_rank % src_attn_tp_size
+        dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
+        pairs = build_transfer_entry_pairs(
+            src_layer_ids or [],
+            dst_layer_ids or [],
+            len(src_state_data_ptrs),
+            len(dst_state_data_ptrs),
+            allow_positional_fallback=self.pp_size == 1,
+        )
+        src_page_indices = np.asarray(prefill_swa_indices, dtype=np.int64)
+        dst_page_indices = np.asarray(dst_swa_indices, dtype=np.int64)
+
+        def process_tensor(src_idx: int, dst_idx: int) -> int:
+            src_item_len = src_state_item_lens[src_idx]
+            dst_item_len = dst_state_item_lens[dst_idx]
+            src_dim = src_state_dim_per_tensor[src_idx]
+            dst_dim = dst_state_dim_per_tensor[dst_idx]
+            outer_count = src_state_slice_outer_counts[src_idx]
+
+            if src_dim * src_attn_tp_size != dst_dim * dst_attn_tp_size:
+                raise RuntimeError(
+                    "SWA KV-head geometry mismatch: "
+                    f"src={src_dim}x{src_attn_tp_size}, "
+                    f"dst={dst_dim}x{dst_attn_tp_size}"
+                )
+            src_denominator = src_dim * outer_count
+            dst_denominator = dst_dim * outer_count
+            if (
+                outer_count <= 0
+                or src_dim <= 0
+                or dst_dim <= 0
+                or src_item_len % src_denominator != 0
+                or dst_item_len % dst_denominator != 0
+                or src_item_len // src_denominator
+                != dst_item_len // dst_denominator
+            ):
+                raise RuntimeError(
+                    "SWA state item layout is incompatible with KV-head slicing: "
+                    f"src_item_len={src_item_len}, dst_item_len={dst_item_len}, "
+                    f"src_dim={src_dim}, dst_dim={dst_dim}, "
+                    f"outer_count={outer_count}"
+                )
+
+            byte_blocks = compute_mamba_state_slice_byte_blocks(
+                src_item_len=src_item_len,
+                dst_item_len=dst_item_len,
+                src_dim=src_dim,
+                dst_dim=dst_dim,
+                outer_count=outer_count,
+                src_attn_tp_size=src_attn_tp_size,
+                dst_attn_tp_size=dst_attn_tp_size,
+                dst_tp_rank_in_group=dst_tp_rank_in_group,
+                local_tp_rank_in_group=local_tp_rank_in_group,
+            )
+            src_offsets = np.asarray([x[0] for x in byte_blocks], dtype=np.int64)
+            dst_offsets = np.asarray([x[1] for x in byte_blocks], dtype=np.int64)
+            lengths = np.asarray([x[2] for x in byte_blocks], dtype=np.int64)
+
+            src_addrs = (
+                src_state_data_ptrs[src_idx]
+                + src_page_indices[:, None] * src_item_len
+                + src_offsets[None, :]
+            ).reshape(-1)
+            dst_addrs = (
+                dst_state_data_ptrs[dst_idx]
+                + dst_page_indices[:, None] * dst_item_len
+                + dst_offsets[None, :]
+            ).reshape(-1)
+            transfer_lengths = np.broadcast_to(
+                lengths[None, :],
+                (len(src_page_indices), len(lengths)),
+            ).reshape(-1)
+            return self.engine.batch_transfer_sync(
+                req.mooncake_session_id,
+                src_addrs.tolist(),
+                dst_addrs.tolist(),
+                transfer_lengths.tolist(),
+            )
+
+        futures = [executor.submit(process_tensor, i, j) for i, j in pairs]
+        for future in concurrent.futures.as_completed(futures):
+            status = future.result()
+            if status != 0:
+                for pending in futures:
+                    pending.cancel()
+                return status
+        return 0
 
     def _send_mamba_state(
         self,

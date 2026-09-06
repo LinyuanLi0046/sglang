@@ -347,13 +347,14 @@ def forward_mla_core_npu(
 
 
 # region DSA
-def _apply_dsa_interleave_half_rope(m, positions, q_pe, k_pe):
-    m.rotary_emb.get_cos_sin_with_position(positions)
-    cos = m.rotary_emb.position_cos.to(device=q_pe.device, dtype=q_pe.dtype).view(
-        -1, 1, 1, m.qk_rope_head_dim
+def _apply_interleaved_rope_with_half_output(rotary_emb, positions, q_pe, k_pe):
+    """Apply RoPE to interleaved Q/K and return half-layout outputs."""
+    rotary_emb.get_cos_sin_with_position(positions)
+    cos = rotary_emb.position_cos.to(device=q_pe.device, dtype=q_pe.dtype).view(
+        -1, 1, 1, q_pe.shape[-1]
     )
-    sin = m.rotary_emb.position_sin.to(device=q_pe.device, dtype=q_pe.dtype).view(
-        -1, 1, 1, m.qk_rope_head_dim
+    sin = rotary_emb.position_sin.to(device=q_pe.device, dtype=q_pe.dtype).view(
+        -1, 1, 1, q_pe.shape[-1]
     )
     q_pe = torch_npu.npu_interleave_rope(q_pe.unsqueeze(2), cos, sin).squeeze(2)
     k_pe = torch_npu.npu_interleave_rope(k_pe.unsqueeze(2), cos, sin).squeeze(2)
@@ -470,12 +471,11 @@ def forward_dsa_prepare_npu(
             perm_y=(1, 0, 2),
         )
 
-        if (
-            m._npu_is_950
-            and is_mla_preprocess_enabled()
-            and not m.rotary_emb.is_neox_style
-        ):
-            q_pe, k_pe = _apply_dsa_interleave_half_rope(m, positions, q_pe, k_pe)
+        if is_mla_preprocess_enabled() and not m.rotary_emb.is_neox_style:
+            # Match the half-layout RoPE outputs used by MLA preprocessing.
+            q_pe, k_pe = _apply_interleaved_rope_with_half_output(
+                m.rotary_emb, positions, q_pe, k_pe
+            )
         else:
             if m.layer_id == 0:
                 m.rotary_emb.sin_cos_cache = m.rotary_emb.cos_sin_cache.index_select(

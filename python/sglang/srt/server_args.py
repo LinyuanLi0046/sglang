@@ -5154,12 +5154,6 @@ class ServerArgs:
                     "uses the WeLM Triton attention path. Torch Compile and "
                     "Prefill NPU Graph remain disabled."
                 )
-            if self.disaggregation_mode != "null":
-                raise ValueError(
-                    "WeLMv4 does not yet support prefill/decode disaggregation: "
-                    "the request-scoped ngram token table is not transferred "
-                    "with the KV cache. Use --disaggregation-mode null."
-                )
             if self.enable_over_encoding:
                 if is_npu() and self.load_format == "dummy":
                     raise ValueError(

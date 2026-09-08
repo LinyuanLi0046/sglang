@@ -171,6 +171,7 @@ class NgramEmbeddingManager:
         """Fill the token table for ngram embedding before a forward pass."""
         if batch is None or not self.enabled:
             return batch
+        self._init_disaggregation_decode_rows(batch)
         batch.ne_token_table = self.table
         # This mask is valid only for the current forward pass. Rebuild it
         # below when the current batch contains an unfinished chunked request.
@@ -243,6 +244,81 @@ class NgramEmbeddingManager:
                     else None
                 )
         return batch
+
+    def _init_disaggregation_decode_rows(self, batch: ScheduleBatch) -> None:
+        """Rebuild newly admitted PD-decode rows from request token history.
+
+        The prefill node transfers KV cache pages and the sampled handoff token.
+        The decode request already owns the complete logical history, so copying
+        the whole request-scoped token-table row over RDMA is unnecessary.
+        """
+        reqs = [
+            req
+            for req in batch.reqs
+            if getattr(req, "ngram_token_table_needs_init", False)
+        ]
+        if not reqs:
+            return
+
+        all_tokens = []
+        token_offsets = []
+        request_lengths = []
+        row_indices = []
+        table_width = self.table.shape[1]
+
+        for req in reqs:
+            if req.req_pool_idx is None:
+                raise RuntimeError(
+                    "Cannot initialize a PD-decode ngram row before allocating "
+                    f"req_pool_idx for request {req.rid}."
+                )
+            tokens = list(req.origin_input_ids)
+            tokens.extend(req.output_ids)
+            if len(tokens) > table_width:
+                raise RuntimeError(
+                    "PD-decode ngram history exceeds the token-table width: "
+                    f"request={req.rid}, history={len(tokens)}, width={table_width}."
+                )
+            token_offsets.append(len(all_tokens))
+            request_lengths.append(len(tokens))
+            row_indices.append(req.req_pool_idx)
+            all_tokens.extend(tokens)
+
+        dtype = self.table.dtype
+        device = self.table.device
+        tokens_tensor = torch.tensor(all_tokens, dtype=dtype, device=device)
+        row_indices_tensor = torch.tensor(
+            row_indices, dtype=torch.int64, device=device
+        )
+        column_starts = torch.zeros(len(reqs), dtype=torch.int32, device=device)
+        req_lens = torch.tensor(request_lengths, dtype=torch.int32, device=device)
+
+        if is_npu():
+            from sglang.srt.layers.welmv4_npu_op import (
+                welmv4_token_table_ragged_update_npu,
+            )
+
+            welmv4_token_table_ragged_update_npu(
+                self.table,
+                tokens_tensor,
+                row_indices_tensor,
+                torch.tensor(token_offsets, dtype=torch.int32, device=device),
+                column_starts,
+                req_lens,
+                max_req_len=max(request_lengths, default=0),
+            )
+        else:
+            _update_token_table(
+                ne_token_table=self.table,
+                tokens=tokens_tensor,
+                row_indices=row_indices_tensor,
+                column_starts=column_starts,
+                req_lens=req_lens,
+                ignore_tokens=None,
+            )
+
+        for req in reqs:
+            req.ngram_token_table_needs_init = False
 
 
 def update_ngram_token_table_after_sampling(

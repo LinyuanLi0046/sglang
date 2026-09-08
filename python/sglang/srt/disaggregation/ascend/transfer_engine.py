@@ -62,7 +62,14 @@ class AscendTransferEngine(MooncakeTransferEngine):
         )
 
         transfer_protocol = self._get_transfer_protocol()
-        if transfer_protocol is None or transfer_protocol == "sdma":
+        hcom_url = os.getenv("ASCEND_MF_HCOM_URL", "")
+
+        if transfer_protocol == "host_rdma":
+            trans_op_type = TransferEngine.TransDataOpType.HOST_RDMA
+            hcom_url = self._get_worker_hcom_url(
+                hcom_url, get_world_group().rank_in_group
+            )
+        elif transfer_protocol is None or transfer_protocol == "sdma":
             trans_op_type = TransferEngine.TransDataOpType.SDMA
         else:
             trans_op_type = TransferEngine.TransDataOpType.DEVICE_RDMA
@@ -76,8 +83,16 @@ class AscendTransferEngine(MooncakeTransferEngine):
                 output_tensor_list, tmp_tensor, group=get_world_group().device_group
             )
         """Initialize the ascend transfer instance."""
+        # Decode owns the store. Prefill must remain a client so that its first
+        # transfer lazily creates a connection to the Decode session.
         ret_value = self.engine.initialize(
-            self.store_url, self.session_id, self.role, self.npu_id, trans_op_type
+            self.store_url,
+            self.session_id,
+            self.role,
+            self.npu_id,
+            trans_op_type,
+            "Decode",
+            hcom_url,
         )
         if ret_value != 0:
             logger.error("Ascend Transfer Engine initialization failed.")
@@ -95,7 +110,7 @@ class AscendTransferEngine(MooncakeTransferEngine):
     @staticmethod
     def _get_transfer_protocol():
         protocol = os.getenv("ASCEND_MF_TRANSFER_PROTOCOL")
-        allowed_protocols = {"device_rdma", "sdma"}
+        allowed_protocols = {"device_rdma", "sdma", "host_rdma"}
         if protocol and protocol.lower() in allowed_protocols:
             return protocol.lower()
         else:
@@ -103,3 +118,45 @@ class AscendTransferEngine(MooncakeTransferEngine):
                 "Invalid or no transfer protocol specified, using default protocol."
             )
             return None
+
+    def _get_worker_hcom_url(self, hcom_url: str, world_rank: int) -> str:
+        if not hcom_url:
+            return hcom_url
+
+        address, separator, port_str = hcom_url.rpartition(":")
+        if not separator or not address.startswith("tcp://"):
+            raise ValueError(
+                "ASCEND_MF_HCOM_URL must use tcp://<IPv4>:<port> or "
+                "tcp://<IPv4>/<mask>:<port>"
+            )
+
+        try:
+            base_port = int(port_str)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid port in ASCEND_MF_HCOM_URL: {hcom_url!r}"
+            ) from exc
+
+        # MemFabric adds its group rank to this base port. Reserve eight ports
+        # per worker for group ranks 0..7, allowing multiple Prefill peers to
+        # join a Decode store. DP-attention does not change world_rank.
+        port_stride = 8
+        worker_port = base_port + world_rank * port_stride
+        if not (1024 <= worker_port and worker_port + port_stride - 1 <= 65535):
+            raise ValueError(
+                "Resolved ASCEND_MF_HCOM_URL port is out of range: "
+                f"base_port={base_port}, world_rank={world_rank}, "
+                f"role={self.role}, "
+                f"resolved_port_range={worker_port}-{worker_port + port_stride - 1}"
+            )
+
+        worker_hcom_url = f"{address}:{worker_port}"
+        logger.info(
+            "Resolved Ascend Host RDMA endpoint: role=%s, world_rank=%d, "
+            "base=%s, endpoint=%s",
+            self.role,
+            world_rank,
+            hcom_url,
+            worker_hcom_url,
+        )
+        return worker_hcom_url

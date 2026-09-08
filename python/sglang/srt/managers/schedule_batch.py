@@ -1042,6 +1042,13 @@ class Req(ReqDllmMixin):
         self.output_topk_index = None
         self.output_dsa_topk_indices = None
 
+        # The decode side of PD disaggregation receives KV cache pages rather
+        # than running the prompt through an EXTEND forward. Models with
+        # request-scoped ngram embeddings therefore need to rebuild this row
+        # once from origin_input_ids + the prefill handoff token before their
+        # first decode forward.
+        self.ngram_token_table_needs_init: bool = False
+
         # capture routed experts
         self.return_routed_experts = return_routed_experts
         self.routed_experts_start_len = routed_experts_start_len

@@ -16,6 +16,7 @@
 # https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen2_moe.py
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 import logging
+import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -87,6 +88,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.welmv4_dp_attention import (
     WelmDpAttentionExecutor,
@@ -128,6 +130,9 @@ logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+
+# Cache only compiled programs, never per-forward Q/K/V or mirror activations.
+_WELMV4_FUSED_QKV_PROGRAMS: Dict[Tuple[Any, int, int, int, bool, bool], Any] = {}
 
 
 class WelmV4CommunicatorRMSNorm(nn.Module):
@@ -1726,6 +1731,136 @@ class Qwen2MoeAttention(nn.Module):
             )
         self.is_nextn = is_nextn
 
+        self.use_npu_fused_qkv = (
+            _is_npu
+            and os.environ.get("SGLANG_NPU_WELMV4_FUSED_QKV", "0") == "1"
+            and get_tensor_model_parallel_world_size() == 4
+            and not is_dp_attention_enabled()
+            and not is_nextn
+            and self.kv_mirror_layer_idx not in self.kv_mirror_layers
+        )
+
+    def _try_npu_fused_qkv(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Optional[
+        Tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            Optional[torch.Tensor],
+            Optional[torch.Tensor],
+        ]
+    ]:
+        """Use the fixed WeLM BF16 ABI for target prefill, decode or verify."""
+        num_tokens = hidden_states.shape[0]
+        if num_tokens == 0:
+            return None
+        mode = forward_batch.forward_mode
+        cos_sin_cache = self.rotary_emb.cos_sin_cache
+        segment_tile_starts = None
+        positions_segmented = False
+        if mode == ForwardMode.EXTEND:
+            if forward_batch.batch_size == 1:
+                # EP's suffix padding need not have the same RoPE as position 0:
+                # its outputs are ignored and its KV writes use the dummy slot.
+                # Only use per-row positions when extrapolating that suffix could
+                # exceed the table. Read existing CPU metadata, not device scalars.
+                positions_contiguous = (
+                    forward_batch.extend_prefix_lens_cpu[0] + num_tokens
+                    <= cos_sin_cache.shape[0]
+                )
+            else:
+                # Built once per ordinary prefill, including short batches.
+                segment_tile_starts = forward_batch.welmv4_rope_segment_tile_starts
+                positions_segmented = True
+                positions_contiguous = False
+        elif mode in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY):
+            # Verify positions are request-local B x D runs, not one global
+            # contiguous run. Reuse the arbitrary-position decode artifact;
+            # graph replay supplies positions and cache slots in device buffers.
+            positions_contiguous = False
+        else:
+            # Draft-extend stays on its existing external-mirror KV path.
+            return None
+
+        has_mirror = (
+            self.kv_mirror_layer_idx in self.kv_mirror_imitated_layers
+            and hasattr(self, "qkv_proj_weight")
+        )
+        weight = self.qkv_proj_weight if has_mirror else self.qkv_proj.weight
+        # CANNBotDSL accepts plain tensors; do not bind/copy loader Parameters.
+        weight = weight.data
+        gamma = self.k_norm.weight.data.view(1, self.head_dim)
+        backend = get_attn_backend()
+        pool = backend.token_to_kv_pool
+        k_cache, v_cache = pool.get_kv_buffer(self.attn.layer_id)
+        k_cache = k_cache.view(-1, self.head_dim)
+        v_cache = v_cache.view(-1, self.head_dim)
+        slot_mapping = (
+            backend.forward_metadata.swa_out_cache_loc
+            if backend._is_swa_layer(self.attn)
+            else forward_batch.out_cache_loc
+        )
+
+        key = (
+            hidden_states.device,
+            weight.shape[0],
+            k_cache.shape[0],
+            cos_sin_cache.shape[0],
+            positions_contiguous,
+            positions_segmented,
+        )
+        program = _WELMV4_FUSED_QKV_PROGRAMS.get(key)
+        if program is None:
+            from sglang.srt.layers.fused_qkv_proj_norm_rope_cache import compile_aot
+
+            program = compile_aot(
+                weight.shape[0],
+                k_cache.shape[0],
+                cos_sin_cache.shape[0],
+                return_v=True,
+                positions_contiguous=positions_contiguous,
+                positions_segmented=positions_segmented,
+            )
+            _WELMV4_FUSED_QKV_PROGRAMS[key] = program
+
+        q = hidden_states.new_empty((num_tokens, self.q_size))
+        k = hidden_states.new_empty((num_tokens, self.kv_size))
+        v = hidden_states.new_empty((num_tokens, self.kv_size))
+        mirror_rows = num_tokens if has_mirror else 1
+        mirror_k = hidden_states.new_empty((mirror_rows, self.kv_size))
+        mirror_v = hidden_states.new_empty((mirror_rows, self.kv_size))
+        args = (
+            hidden_states,
+            weight,
+            gamma,
+            positions.to(torch.int64),
+            cos_sin_cache,
+            slot_mapping.to(torch.int64),
+            q,
+            k,
+            v,
+            mirror_k,
+            mirror_v,
+            k_cache,
+            v_cache,
+            float(self.k_norm.eps),
+        )
+        if positions_segmented:
+            program(*args, segment_tile_starts)
+        else:
+            program(*args)
+        return (
+            q,
+            k,
+            v,
+            mirror_k if has_mirror else None,
+            mirror_v if has_mirror else None,
+        )
+
     @staticmethod
     def _linear_prefetch_tensors(
         projection: nn.Module,
@@ -2039,7 +2174,26 @@ class Qwen2MoeAttention(nn.Module):
                 "active draft decode."
             )
 
-        if frozen_mtp_decode:
+        fused_qkv = (
+            self._try_npu_fused_qkv(positions, hidden_states, forward_batch)
+            if self.use_npu_fused_qkv
+            else None
+        )
+        if fused_qkv is not None:
+            q, k, v, mirror_k, mirror_v = fused_qkv
+            if mirror_k is not None:
+                consumer_layer_id = self.kv_mirror_layers[
+                    self.kv_mirror_imitated_layers.index(self.kv_mirror_layer_idx)
+                ]
+                if consumer_layer_id >= LayerManager.num_target_layers:
+                    _set_welm_mtp_mirror_state(
+                        forward_batch, consumer_layer_id, mirror_k, mirror_v
+                    )
+                else:
+                    KVMirrorManager.set_kv_activation(
+                        self.kv_mirror_layer_idx, (mirror_k, mirror_v)
+                    )
+        elif frozen_mtp_decode:
             if hasattr(self, "kv_mirror_query_proj"):
                 q, _ = self.kv_mirror_query_proj(hidden_states)
             elif getattr(self, "_kv_mirror_mxfp8_query_projection", False):
@@ -2214,90 +2368,101 @@ class Qwen2MoeAttention(nn.Module):
             with device_module.stream(self.alt_stream):
                 gate = self.gate_proj(hidden_states)[0].unsqueeze(-1)
 
-        q_shape = q.shape
-        k_shape = None if k is None else k.shape
+        if fused_qkv is None:
+            q_shape = q.shape
+            k_shape = None if k is None else k.shape
 
-        q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
-        if self.q_norm is not None:
-            q_by_head, _ = self.q_norm(q_by_head)
-        # Q is a strided view of the fused QKV projection when q_norm is
-        # disabled.  Attention requires packed Q later, so materialize that
-        # layout before RoPE and let downstream contiguous() calls be no-ops.
-        q = q_by_head.view(q.shape).contiguous()
+            q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
+            if self.q_norm is not None:
+                q_by_head, _ = self.q_norm(q_by_head)
+            # Q is a strided view of the fused QKV projection when q_norm is
+            # disabled.  Attention requires packed Q later, so materialize that
+            # layout before RoPE and let downstream contiguous() calls be no-ops.
+            q = q_by_head.view(q.shape).contiguous()
 
-        if k is not None:
-            k_by_head = k.view(
-                *k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim
-            )
-            if self.k_norm is not None:
-                k_by_head = mmq_style_k_rms_norm(
-                    k_by_head.contiguous(),
-                    self.k_norm.weight,
-                    self.k_norm.eps,
+            if k is not None:
+                k_by_head = k.view(
+                    *k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim
                 )
-            k = k_by_head.view(k.shape)
+                if self.k_norm is not None:
+                    k_by_head = mmq_style_k_rms_norm(
+                        k_by_head.contiguous(),
+                        self.k_norm.weight,
+                        self.k_norm.eps,
+                    )
+                k = k_by_head.view(k.shape)
 
-        # A single non-speculative extend request is globally contiguous;
-        # ordinary multi-request prefill carries independently contiguous
-        # segment metadata.  Speculative, decode, and mirror-consumer paths
-        # retain the generic kernel.
-        positions_are_contiguous = (
-            forward_batch.batch_size == 1
-            and forward_batch.forward_mode.is_extend_without_speculative()
-        )
-        segment_tile_starts = getattr(
-            forward_batch, "welmv4_rope_segment_tile_starts", None
-        )
-
-        qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
-        if k is None:
-            # WeLM RoPE updates Q and K in place. They must not alias: passing
-            # Q as both operands would rotate the same storage twice on NPU.
-            unused_key = q.clone()
-            q, _ = self.rotary_emb(
-                positions,
-                q,
-                unused_key,
-                positions_are_contiguous=positions_are_contiguous,
-                segment_tile_starts=segment_tile_starts,
-            )
-            q = q.view(q_shape)
-        elif qk_nope_head_dim > 0:
-            is_kv_mirror_last_query = (
-                forward_batch.enable_kv_mirror
+            # A single non-speculative extend request is globally contiguous;
+            # ordinary multi-request prefill carries independently contiguous
+            # segment metadata.  Speculative, decode, and mirror-consumer paths
+            # retain the generic kernel.
+            positions_are_contiguous = (
+                forward_batch.batch_size == 1
                 and forward_batch.forward_mode.is_extend_without_speculative()
-                and self.kv_mirror_layer_idx in self.kv_mirror_layers
             )
-            if is_kv_mirror_last_query:
-                custom_last_index = getattr(
-                    forward_batch, "custom_last_index", None
-                )
-                if custom_last_index is None:
-                    raise RuntimeError(
-                        "WeLMv4 KV-mirror last-query RoPE requires "
-                        "custom_last_index."
-                    )
-                if (
-                    q.shape[0] != custom_last_index.numel()
-                    or k.shape[0] != positions.numel()
-                ):
-                    raise RuntimeError(
-                        "WeLMv4 KV-mirror RoPE requires Q=B and K/positions=T, "
-                        f"got Q={q.shape[0]}, B={custom_last_index.numel()}, "
-                        f"K={k.shape[0]}, T={positions.numel()}."
-                    )
-                # Both target mirror consumers and the physical NextN layer
-                # keep full prompt K/V but contract Q to one row per request.
-                # Rotate Q at the request-tail positions and K at every
-                # original prompt position.
-                q, k = self.rotary_emb(
+            segment_tile_starts = getattr(
+                forward_batch, "welmv4_rope_segment_tile_starts", None
+            )
+
+            qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
+            if k is None:
+                # WeLM RoPE updates Q and K in place. They must not alias: passing
+                # Q as both operands would rotate the same storage twice on NPU.
+                unused_key = q.clone()
+                q, _ = self.rotary_emb(
                     positions,
                     q,
-                    k,
-                    last_index=custom_last_index,
+                    unused_key,
                     positions_are_contiguous=positions_are_contiguous,
                     segment_tile_starts=segment_tile_starts,
                 )
+                q = q.view(q_shape)
+            elif qk_nope_head_dim > 0:
+                is_kv_mirror_last_query = (
+                    forward_batch.enable_kv_mirror
+                    and forward_batch.forward_mode.is_extend_without_speculative()
+                    and self.kv_mirror_layer_idx in self.kv_mirror_layers
+                )
+                if is_kv_mirror_last_query:
+                    custom_last_index = getattr(
+                        forward_batch, "custom_last_index", None
+                    )
+                    if custom_last_index is None:
+                        raise RuntimeError(
+                            "WeLMv4 KV-mirror last-query RoPE requires "
+                            "custom_last_index."
+                        )
+                    if (
+                        q.shape[0] != custom_last_index.numel()
+                        or k.shape[0] != positions.numel()
+                    ):
+                        raise RuntimeError(
+                            "WeLMv4 KV-mirror RoPE requires Q=B and K/positions=T, "
+                            f"got Q={q.shape[0]}, B={custom_last_index.numel()}, "
+                            f"K={k.shape[0]}, T={positions.numel()}."
+                        )
+                    # Both target mirror consumers and the physical NextN layer
+                    # keep full prompt K/V but contract Q to one row per request.
+                    # Rotate Q at the request-tail positions and K at every
+                    # original prompt position.
+                    q, k = self.rotary_emb(
+                        positions,
+                        q,
+                        k,
+                        last_index=custom_last_index,
+                        positions_are_contiguous=positions_are_contiguous,
+                        segment_tile_starts=segment_tile_starts,
+                    )
+                else:
+                    q, k = self.rotary_emb(
+                        positions,
+                        q,
+                        k,
+                        positions_are_contiguous=positions_are_contiguous,
+                        segment_tile_starts=segment_tile_starts,
+                    )
+                q = q.view(q_shape)
+                k = k.view(k_shape)
             else:
                 q, k = self.rotary_emb(
                     positions,
@@ -2306,16 +2471,6 @@ class Qwen2MoeAttention(nn.Module):
                     positions_are_contiguous=positions_are_contiguous,
                     segment_tile_starts=segment_tile_starts,
                 )
-            q = q.view(q_shape)
-            k = k.view(k_shape)
-        else:
-            q, k = self.rotary_emb(
-                positions,
-                q,
-                k,
-                positions_are_contiguous=positions_are_contiguous,
-                segment_tile_starts=segment_tile_starts,
-            )
 
         attn_kwargs = {}
         if self.attn_sink is not None:
@@ -2325,7 +2480,7 @@ class Qwen2MoeAttention(nn.Module):
             k,
             v,
             forward_batch,
-            save_kv_cache=not frozen_mtp_decode,
+            save_kv_cache=not frozen_mtp_decode and fused_qkv is None,
             **attn_kwargs,
         )
         if self.gated_self_attention_headwise:

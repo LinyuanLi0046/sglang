@@ -32,6 +32,8 @@ def build_welmv4_rope_segment_tile_starts(
 
     The final entry is a sentinel.  Consequently, the next entry is both the
     end of a short tail tile and the start of the following tile/request.
+    Metadata is also needed by fused QKV for short multi-request prefill;
+    constructing it must not depend on the standalone RoPE kernel threshold.
     Return ``None`` whenever the framework cannot prove that the supplied
     positions contain exactly one concatenated segment per request.
     """
@@ -44,8 +46,6 @@ def build_welmv4_rope_segment_tile_starts(
     if any(length < 0 for length in lengths):
         return None
     if sum(lengths) != num_position_tokens:
-        return None
-    if num_position_tokens <= _WELMV4_ROPE_PREFILL_ALL_M_THRESHOLD:
         return None
 
     tile_starts: list[int] = []

@@ -431,7 +431,7 @@ class SchedulerDPAttnAdapter:
         return prepare_mlp_sync_batch_raw(
             local_batch,
             model_runner=self.model_runner,
-            dp_size=get_parallel().dp_size,
+            dp_size=get_parallel().attn_dp_size,
             attn_tp_size=self.ps.attn_tp_size,
             attn_cp_size=self.ps.attn_cp_size,
             tp_group=self.tp_group,

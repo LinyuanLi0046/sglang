@@ -41,7 +41,23 @@ def test_aligned_segment_boundary_is_shared_with_next_tile():
     assert tile_starts == list(range(0, 705, 64))
 
 
-def test_rejects_unsafe_or_unprofitable_segment_metadata():
+def test_builds_short_prefill_segment_metadata():
+    for lengths in ([0, 1], [1, 1], [31, 34], [320, 320]):
+        expected = []
+        offset = 0
+        for length in lengths:
+            expected.extend(range(offset, offset + length, 64))
+            offset += length
+        expected.append(offset)
+        assert build_welmv4_rope_segment_tile_starts(
+            lengths,
+            batch_size=len(lengths),
+            num_position_tokens=sum(lengths),
+            ordinary_prefill=True,
+        ) == expected
+
+
+def test_rejects_unsafe_segment_metadata():
     common = dict(
         segment_lengths=[321, 320],
         batch_size=2,
@@ -70,15 +86,6 @@ def test_rejects_unsafe_or_unprofitable_segment_metadata():
     )
     assert (
         build_welmv4_rope_segment_tile_starts(
-            segment_lengths=[320, 320],
-            batch_size=2,
-            num_position_tokens=640,
-            ordinary_prefill=True,
-        )
-        is None
-    )
-    assert (
-        build_welmv4_rope_segment_tile_starts(
             **(common | {"segment_lengths": [642, -1]})
         )
         is None
@@ -88,4 +95,5 @@ def test_rejects_unsafe_or_unprofitable_segment_metadata():
 if __name__ == "__main__":
     test_builds_segment_tiles_without_crossing_request_boundaries()
     test_aligned_segment_boundary_is_shared_with_next_tile()
-    test_rejects_unsafe_or_unprofitable_segment_metadata()
+    test_builds_short_prefill_segment_metadata()
+    test_rejects_unsafe_segment_metadata()

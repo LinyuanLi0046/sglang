@@ -134,6 +134,12 @@ class ForwardMetadata:
     full_sink_prefill_schedule: Optional[tuple] = None
     full_sink_prefill_schedule_key: Optional[tuple] = None
 
+    # FlashAttn separates physical TND offsets from effective sequence lengths.
+    # Graph capture owns these buffers; replay updates their contents in place.
+    welm_flash_cu_seqlens_q: Optional[torch.Tensor] = None
+    welm_flash_seqused_q: Optional[torch.Tensor] = None
+    welm_flash_seqused_kv: Optional[torch.Tensor] = None
+
 
 class AscendAttnMaskBuilder:
     def __init__(self, model_runner: ModelRunner, device, use_fia, use_mla):
@@ -380,14 +386,19 @@ class AscendAttnBackend(AttentionBackend):
             arch in ("WeLMV4MoeForCausalLM", "WeLMV4MoeForCausalLMNextN")
             for arch in architectures
         )
-        self.enable_welm_fia_sink_lse = get_bool_env_var(
-            "ASCEND_USE_FIA_SINK_LSE", "False"
+        self.use_welm_flash_attn = self.is_welm_v4 and get_bool_env_var(
+            "WELM_NPU_USE_FLASH_ATTN", "False"
         )
-        # A WeLMv4 decode graph can contain a mixture of full-attention,
-        # sliding-window, and attention-sink layers. Keep non-sink layers on
-        # FIA v2 during graph capture so they share one dynamic CPU sequence-
-        # length binding (actual_seq_kvlen). Sink layers are dispatched to the
-        # NPU Triton kernel below based on their non-None ``sinks`` argument.
+        if self.use_welm_flash_attn:
+            # Optional dependency: the default Triton path does not import it.
+            import cann_ops_transformer
+
+            self._welm_flash_attn = cann_ops_transformer.flash_attn
+            self._welm_flash_attn_metadata = cann_ops_transformer.flash_attn_metadata
+        # With native FlashAttn disabled, keep the existing WeLM split: sink
+        # layers use Triton, while non-sink decode-graph layers use FIA v2 and
+        # its shared host sequence-length binding. FlashAttn returns before
+        # either legacy attention branch.
         self.force_fia_v2_decode_graph = self.is_welm_v4
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
@@ -402,6 +413,10 @@ class AscendAttnBackend(AttentionBackend):
             self.ascend_attn_mask_builder.mtp_mask,
             self.ascend_attn_mask_builder.mixed_chunk_attn_mask,
         )
+        if self.use_welm_flash_attn:
+            # Fixed 2048 x 2048 upper-triangular template, 1 = masked. Convert
+            # once before capture, not at every layer/forward.
+            self.welm_flash_attn_mask = self.fia_mask.to(torch.int8)
         if self.use_mla:
             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
         self.is_hybrid_swa = model_runner.is_hybrid_swa
@@ -479,39 +494,126 @@ class AscendAttnBackend(AttentionBackend):
         return (
             self.is_welm_v4
             and sinks is not None
-            and not self.enable_welm_fia_sink_lse
+            and not self.use_welm_flash_attn
         )
 
-    def _use_welm_fia_sink_lse(self, sinks: Optional[torch.Tensor]) -> bool:
-        """Use FIA without native sinks and restore sink semantics from LSE."""
-        return (
-            self.is_welm_v4
-            and sinks is not None
-            and self.enable_welm_fia_sink_lse
-        )
+    def _prepare_welm_flash_metadata_inputs(self, forward_batch: ForwardBatch) -> None:
+        """Build eager FlashAttn lengths from the pre-collective local batch.
 
-    @staticmethod
-    def _apply_welm_sink_lse(
-        attn_out: torch.Tensor,
-        softmax_lse: torch.Tensor,
-        sinks: torch.Tensor,
-        input_layout: str,
-    ) -> torch.Tensor:
-        """Apply WeLMv4's zero-value attention sink using FIA's softmax LSE."""
-        if input_layout == "TND":
-            lse = softmax_lse.reshape(attn_out.shape[0], attn_out.shape[1], 1)
-            sink = sinks.float().reshape(1, -1, 1)
-        elif input_layout == "BSND":
-            # FIA returns LSE in BNSD layout for every non-TND input layout.
-            lse = softmax_lse.transpose(1, 2)
-            sink = sinks.float().reshape(1, 1, -1, 1)
+        KV lengths have already been normalized for the forward mode. Keep
+        the original lengths for identifying padding before verify adds D.
+        CPU Q lengths are also retained for restoring eager collective padding.
+        """
+        metadata = self.forward_metadata
+        bs = forward_batch.seq_lens.shape[0]
+        mode = forward_batch.forward_mode
+        if mode.is_target_verify() or mode.is_decode_or_idle():
+            width = self.speculative_num_draft_tokens if mode.is_target_verify() else 1
+            q_lens_cpu = torch.full((bs,), width, dtype=torch.int32, device="cpu")
         else:
-            raise ValueError(
-                f"Unsupported FIA input layout for sink LSE: {input_layout}"
-            )
+            q_lens_cpu = metadata.extend_seq_lens_cpu_int.clone()
+        q_lens_cpu.masked_fill_(forward_batch.seq_lens_cpu <= 0, 0)
+        metadata.extend_seq_lens_cpu_int = q_lens_cpu
+        metadata.welm_flash_seqused_q = q_lens_cpu.to(self.device, non_blocking=True)
+        cu_q_cpu = torch.zeros(bs + 1, dtype=torch.int32, device="cpu")
+        torch.cumsum(q_lens_cpu, dim=0, out=cu_q_cpu[1:])
+        metadata.welm_flash_cu_seqlens_q = cu_q_cpu.to(self.device, non_blocking=True)
+        metadata.welm_flash_seqused_kv = torch.where(
+            forward_batch.seq_lens > 0, metadata.seq_lens, 0
+        ).to(torch.int32)
 
-        sink_scale = torch.sigmoid(lse.float() - sink)
-        return (attn_out.float() * sink_scale).to(attn_out.dtype)
+    def _forward_welm_flash_attention(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        layer: RadixAttention,
+        sinks: Optional[torch.Tensor],
+        *,
+        mirror_prefill: bool = False,
+    ) -> torch.Tensor:
+        """Paged Full/SWA attention with native FP32 sinks, eager or graph.
+
+        Generate the schedule on every invocation so capture includes both
+        FlashAttnMetadata and FlashAttn. No warmup/cross-forward schedule cache.
+        """
+        metadata = self.forward_metadata
+        query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
+        padded_tokens = query.shape[0]
+        kv_lens = metadata.welm_flash_seqused_kv
+        if mirror_prefill:
+            # Ordinary consumers prune Q to one row per request, but retain
+            # the full prompt K/V. Do not overwrite source/prefill Q metadata.
+            num_tokens = kv_lens.shape[0]
+            cu_q = torch.arange(num_tokens + 1, dtype=torch.int32, device=q.device)
+            q_lens = (kv_lens > 0).to(torch.int32)
+        else:
+            cu_q = metadata.welm_flash_cu_seqlens_q
+            q_lens = metadata.welm_flash_seqused_q
+            num_tokens = (
+                padded_tokens
+                if self.graph_mode
+                else int(metadata.extend_seq_lens_cpu_int.sum().item())
+            )
+        if num_tokens == 0:
+            return q.new_zeros((padded_tokens, layer.tp_q_head_num * layer.v_head_dim))
+        query = query[:num_tokens]
+        key = k_cache.view(-1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim)
+        value = v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.v_head_dim)
+        block_table = (
+            metadata.block_tables_swa
+            if self._is_swa_layer(layer)
+            else metadata.block_tables
+        )
+        is_swa = self._has_layerwise_sliding_window(layer)
+        # The metadata and attention calls must agree on every scheduling
+        # attribute. Physical offsets cover all graph rows; used lengths can
+        # be zero for padding, whose output is initialized by FlashAttn itself.
+        common = dict(
+            cu_seqlens_q=cu_q,
+            cu_seqlens_kv=None,
+            seqused_q=q_lens,
+            seqused_kv=kv_lens,
+            max_seqlen_q=-1,
+            max_seqlen_kv=-1,
+            mask_mode=4 if is_swa else 3,
+            win_left=layer.sliding_window_size if is_swa else -1,
+            win_right=0 if is_swa else -1,
+            layout_q="TND",
+            layout_kv="PA_BBND",
+            layout_out="TND",
+        )
+        schedule = self._welm_flash_attn_metadata(
+            layer.tp_q_head_num,
+            layer.tp_k_head_num,
+            layer.qk_head_dim,
+            **common,
+        )
+        output, _ = self._welm_flash_attn(
+            query,
+            key,
+            value,
+            block_table=block_table,
+            sinks=sinks.float() if sinks is not None else None,
+            attn_mask=self.welm_flash_attn_mask,
+            metadata=schedule,
+            softmax_scale=layer.scaling,
+            return_softmax_lse=False,
+            **common,
+        )
+        if num_tokens != padded_tokens:
+            output = torch.cat(
+                [
+                    output,
+                    output.new_zeros(
+                        padded_tokens - num_tokens,
+                        layer.tp_q_head_num,
+                        layer.v_head_dim,
+                    ),
+                ],
+                dim=0,
+            )
+        return output.reshape(padded_tokens, layer.tp_q_head_num * layer.v_head_dim)
 
     def _get_sink_triton_window_size(self, layer: RadixAttention) -> int:
         """Convert WeLMv4's left-window value to the Triton kernel's span."""
@@ -633,6 +735,20 @@ class AscendAttnBackend(AttentionBackend):
             )
         return max_q_len
 
+    def _check_welm_mtp(self) -> int:
+        """Both paged backends require the existing topk=1 linear MTP window."""
+        draft_token_num = int(self.speculative_num_draft_tokens or 0)
+        if draft_token_num < 1:
+            raise RuntimeError("WeLM MTP requires a positive fixed verify width.")
+        if int(self.speculative_eagle_topk or 0) != 1:
+            raise RuntimeError("WeLM MTP requires the topk=1 linear Spec-V2 tree.")
+        if draft_token_num != int(self.speculative_num_steps or 0) + 1:
+            raise RuntimeError(
+                "WeLM MTP requires verify width D=S+1; got "
+                f"D={draft_token_num}, S={self.speculative_num_steps}."
+            )
+        return draft_token_num
+
     def _prepare_welm_mtp_triton_metadata(
         self, q: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:
@@ -654,20 +770,7 @@ class AscendAttnBackend(AttentionBackend):
                 "DRAFT_EXTEND_V2 forwards."
             )
 
-        draft_token_num = int(self.speculative_num_draft_tokens or 0)
-        if draft_token_num < 1:
-            raise RuntimeError(
-                "WeLM MTP Triton requires a positive fixed verify width."
-            )
-        if int(self.speculative_eagle_topk or 0) != 1:
-            raise RuntimeError(
-                "WeLM MTP Triton requires the topk=1 linear Spec-V2 tree."
-            )
-        if draft_token_num != int(self.speculative_num_steps or 0) + 1:
-            raise RuntimeError(
-                "WeLM MTP Triton requires verify width D=S+1; got "
-                f"D={draft_token_num}, S={self.speculative_num_steps}."
-            )
+        draft_token_num = self._check_welm_mtp()
 
         metadata = self.forward_metadata
         if metadata.extend_seq_lens_cpu_int is None:
@@ -1199,6 +1302,19 @@ class AscendAttnBackend(AttentionBackend):
                 + self.speculative_num_draft_tokens
             )
 
+        if self.use_welm_flash_attn:
+            if (
+                forward_batch.forward_mode.is_decode_or_idle()
+                and forward_batch.spec_info is not None
+                and not bool(
+                    getattr(forward_batch.spec_info, "welmv4_mtp_frozen_kv", False)
+                )
+            ):
+                self.forward_metadata.seq_lens = (
+                    self.forward_metadata.seq_lens + self.speculative_step_id + 1
+                )
+            self._prepare_welm_flash_metadata_inputs(forward_batch)
+
         self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
         if (
             not forward_batch.forward_mode.is_draft_extend_v2()
@@ -1301,6 +1417,7 @@ class AscendAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
+        if self.is_hybrid_swa and not self.use_welm_flash_attn:
             # SWA mask: True = masked out (don't attend), False = attend.
             # Pre-allocated at max size, sliced per batch size during capture,
             # content updated via copy_() during replay.
@@ -1344,6 +1461,7 @@ class AscendAttnBackend(AttentionBackend):
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
         if self.is_hybrid_swa:
             metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][:bs, :]
+        if self.is_hybrid_swa and not self.use_welm_flash_attn:
             metadata.swa_mask = self.graph_metadata["swa_mask"][:bs, :, :]
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             num_tokens = out_cache_loc.shape[0]
@@ -1388,6 +1506,23 @@ class AscendAttnBackend(AttentionBackend):
                 [1 + i for i in range(bs)],
                 dtype=torch.int32,
                 device=seq_lens.device,
+            )
+        if self.use_welm_flash_attn:
+            width = (
+                self.speculative_num_draft_tokens
+                if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
+                else 1
+            )
+            # Unlike the Triton cu buffer, this describes the entire physical
+            # B_bucket x width tensor and does not shrink with the live batch.
+            metadata.welm_flash_cu_seqlens_q = (
+                torch.arange(bs + 1, dtype=torch.int32, device=seq_lens.device) * width
+            )
+            metadata.welm_flash_seqused_q = torch.empty(
+                bs, dtype=torch.int32, device=seq_lens.device
+            )
+            metadata.welm_flash_seqused_kv = torch.empty(
+                bs, dtype=torch.int32, device=seq_lens.device
             )
         if forward_mode.is_dllm_extend():
             extend_seq_lens_cpu_int = torch.tensor(
@@ -1450,6 +1585,7 @@ class AscendAttnBackend(AttentionBackend):
             forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
         ):
             welm_mtp_real_rows = seq_lens[:bs] > 0
+        flash_real_rows = seq_lens[:bs] > 0 if self.use_welm_flash_attn else None
 
         # refill the captured SWA write-target buffer in place from the live loc
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
@@ -1479,13 +1615,9 @@ class AscendAttnBackend(AttentionBackend):
             metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
             metadata.block_tables_swa[bs:, :].fill_(0)
 
-            # Generic FIA consumes this dense mask.  WeLM MTP instead routes
-            # every Full/SWA layer through the dedicated Triton sink kernels,
-            # which consume block tables and sequence lengths but never
-            # ``swa_mask``.  Rebuilding a [graph_bs, max_context_len] mask on
-            # every target-verify and draft-extend replay is therefore pure
-            # overhead (14M+ bool elements for bs=56, context=262144).
-            if welm_mtp_real_rows is None:
+            # Only generic FIA consumes this dense mask. WeLM MTP Triton and
+            # native FlashAttn use page tables/lengths and their causal templates.
+            if welm_mtp_real_rows is None and not self.use_welm_flash_attn:
                 # True = masked out (don't attend), False = attend.
                 seq_lens_int = seq_lens[:bs].int()
                 starts = torch.clamp(seq_lens_int - self.sliding_window_size, min=0)
@@ -1517,6 +1649,17 @@ class AscendAttnBackend(AttentionBackend):
         ):
             attention_seq_lens = seq_lens + self.speculative_step_offset_npu
         metadata.seq_lens[:bs].copy_(attention_seq_lens[:bs])
+
+        if self.use_welm_flash_attn:
+            width = (
+                self.speculative_num_draft_tokens
+                if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
+                else 1
+            )
+            metadata.welm_flash_seqused_q.copy_(flash_real_rows.to(torch.int32) * width)
+            metadata.welm_flash_seqused_kv.copy_(
+                torch.where(flash_real_rows, attention_seq_lens[:bs], 0)
+            )
 
         if (
             welm_mtp_real_rows is not None
@@ -1949,14 +2092,19 @@ class AscendAttnBackend(AttentionBackend):
         A mirror consumer receives one query row per request, while ``k_cache``
         still contains every prefix and extend token.  Ordinary prefill metadata
         describes ``extend_seq_lens`` query rows and therefore cannot be reused:
-        FIA must see cumulative Q lengths ``[1, 2, ..., batch_size]`` together
-        with the original, full KV lengths.
+        the attention call needs Q length 1 per request together with the
+        original, full KV lengths.
         """
         num_queries = q.shape[0]
         if num_queries != forward_batch.batch_size:
             raise RuntimeError(
                 "WeLMv4 KV-mirror prefill expects one query per request, but got "
                 f"{num_queries} query rows for batch size {forward_batch.batch_size}."
+            )
+
+        if self.use_welm_flash_attn:
+            return self._forward_welm_flash_attention(
+                q, k_cache, v_cache, layer, sinks, mirror_prefill=True
             )
 
         block_tables = (
@@ -2033,10 +2181,9 @@ class AscendAttnBackend(AttentionBackend):
             self.page_size,
             layer.tp_v_head_num * layer.v_head_dim,
         )
-        use_sink_lse = self._use_welm_fia_sink_lse(sinks)
 
         if self._can_use_tnd(layer):
-            attn_out, softmax_lse = torch_npu.npu_fused_infer_attention_score_v2(
+            attn_out, _ = torch_npu.npu_fused_infer_attention_score_v2(
                 query=q,
                 key=key,
                 value=value,
@@ -2052,13 +2199,9 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_kvlen=actual_seq_kvlen,
                 softmax_scale=layer.scaling,
                 sparse_mode=sparse_mode,
-                learnable_sink=None if use_sink_lse else sinks,
-                return_softmax_lse=use_sink_lse,
+                learnable_sink=sinks,
+                return_softmax_lse=False,
             )
-            if use_sink_lse:
-                attn_out = self._apply_welm_sink_lse(
-                    attn_out, softmax_lse, sinks, "TND"
-                )
         else:
             # Keep a generic BSND fallback for checkpoints whose head dimensions
             # are outside FIA's TND whitelist.  Each call still has Q length 1.
@@ -2068,7 +2211,7 @@ class AscendAttnBackend(AttentionBackend):
                 dtype=q.dtype,
             )
             for seq_idx, total_kv_len in enumerate(actual_seq_kvlen.tolist()):
-                result, softmax_lse = torch_npu.npu_fused_infer_attention_score_v2(
+                result, _ = torch_npu.npu_fused_infer_attention_score_v2(
                     query=q[None, seq_idx : seq_idx + 1],
                     key=key,
                     value=value,
@@ -2084,13 +2227,9 @@ class AscendAttnBackend(AttentionBackend):
                     softmax_scale=layer.scaling,
                     pre_tokens=pre_tokens,
                     next_tokens=next_tokens,
-                    learnable_sink=None if use_sink_lse else sinks,
-                    return_softmax_lse=use_sink_lse,
+                    learnable_sink=sinks,
+                    return_softmax_lse=False,
                 )
-                if use_sink_lse:
-                    result = self._apply_welm_sink_lse(
-                        result, softmax_lse, sinks, "BSND"
-                    )
                 attn_out[seq_idx] = result[0, 0]
 
         return attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -2211,6 +2350,11 @@ class AscendAttnBackend(AttentionBackend):
                     sinks=sinks,
                 )
 
+            if self.use_welm_flash_attn:
+                return self._forward_welm_flash_attention(
+                    q, k_cache, v_cache, layer, sinks
+                )
+
             if sinks is not None or (
                 self._has_layerwise_sliding_window(layer) and self.use_fia
             ):
@@ -2220,7 +2364,6 @@ class AscendAttnBackend(AttentionBackend):
                 else:
                     block_tables = self.forward_metadata.block_tables
                 if self.use_fia and not self._use_welm_sink_triton(sinks):
-                    use_sink_lse = self._use_welm_fia_sink_lse(sinks)
                     if self._can_use_tnd(layer):
                         num_token_padding = q.shape[0]
                         if num_token_padding > forward_batch.num_token_non_padded_cpu:
@@ -2230,7 +2373,7 @@ class AscendAttnBackend(AttentionBackend):
                             ]
                         q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                         block_size = self.page_size
-                        attn_out, softmax_lse = torch_npu.npu_fused_infer_attention_score_v2(
+                        attn_out, _ = torch_npu.npu_fused_infer_attention_score_v2(
                             query=q,
                             key=k_cache.view(
                                 -1,
@@ -2262,13 +2405,9 @@ class AscendAttnBackend(AttentionBackend):
                             actual_seq_kvlen=self.forward_metadata.seq_lens_cpu_int,
                             softmax_scale=layer.scaling,
                             sparse_mode=4 if layer.sliding_window_size != -1 else 3,
-                            learnable_sink=None if use_sink_lse else sinks,
-                            return_softmax_lse=use_sink_lse,
+                            learnable_sink=sinks,
+                            return_softmax_lse=False,
                         )
-                        if use_sink_lse:
-                            attn_out = self._apply_welm_sink_lse(
-                                attn_out, softmax_lse, sinks, "TND"
-                            )
                         attn_out = attn_out.view(
                             -1, layer.tp_q_head_num * layer.v_head_dim
                         )
@@ -2300,7 +2439,7 @@ class AscendAttnBackend(AttentionBackend):
                             if q_len == 0:
                                 continue
                             total_kv_len = seq_lens_cpu[seq_idx]
-                            result, softmax_lse = torch_npu.npu_fused_infer_attention_score_v2(
+                            result, _ = torch_npu.npu_fused_infer_attention_score_v2(
                                 query=q[None, q_len_offset : q_len_offset + q_len],
                                 key=k_cache.view(
                                     -1,
@@ -2334,13 +2473,9 @@ class AscendAttnBackend(AttentionBackend):
                                     if layer.sliding_window_size != -1
                                     else FULL_ATTENTION_WINDOW
                                 ),
-                                learnable_sink=None if use_sink_lse else sinks,
-                                return_softmax_lse=use_sink_lse,
+                                learnable_sink=sinks,
+                                return_softmax_lse=False,
                             )
-                            if use_sink_lse:
-                                result = self._apply_welm_sink_lse(
-                                    result, softmax_lse, sinks, "BSND"
-                                )
                             attn_out[q_len_offset : q_len_offset + q_len] = result[0]
                             q_len_offset += q_len
 
@@ -3011,6 +3146,12 @@ class AscendAttnBackend(AttentionBackend):
             )
             query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
 
+            if self.use_welm_flash_attn:
+                self._check_welm_mtp()
+                return self._forward_welm_flash_attention(
+                    query, k_cache, v_cache, layer, sinks
+                )
+
             is_swa_layer = self._has_layerwise_sliding_window(layer)
             if is_swa_layer and self.is_hybrid_swa:
                 block_table = self.forward_metadata.block_tables_swa
@@ -3306,6 +3447,15 @@ class AscendAttnBackend(AttentionBackend):
                     use_scatter_pa_kv_cache=True,
                 )
 
+        if self.use_welm_flash_attn:
+            return self._forward_welm_flash_attention(
+                q,
+                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                layer,
+                sinks,
+            )
+
         if (
             self.force_fia_v2_decode_graph
             or sinks is not None
@@ -3355,8 +3505,7 @@ class AscendAttnBackend(AttentionBackend):
                 else:
                     sparse_mode = 3
 
-                use_sink_lse = self._use_welm_fia_sink_lse(sinks)
-                attn_output, softmax_lse = torch_npu.npu_fused_infer_attention_score_v2(
+                attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
                     query,
                     k_cache,
                     v_cache,
@@ -3380,13 +3529,9 @@ class AscendAttnBackend(AttentionBackend):
                     block_size=self.page_size,
                     actual_seq_qlen=actual_seq_lengths,
                     actual_seq_kvlen=actual_seq_lengths_kv,
-                    learnable_sink=None if use_sink_lse else sinks,
-                    return_softmax_lse=use_sink_lse,
+                    learnable_sink=sinks,
+                    return_softmax_lse=False,
                 )
-                if use_sink_lse:
-                    attn_output = self._apply_welm_sink_lse(
-                        attn_output, softmax_lse, sinks, "TND"
-                    )
                 attn_output = attn_output.view(
                     -1, layer.tp_q_head_num * layer.v_head_dim
                 )
@@ -3664,6 +3809,11 @@ class AscendAttnBackend(AttentionBackend):
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
+            if self.use_welm_flash_attn:
+                return self._forward_welm_flash_attention(
+                    q, k_cache, v_cache, layer, sinks
+                )
+
             if sinks is not None or (
                 self._has_layerwise_sliding_window(layer) and self.use_fia
             ):
@@ -3673,7 +3823,6 @@ class AscendAttnBackend(AttentionBackend):
                 else:
                     block_tables = self.forward_metadata.block_tables
                 if self.use_fia and not self._use_welm_sink_triton(sinks):
-                    use_sink_lse = self._use_welm_fia_sink_lse(sinks)
                     if self.forward_metadata.seq_lens_cpu_int is None:
                         actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
                     else:
@@ -3689,7 +3838,7 @@ class AscendAttnBackend(AttentionBackend):
                     # mask and can produce a tiling error or wrong visibility.
                     mask = self.fia_mask
 
-                    attn_out, softmax_lse = torch_npu.npu_fused_infer_attention_score_v2(
+                    attn_out, _ = torch_npu.npu_fused_infer_attention_score_v2(
                         q.view(
                             forward_batch.batch_size,
                             -1,
@@ -3714,13 +3863,9 @@ class AscendAttnBackend(AttentionBackend):
                         actual_seq_kvlen=actual_seq_len_kv,
                         pre_tokens=self._get_fia_pre_tokens(layer),
                         next_tokens=0,
-                        learnable_sink=None if use_sink_lse else sinks,
-                        return_softmax_lse=use_sink_lse,
+                        learnable_sink=sinks,
+                        return_softmax_lse=False,
                     )
-                    if use_sink_lse:
-                        attn_out = self._apply_welm_sink_lse(
-                            attn_out, softmax_lse, sinks, "BSND"
-                        )
                     attn_out = attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
                 else:
                     if self._is_welm_full_sink_layer(layer, sinks):

@@ -81,20 +81,20 @@ def _slice_welm_mirror_states(states, num_rows: int):
     return sliced
 
 
-def welmv4_graph_uses_only_triton_sink(model_runner: ModelRunner) -> bool:
-    """Whether every WeLM layer in this runner uses Triton sink attention.
+def welmv4_graph_uses_device_attention_metadata(model_runner: ModelRunner) -> bool:
+    """Whether WeLM attention needs only device inputs at graph replay.
 
-    Such graphs have no host-side FIA sequence-length attribute for
-    ``NPUGraph.update``. Their replay metadata is instead refreshed through the
-    fixed device buffers owned by ``AscendAttnBackend`` before graph replay.
+    Native FlashAttn and all-sink Triton graphs have no host-side FIA length
+    attribute for ``NPUGraph.update``. AscendAttnBackend refreshes their fixed
+    input buffers; FlashAttn also regenerates its schedule inside the graph.
     """
     hf_config = model_runner.model_config.hf_config
     architectures = hf_config.architectures or []
     is_nextn = "WeLMV4MoeForCausalLMNextN" in architectures
     if not (is_nextn or "WeLMV4MoeForCausalLM" in architectures):
         return False
-    if get_bool_env_var("ASCEND_USE_FIA_SINK_LSE", "False"):
-        return False
+    if get_bool_env_var("WELM_NPU_USE_FLASH_ATTN", "False"):
+        return True
 
     num_layers = int(getattr(hf_config, "num_hidden_layers", 0) or 0)
     layer_offset = (
@@ -170,8 +170,8 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             )
             for arch in (model_runner.model_config.hf_config.architectures or [])
         )
-        self.welmv4_triton_sink_only = welmv4_graph_uses_only_triton_sink(
-            model_runner
+        self.welmv4_device_attention_metadata = (
+            welmv4_graph_uses_device_attention_metadata(model_runner)
         )
 
     def _init_arch_map(self):
@@ -292,7 +292,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
 
         graph_key = self._make_graph_key(self.bs)
 
-        if self.welmv4_triton_sink_only:
+        if self.welmv4_device_attention_metadata:
             output = self.backend.replay(graph_key, forward_batch)
         elif not (
             is_deepseek_dsa(self.model_runner.model_config.hf_config)

@@ -24,7 +24,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_v4,
 )
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import (
-    welmv4_graph_uses_only_triton_sink,
+    welmv4_graph_uses_device_attention_metadata,
 )
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
@@ -39,8 +39,8 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
     def __init__(self, eagle_worker: EagleDraftWorker):
         self._init_arch_map()
         super().__init__(eagle_worker)
-        self._welmv4_triton_sink_only = welmv4_graph_uses_only_triton_sink(
-            self.model_runner
+        self._welmv4_device_attention_metadata = (
+            welmv4_graph_uses_device_attention_metadata(self.model_runner)
         )
 
     def _init_arch_map(self):
@@ -97,8 +97,8 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         frozen_welm_kv = bool(
             getattr(forward_batch.spec_info, "welmv4_mtp_frozen_kv", False)
         )
-        if self._welmv4_triton_sink_only:
-            # Triton sink attention consumes the device metadata refreshed by
+        if self._welmv4_device_attention_metadata:
+            # WeLM FlashAttn/Triton consume the device metadata refreshed by
             # init_forward_metadata_out_graph; no CPU graph attribute exists.
             # This is a static property of the captured graph and therefore
             # also applies to an idle replay whose runtime spec stub carries

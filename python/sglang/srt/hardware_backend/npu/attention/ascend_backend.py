@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -139,6 +139,13 @@ class ForwardMetadata:
     welm_flash_cu_seqlens_q: Optional[torch.Tensor] = None
     welm_flash_seqused_q: Optional[torch.Tensor] = None
     welm_flash_seqused_kv: Optional[torch.Tensor] = None
+    welm_flash_max_seqlen_q: int = -1
+
+    # Read-only schedules shared by equal attention geometries in this forward.
+    # Each graph bucket owns its capture outputs; never share across forwards.
+    welm_flash_schedules: dict[tuple, torch.Tensor] = field(default_factory=dict)
+    # Ordinary prefill consumers use one Q per request, unlike source layers.
+    welm_flash_mirror_q_lengths: Optional[tuple[torch.Tensor, torch.Tensor]] = None
 
 
 class AscendAttnMaskBuilder:
@@ -513,6 +520,16 @@ class AscendAttnBackend(AttentionBackend):
         else:
             q_lens_cpu = metadata.extend_seq_lens_cpu_int.clone()
         q_lens_cpu.masked_fill_(forward_batch.seq_lens_cpu <= 0, 0)
+        if mode.is_target_verify():
+            metadata.welm_flash_max_seqlen_q = self.speculative_num_draft_tokens
+        elif mode.is_decode_or_idle():
+            metadata.welm_flash_max_seqlen_q = 1
+        else:
+            # Already on CPU: no new device synchronization. Fixed-slot draft
+            # extend yields D; prefill draft extend retains its prompt Q length.
+            metadata.welm_flash_max_seqlen_q = (
+                max(1, int(q_lens_cpu.max().item())) if bs else 1
+            )
         metadata.extend_seq_lens_cpu_int = q_lens_cpu
         metadata.welm_flash_seqused_q = q_lens_cpu.to(self.device, non_blocking=True)
         cu_q_cpu = torch.zeros(bs + 1, dtype=torch.int32, device="cpu")
@@ -534,8 +551,8 @@ class AscendAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         """Paged Full/SWA attention with native FP32 sinks, eager or graph.
 
-        Generate the schedule on every invocation so capture includes both
-        FlashAttnMetadata and FlashAttn. No warmup/cross-forward schedule cache.
+        Generate one schedule per Q family and attention geometry in this
+        forward. The in-graph hook clears warmup results before actual capture.
         """
         metadata = self.forward_metadata
         query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
@@ -545,11 +562,17 @@ class AscendAttnBackend(AttentionBackend):
             # Ordinary consumers prune Q to one row per request, but retain
             # the full prompt K/V. Do not overwrite source/prefill Q metadata.
             num_tokens = kv_lens.shape[0]
-            cu_q = torch.arange(num_tokens + 1, dtype=torch.int32, device=q.device)
-            q_lens = (kv_lens > 0).to(torch.int32)
+            if metadata.welm_flash_mirror_q_lengths is None:
+                metadata.welm_flash_mirror_q_lengths = (
+                    torch.arange(num_tokens + 1, dtype=torch.int32, device=q.device),
+                    (kv_lens > 0).to(torch.int32),
+                )
+            cu_q, q_lens = metadata.welm_flash_mirror_q_lengths
+            max_q = 1
         else:
             cu_q = metadata.welm_flash_cu_seqlens_q
             q_lens = metadata.welm_flash_seqused_q
+            max_q = metadata.welm_flash_max_seqlen_q
             num_tokens = (
                 padded_tokens
                 if self.graph_mode
@@ -574,7 +597,7 @@ class AscendAttnBackend(AttentionBackend):
             cu_seqlens_kv=None,
             seqused_q=q_lens,
             seqused_kv=kv_lens,
-            max_seqlen_q=-1,
+            max_seqlen_q=max_q,
             max_seqlen_kv=-1,
             mask_mode=4 if is_swa else 3,
             win_left=layer.sliding_window_size if is_swa else -1,
@@ -583,12 +606,32 @@ class AscendAttnBackend(AttentionBackend):
             layout_kv="PA_BBND",
             layout_out="TND",
         )
-        schedule = self._welm_flash_attn_metadata(
+        # Lengths/batch/device are fixed within this ForwardMetadata and Q
+        # family. KV cache addresses, layer IDs and sink values do not affect
+        # scheduling. Mirror consumers must not reuse the source's multi-Q plan.
+        schedule_key = (
+            mirror_prefill,
             layer.tp_q_head_num,
             layer.tp_k_head_num,
             layer.qk_head_dim,
-            **common,
+            common["mask_mode"],
+            common["win_left"],
+            common["win_right"],
+            common["layout_q"],
+            common["layout_kv"],
+            common["layout_out"],
+            common["max_seqlen_q"],
+            common["max_seqlen_kv"],
         )
+        schedule = metadata.welm_flash_schedules.get(schedule_key)
+        if schedule is None:
+            schedule = self._welm_flash_attn_metadata(
+                layer.tp_q_head_num,
+                layer.tp_k_head_num,
+                layer.qk_head_dim,
+                **common,
+            )
+            metadata.welm_flash_schedules[schedule_key] = schedule
         output, _ = self._welm_flash_attn(
             query,
             key,
@@ -1240,6 +1283,13 @@ class AscendAttnBackend(AttentionBackend):
             out_cache_loc=forward_batch.out_cache_loc,
         )
 
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        if self.use_welm_flash_attn:
+            # run_once invokes this for each warmup AND the actual capture.
+            # Capture must record fresh producers, not reuse warmup schedules.
+            self.forward_metadata.welm_flash_schedules.clear()
+            self.forward_metadata.welm_flash_mirror_q_lengths = None
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
@@ -1513,6 +1563,8 @@ class AscendAttnBackend(AttentionBackend):
                 if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
                 else 1
             )
+            # Fixed per-request upper bound, including fully padded replays.
+            metadata.welm_flash_max_seqlen_q = width
             # Unlike the Triton cu buffer, this describes the entire physical
             # B_bucket x width tensor and does not shrink with the live batch.
             metadata.welm_flash_cu_seqlens_q = (

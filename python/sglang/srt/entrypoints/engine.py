@@ -120,6 +120,7 @@ from sglang.srt.utils.network import (
     get_zmq_socket,
     is_port_available,
 )
+from sglang.srt.utils.npu_affinity import log_npu_affinity_summary
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.version import __version__
@@ -908,6 +909,12 @@ class Engine(EngineScoreMixin, EngineBase):
 
         def wait_for_ready():
             infos = _wait_for_scheduler_ready(scheduler_pipe_readers, scheduler_procs)
+            log_npu_affinity_summary(
+                infos,
+                base_gpu_id=server_args.base_gpu_id,
+                tp_size=server_args.tp_size,
+                port=server_args.port,
+            )
             scheduler_infos.extend(infos)
             if use_dp_controller:
                 for info in infos:

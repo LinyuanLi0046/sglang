@@ -311,6 +311,10 @@ class Envs:
     SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS = EnvInt(0)
     IS_H200 = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
+    # NPU CPU affinity always binds early and reapplies to all threads after init.
+    # Zero uses the NPU's full, non-overlapping share of local physical cores.
+    SGLANG_NPU_AFFINITY_PCORES_PER_PROC = EnvInt(0)
+    SGLANG_NPU_MEMORY_PREFERRED_BIND = EnvBool(False)
     SGLANG_ENABLE_CP_V2 = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)

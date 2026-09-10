@@ -17,6 +17,11 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_cpu_ids_by_node, is_cuda
+from sglang.srt.utils.npu_affinity import (
+    NpuAffinityError,
+    query_npu_smi_topology,
+    resolve_physical_npu_id,
+)
 
 _is_cuda = is_cuda()
 
@@ -25,6 +30,42 @@ logger = logging.getLogger(__name__)
 
 @contextmanager
 def configure_subprocess(server_args: ServerArgs, gpu_id: int):
+    npu_preferred = (
+        server_args.device == "npu" and envs.SGLANG_NPU_MEMORY_PREFERRED_BIND.get()
+    )
+    npu_entry = None
+    if server_args.device == "npu" and (
+        npu_preferred
+        or (server_args.numa_node is not None and envs.SGLANG_SET_CPU_AFFINITY.get())
+    ):
+        # The launcher only needs device/NUMA topology. CPU ownership and the
+        # initial allowed mask are resolved in the scheduler child, not here.
+        try:
+            physical_npu_id = resolve_physical_npu_id(gpu_id)
+            npu_entry = query_npu_smi_topology().entries.get(physical_npu_id)
+            if npu_entry is None:
+                raise NpuAffinityError(
+                    f"Physical NPU{physical_npu_id} is absent from npu-smi topology",
+                    stage="select_npu_topology",
+                    logical_npu_id=gpu_id,
+                    physical_npu_id=physical_npu_id,
+                )
+        except NpuAffinityError as exc:
+            logger.warning(
+                "NPU NUMA topology unavailable for runtime NPU %s: %s; "
+                "skipping automatic memory preference",
+                gpu_id,
+                exc,
+            )
+        if npu_entry is not None and server_args.numa_node is not None:
+            configured_node = server_args.numa_node[gpu_id]
+            if configured_node != npu_entry.numa_node:
+                raise RuntimeError(
+                    f"Configured NUMA node {configured_node} conflicts with "
+                    f"physical NPU{npu_entry.physical_npu_id} topology "
+                    f"NUMA node {npu_entry.numa_node}"
+                )
+
     if envs.SGLANG_NUMA_BIND_V2.get():
         numa_node = get_numa_node_if_available(server_args, gpu_id)
         if numa_node is not None:
@@ -54,19 +95,55 @@ def configure_subprocess(server_args: ServerArgs, gpu_id: int):
                             f"{probe_suffix}; skipping NUMA binding for GPU {gpu_id}."
                         ),
                     )
-                    yield
-                    return
-                executable, debug_str = _create_numactl_executable(
-                    numactl_args=numactl_args
-                )
-                debug_str += (
-                    f", logical_gpu_id={gpu_id}, "
-                    f"physical_gpu_id={_get_nvml_device_index(gpu_id)}, "
-                    f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')}"
-                )
-                with _mp_set_executable(executable=executable, debug_str=debug_str):
-                    yield
-                    return
+                    if not npu_preferred:
+                        yield
+                        return
+                else:
+                    executable, debug_str = _create_numactl_executable(
+                        numactl_args=numactl_args
+                    )
+                    if server_args.device == "npu":
+                        debug_str += f", runtime_npu={gpu_id}"
+                        if npu_entry is not None:
+                            debug_str += f", physical_npu={npu_entry.physical_npu_id}"
+                    else:
+                        debug_str += (
+                            f", logical_gpu_id={gpu_id}, "
+                            f"physical_gpu_id={_get_nvml_device_index(gpu_id)}, "
+                            "CUDA_VISIBLE_DEVICES="
+                            f"{os.environ.get('CUDA_VISIBLE_DEVICES', '')}"
+                        )
+                    with _mp_set_executable(executable=executable, debug_str=debug_str):
+                        yield
+                        return
+
+    if npu_preferred and npu_entry is not None:
+        requested_args = f"--preferred={npu_entry.numa_node}"
+        effective_args, probe_err = _probe_numactl_args(requested_args)
+        if effective_args is None:
+            logger.warning(
+                "NPU memory preference skipped: runtime_npu=%s physical_npu=%s "
+                "numa=%s reason=%s",
+                gpu_id,
+                npu_entry.physical_npu_id,
+                npu_entry.numa_node,
+                probe_err or "numactl rejected the policy",
+            )
+        else:
+            executable, debug_str = _create_numactl_executable(
+                numactl_args=effective_args
+            )
+            logger.info(
+                "NPU memory preference: runtime_npu=%s physical_npu=%s "
+                "numa=%s args=%s",
+                gpu_id,
+                npu_entry.physical_npu_id,
+                npu_entry.numa_node,
+                effective_args,
+            )
+            with _mp_set_executable(executable=executable, debug_str=debug_str):
+                yield
+                return
     yield
 
 

@@ -302,6 +302,13 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
+from sglang.srt.utils.npu_affinity import (
+    NpuAffinityError,
+    apply_npu_cpu_affinity,
+    build_npu_affinity_report,
+    log_npu_affinity_result,
+    resolve_npu_affinity_assignment,
+)
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.tensor_bridge import use_mlx
@@ -4870,8 +4877,9 @@ def configure_scheduler_process(
     configure_logger(server_args, prefix=prefix)
     suppress_other_loggers()
 
-    # Set cpu affinity to this gpu process
-    if envs.SGLANG_SET_CPU_AFFINITY.get():
+    # NPU workers bind before initialization and reapply after it completes.
+    # Keep the existing binding point and policy for other devices.
+    if envs.SGLANG_SET_CPU_AFFINITY.get() and not _is_npu:
         set_gpu_proc_affinity(
             server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
         )
@@ -4881,6 +4889,57 @@ def configure_scheduler_process(
             numa_bind_to_node(numa_node)
 
     return dp_rank
+
+
+def _prepare_npu_scheduler_cpu_affinity(server_args: ServerArgs, gpu_id: int):
+    if not (_is_npu and envs.SGLANG_SET_CPU_AFFINITY.get()):
+        return None, None, None
+
+    try:
+        # gpu_id already includes base_gpu_id. Resolve once, before narrowing
+        # this thread's allowed CPUs; final must reuse exactly this assignment.
+        assignment = resolve_npu_affinity_assignment(
+            logical_npu_id=gpu_id, emit_topology_log=False
+        )
+        if server_args.numa_node is not None:
+            configured_node = server_args.numa_node[gpu_id]
+            if configured_node != assignment.numa_node:
+                raise NpuAffinityError(
+                    f"Configured NUMA node {configured_node} conflicts with "
+                    f"NPU topology NUMA node {assignment.numa_node}",
+                    stage="validate_configured_numa_node",
+                    logical_npu_id=assignment.logical_npu_id,
+                    physical_npu_id=assignment.physical_npu_id,
+                )
+        result = apply_npu_cpu_affinity(
+            assignment, phase="early", bind_all_threads=False, emit_log=False
+        )
+        return assignment, result, None
+    except NpuAffinityError as exc:
+        # Logging is configured below. Do not fall back to whole-machine CPU
+        # slices, which can leave the actual NPU's affinity range.
+        return None, None, exc
+
+
+def _log_npu_scheduler_affinity_failure(exc: NpuAffinityError, phase: str):
+    logger.warning(
+        "\n================ NPU CPU AFFINITY FAILED ================\n"
+        "PID              : %s\n"
+        "Phase            : %s\n"
+        "Runtime NPU      : %s\n"
+        "Physical NPU     : %s\n"
+        "Topology source  : npu-smi info -t topo\n"
+        "Failure stage    : %s\n"
+        "Reason           : %s\n"
+        "Result           : automatic binding failed; no GPU affinity fallback\n"
+        "=========================================================\n",
+        os.getpid(),
+        phase,
+        exc.logical_npu_id,
+        exc.physical_npu_id,
+        exc.stage,
+        exc,
+    )
 
 
 def run_scheduler_process(
@@ -4898,6 +4957,10 @@ def run_scheduler_process(
     display_dp_rank: Optional[int] = None,
     display_moe_ep_rank: Optional[int] = None,
 ):
+    npu_assignment, npu_early_result, npu_affinity_error = (
+        _prepare_npu_scheduler_cpu_affinity(server_args, gpu_id)
+    )
+
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
     dp_rank = configure_scheduler_process(
@@ -4913,6 +4976,11 @@ def run_scheduler_process(
         display_dp_rank=display_dp_rank,
         display_moe_ep_rank=display_moe_ep_rank,
     )
+    # Print early results only after configuring the worker's rank-aware logger.
+    if npu_early_result is not None:
+        log_npu_affinity_result(npu_assignment, npu_early_result, phase="early")
+    elif npu_affinity_error is not None:
+        _log_npu_scheduler_affinity_failure(npu_affinity_error, phase="early")
     # Scheduler.__init__ reads the config namespaces before the model
     # worker's own publish.
     publish(server_args, role="scheduler")
@@ -4947,8 +5015,31 @@ def run_scheduler_process(
             dp_rank,
         )
 
+        # Include threads created during model/runtime initialization. Reuse the
+        # original assignment, never repartition the already-bound CPU mask.
+        npu_final_result = None
+        if npu_assignment is not None:
+            try:
+                npu_final_result = apply_npu_cpu_affinity(
+                    npu_assignment, phase="final", bind_all_threads=True
+                )
+            except NpuAffinityError as exc:
+                npu_affinity_error = exc
+                _log_npu_scheduler_affinity_failure(exc, phase="final")
+
         # Send initialization info back to the parent process
-        pipe_writer.send(scheduler.get_init_info())
+        init_info = scheduler.get_init_info()
+        if _is_npu and envs.SGLANG_SET_CPU_AFFINITY.get():
+            init_info["npu_cpu_affinity"] = build_npu_affinity_report(
+                npu_assignment,
+                npu_final_result,
+                runtime_npu_id=gpu_id,
+                tp_rank=tp_rank,
+                pp_rank=pp_rank,
+                dp_rank=dp_rank,
+                error=npu_affinity_error,
+            )
+        pipe_writer.send(init_info)
 
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
         scheduler.run_event_loop()

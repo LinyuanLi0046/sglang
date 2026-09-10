@@ -66,6 +66,7 @@ from sglang.srt.utils.network import (
     get_zmq_socket,
     get_zmq_socket_on_host,
 )
+from sglang.srt.utils.npu_affinity import log_npu_affinity_summary
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -729,6 +730,12 @@ class DataParallelController:
         for i in range(len(scheduler_pipe_readers)):
             scheduler_info.append(scheduler_pipe_readers[i].recv())
 
+        log_npu_affinity_summary(
+            scheduler_info,
+            base_gpu_id=server_args.base_gpu_id + base_gpu_id,
+            tp_size=server_args.tp_size,
+            port=server_args.port,
+        )
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
 

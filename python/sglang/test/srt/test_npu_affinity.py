@@ -572,8 +572,13 @@ class TestApplyAffinity(unittest.TestCase):
         self.assertEqual(result.threads_exited, 2)
         self.assertEqual(result.threads_failed, 1)
         self.assertEqual(result.threads_mismatched, 1)
-        self.assertIn("tid=103", "\n".join(logs.output))
-        self.assertIn("tid=104", "\n".join(logs.output))
+        output = logs.records[0].getMessage().strip().splitlines()
+        self.assertEqual(len(output), 4)  # Two content lines and two separators.
+        self.assertIn("status=INCOMPLETE", output[1])
+        self.assertIn("threads_matched=1/5", output[2])
+        self.assertIn("threads_failed=1", output[2])
+        self.assertIn("threads_mismatched=1", output[2])
+        self.assertIn("threads_exited=2", output[2])
 
     def test_thread_enumeration_failure_is_reported(self):
         def denied_threads():
@@ -672,22 +677,32 @@ class TestApplyAffinity(unittest.TestCase):
                 logical_npu_id=0, emit_topology_log=True
             )
             apply_npu_cpu_affinity(assignment, phase="early", bind_all_threads=False)
-            apply_npu_cpu_affinity(assignment, phase="final", bind_all_threads=False)
+            with patch.object(
+                npu_affinity.psutil,
+                "Process",
+                return_value=SimpleNamespace(threads=lambda: [SimpleNamespace(id=101)]),
+            ):
+                apply_npu_cpu_affinity(assignment, phase="final", bind_all_threads=True)
         output = "\n".join(logs.output)
         self.assertIn("raw_cpu_affinity=0-7,16-23", output)
         self.assertIn("===============", output)
         self.assertIn("NPU CPU AFFINITY", output)
         self.assertIn("phase=early", output)
         self.assertIn("phase=final", output)
-        self.assertIn("main_matched=True", output)
+        self.assertIn("status=SUCCESS", output)
+        self.assertIn("threads=main-only", output)
+        self.assertIn("threads_matched=1/1", output)
         self.assertIn("threads_failed=0", output)
-        self.assertTrue(
-            any(
-                "\n" in record.getMessage()
-                and "NPU CPU AFFINITY" in record.getMessage()
-                for record in logs.records
-            )
-        )
+        result_blocks = [
+            record.getMessage().strip().splitlines()
+            for record in logs.records
+            if "NPU CPU AFFINITY RESULT" in record.getMessage()
+        ]
+        self.assertEqual(len(result_blocks), 2)
+        for lines in result_blocks:
+            self.assertEqual(len(lines), 4)  # Two content lines and two separators.
+            self.assertIn("raw_cpu_affinity=0-7,16-23", lines[1])
+            self.assertIn("main_cpu_mask=0-1,16-17 assigned_cores=2P/4L", lines[2])
 
 
 class TestNpuAffinitySummary(unittest.TestCase):

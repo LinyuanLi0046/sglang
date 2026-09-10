@@ -880,7 +880,7 @@ def log_npu_affinity_result(
     result: NpuAffinityApplyResult,
     phase: Literal["early", "final"],
 ) -> None:
-    """Log one result block, including an early result after logger setup."""
+    """Log two result lines; full topology and thread issues stay in the summary."""
 
     if phase not in ("early", "final"):
         raise ValueError(f"Unsupported NPU affinity phase {phase!r}")
@@ -888,75 +888,35 @@ def log_npu_affinity_result(
     raw_affinity = assignment.raw_cpu_affinity or format_cpu_list(
         assignment.local_cpu_ids
     )
-    cores_by_socket: dict[int, list[int]] = defaultdict(list)
-    for socket_id, core_id in assignment.physical_core_keys:
-        cores_by_socket[socket_id].append(core_id)
-    core_description = "\n".join(
-        f"  socket={socket_id} physical_core_ids={format_cpu_list(core_ids)}"
-        for socket_id, core_ids in sorted(cores_by_socket.items())
+    binding = (
+        f"main_cpu_mask={format_cpu_list(result.main_actual_cpu_ids)} "
+        f"assigned_cores={assignment.effective_pcores}P/{len(result.requested_cpu_ids)}L"
     )
-    lines = [
-        "=============== NPU CPU AFFINITY RESULT ===============",
-        f"phase={phase} status={status} pid={os.getpid()}",
-        f"topology_source={assignment.topology_source!r}",
-        "--------------- Physical NPU topology ----------------",
-        f"runtime_npu={assignment.runtime_npu_id} "
-        f"physical_npu={assignment.physical_npu_id} numa={assignment.numa_node}",
-        f"visible_devices={assignment.visible_devices}",
-        f"npu-smi physical NPU{assignment.physical_npu_id} "
-        f"raw_cpu_affinity={raw_affinity}",
-        "--------------- Fixed CPU ownership ------------------",
-        f"group_physical_npus={list(assignment.group_physical_npu_ids)} "
-        f"slot={assignment.slot_index}/{assignment.slots_on_node} (zero-based)",
-        f"ownership_slice=[{assignment.ownership_start}:{assignment.ownership_end}] "
-        f"owned_physical_cores={len(assignment.owned_physical_core_keys)}",
-        f"allowed_cpus_before_early={format_cpu_list(assignment.allowed_cpu_ids)}",
-        f"requested_pcores={assignment.requested_pcores}"
-        + (" (auto)" if assignment.requested_pcores == 0 else ""),
-        f"effective_pcores={assignment.effective_pcores}",
-        f"logical_cpus={len(result.requested_cpu_ids)}",
-        "assigned_physical_cores:\n" + core_description,
-        "--------------- CPU mask read-back -------------------",
-        f"expected_cpu_mask={format_cpu_list(result.requested_cpu_ids)}",
-        f"actual_main_cpu_mask={format_cpu_list(result.main_actual_cpu_ids)}",
-        f"main_matched={result.main_matched}",
-        "--------------- Thread binding results ---------------",
-        f"bind_all_threads={result.bind_all_threads}",
-        f"threads_total={result.threads_total} threads_bound={result.threads_bound} "
-        f"threads_matched={result.threads_bound - result.threads_mismatched}",
-        f"threads_exited={result.threads_exited} "
-        f"threads_failed={result.threads_failed} "
-        f"threads_mismatched={result.threads_mismatched}",
-    ]
     if result.bind_all_threads:
-        lines.append(
-            f"matched_threads_cpu_mask={format_cpu_list(result.requested_cpu_ids)}"
+        binding += (
+            f" threads_matched={result.threads_bound - result.threads_mismatched}"
+            f"/{result.threads_total} threads_failed={result.threads_failed}"
+            f" threads_mismatched={result.threads_mismatched}"
+            f" threads_exited={result.threads_exited}"
         )
     else:
-        lines.append("all-thread binding will run after Scheduler initialization")
-    if 0 < assignment.effective_pcores < assignment.requested_pcores:
-        lines.append(
-            "CPU budget clipped to available complete SMT cores within fixed ownership"
+        binding += " threads=main-only"
+    if not result.main_matched:
+        binding += (
+            " main_matched=False expected_cpu_mask="
+            + format_cpu_list(result.requested_cpu_ids)
         )
-    for thread_result in result.thread_results:
-        if thread_result.status in ("failed", "mismatched"):
-            tid = (
-                str(thread_result.thread_id)
-                if thread_result.thread_id is not None
-                else "enumeration"
-            )
-            lines.extend(
-                [
-                    f"tid={tid} status={thread_result.status}",
-                    "  expected_cpu_mask="
-                    + format_cpu_list(result.requested_cpu_ids),
-                    "  actual_cpu_mask="
-                    + format_cpu_list(thread_result.actual_cpu_ids),
-                ]
-            )
-            if thread_result.error:
-                lines.append(f"  error={thread_result.error}")
-    lines.append("=============== END NPU CPU AFFINITY RESULT ===============")
+    if 0 < assignment.effective_pcores < assignment.requested_pcores:
+        binding += f" requested_pcores={assignment.requested_pcores} (clipped)"
+    lines = [
+        "=============== NPU CPU AFFINITY RESULT ===============",
+        f"phase={phase} status={status} pid={os.getpid()} "
+        f"runtime_npu={assignment.runtime_npu_id} "
+        f"physical_npu={assignment.physical_npu_id} numa={assignment.numa_node} "
+        f"raw_cpu_affinity={raw_affinity}",
+        binding,
+        "=============== END NPU CPU AFFINITY RESULT ===============",
+    ]
     log = logger.info if result.success else logger.warning
     log("\n" + "\n".join(lines) + "\n")
 

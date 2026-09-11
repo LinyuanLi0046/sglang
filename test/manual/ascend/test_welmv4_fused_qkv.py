@@ -9,10 +9,11 @@ No server, checkpoint, distributed initialization or small operator wheel is
 needed. The operator is imported from sglang.srt.layers. Missing NPU support
 is reported as SKIP; SDK import/compilation failures on NPU remain errors.
 
-The tests compare contiguous/segmented loads with per-row positions, and
-check dense outputs, raw mirror outputs and KV scatter. They do not establish
-independent GEMM/norm/RoPE accuracy or model/Graph correctness, and do not
-measure latency. Compiled callables are reused across M and segment lengths.
+The tests compare contiguous loads with per-row positions, including ragged
+prefill and target verify, and check dense outputs, raw mirror outputs and KV
+scatter. They do not establish independent GEMM/norm/RoPE accuracy or
+model/Graph correctness, and do not measure latency. Compiled callables are
+reused across M.
 """
 
 import importlib.util
@@ -83,7 +84,6 @@ class TestWeLMv4FusedQKV(unittest.TestCase):
                 self.MAX_POSITION,
                 return_v=True,
                 positions_contiguous=mode == "contiguous",
-                positions_segmented=mode == "segmented",
             )
         return self.programs[key]
 
@@ -99,7 +99,6 @@ class TestWeLMv4FusedQKV(unittest.TestCase):
 
         # Build test metadata on CPU; this is not framework/forward code.
         positions = torch.zeros(m, dtype=torch.int64, device="cpu")
-        starts = []
         offset = 0
         for length, prefix in zip(lengths, prefixes):
             self.assertGreaterEqual(prefix, 0)
@@ -107,9 +106,7 @@ class TestWeLMv4FusedQKV(unittest.TestCase):
             positions[offset : offset + length] = torch.arange(
                 prefix, prefix + length, device="cpu"
             )
-            starts.extend(range(offset, offset + length, 64))
             offset += length
-        starts.append(real_m)
 
         # Real rows use nonconsecutive, unique cache slots. Padding uses 0.
         slots = torch.zeros(m, dtype=torch.int64, device="cpu")
@@ -118,12 +115,11 @@ class TestWeLMv4FusedQKV(unittest.TestCase):
         # Preserve one real write even in M=1; otherwise test skip-write too.
         if real_m > 1:
             slots[real_m // 2] = -1
-        segments = torch.tensor(starts, dtype=torch.int32, device=self.device)
-        return hidden, positions.to(self.device), slots.to(self.device), segments
+        return hidden, positions.to(self.device), slots.to(self.device)
 
     def _invoke(self, width, mode, inputs):
         torch = self.torch
-        hidden, positions, slots, segments = inputs
+        hidden, positions, slots = inputs
         m = hidden.shape[0]
         mirror_m = m if width == 2560 else 1
         shapes = ((m, 1536), (m, 256), (m, 256), (mirror_m, 256), (mirror_m, 256))
@@ -154,10 +150,7 @@ class TestWeLMv4FusedQKV(unittest.TestCase):
             1e-6,
         )
         program = self._program(width, mode)
-        if mode == "segmented":
-            program(*args, segments)
-        else:
-            program(*args)
+        program(*args)
         torch.npu.synchronize()
 
         # Test assertions run on CPU, outside the operator execution.
@@ -195,6 +188,29 @@ class TestWeLMv4FusedQKV(unittest.TestCase):
         actual = self._invoke(width, mode, inputs)
         self._assert_equal(width, reference, actual)
 
+    def _compare_requests(self, width, lengths, *, prefixes=None):
+        inputs = self._inputs(lengths, prefixes=prefixes)
+        packed = self._invoke(width, "row", inputs)
+        hidden, positions, slots = inputs
+        requests = [i for i, length in enumerate(lengths) if length > 0]
+        selected = {requests[0], requests[len(requests) // 2], requests[-1]}
+        for request in sorted(selected):
+            start = sum(lengths[:request])
+            end = start + lengths[request]
+            reference = self._invoke(
+                width,
+                "contiguous",
+                (hidden[start:end], positions[start:end], slots[start:end]),
+            )
+            for i in range(5 if width == 2560 else 3):
+                self.torch.testing.assert_close(
+                    packed[i][start:end],
+                    reference[i],
+                    rtol=0,
+                    atol=0,
+                    msg=f"request={request}, {self.OUTPUT_NAMES[i]}",
+                )
+
     def test_contiguous_prefill_matches_row_positions(self):
         for width in (2048, 2560):
             for m, pad in ((1, False), (129, False), (129, True), (641, True)):
@@ -203,7 +219,7 @@ class TestWeLMv4FusedQKV(unittest.TestCase):
                         width, "contiguous", self._inputs((m,), pad=pad)
                     )
 
-    def test_segmented_prefill_matches_row_positions(self):
+    def test_ragged_prefill_matches_per_request_contiguous(self):
         cases = (
             (0, 1),
             (1, 1),
@@ -219,7 +235,7 @@ class TestWeLMv4FusedQKV(unittest.TestCase):
         for width in (2048, 2560):
             for case_id, lengths in enumerate(cases):
                 with self.subTest(width=width, case=case_id, m=sum(lengths)):
-                    self._compare_modes(width, "segmented", self._inputs(lengths))
+                    self._compare_requests(width, lengths)
 
     def test_target_verify_positions_match_per_request_contiguous(self):
         # Verify packs B independent D-token runs. The combined call must use
@@ -229,7 +245,7 @@ class TestWeLMv4FusedQKV(unittest.TestCase):
                 with self.subTest(width=width, bs=bs, draft_tokens=draft_tokens):
                     inputs = self._inputs((draft_tokens,) * bs, pad=False)
                     packed = self._invoke(width, "row", inputs)
-                    hidden, positions, slots, _ = inputs
+                    hidden, positions, slots = inputs
                     for request in sorted({0, bs // 2, bs - 1}):
                         start = request * draft_tokens
                         end = start + draft_tokens
@@ -240,7 +256,6 @@ class TestWeLMv4FusedQKV(unittest.TestCase):
                                 hidden[start:end],
                                 positions[start:end],
                                 slots[start:end],
-                                None,
                             ),
                         )
                         for i in range(5 if width == 2560 else 3):
@@ -262,14 +277,11 @@ class TestWeLMv4FusedQKV(unittest.TestCase):
                         (257,), prefixes=(self.MAX_POSITION - 257,), pad=False
                     ),
                 )
-            with self.subTest(width=width, mode="segmented"):
-                self._compare_modes(
+            with self.subTest(width=width, mode="row", bs=2):
+                self._compare_requests(
                     width,
-                    "segmented",
-                    self._inputs(
-                        (257, 384),
-                        prefixes=(self.MAX_POSITION - 257, self.MAX_POSITION - 384),
-                    ),
+                    (257, 384),
+                    prefixes=(self.MAX_POSITION - 257, self.MAX_POSITION - 384),
                 )
 
     def test_arbitrary_decode_positions_and_repeated_launch(self):

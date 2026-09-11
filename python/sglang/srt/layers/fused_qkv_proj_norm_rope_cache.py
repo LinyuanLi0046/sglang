@@ -140,7 +140,6 @@ class FusedQkvProjNormRopeCacheKernel:
         return_v: bool = False,
         has_mirror: bool = True,
         positions_contiguous: bool = True,
-        positions_segmented: bool = False,
     ):
         # Trace-time constants: fold the optional v materialization, the
         # mirror block-store, and the cos/sin load mode away before IR
@@ -154,124 +153,6 @@ class FusedQkvProjNormRopeCacheKernel:
         self.return_v = bool(return_v)
         self.has_mirror = bool(has_mirror)
         self.positions_contiguous = bool(positions_contiguous)
-        self.positions_segmented = bool(positions_segmented)
-
-    @jit
-    def _copy_segment_cos_sin(self, cs_buf, gm_cos_sin, dst_row, pos, remaining):
-        # Each framework segment is <=64 rows. Use existing static tile-view
-        # shapes with runtime tile coordinates: coordinates are TILE indices,
-        # not row offsets. Dyadic pieces also handle unaligned request ends
-        # without dynamic UB slice offsets or another staging buffer.
-        # cs_buf is an acquired Tensor, not a Channel: automatic Channel
-        # transactions cannot be inferred through scf.while in this SDK.
-        while remaining > 0:
-            # DSL branch results must be initialized in the enclosing scope.
-            copy_rows = 1
-            if remaining >= 64 and dst_row % 64 == 0:
-                copy_rows = 64
-                mem_copy(
-                    tile_view(cs_buf, (64, ROPE_DIM), (dst_row // 64, 0)),
-                    tile_view(
-                        gm_cos_sin[pos : pos + 64, 0:ROPE_DIM],
-                        (64, ROPE_DIM), (0, 0),
-                    ),
-                )
-            elif remaining >= 32 and dst_row % 32 == 0:
-                copy_rows = 32
-                mem_copy(
-                    tile_view(cs_buf, (32, ROPE_DIM), (dst_row // 32, 0)),
-                    tile_view(
-                        gm_cos_sin[pos : pos + 32, 0:ROPE_DIM],
-                        (32, ROPE_DIM), (0, 0),
-                    ),
-                )
-            elif remaining >= 16 and dst_row % 16 == 0:
-                copy_rows = 16
-                mem_copy(
-                    tile_view(cs_buf, (16, ROPE_DIM), (dst_row // 16, 0)),
-                    tile_view(
-                        gm_cos_sin[pos : pos + 16, 0:ROPE_DIM],
-                        (16, ROPE_DIM), (0, 0),
-                    ),
-                )
-            elif remaining >= 8 and dst_row % 8 == 0:
-                copy_rows = 8
-                mem_copy(
-                    tile_view(cs_buf, (8, ROPE_DIM), (dst_row // 8, 0)),
-                    tile_view(
-                        gm_cos_sin[pos : pos + 8, 0:ROPE_DIM],
-                        (8, ROPE_DIM), (0, 0),
-                    ),
-                )
-            elif remaining >= 4 and dst_row % 4 == 0:
-                copy_rows = 4
-                mem_copy(
-                    tile_view(cs_buf, (4, ROPE_DIM), (dst_row // 4, 0)),
-                    tile_view(
-                        gm_cos_sin[pos : pos + 4, 0:ROPE_DIM],
-                        (4, ROPE_DIM), (0, 0),
-                    ),
-                )
-            elif remaining >= 2 and dst_row % 2 == 0:
-                copy_rows = 2
-                mem_copy(
-                    tile_view(cs_buf, (2, ROPE_DIM), (dst_row // 2, 0)),
-                    tile_view(
-                        gm_cos_sin[pos : pos + 2, 0:ROPE_DIM],
-                        (2, ROPE_DIM), (0, 0),
-                    ),
-                )
-            else:
-                mem_copy(
-                    tile_view(cs_buf, (1, ROPE_DIM), (dst_row, 0)),
-                    tile_view(gm_cos_sin, (1, ROPE_DIM), (pos, 0)),
-                )
-            dst_row += copy_rows
-            pos += copy_rows
-            remaining -= copy_rows
-
-    @jit
-    def _load_segmented_cos_sin(
-        self, cs_buf, gm_cos_sin, gm_positions, gm_segment_tile_starts, row0, rows_here
-    ):
-        # The final entry is the real-token sentinel, excluding EP padding.
-        # Reuse the framework's request-local <=64-row tiles. The AIV split
-        # can start/end inside a tile, especially in a balanced tail pair.
-        num_tiles = gm_segment_tile_starts.shape[0] - 1
-        # Framework metadata stays int32; DSL coordinates/selects use int64.
-        real_tokens = dtypes.int64(gm_segment_tile_starts[num_tiles])
-        row_end = row0 + rows_here
-        real_end = select(row_end < real_tokens, row_end, real_tokens)
-        cursor = row0
-        if cursor < real_end:
-            lo = 0
-            hi = num_tiles
-            while lo + 1 < hi:
-                mid = (lo + hi) // 2
-                if dtypes.int64(gm_segment_tile_starts[mid]) <= cursor:
-                    lo = mid
-                else:
-                    hi = mid
-            tile_id = lo
-            while cursor < real_end:
-                tile_end = dtypes.int64(gm_segment_tile_starts[tile_id + 1])
-                end = select(tile_end < real_end, tile_end, real_end)
-                pos = gm_positions[cursor]
-                self._copy_segment_cos_sin(
-                    cs_buf, gm_cos_sin, cursor - row0, pos, end - cursor
-                )
-                cursor = end
-                tile_id += 1
-
-        # No segment describes padding. Read its supplied (dummy) positions,
-        # rather than extrapolating the last request beyond the RoPE table.
-        padding_start = select(real_end > row0, real_end - row0, 0)
-        for r in range(padding_start, rows_here):
-            pos = gm_positions[row0 + r]
-            mem_copy(
-                tile_view(cs_buf, (1, ROPE_DIM), (r, 0)),
-                tile_view(gm_cos_sin, (1, ROPE_DIM), (pos, 0)),
-            )
 
     @jit
     def _rope_q(self, in_ch, out_ch, cs_ch, cur_rows):
@@ -537,7 +418,6 @@ class FusedQkvProjNormRopeCacheKernel:
         gm_k_cache: Tensor,
         gm_v_cache: Tensor,
         epsilon,
-        gm_segment_tile_starts: Tensor,
     ):
         block_idx = get_block_idx()
         block_num = get_block_num()
@@ -626,17 +506,7 @@ class FusedQkvProjNormRopeCacheKernel:
             # Table extent is a compile-time constant under every spec form
             # (JIT trace or AOT TensorSpec).
             table_rows = gm_cos_sin.shape[0]
-            cs_data = cs_ch
-            if const_expr(self.positions_segmented):
-                # Own one producer transaction for the entire segmented tile,
-                # including padding. Loops receive only the acquired Tensor.
-                cs_write = cs_ch.acquire()
-                self._load_segmented_cos_sin(
-                    cs_write, gm_cos_sin, gm_positions,
-                    gm_segment_tile_starts, row0, rows_here,
-                )
-                cs_ch.commit(cs_write)
-            elif const_expr(self.positions_contiguous):
+            if const_expr(self.positions_contiguous):
                 # Prefill: one run of TILE_VEC_M consecutive table rows.
                 pos_base = gm_positions[row0]
                 if rows_here > 0:
@@ -710,19 +580,15 @@ class FusedQkvProjNormRopeCacheKernel:
             out_rows = local_slice(
                 out_ch, (rows_here, HEAD_DIM), stride=(HEAD_DIM, 1)
             )
-            if const_expr(self.positions_segmented):
-                # Match the explicit producer without mixing automatic and
-                # manual accesses to cs_ch. Wait only before vector consumption.
-                cs_data = cs_ch.wait()
             if u < NUM_Q_HEADS:
-                self._rope_q(cv_ub, out_ch, cs_data, rows_here)
+                self._rope_q(cv_ub, out_ch, cs_ch, rows_here)
                 q_half = partition_view(
                     tile_view(gm_q, (PAIR_M, HEAD_DIM), (pair, u)), split_m, sub
                 )
                 mem_copy(q_half, out_rows)
             elif u == UNIT_K:
                 self._norm_rope_k(
-                    cv_ub, out_ch, cs_data, gamma_ch, rows_here, AVG, epsilon
+                    cv_ub, out_ch, cs_ch, gamma_ch, rows_here, AVG, epsilon
                 )
                 k_half = partition_view(
                     tile_view(gm_k, (PAIR_M, HEAD_DIM), (pair, 0)),
@@ -784,22 +650,18 @@ class FusedQkvProjNormRopeCacheKernel:
                             tile_view(gm_m, (1, HEAD_DIM), (row0 + r, 0)),
                             tile_view(out_ch, (1, HEAD_DIM), (r, 0)),
                         )
-            if const_expr(self.positions_segmented):
-                # Also drain the transaction for V/mirror and zero-row items,
-                # so every item has a balanced producer/consumer lifetime.
-                cs_ch.release(cs_data)
 
 
 def compile_aot(
     qkv_width, num_slots, max_pos, return_v=False,
-    positions_contiguous=True, positions_segmented=False,
+    positions_contiguous=True,
 ):
     """AOT-compile ONE dynamic-M artifact (ProviderCallable).
 
     The token count M is a symbolic ``Dim("M", min=1)`` — the same compiled
     artifact serves every M >= 1 (prefill chunk sizes, decode batches,
-    anything in between) with no per-shape recompilation. The optional
-    segment-table length is also symbolic; deployment constants are:
+    anything in between) with no per-shape recompilation. Deployment
+    constants are:
 
         qkv_width: 2560 (kv-mirror source layer) or 2048 (plain QKV layer)
         num_slots: paged KV cache rows (flattenable to (slots, 256))
@@ -809,17 +671,9 @@ def compile_aot(
             runtime-contiguous position run); False = decode artifact
             (per-token gather, arbitrary positions). Both share the identical
             dynamic-M Dim and epilogue math.
-        positions_segmented: True = multi-request prefill artifact, using
-            request-local intervals from WeLM's RoPE segment tile table.
-            Takes precedence over positions_contiguous. Table entries are
-            strictly increasing int32 row offsets, start at 0, end at the
-            real-token count (<=M), and describe contiguous-position runs
-            of at most 64 rows. Remaining rows are suffix padding.
 
     The returned callable takes the same 14 runtime arguments as
-    ``FusedQkvProjNormRopeCache.run`` (gamma as (1, 256)). The segmented
-    artifact takes a 15th argument: the device segment table, including
-    its sentinel. Its dynamic length does not specialize the artifact.
+    ``FusedQkvProjNormRopeCache.run`` (gamma as (1, 256)).
 
     The ``Dim``-shared M slots (hidden/positions/slot/q/k/v and, for
     mirror layers, mk/mv) are runtime-equality-checked by the framework on
@@ -854,11 +708,6 @@ def compile_aot(
         TensorSpec((num_slots, HEAD_DIM), bf),
         dtypes.float32,
     )
-    if positions_segmented:
-        segment_entries = Dim("segment_entries", min=2)
-        return op.run_segmented.compile(
-            *specs, TensorSpec((segment_entries,), dtypes.int32)
-        )
     return op.run.compile(*specs)
 
 
@@ -936,55 +785,6 @@ class FusedQkvProjNormRopeCache:
             gm_k_cache,
             gm_v_cache,
             eps,
-            # Unused stand-in: the non-segmented kernel folds this input
-            # away. Preserve the existing 14-argument public run ABI.
-            gm_positions,
-        )
-
-    @jit
-    def run_segmented(
-        self,
-        gm_hidden,
-        gm_weight,
-        gm_gamma,
-        gm_positions,
-        gm_cos_sin,
-        gm_slot,
-        gm_q,
-        gm_k,
-        gm_v,
-        gm_mk,
-        gm_mv,
-        gm_k_cache,
-        gm_v_cache,
-        eps: float,
-        gm_segment_tile_starts,
-    ):
-        m_rows = gm_hidden.shape[0]
-        m_pairs = (m_rows + PAIR_M - 1) // PAIR_M
-        block_dim = m_pairs * (gm_weight.shape[0] // BASE_N)
-        grid_cap = _aic_block_limit()
-        if block_dim > grid_cap:
-            block_dim = grid_cap
-        op = FusedQkvProjNormRopeCacheKernel(
-            self._return_v, self._has_mirror, False, True
-        )
-        op[block_dim](
-            gm_hidden,
-            gm_weight,
-            gm_gamma,
-            gm_positions,
-            gm_cos_sin,
-            gm_slot,
-            gm_q,
-            gm_k,
-            gm_v,
-            gm_mk,
-            gm_mv,
-            gm_k_cache,
-            gm_v_cache,
-            eps,
-            gm_segment_tile_starts,
         )
 
 

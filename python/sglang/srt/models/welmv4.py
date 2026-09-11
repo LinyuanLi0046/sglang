@@ -1760,8 +1760,6 @@ class Qwen2MoeAttention(nn.Module):
             return None
         mode = forward_batch.forward_mode
         cos_sin_cache = self.rotary_emb.cos_sin_cache
-        segment_tile_starts = None
-        positions_segmented = False
         if mode == ForwardMode.EXTEND:
             if forward_batch.batch_size == 1:
                 # EP's suffix padding need not have the same RoPE as position 0:
@@ -1773,9 +1771,8 @@ class Qwen2MoeAttention(nn.Module):
                     <= cos_sin_cache.shape[0]
                 )
             else:
-                # Built once per ordinary prefill, including short batches.
-                segment_tile_starts = forward_batch.welmv4_rope_segment_tile_starts
-                positions_segmented = True
+                # Each request has its own position range. Keep fused QKV
+                # enabled, using the original per-row cos/sin loads.
                 positions_contiguous = False
         elif mode in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY):
             # Verify positions are request-local B x D runs, not one global
@@ -1811,7 +1808,6 @@ class Qwen2MoeAttention(nn.Module):
             k_cache.shape[0],
             cos_sin_cache.shape[0],
             positions_contiguous,
-            positions_segmented,
         )
         program = _WELMV4_FUSED_QKV_PROGRAMS.get(key)
         if program is None:
@@ -1823,7 +1819,6 @@ class Qwen2MoeAttention(nn.Module):
                 cos_sin_cache.shape[0],
                 return_v=True,
                 positions_contiguous=positions_contiguous,
-                positions_segmented=positions_segmented,
             )
             _WELMV4_FUSED_QKV_PROGRAMS[key] = program
 
@@ -1849,10 +1844,7 @@ class Qwen2MoeAttention(nn.Module):
             v_cache,
             float(self.k_norm.eps),
         )
-        if positions_segmented:
-            program(*args, segment_tile_starts)
-        else:
-            program(*args)
+        program(*args)
         return (
             q,
             k,

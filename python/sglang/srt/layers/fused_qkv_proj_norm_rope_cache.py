@@ -163,6 +163,8 @@ class FusedQkvProjNormRopeCacheKernel:
         # not row offsets. Dyadic pieces also handle unaligned request ends
         # without dynamic UB slice offsets or another staging buffer.
         while remaining > 0:
+            # DSL branch results must be initialized in the enclosing scope.
+            copy_rows = 1
             if remaining >= 64 and dst_row % 64 == 0:
                 copy_rows = 64
                 mem_copy(
@@ -218,7 +220,6 @@ class FusedQkvProjNormRopeCacheKernel:
                     ),
                 )
             else:
-                copy_rows = 1
                 mem_copy(
                     tile_view(cs_ch, (1, ROPE_DIM), (dst_row, 0)),
                     tile_view(gm_cos_sin, (1, ROPE_DIM), (pos, 0)),

@@ -83,6 +83,7 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
                 last_loc,
                 self.free_pages,
                 out_indices,
+                num_new_pages_item,
                 MAX_BATCH_SIZE=NPU_ALLOC_EXTEND_MAX_BATCH_SIZE,
                 PAGE_SIZE=self.page_size,
                 BLOCK_SIZE=NPU_ALLOC_EXTEND_BLOCK_SIZE,

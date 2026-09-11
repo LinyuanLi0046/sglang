@@ -109,6 +109,7 @@ def alloc_extend_kernel(
         "last_loc_ptr",
         "free_page_ptr",
         "out_indices_ptr",
+        "num_new_pages_item",
     ]
 )
 def alloc_extend_kernel_npu(
@@ -117,6 +118,7 @@ def alloc_extend_kernel_npu(
     last_loc_ptr,
     free_page_ptr,
     out_indices_ptr,
+    num_new_pages_item,
     MAX_BATCH_SIZE: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -181,49 +183,64 @@ def alloc_extend_kernel_npu(
         mask=part1_mask,
     )
 
-    # Part 2: each program writes one independent 2K slice of the new full
-    # pages.  Increasing the request length only increases grid axis 1.
-    full_page_start = pages_before * PAGE_SIZE
-    full_page_end = (seq_len // PAGE_SIZE) * PAGE_SIZE
-    num_part2 = tl.maximum(full_page_end - full_page_start, 0)
-    block_offsets = tl.arange(0, BLOCK_SIZE)
-    part2_offsets = chunk_id * BLOCK_SIZE + block_offsets
-    part2_mask = part2_offsets < num_part2
-    page_ids = tl.load(
-        free_page_ptr
-        + new_page_start
-        + part2_offsets // PAGE_SIZE,
-        mask=part2_mask,
-        other=0,
-    )
-    tl.store(
-        out_indices_ptr + output_start + num_part1 + part2_offsets,
-        page_ids * PAGE_SIZE + part2_offsets % PAGE_SIZE,
-        mask=part2_mask,
-    )
+    # No new pages means Part 1 is sufficient.  In particular, do not issue
+    # even masked free-page loads when the free-page tensor may be empty.
+    if num_new_pages_item > 0:
+        # Part 2: each program writes one independent 2K slice of the new full
+        # pages.  Increasing the request length only increases grid axis 1.
+        full_page_start = pages_before * PAGE_SIZE
+        full_page_end = (seq_len // PAGE_SIZE) * PAGE_SIZE
+        num_part2 = tl.maximum(full_page_end - full_page_start, 0)
+        block_offsets = tl.arange(0, BLOCK_SIZE)
+        part2_offsets = chunk_id * BLOCK_SIZE + block_offsets
+        part2_mask = part2_offsets < num_part2
+        # Keep masked lanes inside the reserved free-page range as well.
+        # Valid lanes retain their original request-local page indices.
+        part2_page = part2_offsets // PAGE_SIZE
+        page_in_req = tl.minimum(part2_page, tl.maximum(num_new_pages - 1, 0))
+        safe_page = tl.minimum(new_page_start + page_in_req, num_new_pages_item - 1)
+        safe_page = tl.maximum(safe_page, 0)
+        page_ids = tl.load(
+            free_page_ptr + safe_page,
+            mask=part2_mask,
+            other=0,
+        )
+        tl.store(
+            out_indices_ptr + output_start + num_part1 + part2_offsets,
+            page_ids * PAGE_SIZE + part2_offsets % PAGE_SIZE,
+            mask=part2_mask,
+        )
 
-    # Part 3: write the final new partial page, again only from chunk zero.
-    num_part3 = seq_len - full_page_end
-    has_remaining_after_part1 = pre_len + num_part1 < seq_len
-    has_part3 = has_remaining_after_part1 & (num_part3 > 0)
-    has_part3 = has_part3 & is_first_chunk
-    last_new_page_offset = tl.maximum(num_new_pages - 1, 0)
-    last_new_page = tl.load(
-        free_page_ptr + new_page_start + last_new_page_offset,
-        mask=has_part3,
-        other=0,
-    )
-    part3_mask = page_offsets < num_part3
-    part3_mask = part3_mask & has_part3
-    tl.store(
-        out_indices_ptr
-        + output_start
-        + num_part1
-        + num_part2
-        + page_offsets,
-        last_new_page * PAGE_SIZE + page_offsets,
-        mask=part3_mask,
-    )
+        # Part 3: write the final new partial page, again only from chunk zero.
+        num_part3 = seq_len - full_page_end
+        has_remaining_after_part1 = pre_len + num_part1 < seq_len
+        has_part3 = has_remaining_after_part1 & (num_part3 > 0)
+        has_part3 = has_part3 & is_first_chunk
+        has_part3 = has_part3 & (num_new_pages > 0)
+        last_new_page_offset = tl.minimum(
+            tl.maximum(num_new_pages - 1, 0),
+            tl.maximum(num_new_pages_item - new_page_start - 1, 0),
+        )
+        safe_last_page = tl.minimum(
+            new_page_start + last_new_page_offset, num_new_pages_item - 1
+        )
+        safe_last_page = tl.maximum(safe_last_page, 0)
+        last_new_page = tl.load(
+            free_page_ptr + safe_last_page,
+            mask=has_part3,
+            other=0,
+        )
+        part3_mask = page_offsets < num_part3
+        part3_mask = part3_mask & has_part3
+        tl.store(
+            out_indices_ptr
+            + output_start
+            + num_part1
+            + num_part2
+            + page_offsets,
+            last_new_page * PAGE_SIZE + page_offsets,
+            mask=part3_mask,
+        )
 
 
 # Same free_page_ptr alignment rationale as alloc_extend_kernel above.

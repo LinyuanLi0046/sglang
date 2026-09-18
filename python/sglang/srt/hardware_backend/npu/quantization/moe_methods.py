@@ -795,6 +795,9 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
 
     def __init__(self, weight_prefix: str):
         super().__init__(quant_config=None)
+        # This describes the logical layout, not just the NPU storage format.
+        # Legacy GMM weights can also be ND while already carrying a transpose.
+        self.use_megamoe_canonical_layout = False
         if weight_prefix == "w13":
             self.matmul = GroupedMatmulSwigluQuant()
             self.hidden_states_quantizer = HiddenStatesDynamicQuant(
@@ -842,6 +845,32 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         else:
             weight, scale = self._quantize_weight_online(weight, weight_prefix)
 
+        if getattr(layer, "welm_megamoe_keep_nd", False):
+            # MegaMoE consumes canonical ND [E, N, K] and [E, N, K//64, 2].
+            # Keep one copy; old GMMs obtain matching transpose views at call time.
+            e8m0_dtype = _get_float8_e8m0fnu_dtype()
+            if e8m0_dtype is None:
+                raise RuntimeError("MXFP8 MegaMoE requires torch.float8_e8m0fnu")
+            scale = scale.contiguous()
+            if scale.dtype == torch.uint8:
+                # ModelSlim stores E8M0 encodings, not integer-valued scales.
+                scale = scale.view(e8m0_dtype)
+            setattr(
+                layer,
+                f"{weight_prefix}_weight",
+                Parameter(weight.contiguous(), requires_grad=False),
+            )
+            setattr(
+                layer,
+                f"{weight_prefix}_weight_scale",
+                Parameter(scale, requires_grad=False),
+            )
+            self.use_megamoe_canonical_layout = True
+            if weight_prefix == "w13":
+                # Opt-in layers use DeepEP for decode/verify and capacity fallback.
+                self._set_dispatcher_output_dtype(layer, "bf16")
+            return
+
         # FRACTAL_NZ before the transpose, never after. gmm1 asserts that weight
         # and weight_scale carry the SAME transpose flag (CheckMXTranspose: "the
         # transposition of weightScale/weight should be equal"), and the cast
@@ -882,6 +911,11 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             dispatcher_dtype = "bf16" if get_moe_a2a_backend().is_deepep() else "mxfp8"
             self._set_dispatcher_output_dtype(layer, dispatcher_dtype)
 
+    def _weight_scale_for_gmm(self, scale: torch.Tensor) -> torch.Tensor:
+        if self.use_megamoe_canonical_layout:
+            return scale.transpose(1, 2)
+        return scale
+
     def apply_fused_gmm1_swiglu(
         self,
         quant_info: "AscendQuantInfo",
@@ -911,8 +945,8 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             hidden_states,
             expert_tokens,
             group_list_type=group_list_type,
-            transposed=True,
-            weight_scale=[quant_info.w13_weight_scale],
+            transposed=not self.use_megamoe_canonical_layout,
+            weight_scale=[self._weight_scale_for_gmm(quant_info.w13_weight_scale)],
             x_scale=pertoken_scale,
             dequant_mode=2,
             quant_mode=2,
@@ -944,7 +978,11 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
 
         e8m0_dtype = _require_e8m0_dtype()
         scale_args: Dict[str, Any] = {
-            "scale": [getattr(quant_info, f"{weight_prefix}_weight_scale", None)],
+            "scale": [
+                self._weight_scale_for_gmm(
+                    getattr(quant_info, f"{weight_prefix}_weight_scale", None)
+                )
+            ],
             "per_token_scale": [pertoken_scale],
             "scale_dtype": e8m0_dtype,
             "per_token_scale_dtype": e8m0_dtype,
@@ -958,6 +996,6 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             expert_tokens,
             output_dtype,
             group_list_type=group_list_type,
-            transposed=True,
+            transposed=not self.use_megamoe_canonical_layout,
             **scale_args,
         )

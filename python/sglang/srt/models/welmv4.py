@@ -955,6 +955,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )
         # Set before weight postprocessing: MegaMoE reuses these weights in ND.
         # Decode/verify and DeepEP fallback share the same storage as prefill.
+        # MXFP8 GMMs use matching weight/scale transpose views of canonical ND.
         self.experts.welm_megamoe_keep_nd = (
             envs.WELM_NPU_USE_MEGAMOE.get()
             and self.welm_local_ep_kernel_available

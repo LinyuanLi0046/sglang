@@ -643,7 +643,8 @@ class Envs:
     # NPU
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
-    # BF16/MXFP8 WeLM target prefill, non-consumer EP; shared expert is serial.
+    # BF16/MXFP8 WeLM target prefill, non-consumer EP; only shared gate/up may
+    # overlap TopK with NPU multi-stream enabled. The rest precedes MegaMoE.
     WELM_NPU_USE_MEGAMOE = EnvBool(False)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
     # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2

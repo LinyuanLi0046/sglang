@@ -73,6 +73,13 @@ def process_identity(pid):
         return {"starttime": "unknown", "state": "unknown"}
 
 
+def pid_namespace():
+    try:
+        return os.readlink("/proc/self/ns/pid")
+    except OSError:
+        return "unknown"
+
+
 def _pack(kind, ctx, reason="", values=None, enter=0, progress=0, phase_enter=0):
     values = values or {}
     return PAYLOAD.pack(
@@ -205,6 +212,7 @@ class Recorder:
         self.buf[:16] = b"SGLANG_PD_DIAG1\0"
         manifest = dict(version=VERSION, pid=self.pid, role=role, rank=rank,
                         device=device, level=level, identity=identity,
+                        pid_namespace=pid_namespace(),
                         hostname=os.uname().nodename if hasattr(os, "uname") else "unknown",
                         created_ns=time.time_ns(), monotonic_ns=time.monotonic_ns(),
                         size=SIZE, event_coverage="cpu-only until EVENT_POOL_READY",
@@ -288,6 +296,15 @@ class Recorder:
             self.contexts[room] = ctx
         return ctx
 
+    def _cache_req_context(self, req, ctx):
+        # Input messages (e.g. msgspec.Struct) may reject dynamic attributes.
+        # The bounded room registry also carries their context into scheduler Req.
+        try:
+            req._pd_diag_context = ctx
+        except (AttributeError, TypeError):
+            pass
+        self.contexts[ctx.room] = ctx
+
     def req_context(self, req):
         rid = getattr(req, "rid", "")
         if not isinstance(rid, str):
@@ -311,8 +328,7 @@ class Recorder:
                 ctx = Context(room=ctx.room, attempt=time.monotonic_ns())
                 self.closed_contexts.pop(ctx.room, None)
             ctx = ctx._replace(rid=rid)
-            req._pd_diag_context = ctx
-            self.contexts[ctx.room] = ctx
+            self._cache_req_context(req, ctx)
         return ctx
 
     def emit(self, kind, ctx=None, reason="", **values):
@@ -726,8 +742,7 @@ def next_attempt(req, reason):
             return
         recorder.request(previous, "TERMINAL", "attempt ended: " + reason, progress=True)
         ctx = previous._replace(attempt=time.monotonic_ns(), batch=0, call=0, parent=0)
-        req._pd_diag_context = ctx
-        recorder.contexts[ctx.room] = ctx
+        recorder._cache_req_context(req, ctx)
         recorder.closed_contexts.pop(ctx.room, None)
         recorder.request(ctx, "RETRY", reason, progress=True)
     except Exception:

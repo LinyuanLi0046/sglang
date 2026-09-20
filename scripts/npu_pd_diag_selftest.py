@@ -3,11 +3,13 @@
 
 import concurrent.futures
 import importlib.util
+import json
 import tempfile
 import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 def load(name, path):
@@ -25,6 +27,24 @@ def main():
         recorder = core.Recorder(directory, "prefill", 0, 0)
         core._instance = recorder
         recorder.set_ready()
+        # IPC msgspec.Struct messages reject undeclared attributes, unlike Req.
+        class SlottedRequest:
+            __slots__ = ("rid", "bootstrap_room")
+
+            def __init__(self):
+                self.rid, self.bootstrap_room = "slotted-input", 77
+
+        slotted = SlottedRequest()
+        recorder.request(slotted, "ARRIVED", "scheduler received request")
+        slot_ctx = recorder.req_context(slotted)
+        constructed = SimpleNamespace(rid=slotted.rid, bootstrap_room=77)
+        recorder.request(constructed, "ARRIVED", "request constructed")
+        assert constructed._pd_diag_context == slot_ctx
+        time.sleep(0.02)  # Windows monotonic clock may have a coarse resolution.
+        core.next_attempt(slotted, "retry slotted input")
+        assert recorder.req_context(slotted).attempt != slot_ctx.attempt
+        recorder.request(slotted, "TERMINAL", "complete")
+        assert recorder.writer().drops == 0, "slotted input lost its diagnostic context"
         stalled = SimpleNamespace(rid="waiting-request", bootstrap_room=123, req_pool_idx=None)
         recorder.request(stalled, "BOOTSTRAP", "waiting for metadata")
         writer = recorder.writer()
@@ -151,7 +171,6 @@ def main():
             collect.save_incident(output, [worker], [{"kind": "MANUAL"}], journal, False, [])
         assert len(list(output.glob("incident-*"))) == 2
         for report in output.glob("incident-*/report.json"):
-            import json
             assert json.loads(report.read_text())["workers"]
         journal.file.close()
 
@@ -171,9 +190,116 @@ def main():
         worker.buf.close()
         worker.file.close()
         recorder.buf.close()
+
+    # One collector must retain all P4+D4 raw maps, not just the first seven.
+    with tempfile.TemporaryDirectory(prefix="pd-diag-paired-") as directory:
+        source, output = Path(directory) / "source", Path(directory) / "output"
+        output.mkdir()
+        old = core.Recorder(source, "prefill", 0, 0)
+        manifest = json.loads(old.path.with_suffix(".json").read_text())
+        manifest["pid"] = -1
+        old.path.with_suffix(".json").write_text(json.dumps(manifest))
+        current = [core.Recorder(source, role, rank, rank)
+                   for role in ("prefill", "decode") for rank in range(4)]
+        workers, retired = {}, set()
+        journal = collect.Journal(output, limit=2048)
+        lifecycle = collect.Journal(output, limit=4096, prefix="lifecycle")
+        with patch.object(collect, "worker_liveness", side_effect=lambda m: False if m["pid"] == -1 else None):
+            collect.discover_workers([str(source)], workers, retired, lifecycle)
+        assert str(old.path) in retired and len(workers) == 8
+        for writer in current:
+            writer.set_ready()
+        for worker in workers.values():
+            worker.read()
+        collect.save_incident(output, list(workers.values()), [{"kind": "MANUAL"}],
+                              journal, False, [], lifecycle=lifecycle)
+        report = json.loads((output / "incident-0/report.json").read_text())
+        assert report["raw_complete"] and len(report["raw_artifacts"]) == 8
+        assert report["raw_expected_bytes"] == 8 * core.SIZE
+        assert len(list((output / "incident-0").glob("*.mmap"))) == 8
+        assert len(list((output / "incident-0").glob("decode-*.json"))) == 4
+
+        # Initial warmup markers cannot fill every observation snapshot.
+        warm = core._pack("EVENT_PENDING", core.Context(), reason="EVENT_WARM")
+        core.write_slot(current[0].buf, core.EVENT_BASE, 1, warm)
+        worker = workers[str(current[0].path)]
+        _, snapshot = worker.read()
+        assert not snapshot["events"]
+        assert "fragments" not in str(collect.compact_observation(snapshot))
+        gone = dict(snapshot, alive=False)
+        assert [t["kind"] for t in worker.triggers([], gone, time.monotonic_ns(), 5, 10, 30)] == ["PROCESS_GONE"]
+
+        # Protect the first wait while that cohort remains stalled, even when
+        # another request stalls later. A later episode can replace it.
+        guard = collect.WaitSnapshot()
+        first = dict(kind="PD_WAIT_LONG", worker=str(worker.path), key=[123, 1])
+        second = dict(first, key=[456, 2])
+        assert guard.update([first], workers)
+        assert not guard.update([], workers), "temporary progress unlocked the first snapshot"
+        assert not guard.update([first], workers), "same pending request replaced first snapshot"
+        assert not guard.update([first, second], workers)
+        worker.terminals[(123, 1)] = time.monotonic_ns()
+        assert guard.update([second], workers)
+        assert not guard.update([], workers)
+        collect.save_incident(output, [worker], [first], journal, False, [],
+                              lifecycle=lifecycle, first_wait=True)
+        pinned = (output / "incident-first-wait/report.json").read_bytes()
+        collect.save_incident(output, [worker], [{"kind": "MANUAL"}], journal, False, [])
+        collect.save_incident(output, [worker], [{"kind": "MANUAL"}], journal, False, [])
+        assert (output / "incident-first-wait/report.json").read_bytes() == pinned
+
+        # High-frequency execution history must not evict PD lifecycle evidence.
+        entry = dict(kind="PD_TERMINAL", room=123, reason="failed before peer arrived")
+        assert collect.lifecycle_record(entry)
+        assert not collect.lifecycle_record(dict(kind="EVENT_QUERY_RETURN"))
+        lifecycle.append(dict(event=entry))
+        lifecycle.flush()
+        for i in range(100):
+            journal.append(dict(kind="EVENT_QUERY_RETURN", tick=i))
+        assert "failed before peer arrived" in lifecycle.path.read_text()
+
+        # A mounted foreign namespace is unknown, not dead: keep reading it
+        # and never attach to a coincidentally matching local PID.
+        manifest = dict(worker.manifest, identity={"starttime": "42", "state": "S"},
+                        pid_namespace="pid:[peer]")
+        with patch.object(collect.core, "pid_namespace", return_value="pid:[local]"), \
+             patch.object(collect.core, "process_identity", return_value={"starttime": "42", "state": "S"}):
+            assert collect.worker_liveness(manifest) is None
+            same_namespace = dict(manifest, pid_namespace="pid:[local]")
+            assert collect.worker_liveness(same_namespace) is True
+            assert collect.worker_liveness(dict(manifest, hostname="other-host")) is None
+        with patch.object(collect.core, "pid_namespace", return_value="pid:[local]"), \
+             patch.object(collect.core, "process_identity", return_value={"starttime": "unknown", "state": "unknown"}), \
+             patch.object(collect.os, "stat", side_effect=PermissionError("cannot inspect peer")):
+            assert collect.worker_liveness(same_namespace) is None
+        with patch.object(collect.core, "pid_namespace", return_value="pid:[local]"), \
+             patch.object(collect.core, "process_identity", return_value={"starttime": "unknown", "state": "unknown"}), \
+             patch.object(collect.os, "stat", side_effect=FileNotFoundError("process exited")):
+            assert collect.worker_liveness(same_namespace) is False
+
+        # Incomplete copies must be explicit in the saved report, not silent.
+        class UnreadableBuffer:
+            def __getitem__(self, _):
+                raise OSError("simulated raw copy failure")
+        original_buffer = worker.buf
+        worker.buf = UnreadableBuffer()
+        collect.save_incident(output, [worker], [{"kind": "MANUAL"}], journal, False, [])
+        worker.buf = original_buffer
+        reports = [json.loads(p.read_text()) for p in output.glob("incident-[01]/report.json")]
+        assert any(not r["raw_complete"] and "error" in r["raw_artifacts"][0] for r in reports)
+        journal.file.close()
+        lifecycle.file.close()
+        for reader in workers.values():
+            reader.buf.close()
+            reader.file.close()
+        for writer in [old] + current:
+            writer.buf.close()
     print("PASS: retention, duplicate progress, health exclusion, ring wrap, abort/native lifetime,")
     print("      room reuse, executor context/cancel, Event non-reuse/query-inflight, torn reads,")
     print("      disabled identity, bounded incident persistence/rotation")
+    print("      slotted IPC input/retry, P4+D4 complete raw maps, old-run filtering,")
+    print("      warmup exclusion, first-wait protection, independent lifecycle retention")
+    print("      unknown peer namespace/permissions, explicit raw copy failure")
 
 
 if __name__ == "__main__":

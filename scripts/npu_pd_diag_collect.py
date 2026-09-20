@@ -21,10 +21,10 @@ spec.loader.exec_module(core)
 
 
 class Journal:
-    """Four 64 MiB segments; rotation only touches collector-owned files."""
-    def __init__(self, directory, limit=64 * 1024 * 1024):
-        self.directory, self.limit = directory, limit
-        self.path = directory / "history-0.jsonl"
+    """Four bounded segments; rotation only touches collector-owned files."""
+    def __init__(self, directory, limit=64 * 1024 * 1024, prefix="history"):
+        self.directory, self.limit, self.prefix = directory, limit, prefix
+        self.path = directory / f"{prefix}-0.jsonl"
         self.file = self.path.open("a", encoding="utf-8")
         self.size = self.path.stat().st_size
 
@@ -33,11 +33,11 @@ class Journal:
         size = len(line.encode("utf-8"))
         if self.size + size > self.limit:
             self.file.close()
-            (self.directory / "history-3.jsonl").unlink(missing_ok=True)
+            (self.directory / f"{self.prefix}-3.jsonl").unlink(missing_ok=True)
             for i in (2, 1, 0):
-                src = self.directory / f"history-{i}.jsonl"
+                src = self.directory / f"{self.prefix}-{i}.jsonl"
                 if src.exists():
-                    src.replace(self.directory / f"history-{i + 1}.jsonl")
+                    src.replace(self.directory / f"{self.prefix}-{i + 1}.jsonl")
             self.file = self.path.open("a", encoding="utf-8")
             self.size = 0
         self.file.write(line)
@@ -45,6 +45,67 @@ class Journal:
 
     def flush(self):
         self.file.flush()
+
+
+def lifecycle_record(record):
+    kind = record["kind"]
+    return (kind.startswith(("PD_", "METADATA_")) or
+            kind in ("COVERAGE_GAP", "ABORT_REQ", "SCHEDULER_EXCEPTION", "WATCHDOG"))
+
+
+def compact_observation(snapshot):
+    """History is an index, not a full copy of every mmap once per second."""
+    return dict(
+        state=snapshot["state"], alive=snapshot["alive"], ready=snapshot["ready"],
+        coverage=snapshot["coverage"],
+        requests=[{k: v for k, v in req.items() if k != "fragments"}
+                  for req in snapshot["requests"]],
+        active_counts={k: len(snapshot[k]) for k in ("calls", "events", "jobs")},
+    )
+
+
+class WaitSnapshot:
+    """Progress/torn reads are not completion: require terminal/death evidence."""
+    def __init__(self):
+        self.protected = set()
+
+    def update(self, triggers, workers):
+        waiting = {(t["worker"], tuple(t["key"])) for t in triggers
+                   if t["kind"] == "PD_WAIT_LONG"}
+        for path, key in list(self.protected):
+            worker = workers.get(path)
+            if worker is not None and (key in worker.terminals or
+                                       worker.last_snapshot["alive"] is False):
+                self.protected.discard((path, key))
+        if waiting and not self.protected:
+            self.protected = waiting
+            return True
+        return False
+
+
+def worker_liveness(manifest, previously_verified=False):
+    host = os.uname().nodename if hasattr(os, "uname") else "unknown"
+    expected = manifest["identity"]["starttime"]
+    if host != manifest["hostname"] or expected == "unknown":
+        return None
+    namespace = manifest.get("pid_namespace", "unknown")
+    same_namespace = namespace != "unknown" and namespace == core.pid_namespace()
+    if namespace != "unknown" and not same_namespace:
+        return None  # A mounted peer directory does not share our /proc/PIDs.
+    current = core.process_identity(manifest["pid"])
+    if current["starttime"] == expected:
+        return current["state"] != "Z"
+    if not same_namespace and not previously_verified:
+        return None  # Legacy manifest, offline artifact, or another PID namespace.
+    if current["starttime"] != "unknown":
+        return False  # Verified namespace, but the PID was reused.
+    try:
+        os.stat(f"/proc/{manifest['pid']}")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        pass
+    return None  # Permission/read failure must not permanently retire a peer.
 
 
 class Worker:
@@ -62,14 +123,11 @@ class Worker:
         self.terminals = OrderedDict()
         self.ready = False
         self.last_snapshot = None
+        self.last_observation = None
+        self.identity_verified = False
 
     def same_process(self):
-        pid = self.manifest["pid"]
-        current = core.process_identity(pid)
-        expected = self.manifest["identity"]["starttime"]
-        host = os.uname().nodename if hasattr(os, "uname") else "unknown"
-        return (host == self.manifest["hostname"] and expected != "unknown"
-                and current["starttime"] == expected)
+        return worker_liveness(self.manifest, self.identity_verified) is True
 
     def read(self):
         records, fragments, calls, events, jobs = [], [], [], [], []
@@ -119,7 +177,8 @@ class Worker:
                     calls.append(entry)
         for n in range(core.EVENTS):
             entry = core.read_slot(self.buf, core.EVENT_BASE + n * core.SLOT)
-            if entry and not entry.get("torn") and entry["kind"] != "EVENT_DONE":
+            if (entry and not entry.get("torn") and entry["kind"] != "EVENT_DONE"
+                    and entry["reason"] != "EVENT_WARM"):
                 events.append(entry)
         for n in range(core.JOBS):
             entry = core.read_slot(self.buf, core.JOB_BASE + n * core.SLOT)
@@ -150,23 +209,22 @@ class Worker:
         event_flags = core.U64.unpack_from(self.buf, 40)[0]
         observer_ns = core.U64.unpack_from(self.buf, 48)[0]
         observer_stale = bool(event_flags & 1) and time.monotonic_ns() - observer_ns > 2_000_000_000
-        identity_known = self.manifest["identity"]["starttime"] != "unknown"
-        alive = self.same_process() and current["state"] != "Z"
+        alive = worker_liveness(self.manifest, self.identity_verified)
+        self.identity_verified |= alive is True
         snapshot = dict(manifest=self.manifest, ready=self.ready,
-                        alive=alive if identity_known else None, process=current,
+                        alive=alive, process=current,
                         coverage=dict(registration_or_table_drops=drops, ring_lost=self.lost,
                                       torn_reads=self.torn, mf_internal="not instrumented",
                                       event_flags=event_flags, observer_stale=observer_stale,
                                       peer_evidence="only sources supplied to this collector"),
                         requests=requests, calls=calls, events=events, jobs=jobs)
         snapshot["state"] = (
-            "UNKNOWN" if not identity_known else
-            "PROCESS_GONE" if not alive else
+            "PROCESS_GONE" if alive is False else
             "INITIALIZING" if not self.ready else
             "EXECUTING_AND_PD_WAITING" if requests and (calls or events or jobs) else
             "PD_WAITING" if requests else
             "EXECUTING" if calls or events or jobs else
-            "UNKNOWN" if drops or self.torn or self.lost or observer_stale or event_flags & 2 else
+            "UNKNOWN" if alive is None or drops or self.torn or self.lost or observer_stale or event_flags & 2 else
             "NO_ACTIVE_WORK_OBSERVED"
         )
         self.last_snapshot = snapshot
@@ -176,6 +234,7 @@ class Worker:
         triggers = []
         if snapshot["alive"] is False:
             triggers.append(dict(kind="PROCESS_GONE", key="process", age=0))
+            return triggers  # Dead workers cannot make fresh device/PD progress.
         for entry in records:
             if entry["kind"] in ("SCHEDULER_EXCEPTION", "WATCHDOG") or (
                     entry["kind"].endswith("_EXCEPTION") and not entry["kind"].startswith("EVENT")):
@@ -210,6 +269,41 @@ class Worker:
                 triggers.append(dict(kind="JOB_STALL", key=entry["call"], age=age,
                                      stack=age >= stack_sec, evidence=entry))
         return triggers
+
+
+def discover_workers(sources, workers, retired, journal):
+    """Skip superseded, non-live generations; never delete source artifacts."""
+    candidates = {}
+    for source in sources:
+        for path in Path(source).glob("*.mmap"):
+            key = str(path)
+            if key in workers or key in retired:
+                continue
+            try:
+                manifest = json.loads(path.with_suffix(".json").read_text())
+                candidates[key] = (path, manifest)
+            except (OSError, ValueError):
+                continue  # A worker may still be publishing its manifest.
+
+    def identity_key(path, manifest):
+        return (str(path.parent), manifest["hostname"], manifest["role"],
+                manifest["rank"], manifest["device"])
+
+    latest = {}
+    for path, manifest in list(candidates.values()) + [
+            (w.path, w.manifest) for w in workers.values()]:
+        key = identity_key(path, manifest)
+        latest[key] = max(latest.get(key, 0), manifest["created_ns"])
+    for key, (path, manifest) in candidates.items():
+        if (manifest["created_ns"] < latest[identity_key(path, manifest)]
+                and worker_liveness(manifest) is False):
+            retired.add(key)
+            journal.append(dict(worker=key, kind="SUPERSEDED_WORKER", manifest=manifest))
+            continue
+        if len(workers) >= 64:
+            raise RuntimeError("64 current recorder files exceeded; use a fresh run directory")
+        workers[key] = Worker(path)
+        journal.append(dict(worker=key, kind="WORKER_DISCOVERED", manifest=manifest))
 
 
 def tail(path, limit):
@@ -280,7 +374,8 @@ def collect_stacks(workers, directory, budget=20):
     return outcome
 
 
-def save_incident(output, workers, triggers, journal, stacks, logs):
+def save_incident(output, workers, triggers, journal, stacks, logs,
+                  lifecycle=None, first_wait=False):
     # Two owned slots, always save evidence before invoking an external tool.
     slots = [output / f"incident-{i}" for i in range(2)]
     index = next((i for i, p in enumerate(slots) if not p.exists()), None)
@@ -293,7 +388,7 @@ def save_incident(output, workers, triggers, journal, stacks, logs):
             protected = max(with_stacks, key=lambda i: slots[i].stat().st_mtime_ns)
             candidates.remove(protected)
         index = min(candidates, key=lambda i: slots[i].stat().st_mtime_ns)
-    directory = slots[index]
+    directory = output / "incident-first-wait" if first_wait else slots[index]
     if directory.exists():
         # Only this tool's flat artifact files; never recursively remove a path.
         for p in directory.iterdir():
@@ -301,6 +396,8 @@ def save_incident(output, workers, triggers, journal, stacks, logs):
                 p.unlink()
     directory.mkdir(exist_ok=True)
     journal.flush()
+    if lifecycle is not None:
+        lifecycle.flush()
     report = dict(time=time.strftime("%Y-%m-%dT%H:%M:%S%z"), triggers=triggers,
                   workers=[w.last_snapshot for w in workers],
                   interpretation="PD_WAIT_LONG is evidence of waiting, not proof of a deadlock. "
@@ -314,25 +411,44 @@ def save_incident(output, workers, triggers, journal, stacks, logs):
         report["workers"] = [{k: v for k, v in w.items() if k not in ("calls", "requests", "events", "jobs")}
                              for w in report["workers"]]
         encoded = json.dumps(report, ensure_ascii=False, indent=2)
-    (directory / "report.json").write_text(encoded)
     # Copy a recent bounded journal tail; old rings can wrap before the next incident.
     (directory / "recent-history.jsonl").write_text(tail(journal.path, 16 * 1024 * 1024))
-    remaining = 160 * 1024 * 1024
+    if lifecycle is not None:
+        for path in lifecycle.directory.glob(f"{lifecycle.prefix}-*.jsonl"):
+            shutil.copyfile(path, directory / path.name)
+    # The worker limit bounds space. Never spend a fixed global budget on P
+    # first and silently omit D: P4+D4 needs eight maps, about 176.2 MiB.
+    raw_artifacts = []
     for worker in workers:
         prefix = worker.path.stem
         data = json.dumps(proc_snapshot(worker), ensure_ascii=False, indent=2)
         if len(data.encode("utf-8")) > 256 * 1024:
             data = json.dumps({"coverage": "truncated proc snapshot", "text": data[:128 * 1024]})
         (directory / f"proc-{prefix}.json").write_text(data)
-        if remaining >= core.SIZE:
-            (directory / f"{prefix}.mmap").write_bytes(worker.buf[:])
-            remaining -= core.SIZE
+        artifact = dict(worker=str(worker.path), file=f"{prefix}.mmap", saved=False)
+        try:
+            (directory / f"{prefix}.json").write_text(json.dumps(worker.manifest, indent=2))
+            with (directory / artifact["file"]).open("wb") as raw:
+                for offset in range(0, core.SIZE, 1024 * 1024):
+                    raw.write(worker.buf[offset:offset + 1024 * 1024])
+            artifact["saved"] = True
+            artifact["bytes"] = core.SIZE
+        except OSError as exc:
+            artifact["error"] = str(exc)
+        raw_artifacts.append(artifact)
+    report["raw_artifacts"] = raw_artifacts
+    report["raw_complete"] = bool(workers) and all(item["saved"] for item in raw_artifacts)
+    report["raw_expected_bytes"] = len(workers) * core.SIZE
+    report["snapshot_kind"] = "first_pd_wait" if first_wait else "rolling"
+    (directory / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2))
     for i, log in enumerate(logs[:8]):
         (directory / f"log-{i}.txt").write_text(tail(log, 1024 * 1024))
     if stacks:
         result = collect_stacks(workers, directory)
         (directory / "stack-result.json").write_text(json.dumps(result, indent=2))
     print(f"{report['time']} saved {directory} ({', '.join(sorted({t['kind'] for t in triggers}))})", flush=True)
+    if not report["raw_complete"]:
+        print("WARNING: incomplete raw snapshot; see report.json raw_artifacts", flush=True)
 
 
 def main():
@@ -366,19 +482,17 @@ def main():
     with lock_path.open("x") as lock:
         lock.write(str(os.getpid()))
     journal = Journal(args.output)
+    lifecycle = Journal(args.output, limit=16 * 1024 * 1024, prefix="lifecycle")
     workers, seen, notices = {}, {}, {}
+    retired = set()
+    wait_snapshot = WaitSnapshot()
     stack_collected = False
     last_flush = last_wait_snapshot = time.monotonic()
     try:
         while True:
             notice_triggers = []
+            discover_workers(args.source, workers, retired, lifecycle)
             for source in args.source:
-                for path in Path(source).glob("*.mmap"):
-                    if str(path) in workers or not path.with_suffix(".json").exists():
-                        continue
-                    if len(workers) >= 64:
-                        raise RuntimeError("64 recorder files exceeded; use a fresh run directory")
-                    workers[str(path)] = Worker(path)
                 for path in list(Path(source).glob("notice-*.json"))[:128]:
                     try:
                         stamp = path.stat().st_mtime_ns
@@ -396,7 +510,12 @@ def main():
                 records, snapshot = worker.read()
                 for record in records:
                     journal.append(dict(worker=path, event=record))
-                journal.append(dict(worker=path, observation=snapshot))
+                    if lifecycle_record(record):
+                        lifecycle.append(dict(worker=path, event=record))
+                observation = compact_observation(snapshot)
+                if observation != worker.last_observation:
+                    journal.append(dict(worker=path, time_ns=time.time_ns(), observation=observation))
+                    worker.last_observation = observation
                 for t in worker.triggers(records, snapshot, now, args.snapshot_after,
                                          args.stack_after, args.pd_wait_after):
                     t["worker"] = path
@@ -419,17 +538,35 @@ def main():
                                     for t in triggers)
             if not execution_stalled:
                 stack_collected = False
-            if fresh or args.once:
+            first_wait = wait_snapshot.update(triggers, workers)
+            if first_wait:
+                save_incident(args.output, list(workers.values()), triggers, journal,
+                              False, args.log_file, lifecycle=lifecycle, first_wait=True)
+                last_wait_snapshot = time.monotonic()
+            # The protected snapshot already contains this tick's full P/D
+            # state; avoid writing all maps twice unless we also need stacks.
+            if (fresh or args.once) and (not first_wait or need_stack or args.once):
                 take_stack = need_stack and not stack_collected and not args.no_stack and not args.once
                 save_incident(args.output, list(workers.values()), triggers or [{"kind": "MANUAL"}],
-                              journal, take_stack, args.log_file)
+                              journal, take_stack, args.log_file, lifecycle=lifecycle)
                 stack_collected |= take_stack
                 if any(t["kind"] == "PD_WAIT_LONG" for t in fresh):
                     last_wait_snapshot = time.monotonic()
+            for path, worker in list(workers.items()):
+                if worker.last_snapshot["alive"] is False:
+                    # Its final state/raw map was saved above. Do not re-read or
+                    # serialize dead warmup state forever, or crowd out a restart.
+                    lifecycle.append(dict(worker=path, kind="WORKER_RETIRED",
+                                          manifest=worker.manifest))
+                    worker.buf.close()
+                    worker.file.close()
+                    workers.pop(path)
+                    retired.add(path)
             if args.once:
                 break
             if time.monotonic() - last_flush >= 5:
                 journal.flush()
+                lifecycle.flush()
                 last_flush = time.monotonic()
             time.sleep(1)
     except KeyboardInterrupt:
@@ -437,6 +574,8 @@ def main():
     finally:
         journal.flush()
         journal.file.close()
+        lifecycle.flush()
+        lifecycle.file.close()
         for worker in workers.values():
             worker.buf.close()
             worker.file.close()

@@ -3515,6 +3515,8 @@ class SignalHandler:
         self.tokenizer_manager.gracefully_exit = True
 
     def running_phase_sigquit_handler(self, signum=None, frame=None):
+        from sglang.srt.utils import npu_pd_diagnostics
+        npu_pd_diagnostics.emergency_note("PARENT_SIGQUIT")
         logger.error(
             f"SIGQUIT received. {signum=}, {frame=}. It usually means one child failed."
         )

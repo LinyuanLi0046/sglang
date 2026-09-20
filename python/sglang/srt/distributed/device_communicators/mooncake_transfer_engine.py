@@ -5,6 +5,7 @@ import logging
 import os
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
+from sglang.srt.utils import npu_pd_diagnostics as pd_diag
 from sglang.srt.environ import envs
 from sglang.srt.utils.network import NetworkAddress, get_free_port, get_local_ip_auto
 
@@ -242,9 +243,17 @@ class MooncakeTransferEngine:
     ) -> int:
         """Synchronously transfer data to the specified addresses in batches."""
         try:
-            ret = self.engine.batch_transfer_sync_write(
-                session_id, buffers, peer_buffer_addresses, lengths
-            )
+            if pd_diag.get() is None:
+                ret = self.engine.batch_transfer_sync_write(
+                    session_id, buffers, peer_buffer_addresses, lengths
+                )
+            else:
+                with pd_diag.span("MF_NATIVE", available=len(lengths), needed=sum(lengths)):
+                    pd_diag.emit("MF_SESSION", reason=session_id)
+                    ret = self.engine.batch_transfer_sync_write(
+                        session_id, buffers, peer_buffer_addresses, lengths
+                    )
+                    pd_diag.emit("MF_STATUS", status=ret)
         except Exception:
             ret = -1
             if not hasattr(self.engine, "batch_transfer_sync_write"):

@@ -27,6 +27,7 @@ from functools import partial
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
+from sglang.srt.utils import npu_pd_diagnostics as pd_diag
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
@@ -502,6 +503,7 @@ class Scheduler(
         maybe_revert_pr_fix()
 
         # Launch a model worker and draft model worker if using speculative decoding
+        pd_diag.initialize(server_args, tp_rank, gpu_id)
         self.init_model_worker()
 
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
@@ -662,6 +664,8 @@ class Scheduler(
         self.init_batch_result_processor()
 
         self.is_initializing = False
+        if (diag := pd_diag.get()) is not None:
+            diag.set_ready()
 
     def init_zbal_on_npu(self):
         if _is_npu:
@@ -1871,6 +1875,8 @@ class Scheduler(
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
         for recv_req in recv_reqs:
+            if pd_diag.get() is not None:
+                pd_diag.request(recv_req, "ARRIVED", "scheduler received request")
             # Skip health check when server is busy — ongoing requests already carry health info.
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
                 for_health_check=True
@@ -2465,6 +2471,7 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        pd_diag.request(req, "ARRIVED", "request constructed")
         self._maybe_namespace_elastic_radix_cache(req)
 
         if self.spec_algorithm.is_dflash_family():
@@ -3559,6 +3566,7 @@ class Scheduler(
                 batch.sampling_info = sched_sampling_info
 
     @scheduler_nvtx_method("scheduler.run_batch")
+    @pd_diag.traced("RUN_BATCH", batch=True)
     def run_batch(
         self,
         batch: ScheduleBatch,
@@ -4345,6 +4353,7 @@ class Scheduler(
         return RpcReqOutput(success=success, message="" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
+        pd_diag.emit("ABORT_REQ", reason=recv_req.rid, status=int(recv_req.abort_all))
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
@@ -5106,6 +5115,7 @@ def run_scheduler_process(
 
     except Exception:
         traceback = get_exception_traceback()
+        pd_diag.emit("SCHEDULER_EXCEPTION", reason="see service traceback")
         logger.error(f"Scheduler hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
         # Opt-in: SIGKILL the pgroup so sibling ranks don't spew thousands

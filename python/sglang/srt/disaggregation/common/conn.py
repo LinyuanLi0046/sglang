@@ -16,6 +16,7 @@ import torch.distributed as dist
 import zmq
 from aiohttp import web
 
+from sglang.srt.utils import npu_pd_diagnostics as pd_diag
 from sglang.srt.disaggregation.base.conn import (
     BaseKVBootstrapServer,
     BaseKVManager,
@@ -309,6 +310,7 @@ class CommonKVManager(BaseKVManager):
         return self.request_status[bootstrap_room]
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
+        diagnostic_old_status = self.request_status.get(bootstrap_room) if pd_diag.get() is not None else None
         if bootstrap_room not in self.request_status:
             # Do not resurrect a cleared entry with Failed: once clear() has
             # popped the room from request_status, any late update_status(Failed)
@@ -324,8 +326,15 @@ class CommonKVManager(BaseKVManager):
                 self.request_status[bootstrap_room] = max(
                     self.request_status[bootstrap_room], status
                 )
+        if pd_diag.get() is not None:
+            current_status = self.request_status[bootstrap_room]
+            if diagnostic_old_status != current_status:
+                pd_diag.request(bootstrap_room,
+                                "TERMINAL" if current_status in (KVPoll.Success, KVPoll.Failed) else "STATUS",
+                                "local manager status", progress=True, status=current_status)
 
     def record_failure(self, bootstrap_room: int, failure_reason: str):
+        pd_diag.request(bootstrap_room, "FAILURE", failure_reason, progress=True)
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
 
@@ -1227,6 +1236,7 @@ class CommonKVSender(BaseKVSender):
         raise Exception("Fake KVReceiver Exception")
 
     def clear(self) -> None:
+        pd_diag.request(self.bootstrap_room, "CLEARED", "sender clear; not native drain", progress=True)
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
             self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
@@ -1288,6 +1298,8 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr.required_prefill_response_num_table[self.bootstrap_room] = (
             self.required_prefill_response_num
         )
+        pd_diag.request(self.bootstrap_room, "PREALLOC", "bootstrap info resolved", progress=True,
+                        need=self.required_dst_info_num, need_done=self.required_prefill_response_num)
 
         if self.kv_mgr.enable_staging:
             self.require_staging = (
@@ -1482,6 +1494,7 @@ class CommonKVReceiver(BaseKVReceiver):
         raise Exception("Fake KVReceiver Exception")
 
     def clear(self) -> None:
+        pd_diag.request(self.bootstrap_room, "CLEARED", "receiver clear; not native drain", progress=True)
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)

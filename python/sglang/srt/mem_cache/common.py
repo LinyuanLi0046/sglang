@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+from sglang.srt.utils import npu_pd_diagnostics as pd_diag
 from sglang.kernels.ops.memory.common import (
     _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
 )
@@ -129,7 +130,9 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
             tree_cache.evict(EvictParams(num_tokens=num_tokens - available_size))
 
 
+@pd_diag.traced("KV_RELEASE")
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+    pd_diag.release_snapshot(req, tree_cache)
     # the two resources currently have the same lifecycle, thus simplify logic below
     assert (req.req_pool_idx is None) == (req.kv is None)
     # MambaRadixCache may alloc mamba state before alloc KV cache

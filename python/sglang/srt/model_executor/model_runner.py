@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Optional, Union
 import torch
 import torch.distributed as dist
 
+from sglang.srt.utils import npu_pd_diagnostics as pd_diag
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -359,6 +360,7 @@ class ModelRunner:
         # Initialize MooncakeTransferEngine BEFORE init_torch_distributed so
         # that the shared TE can be passed to the Mooncake PG backend (avoids
         # creating duplicate TransferEngines).
+        pd_diag.prepare_events(torch.get_device_module(self.device), server_args)
         self.init_shared_mooncake_transfer_engine()
 
         # Get available memory before model loading.
@@ -1487,6 +1489,7 @@ class ModelRunner:
         forward_batch.split_index = next_split_index
         return ret
 
+    @pd_diag.traced("MODEL", device=True)
     def forward(
         self,
         forward_batch: ForwardBatch,
@@ -1748,6 +1751,7 @@ class ModelRunner:
         # when structured output (grammar) is used.
         sampling_info.grammar_mask = None
 
+    @pd_diag.traced("SAMPLE", device=True)
     def sample(
         self,
         logits_output: LogitsProcessorOutput,

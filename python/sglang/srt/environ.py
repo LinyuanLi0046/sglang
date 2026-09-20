@@ -317,6 +317,10 @@ class Envs:
     # Extra local physical cores for HOST_RDMA PD threads; never taken from
     # the existing compute assignment. Zero preserves the old binding path.
     SGLANG_NPU_PD_AFFINITY_PCORES_PER_PROC = EnvInt(0)
+    # Opt-in CPU flight recorder; collector is a separately launched process.
+    SGLANG_NPU_PD_DIAG = EnvBool(False)
+    SGLANG_NPU_PD_DIAG_DIR = EnvStr("/dev/shm/sglang_pd_diag")
+    SGLANG_NPU_PD_DIAG_LEVEL = EnvStr("cpu")
     # Dump thread names/IDs and read-back CPU masks after final NPU binding.
     SGLANG_NPU_AFFINITY_DEBUG_THREADS = EnvBool(False)
     # Optionally migrate existing host pages after final NPU CPU binding.

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 
+from sglang.srt.utils import npu_pd_diagnostics as pd_diag
 from sglang.srt.environ import envs
 from sglang.srt.utils import get_npu_memory_capacity, is_npu
 
@@ -336,14 +337,18 @@ def wait_share_stream():
     stream = get_share_stream()
     if stream is not None:
         cur_stream = torch.get_device_module().current_stream()
+        pd_diag.emit("SHARED_JOIN_ENTER")
         cur_stream.wait_stream(stream)
+        pd_diag.stage_mark("SHARED_JOIN_RETURN")
 
 
 def wait_routed_stream():
     stream = get_routed_stream()
     if stream is not None:
         cur_stream = torch.get_device_module().current_stream()
+        pd_diag.emit("ROUTED_JOIN_ENTER")
         cur_stream.wait_stream(stream)
+        pd_diag.stage_mark("ROUTED_JOIN_RETURN")
 
 
 def process_shared_expert(hidden_states, forward_func):
@@ -354,6 +359,7 @@ def process_shared_expert(hidden_states, forward_func):
     stream.wait_stream(torch.get_device_module().current_stream())
     with torch.get_device_module().stream(stream):
         shared_output = forward_func(hidden_states)
+        pd_diag.stage_mark("SHARED_ENQUEUED", stream)
     return shared_output
 
 
@@ -365,4 +371,5 @@ def process_routed_expert(hidden_states, topk_output, forward_func):
     stream.wait_stream(torch.get_device_module().current_stream())
     with torch.get_device_module().stream(stream):
         shared_output = forward_func(hidden_states, topk_output)
+        pd_diag.stage_mark("ROUTED_ENQUEUED", stream)
     return shared_output

@@ -24,6 +24,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.utils import npu_pd_diagnostics as pd_diag
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.configs.model_config import get_welmv4_layerwise_sliding_windows
 from sglang.srt.distributed import (
@@ -1990,6 +1991,7 @@ class Qwen2MoeAttention(nn.Module):
             mirror_v if has_mirror else None,
         )
 
+    @pd_diag.traced("QKV_AG")
     def _npu_prefill_ag_fused_qkv(
         self,
         positions: torch.Tensor,
@@ -2095,13 +2097,16 @@ class Qwen2MoeAttention(nn.Module):
         # input-stream dependencies then cannot include earlier chunk consumers.
         # All allocations, input packing and compilation are already complete.
         for start, end, send, receive in chunk_buffers:
+            pd_diag.emit("AG_SUBMIT", start=start, end=end)
             work = torch.distributed.all_gather_into_tensor(
                 receive, send, group=group.device_group, async_op=True
             )
             pending.append((work, start, end, send, receive))
 
         for chunk_idx, (work, start, end, send, receive) in enumerate(pending):
+            pd_diag.emit("AG_WAIT_ENTER", extra=chunk_idx)
             work.wait()
+            pd_diag.stage_mark("AG_WAIT_RETURN")
             rows = end - start
             programs[rope_modes[chunk_idx]](
                 receive,
@@ -2227,6 +2232,7 @@ class Qwen2MoeAttention(nn.Module):
                 rank_major_input[:, start:end, :].contiguous().view(-1, input_size)
             )
             partial = F.linear(chunk_input, self.o_proj.weight, bias)
+            pd_diag.emit("RS_SUBMIT", extra=chunk_idx)
             work = torch.distributed.reduce_scatter_tensor(
                 output[start:end],
                 partial,
@@ -2237,7 +2243,9 @@ class Qwen2MoeAttention(nn.Module):
             # Keep send buffers alive and submit the next MM before joining RS.
             pending.append((work, partial))
         for work, _ in pending:
+            pd_diag.emit("RS_WAIT_ENTER")
             work.wait()
+            pd_diag.stage_mark("RS_WAIT_RETURN")
         return output
 
     @staticmethod
@@ -2687,6 +2695,7 @@ class Qwen2MoeAttention(nn.Module):
             self.alt_stream.wait_stream(current_stream)
             with device_module.stream(self.alt_stream):
                 gate = self.gate_proj(hidden_states)[0].unsqueeze(-1)
+                pd_diag.stage_mark("GATE_ALT_ENQUEUED", self.alt_stream)
 
         if fused_qkv is None:
             q_shape = q.shape
@@ -2792,6 +2801,7 @@ class Qwen2MoeAttention(nn.Module):
                     segment_tile_starts=segment_tile_starts,
                 )
 
+        pd_diag.stage_mark("QKV_ROPE_RETURN")
         attn_kwargs = {}
         if self.attn_sink is not None:
             attn_kwargs["sinks"] = self.attn_sink
@@ -2803,15 +2813,18 @@ class Qwen2MoeAttention(nn.Module):
             save_kv_cache=not frozen_mtp_decode and fused_qkv is None,
             **attn_kwargs,
         )
+        pd_diag.stage_mark("ATTENTION_OP_RETURN")
         if self.gated_self_attention_headwise:
             attn_shape = attn_output.shape
             if gate is None:
                 gate_input = hidden_states
                 if prefill_gate_hidden_states is not None:
                     if prefill_gate_all_gather_on_alt_stream:
+                        pd_diag.emit("GATE_AG_JOIN_ENTER")
                         torch.get_device_module().current_stream().wait_stream(
                             self.alt_stream
                         )
+                        pd_diag.stage_mark("GATE_AG_JOIN_RETURN")
                     gate_input = prefill_gate_hidden_states
                 gate = self.gate_proj(gate_input)[0].unsqueeze(-1)
                 if prefill_ag_qkv_slices is not None:
@@ -2834,6 +2847,7 @@ class Qwen2MoeAttention(nn.Module):
                 # Normal inference first consumes gate in sigmoid_mul. Joining
                 # here lets gate projection overlap the complete attention op.
                 current_stream.wait_stream(self.alt_stream)
+                pd_diag.stage_mark("GATE_ALT_JOIN_RETURN")
             if _is_npu:
                 inplace_sigmoid_mul_npu(gate, attn_output)
             else:
@@ -3097,6 +3111,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         get_tp_group().all_gather_into_tensor(gathered, local_tensor.contiguous())
         return gathered
 
+    @pd_diag.traced("PREPARE_ATTN")
     def _npu_prefill_deepep_prepare_attention(
         self,
         hidden_states: torch.Tensor,
@@ -3133,6 +3148,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             local_hidden_states = self._all_gather_tp_rows(local_hidden_states)
         return local_hidden_states, local_residual
 
+    @pd_diag.traced("FINISH_ATTN")
     def _npu_prefill_deepep_finish_attention(
         self,
         hidden_states: torch.Tensor,
@@ -3550,6 +3566,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             oproj_rs_pipeline_chunks > 0 or use_fused_oproj_rs
         )
         if hidden_states.shape[0] != 0:
+            pd_diag.emit("ATTN_ENTER", extra=self.layer_id)
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -3567,6 +3584,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 ),
                 prefill_ag_qkv_slices=prefill_ag_qkv_slices,
             )
+            pd_diag.stage_mark("ATTN_RETURN")
         if is_first_kv_mirror_consumer:
             mirror_num_real_rows = int(forward_batch.batch_size)
             if forward_batch.custom_last_index.numel() != mirror_num_real_rows:
@@ -3709,6 +3727,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             ),
             deepep_num_max_dispatch_tokens_override=mirror_ll_capacity,
         ):
+            pd_diag.emit("MOE_ENTER", extra=self.layer_id)
             mlp_output = self.mlp(
                 hidden_states,
                 hidden_states_fp32,
@@ -3726,6 +3745,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     and getattr(self.mlp, "tp_size", 1) == 1
                 ),
             )
+        pd_diag.stage_mark("MOE_RETURN")
         experts_output = None
         shared_output = None
         if isinstance(mlp_output, tuple):
@@ -4394,6 +4414,8 @@ class Qwen2MoeModel(nn.Module):
             )
         else:
             for i in range(self.start_layer, self.end_layer):
+                if pd_diag.get() is not None:
+                    pd_diag.layer_mark("LAYER_ENTER", i)
                 if i in self.layers_to_capture:
                     aux_hidden_states.append(
                         hidden_states + residual
@@ -4405,6 +4427,8 @@ class Qwen2MoeModel(nn.Module):
                     hidden_states, residual = layer(
                         positions, hidden_states, forward_batch, residual
                     )
+                if pd_diag.get() is not None:
+                    pd_diag.layer_mark("LAYER_RETURN", i, last=i == self.end_layer - 1)
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {

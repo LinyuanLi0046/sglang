@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.utils import npu_pd_diagnostics as pd_diag
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.io_struct import (
@@ -551,6 +552,7 @@ class TpModelWorker(BaseTpWorker):
             can_run_cuda_graph=can_run_cuda_graph,
         )
 
+    @pd_diag.traced("WORKER_FORWARD")
     def forward_batch_generation(
         self,
         batch: Optional[ScheduleBatch],

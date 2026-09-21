@@ -2,6 +2,7 @@
 """Independent NPU PD collector. No torch import and no device API calls."""
 
 import argparse
+import gzip
 import importlib.util
 import json
 import mmap
@@ -11,7 +12,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from pathlib import Path
 
 CORE_PATH = Path(__file__).resolve().parents[1] / "python/sglang/srt/utils/npu_pd_diagnostics.py"
@@ -20,15 +21,71 @@ core = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(core)
 
 
+class OutputVolume:
+    """Rolling write-volume measurement, never a quota that drops evidence."""
+    def __init__(self):
+        self.samples = deque()
+        self.total = 0
+
+    def add(self, size):
+        self.samples.append((time.monotonic(), size))
+        self.total += size
+
+    def recent(self):
+        cutoff = time.monotonic() - 600
+        while self.samples and self.samples[0][0] <= cutoff:
+            self.total -= self.samples.popleft()[1]
+        return self.total
+
+
+class GzipBlocks:
+    """Complete gzip members per 64 KiB/flush, so flushed live logs are readable.
+
+    Only the collector compresses; producer processes never wait for this writer.
+    Earlier members remain recoverable if a later write/process is interrupted.
+    """
+    def __init__(self, path, volume=None):
+        self.stream = path.open("xb")
+        self.block = bytearray()
+        self.volume = volume
+
+    def write(self, text):
+        data = text.encode("utf-8")
+        for offset in range(0, len(data), 64 * 1024):
+            self.block.extend(data[offset:offset + 64 * 1024])
+            if len(self.block) >= 64 * 1024:
+                self._write_block()
+
+    def _write_block(self):
+        if self.block:
+            compressed = gzip.compress(self.block, compresslevel=1, mtime=0)
+            self.stream.write(compressed)
+            if self.volume is not None:
+                self.volume.add(len(compressed))
+            self.block.clear()
+
+    def flush(self):
+        self._write_block()
+        self.stream.flush()
+
+    def close(self):
+        try:
+            self.flush()
+        finally:
+            self.stream.close()
+
+
 class Journal:
     """Append-only segments. Segment size is not a retention/capacity limit."""
-    def __init__(self, directory, limit=64 * 1024 * 1024, prefix="history"):
+    def __init__(self, directory, limit=64 * 1024 * 1024, prefix="history", volume=None):
         self.directory, self.limit, self.prefix = directory, limit, prefix
-        indices = [int(p.stem.rsplit("-", 1)[1]) for p in directory.glob(f"{prefix}-*.jsonl")
-                   if p.stem.rsplit("-", 1)[1].isdigit()]
+        self.volume = volume
+        indices = [int(p.name.split(".")[0].rsplit("-", 1)[1])
+                   for p in directory.glob(f"{prefix}-*.jsonl*")
+                   if p.name.split(".")[0].rsplit("-", 1)[1].isdigit()]
         self.index = max(indices, default=-1) + 1
-        self.path = directory / f"{prefix}-{self.index}.jsonl"
-        self.file = self.path.open("x", encoding="utf-8")
+        self.path = directory / f"{prefix}-{self.index}.jsonl.gz"
+        self.file = GzipBlocks(self.path, volume)
         self.size = 0
 
     def append(self, data):
@@ -37,8 +94,8 @@ class Journal:
         if self.size + size > self.limit:
             self.file.close()
             self.index += 1
-            self.path = self.directory / f"{self.prefix}-{self.index}.jsonl"
-            self.file = self.path.open("x", encoding="utf-8")
+            self.path = self.directory / f"{self.prefix}-{self.index}.jsonl.gz"
+            self.file = GzipBlocks(self.path, self.volume)
             self.size = 0
         self.file.write(line)
         self.size += size
@@ -408,9 +465,9 @@ def collect_stacks(workers, directory, budget=20):
 
 
 def save_incident(output, workers, triggers, journal, stacks, logs,
-                  lifecycle=None, first_wait=False):
+                  lifecycle=None, first_wait=False, full=True, raw_reference=None, volume=None):
     # Every incident gets a fresh directory; never overwrite previous evidence.
-    label = "first-wait" if first_wait else "snapshot"
+    label = "first-wait" if first_wait else "snapshot" if full else "status"
     directory = output / f"incident-{time.time_ns()}-{label}"
     directory.mkdir()
     journal.flush()
@@ -425,41 +482,51 @@ def save_incident(output, workers, triggers, journal, stacks, logs,
     # all growing history into every incident (quadratic I/O). Keep the whole run.
     report["journals"] = {
         item.prefix: [dict(file=os.path.relpath(p, directory), bytes_at_snapshot=p.stat().st_size)
-                      for p in sorted(item.directory.glob(f"{item.prefix}-*.jsonl"))]
+                      for p in sorted(item.directory.glob(f"{item.prefix}-*.jsonl*"))]
         for item in (journal, lifecycle) if item is not None
     }
     raw_artifacts = []
-    for worker in workers:
+    for worker in workers if full else ():
         prefix = worker.path.stem
         data = json.dumps(proc_snapshot(worker), ensure_ascii=False, indent=2)
-        (directory / f"proc-{prefix}.json").write_text(data)
-        artifact = dict(worker=str(worker.path), file=f"{prefix}.mmap", saved=False)
+        with gzip.open(directory / f"proc-{prefix}.json.gz", "xt", encoding="utf-8", compresslevel=1) as proc:
+            proc.write(data)
+        artifact = dict(worker=str(worker.path), file=f"{prefix}.mmap.gz", saved=False, compression="gzip")
         try:
             (directory / f"{prefix}.json").write_text(json.dumps(worker.manifest, indent=2))
-            with (directory / artifact["file"]).open("wb") as raw:
+            with gzip.open(directory / artifact["file"], "xb", compresslevel=1) as raw:
                 for offset in range(0, worker.size, 1024 * 1024):
                     raw.write(worker.buf[offset:offset + 1024 * 1024])
             artifact["saved"] = True
             artifact["bytes"] = worker.size
+            artifact["stored_bytes"] = (directory / artifact["file"]).stat().st_size
         except OSError as exc:
             artifact["error"] = str(exc)
         raw_artifacts.append(artifact)
     report["raw_artifacts"] = raw_artifacts
-    report["raw_complete"] = bool(workers) and all(item["saved"] for item in raw_artifacts)
-    report["raw_expected_bytes"] = sum(w.size for w in workers)
-    report["snapshot_kind"] = "first_pd_wait" if first_wait else "snapshot"
+    report["raw_included"] = full
+    report["raw_complete"] = bool(workers) and all(item["saved"] for item in raw_artifacts) if full else None
+    report["raw_expected_bytes"] = sum(w.size for w in workers) if full else 0
+    report["snapshot_kind"] = "first_pd_wait" if first_wait else "snapshot" if full else "status_only"
+    if not full:
+        report["raw_omission_reason"] = "periodic PD wait: current state and incremental journals retained; no repeated raw copy"
+        report["previous_raw_snapshot"] = os.path.relpath(raw_reference, directory) if raw_reference else None
     (directory / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2))
-    for i, log in enumerate(logs):
+    for i, log in enumerate(logs if full else ()):
         try:
-            shutil.copyfile(log, directory / f"log-{i}.txt")
+            with Path(log).open("rb") as source, gzip.open(directory / f"log-{i}.txt.gz", "xb", compresslevel=1) as dest:
+                shutil.copyfileobj(source, dest, length=1024 * 1024)
         except OSError as exc:
             (directory / f"log-{i}-error.txt").write_text(str(exc))
     if stacks:
         result = collect_stacks(workers, directory)
         (directory / "stack-result.json").write_text(json.dumps(result, indent=2))
     print(f"{report['time']} saved {directory} ({', '.join(sorted({t['kind'] for t in triggers}))})", flush=True)
-    if not report["raw_complete"]:
+    if full and not report["raw_complete"]:
         print("WARNING: incomplete raw snapshot; see report.json raw_artifacts", flush=True)
+    if volume is not None:
+        volume.add(sum(path.stat().st_size for path in directory.iterdir() if path.is_file()))
+    return directory
 
 
 def main():
@@ -492,13 +559,16 @@ def main():
     lock_path = args.output / "collector.lock"
     with lock_path.open("x") as lock:
         lock.write(str(os.getpid()))
-    journal = Journal(args.output)
-    lifecycle = Journal(args.output, limit=16 * 1024 * 1024, prefix="lifecycle")
+    volume = OutputVolume()
+    journal = Journal(args.output, volume=volume)
+    lifecycle = Journal(args.output, limit=16 * 1024 * 1024, prefix="lifecycle", volume=volume)
     workers, seen, notices = {}, {}, {}
     retired = set()
     wait_snapshot = WaitSnapshot()
     stack_collected = False
     last_flush = last_wait_snapshot = time.monotonic()
+    last_volume_report = time.monotonic()
+    last_raw_snapshot = None
     try:
         while True:
             notice_triggers = []
@@ -527,9 +597,10 @@ def main():
                           "(registration, execution lost, torn, lifecycle lost, lifecycle torn)", flush=True)
                     worker.warned_coverage = counts
                 for record in records:
-                    journal.append(dict(worker=path, event=record))
                     if lifecycle_record(record):
                         lifecycle.append(dict(worker=path, event=record))
+                    else:
+                        journal.append(dict(worker=path, event=record))
                 observation = compact_observation(snapshot)
                 if observation != worker.last_observation:
                     journal.append(dict(worker=path, time_ns=time.time_ns(), observation=observation))
@@ -557,18 +628,18 @@ def main():
             if not execution_stalled:
                 stack_collected = False
             first_wait = wait_snapshot.update(triggers, workers)
-            if first_wait:
-                save_incident(args.output, list(workers.values()), triggers, journal,
-                              False, args.log_file, lifecycle=lifecycle, first_wait=True)
-                last_wait_snapshot = time.monotonic()
-            # The protected snapshot already contains this tick's full P/D
-            # state; avoid writing all maps twice unless we also need stacks.
-            if (fresh or args.once) and (not first_wait or need_stack or args.once):
+            # First-wait + execution escalation in one tick needs only one full
+            # snapshot; save it before optional attach, as save_incident does.
+            if first_wait or fresh or args.once:
                 take_stack = need_stack and not stack_collected and not args.no_stack and not args.once
-                save_incident(args.output, list(workers.values()), triggers or [{"kind": "MANUAL"}],
-                              journal, take_stack, args.log_file, lifecycle=lifecycle)
+                full = first_wait or args.once or any(t["kind"] != "PD_WAIT_LONG" for t in fresh)
+                saved = save_incident(args.output, list(workers.values()), triggers or [{"kind": "MANUAL"}],
+                              journal, take_stack, args.log_file, lifecycle=lifecycle, full=full,
+                              raw_reference=last_raw_snapshot, volume=volume, first_wait=first_wait)
+                if full:
+                    last_raw_snapshot = saved
                 stack_collected |= take_stack
-                if any(t["kind"] == "PD_WAIT_LONG" for t in fresh):
+                if first_wait or any(t["kind"] == "PD_WAIT_LONG" for t in fresh):
                     last_wait_snapshot = time.monotonic()
             for path, worker in list(workers.items()):
                 if worker.last_snapshot["alive"] is False:
@@ -586,6 +657,14 @@ def main():
                 journal.flush()
                 lifecycle.flush()
                 last_flush = time.monotonic()
+            if time.monotonic() - last_volume_report >= 60:
+                written = volume.recent()
+                sample = dict(kind="DIAG_OUTPUT_VOLUME", window_seconds=600,
+                              bytes_written=written, target_bytes=1_000_000_000,
+                              over_target=written > 1_000_000_000, policy="warn_only_no_data_dropped")
+                lifecycle.append(sample)
+                print(json.dumps(sample), flush=True)
+                last_volume_report = time.monotonic()
             time.sleep(1)
     except KeyboardInterrupt:
         pass

@@ -2,7 +2,7 @@
 
 这是 opt-in 诊断，不是故障修复。默认关闭；不修改 MF、绑核、传输额度、业务 timeout、KV 分配、模型算子或既有 stream wait。
 
-**当前落盘策略：不设置总容量/保留份数上限，不自动删除或覆盖历史。** history、lifecycle 只按文件大小分段，所有旧分段保留；每次现场使用新的时间戳目录。内存 ring 仍有界，覆盖、撕裂和写盘失败必须查看 coverage，不能把“磁盘不限量”理解为绝对零丢失。请使用空间足够的持久化数据盘并监控剩余空间，不要把无限增长的落盘目录放进 `/dev/shm`。本次不改 router、无需重建原生模块。
+**当前落盘策略：无损压缩、增量记录，不设置保留容量上限，不自动删除或覆盖历史。** history、lifecycle 只按文件大小分段，所有旧分段保留。首次异常/升级保存完整压缩现场，持续 PD 等待每 30 秒只保存状态报告，不再重复复制全部 mmap。目标是当前 P+D 工作负载下新增诊断文件低于 **1 GB/10 分钟**；这是测量和优化目标，不是达到后丢弃证据的硬配额。内存 ring 仍有界，覆盖、撕裂和写盘失败必须查看 coverage。请使用持久化数据盘并监控空间，不要把无限增长的落盘目录放进 `/dev/shm`。本次不改 router、无需重建原生模块。
 
 ## 1. 当前建议
 
@@ -79,7 +79,7 @@ nohup python scripts/npu_pd_diag_collect.py \
 
 不要让两个 collector 使用同一个 output 目录。`collector.lock` 防止重复运行；若 collector 被 SIGKILL 遗留该文件，先确认文件中 PID 的进程确实已退出，再手动移走锁文件，或用新的 output 目录。
 
-为了同时保存服务日志，可追加 `--log-file /绝对路径/P.log`。每次现场完整复制显式指定的文件，不再限制个数或只留末尾 1 MiB；很大的服务日志会增加采集 I/O，也可以不传此参数，单独保留原始服务日志。不自动扫描日志盘。服务日志可能含业务内容，请注意现场目录权限。
+为了同时保存服务日志，可追加 `--log-file /绝对路径/P.log`。仅在完整现场时无损压缩复制显式指定的文件，不限制个数或只留末尾；周期性等待状态报告不重复复制。很大的历史服务日志会增加采集 CPU/I/O，也可能超过 1 GB/10 分钟目标，建议单独保留原服务日志、不传此参数。不自动扫描日志盘。服务日志可能含业务内容，请注意现场目录权限。
 
 ## 4. 触发规则
 
@@ -92,7 +92,7 @@ nohup python scripts/npu_pd_diag_collect.py \
 
 collector 每秒扫描；所以实际触发通常在阈值后的约一个扫描周期内。抓栈每个子命令最多约 5 秒，总预算约 20 秒，超时只结束 collector 自己的 py-spy 子进程，不杀 SGLang。抓栈期间可能出现一段采集间隔，ring 覆盖会明确标记缺口；抓栈前的证据已经落盘。
 
-首次 PD 长等待保存到 `incident-<时间戳>-first-wait`；后续现场保存到新的 `incident-<时间戳>-snapshot`。旧目录永久保留，不再覆盖。重叠出现的等待请求属于同一组，原始请求取消不会让尚未结束的其他等待失去最初现场。常规等待快照仍按 `--pd-wait-after` 节流，不因新慢请求每秒复制全部 raw。节流是采集频率，不是日志保留容量限制。正常等待也可能触发，触发本身不表示故障。
+首次 PD 长等待保存完整压缩现场 `incident-<时间戳>-first-wait`；持续等待每 30 秒保存 `incident-<时间戳>-status`，包含所有已发现进程的当前请求/调用/设备事件/job 状态和日志引用，不复制 raw、`/proc` 或服务日志。增量事件始终持续落盘。新的执行停滞、升级抓栈、异常、进程退出、手动 `--once` 仍保存完整压缩 `incident-<时间戳>-snapshot`。旧目录永久保留。重叠等待属于同一组，原请求取消不会使其最初现场被覆盖；新一轮等待仍保留首份完整现场。触发本身不表示故障。
 
 `py-spy` 必须已经在 collector 的 PATH 中，且当前用户/容器具有合法 attach 权限。工具不会修改 ptrace、容器 capability、cpuset 或安全策略。未安装或权限不足会记录原因，其他采集继续。完全不希望自动 attach 时追加 `--no-stack`。
 
@@ -117,8 +117,9 @@ ls -lh /data2/pd_diag_artifacts/run_0920
 
 每个 recorder 应有一对 `.json` manifest 和 `.mmap`；TP4 单 HTTP worker 的 P 应有 5 对（4 scheduler + 1 API），D 同理。collector 约每 5 秒 flush：
 
-- `history-*.jsonl`：每段约 64 MiB，段号不断增加，旧段不删除；保存执行事件及变化的精简 observation。
-- `lifecycle-*.jsonl`：每段约 16 MiB，段号不断增加，旧段不删除。保存请求入口、PD 阶段、metadata、终态、取消及覆盖缺口；`PD_MODEL` 只进 history，不进 lifecycle。v2 在 producer mmap 中也使用独立低频环，避免 collector 读取前就被逐 token 事件覆盖。
+- `history-*.jsonl.gz`：按解压前约 64 MiB 分段，保存执行事件及变化的精简 observation。
+- `lifecycle-*.jsonl.gz`：按解压前约 16 MiB 分段，保存请求入口、PD 阶段、metadata、终态、取消及覆盖缺口；`PD_MODEL` 只进 history，不进 lifecycle，低频事件也不再重复写入 history。v2 producer mmap 使用独立低频环，避免逐 token 事件覆盖请求边界。
+- 两类均为一级 gzip **无损压缩**，所有段永久保留；压缩只在 collector 进程，不在 SGLang 执行线程。约每 64 KiB/flush 写入一个完整 gzip member，运行中的已 flush 部分可直接读取；进程强杀时尚未写入/未写完的尾部仍可能丢失。
 - startup `EVENT_WARM` 不作为活动设备工作反复写入 observation；原始 mmap 中的数据仍然保留。
 
 可在另一个 output 目录做一次只读快照，不抓栈：
@@ -130,13 +131,19 @@ python scripts/npu_pd_diag_collect.py \
   --output /data2/pd_diag_artifacts/manual_check_01 --once
 ```
 
-每份时间戳现场包含 `report.json`、**全部已发现 recorder 的原始 mmap 及配套 manifest**、完整的选定 `/proc` 文本、线程列表、可选服务日志及栈。`/proc` 从头读取，不再 SEEK_END。堆栈输出和 report 不再按大小截断，但抓栈的时间上限保留，以避免长时间 attach。
+完整现场包含 `report.json`、**全部已发现 recorder 的 `.mmap.gz` 及配套 manifest**、`.json.gz` 格式的完整选定 `/proc` 文本、线程列表、可选压缩服务日志及栈。mmap 解压后逐字节一致；不是采样或截断。`/proc` 从头读取，不再 SEEK_END。堆栈输出和 report 不按大小截断，但抓栈时间上限保留，以避免长时间 attach。周期性 `status` 只保留当前状态及增量日志引用，其 `raw_included=false`、`raw_complete=null`，明确区别于复制失败。
 
 完整 history/lifecycle 保留在 output 根目录。report 的 `journals` 字段记录相对路径和快照时文件长度，避免每次现场重复复制全部增长中的历史。**交付现场要带整个 output 目录，不能只拷贝一个 incident 子目录。** 新 collector 可以读取 v1 旧 mmap，但旧 recorder 本身没有独立低频环；要启用隔离和前端补点，必须重启升级后的服务。
 
-P4+D4 加两个单进程 API，每份 raw 约 **380.3 MiB**；如果持续等待、每 30 秒保存一次，单 raw 就约 **44.6 GiB/小时**，还不包含日志和栈。没有自动容量上限或清理：务必监控数据盘，空间不足时会明确报错，不能继续声称采集完整。最多 64 个当前 recorder，更多 rank 的空间按实际数量增加。复制不暂停模型/设备，CRC/sequence 检测撕裂；现场复制及抓栈可能延迟下一次 ring 读取，覆盖会记录在 coverage 中。
+P4+D4 加两个 API 的**常驻 mmap**仍约 380.3 MiB，不会每 30 秒累加；它也不等于整个 collector 的 RSS。现在不再每 30 秒落盘 380.3 MiB：完整 raw 一级 gzip 压缩，持续等待仅追加状态。对提供的 0921-02 旧数据离线测试，8 个当前 worker raw 从 176.16 MiB 压到 2.26 MiB；旧 history/lifecycle 合计 250.44 MiB，使用新分块 writer 压到约 15.41 MiB。这是已保留样本、本机测试，不是远端任意负载的体积或时延保证。
 
-检查每份 `report.json`：`raw_complete=true`，`raw_artifacts` 对 P4+D4 加两个单进程 API 应有 10 项且 `saved=true`，每项带源路径；保存失败会记录错误并告警。这只表示已发现文件复制完整，不保证未接入的 peer/进程已采集，也不消除 ring coverage gap。注意 `lifecycle_ring_lost`、`lifecycle_torn_reads` 和 `lifecycle_isolated`；新增丢失会在 collector.log 告警。
+每分钟输出 `DIAG_OUTPUT_VOLUME` 到 collector.log 和 lifecycle：`bytes_written` 是本 collector 最近 600 秒新增文件字节数，目标 `target_bytes=1000000000`；超过时 `over_target=true`，不会删旧记录或停止写入。使用一个 collector 同时采集 P/D 才是合计值；分开部署则需相加。计数包含压缩 journals、现场文件及显式附加的服务日志副本，不包含常驻 source mmap、外部服务日志原件和重定向的 collector.log；重启后窗口重新累计。大量全新故障或巨大的附加服务日志仍可能超过目标，需远端验证。
+
+没有自动容量清理：空间不足会明确报错。压缩消耗 collector CPU；完整现场复制及抓栈仍可能延迟下一次 ring 读取，coverage 会记录缺口，因此不承诺零扰动。
+
+检查**完整现场**的 `report.json`：`raw_complete=true`，`raw_artifacts` 对 P4+D4 加两个 API 应有 10 项且 `saved=true`，每项带源路径、解压后 `bytes` 和压缩后 `stored_bytes`；失败会记录错误并告警。这只表示已发现文件复制完整，不保证未接入的 peer/进程已采集，也不消除 ring coverage gap。注意 `lifecycle_ring_lost`、`lifecycle_torn_reads` 和 `lifecycle_isolated`。周期性状态报告的 `previous_raw_snapshot` 指向前一份完整现场，不能把旧 raw 当成该状态报告时刻的 raw。
+
+离线需要按旧格式读取 raw 时，可在完整现场目录执行 `gzip -dk -- *.mmap.gz`，保留压缩原件并生成 `.mmap`；解压需要额外磁盘空间。JSONL 可用 `gzip -cd lifecycle-0.jsonl.gz` 或 Python 标准库 `gzip.open(path, 'rt')` 阅读，不需要安装额外包。
 
 离线查看概要，无需连接 NPU：
 

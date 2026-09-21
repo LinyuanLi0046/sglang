@@ -5,6 +5,7 @@ import concurrent.futures
 import asyncio
 import importlib.util
 import io
+import gzip
 import json
 import tempfile
 import threading
@@ -294,9 +295,22 @@ def main():
         report = json.loads((incident / "report.json").read_text())
         assert report["raw_complete"] and len(report["raw_artifacts"]) == 8
         assert report["raw_expected_bytes"] == 8 * core.SIZE
-        assert len(list(incident.glob("*.mmap"))) == 8
+        assert len(list(incident.glob("*.mmap.gz"))) == 8
         assert len(list(incident.glob("decode-*.json"))) == 4
         assert report["journals"]["lifecycle"]
+        # Raw gzip is byte-for-byte reversible, not a sampled/filtered mmap.
+        artifact = report["raw_artifacts"][0]
+        with gzip.open(incident / artifact["file"], "rb") as raw:
+            assert raw.read() == Path(artifact["worker"]).read_bytes()
+        assert sum(a["stored_bytes"] for a in report["raw_artifacts"]) < report["raw_expected_bytes"] // 10
+        status_only = collect.save_incident(output, list(workers.values()), [{"kind": "PD_WAIT_LONG"}],
+                                            journal, False, [], lifecycle=lifecycle, full=False,
+                                            raw_reference=incident)
+        light_report = json.loads((status_only / "report.json").read_text())
+        assert light_report["raw_included"] is False and light_report["raw_complete"] is None
+        assert not list(status_only.glob("*.mmap*"))
+        assert (status_only / light_report["previous_raw_snapshot"]).resolve() == incident.resolve()
+        assert len(light_report["workers"]) == 8
 
         # Initial warmup markers cannot fill every observation snapshot.
         warm = core._pack("EVENT_PENDING", core.Context(), reason="EVENT_WARM")
@@ -340,7 +354,8 @@ def main():
         lifecycle.flush()
         for i in range(100):
             journal.append(dict(kind="EVENT_QUERY_RETURN", tick=i))
-        assert "failed before peer arrived" in lifecycle.path.read_text()
+        with gzip.open(lifecycle.path, "rt", encoding="utf-8") as file:
+            assert "failed before peer arrived" in file.read()
         # More than four segments, including across a collector restart: no
         # old file may be renamed, overwritten, or deleted.
         archival = collect.Journal(output, limit=64, prefix="archive-test")
@@ -350,9 +365,26 @@ def main():
         archival = collect.Journal(output, limit=64, prefix="archive-test")
         archival.append({"i": 20})
         archival.file.close()
-        rows = [json.loads(line) for path in output.glob("archive-test-*.jsonl")
-                for line in path.read_text().splitlines()]
+        rows = []
+        for path in output.glob("archive-test-*.jsonl.gz"):
+            with gzip.open(path, "rt", encoding="utf-8") as file:
+                rows.extend(json.loads(line) for line in file)
         assert sorted(row["i"] for row in rows) == list(range(21))
+        # Multiple complete members are readable while the journal is open.
+        blocks = collect.Journal(output, prefix="gzip-live")
+        for i in range(3):
+            blocks.append({"i": i, "value": "x" * 100_000})
+            blocks.flush()
+            with gzip.open(blocks.path, "rt", encoding="utf-8") as file:
+                assert [json.loads(line)["i"] for line in file] == list(range(i + 1))
+        blocks.file.close()
+        # Measurement warns rather than enforcing a lossy quota.
+        meter = collect.OutputVolume()
+        with patch.object(collect.time, "monotonic", return_value=0):
+            meter.add(1_000_000_001)
+            assert meter.recent() > 1_000_000_000
+        with patch.object(collect.time, "monotonic", return_value=601):
+            assert meter.recent() == 0
 
         # A mounted foreign namespace is unknown, not dead: keep reading it
         # and never attach to a coincidentally matching local PID.
@@ -382,7 +414,7 @@ def main():
         collect.save_incident(output, [worker], [{"kind": "MANUAL"}], journal, False, [])
         worker.buf = original_buffer
         reports = [json.loads(p.read_text()) for p in output.glob("incident-*/report.json")]
-        assert any(not r["raw_complete"] and "error" in r["raw_artifacts"][0] for r in reports)
+        assert any(r["raw_complete"] is False and "error" in r["raw_artifacts"][0] for r in reports)
         journal.file.close()
         lifecycle.file.close()
         for reader in workers.values():
@@ -397,6 +429,7 @@ def main():
     print("      warmup exclusion, first-wait protection, independent lifecycle retention")
     print("      unknown peer namespace/permissions, explicit raw copy failure")
     print("      procfs without seek, isolated lifecycle ring, concurrent ASGI identity/cancellation")
+    print("      lossless gzip/live members, status-only repeated waits, rolling byte measurement")
 
 
 if __name__ == "__main__":

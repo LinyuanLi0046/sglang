@@ -29,7 +29,6 @@ from typing import TYPE_CHECKING, List, Optional
 import numpy as np
 import torch
 
-from sglang.srt.utils import npu_pd_diagnostics as pd_diag
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
@@ -290,9 +289,7 @@ class PrefillBootstrapQueue:
     def create_sender(self, req: Req, num_kv_heads: int) -> bool:
         """Create a KV sender for the request without enqueuing it.
         Returns False if the request exceeds KV capacity."""
-        pd_diag.request(req, "BOOTSTRAP", "create sender", progress=True)
         if self._check_if_req_exceed_kv_capacity(req):
-            pd_diag.request(req, "TERMINAL", "input exceeds KV capacity", progress=True)
             return False
 
         backend = (
@@ -321,11 +318,8 @@ class PrefillBootstrapQueue:
             return True
 
         if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
-            pd_diag.request(req, "BOOTSTRAP", "metadata buffer unavailable", available=0)
             return False
         req.metadata_buffer_index = self.req_to_metadata_buffer_idx_allocator.alloc()
-        pd_diag.request(req, "BOOTSTRAP", "metadata buffer allocated", progress=True,
-                        extra=req.metadata_buffer_index)
         assert req.metadata_buffer_index is not None
         return True
 
@@ -347,7 +341,6 @@ class PrefillBootstrapQueue:
         )
         req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
         req.pending_bootstrap = False
-        pd_diag.request(req, "WAIT_PREFILL", "bootstrap finalized", progress=True)
         return True
 
     def add(self, req: Req, num_kv_heads: int) -> None:
@@ -424,7 +417,6 @@ class PrefillBootstrapQueue:
             )
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
-            pd_diag.request(req, "BOOTSTRAP", "consensus poll", status=poll)
             if poll is None:
                 continue
 
@@ -651,7 +643,6 @@ class SchedulerDisaggregationPrefillMixin:
             # Update last_batch
             self.last_batch = batch
 
-    @pd_diag.traced("PROCESS_RESULT", batch=True)
     def process_batch_result_disagg_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -688,8 +679,7 @@ class SchedulerDisaggregationPrefillMixin:
         assert batch.spec_info is result.next_draft_input
         draft_input = result.next_draft_input
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
-        with pd_diag.span("RESULT_TO_HOST"):
-            next_token_ids = result.next_token_ids.tolist()
+        next_token_ids = result.next_token_ids.tolist()
         self.batch_result_processor.move_logprobs_to_cpu(
             batch=batch,
             logits_output=logits_output,
@@ -1113,7 +1103,6 @@ class SchedulerDisaggregationPrefillMixin:
             req.disagg_kv_sender._early_send_wait_event = ev
         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
 
-    @pd_diag.traced("SEND_CHUNK")
     def send_kv_chunk(
         self: Scheduler,
         req: Req,
@@ -1255,9 +1244,6 @@ class SchedulerDisaggregationPrefillMixin:
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             return
-        pd_diag.page_snapshot(req, page_indices)
-        pd_diag.request(req, "TRANSFER", "enqueue KV chunk", progress=True,
-                        start=start_idx, end=end_idx, cached=len(req.prefix_indices))
         req.disagg_kv_sender.send(
             page_indices,
             state_indices,
@@ -1271,7 +1257,6 @@ class SchedulerDisaggregationPrefillMixin:
         maybe_cache_unfinished_req(req, self.tree_cache)
         release_kv_cache(req, self.tree_cache)
         req.reset_for_retract()
-        pd_diag.next_attempt(req, "optimistic prefill requeue")
         req.output_ids = array("q")
         req.start_send_idx = 0
         req.tmp_end_idx = -1

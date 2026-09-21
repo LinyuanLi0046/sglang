@@ -50,7 +50,6 @@ from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.utils import npu_pd_diagnostics as pd_diag
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
@@ -392,7 +391,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         # Parse args
         self.server_args = server_args
-        pd_diag.initialize_frontend(server_args)
         self._config_updates: List[Tuple[str, Dict[str, Any]]] = []
         self.elastic_worker_count = server_args.dp_size
         self.elastic_pending_ep_size = None
@@ -536,24 +534,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _dispatch_to_scheduler(self, obj: Any) -> None:
         if self.tokenizer_ipc_name is not None:
             stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
-        pd_diag.frontend_request("FRONT_IPC_ENTER", obj, type(obj).__name__)
-        try:
-            sock_send(self.send_to_scheduler, obj)
-        except BaseException as exc:
-            pd_diag.frontend_request("FRONT_IPC_ERROR", obj, type(exc).__name__)
-            raise
-        pd_diag.frontend_request("FRONT_IPC_RETURN", obj, type(obj).__name__)
+        sock_send(self.send_to_scheduler, obj)
 
     async def _async_dispatch_to_scheduler(self, obj: Any) -> None:
         if self.tokenizer_ipc_name is not None:
             stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
-        pd_diag.frontend_request("FRONT_IPC_ENTER", obj, type(obj).__name__)
-        try:
-            await async_sock_send(self.send_to_scheduler, obj)
-        except BaseException as exc:
-            pd_diag.frontend_request("FRONT_IPC_ERROR", obj, type(exc).__name__)
-            raise
-        pd_diag.frontend_request("FRONT_IPC_RETURN", obj, type(obj).__name__)
+        await async_sock_send(self.send_to_scheduler, obj)
 
     def init_running_status(self):
         # Request states
@@ -747,7 +733,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
-        pd_diag.frontend_request("FRONT_GENERATE", obj, "normalized request")
         self._set_default_priority(obj)
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
@@ -787,7 +772,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 else:
                     async for response in self._handle_batch_request(obj, request):
                         yield response
-        except Exception as exc:
+        except Exception:
             # _init_req_state created a rid_to_state entry per (sub-)request up
             # front. The normal remover is the scheduler-response path
             # (_handle_batch_output), so a failure *before* a request reaches the
@@ -796,10 +781,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # are still pending; entries already removed on the normal completion
             # path are left untouched (pop is a no-op).
             self._discard_pending_req_states(obj)
-            pd_diag.frontend_request("FRONT_GENERATE_ERROR", obj, type(exc).__name__)
             raise
-        finally:
-            pd_diag.frontend_request("FRONT_GENERATE_END", obj)
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool
@@ -963,7 +945,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             input_ids, token_type_ids, input_format, original_batch_size
         )
 
-    @pd_diag.frontend_tokenize
     async def _tokenize_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -1658,7 +1639,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     and await request.is_disconnected()
                 ):
                     # Abort the request for disconnected requests (non-streaming, waiting queue)
-                    pd_diag.frontend_request("FRONT_ABORT_CAUSE", obj, "HTTP disconnect while waiting")
                     self.abort_request(obj.rid)
                     # Use exception to kill the whole call stack and asyncio task
                     raise ValueError(
@@ -1740,7 +1720,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     and await request.is_disconnected()
                 ):
                     # Abort the request for disconnected requests (non-streaming, running)
-                    pd_diag.frontend_request("FRONT_ABORT_CAUSE", obj, "HTTP disconnect while running")
                     self.abort_request(obj.rid)
                     # Use exception to kill the whole call stack and asyncio task
                     raise ValueError(
@@ -1880,7 +1859,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ):
             return
         req = AbortReq(rid=rid, abort_all=abort_all)
-        pd_diag.frontend_request("FRONT_ABORT", req, "tokenizer abort requested", extra=int(abort_all))
         self._dispatch_to_scheduler(req)
         if self.enable_metrics:
             # TODO: also use custom_labels from the request
@@ -2052,7 +2030,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Abort the request if the client is disconnected.
         async def abort_request():
             await asyncio.sleep(2)
-            pd_diag.frontend_request("FRONT_ABORT_CAUSE", obj, "response background cleanup")
             if obj.is_single:
                 self.abort_request(obj.rid)
             else:
@@ -3538,8 +3515,6 @@ class SignalHandler:
         self.tokenizer_manager.gracefully_exit = True
 
     def running_phase_sigquit_handler(self, signum=None, frame=None):
-        from sglang.srt.utils import npu_pd_diagnostics
-        npu_pd_diagnostics.emergency_note("PARENT_SIGQUIT")
         logger.error(
             f"SIGQUIT received. {signum=}, {frame=}. It usually means one child failed."
         )

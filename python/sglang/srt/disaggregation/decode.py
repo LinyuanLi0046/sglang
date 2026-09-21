@@ -31,7 +31,6 @@ import numpy as np
 import torch
 from torch.distributed import ProcessGroup
 
-from sglang.srt.utils import npu_pd_diagnostics as pd_diag
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
@@ -525,11 +524,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         dispatch happens later, after preallocation and ``send_metadata`` (see
         ``pop_preallocated``).
         """
-        if is_retracted or is_rebootstrap:
-            pd_diag.next_attempt(req, "decode retract/rebootstrap")
-        pd_diag.request(req, "PREALLOC", "decode request queued", progress=True)
         if self._check_if_req_exceed_kv_capacity(req):
-            pd_diag.request(req, "TERMINAL", "input exceeds KV capacity", progress=True)
             return
 
         if is_retracted:
@@ -892,13 +887,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         remaining.append(decode_req)
 
         self.pending_reqs = remaining
-        if pd_diag.get() is not None:
-            for decode_req in remaining:
-                pd_diag.request(decode_req.req, "PREALLOC", "waiting for P info/DP rank")
 
         for decode_req, prefill_dp_rank in resolved:
-            pd_diag.request(decode_req.req, "PREALLOC", "P DP rank resolved", progress=True,
-                            extra=prefill_dp_rank)
             decode_req.kv_receiver.init(prefill_dp_rank)
 
     def pop_preallocated(
@@ -1005,19 +995,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 continue
 
             if not decode_req.waiting_for_input:
-                pd_diag.request(decode_req.req, "PREALLOC", "handshake not ready")
                 continue
 
             if self.req_to_token_pool.available_size() <= 0:
-                pd_diag.request(decode_req.req, "PREALLOC", "request slots exhausted", available=0)
                 break
 
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
-                pd_diag.request(decode_req.req, "PREALLOC", "metadata buffers exhausted", available=0)
                 break
 
             if hisparse_req_budget <= 0:
-                pd_diag.request(decode_req.req, "PREALLOC", "hisparse budget exhausted", available=0)
                 break
 
             # Memory estimation: don't add if the projected memory cannot be met
@@ -1076,14 +1062,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
                 > full_allocatable_tokens
             ):
-                pd_diag.request(decode_req.req, "PREALLOC", "full KV admission budget",
-                                available=full_allocatable_tokens, needed=required_tokens_for_request)
                 if prefix_len > 0:
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                 break
             if required_tokens_for_request > full_allocatable_tokens:
-                pd_diag.request(decode_req.req, "PREALLOC", "full KV allocation budget",
-                                available=full_allocatable_tokens, needed=required_tokens_for_request)
                 if prefix_len > 0:
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                 break
@@ -1102,8 +1084,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
                     > swa_allocatable_tokens
                 ):
-                    pd_diag.request(decode_req.req, "PREALLOC", "SWA KV admission budget",
-                                    available=swa_allocatable_tokens, needed=swa_required)
                     if prefix_len > 0:
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                     break
@@ -1126,8 +1106,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 total_prefix_len,
             )
             decode_req.prefix_match = prefix_match
-            pd_diag.request(decode_req.req, "TRANSFER", "KV preallocated", progress=True,
-                            needed=required_alloc_tokens, cached=total_prefix_len)
             if self.scheduler.enable_decode_hicache:
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
             hisparse_req_budget -= 1
@@ -2028,7 +2006,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         transferred_reqs = []
         indices_to_remove = set()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
-            pd_diag.request(decode_req.req, "TRANSFER", "completion consensus poll", status=poll)
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 

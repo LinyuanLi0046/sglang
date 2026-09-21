@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import torch
 
-from sglang.srt.utils import npu_pd_diagnostics as pd_diag
 from sglang.srt.environ import envs
 
 _MAX_LOCAL_ROWS = 16384
@@ -88,7 +87,6 @@ class WelmPrefillMegaMoE:
         # Use host metadata only; never read a device scalar to skip padding.
         return min(max(real_rows - attn_tp_rank * shard_rows, 0), shard_rows)
 
-    @pd_diag.traced("MEGAMOE")
     def forward_layer(
         self,
         experts,

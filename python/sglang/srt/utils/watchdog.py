@@ -146,8 +146,6 @@ class WatchdogRaw:
                     watchdog_last_time = current
             time.sleep(self.watchdog_timeout / 2)
 
-        from sglang.srt.utils import npu_pd_diagnostics
-        npu_pd_diagnostics.emit("WATCHDOG", reason=self.debug_name)
         if self.dump_info is not None and (info_msg := self.dump_info()):
             logger.error(f"{self.debug_name} debug info:\n{info_msg}")
 

@@ -29,7 +29,6 @@ class TransferKVChunk:
     trace_ctx: Union[TraceReqContext, TraceNullContext] = dataclasses.field(
         default_factory=TraceNullContext
     )
-    diagnostic_context: object = None  # Immutable CPU IDs only; never holds Req/Tensor.
 
 
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:

@@ -6,7 +6,6 @@ from typing import List, Optional, Tuple
 import numpy as np
 import numpy.typing as npt
 
-from sglang.srt.utils import npu_pd_diagnostics as pd_diag
 from sglang.srt.disaggregation.ascend.transfer_engine import AscendTransferEngine
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
@@ -115,7 +114,6 @@ class AscendKVManager(MooncakeKVManager):
         layers_current_pp_stage = len(src_kv_ptrs)
         return src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage
 
-    @pd_diag.traced("KV_FULL")
     def send_kvcache(
         self,
         mooncake_session_id: str,
@@ -210,7 +208,7 @@ class AscendKVManager(MooncakeKVManager):
 
         if self.enable_custom_mem_pool:
             futures = [
-                pd_diag.submit(executor,
+                executor.submit(
                     process_layer,
                     src_ptr,
                     dst_ptr,
@@ -222,8 +220,7 @@ class AscendKVManager(MooncakeKVManager):
                 status = future.result()
                 if status != 0:
                     for f in futures:
-                        cancelled = f.cancel()
-                        pd_diag.emit("JOB_CANCEL_RESULT", status=int(cancelled))
+                        f.cancel()
                     return status
         else:
             # Combining all layers' params in one batch transfer is more efficient

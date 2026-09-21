@@ -15,7 +15,6 @@ import numpy.typing as npt
 import zmq
 from prometheus_client import Counter
 
-from sglang.srt.utils import npu_pd_diagnostics as pd_diag
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
@@ -611,7 +610,6 @@ class MooncakeKVManager(CommonKVManager):
             )
         return ret
 
-    @pd_diag.traced("TRANSFER_BLOCKS")
     def _transfer_data(self, mooncake_session_id, transfer_blocks):
         if not transfer_blocks:
             return 0
@@ -754,7 +752,7 @@ class MooncakeKVManager(CommonKVManager):
 
         if self.enable_custom_mem_pool:
             futures = [
-                pd_diag.submit(executor,
+                executor.submit(
                     process_layer,
                     src_ptr,
                     dst_ptr,
@@ -891,7 +889,7 @@ class MooncakeKVManager(CommonKVManager):
 
         if self.enable_custom_mem_pool:
             futures = [
-                pd_diag.submit(executor, process_layer, src_ptr, dst_ptr, token_item_len)
+                executor.submit(process_layer, src_ptr, dst_ptr, token_item_len)
                 for src_ptr, dst_ptr, token_item_len in layers_params
             ]
             for future in concurrent.futures.as_completed(futures):
@@ -1021,11 +1019,11 @@ class MooncakeKVManager(CommonKVManager):
         futures = []
         for i in range(layers_current_pp_stage):
             futures.append(
-                pd_diag.submit(executor, process_layer_tp_aware, src_k_ptrs[i], dst_k_ptrs[i])
+                executor.submit(process_layer_tp_aware, src_k_ptrs[i], dst_k_ptrs[i])
             )
         for i in range(layers_current_pp_stage):
             futures.append(
-                pd_diag.submit(executor, process_layer_tp_aware, src_v_ptrs[i], dst_v_ptrs[i])
+                executor.submit(process_layer_tp_aware, src_v_ptrs[i], dst_v_ptrs[i])
             )
 
         for future in concurrent.futures.as_completed(futures):
@@ -1037,7 +1035,6 @@ class MooncakeKVManager(CommonKVManager):
 
         return 0
 
-    @pd_diag.traced("KV_AUX")
     def send_aux(
         self,
         req: TransferInfo,
@@ -1062,7 +1059,6 @@ class MooncakeKVManager(CommonKVManager):
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
-    @pd_diag.traced("KV_AUX_TCP")
     def send_aux_tcp(
         self,
         req: TransferInfo,
@@ -1179,7 +1175,6 @@ class MooncakeKVManager(CommonKVManager):
         """State types whose page lists are positional and must not be truncated."""
         return st in (StateType.SWA_RING, StateType.C128_STATE)
 
-    @pd_diag.traced("KV_STATE")
     def maybe_send_extra(
         self,
         req: TransferInfo,
@@ -1534,17 +1529,8 @@ class MooncakeKVManager(CommonKVManager):
             )
 
         while True:
-            diagnostic_token = None
-            diagnostic_previous = None
-            diagnostic_error = None
             try:
                 kv_chunk: TransferKVChunk = queue.get()
-                if (diag := pd_diag.get()) is not None:
-                    diagnostic_previous = diag.context()
-                    ctx = kv_chunk.diagnostic_context or diag.room_context(kv_chunk.room)
-                    diagnostic_token = diag.begin("KV_CHUNK", ctx)
-                    diag.local.context = diagnostic_token[3] if diagnostic_token else ctx
-                    diag.request(ctx, "SENDING", "transfer worker dequeued", progress=True)
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -1822,15 +1808,10 @@ class MooncakeKVManager(CommonKVManager):
                         self._staging_ctx.prefetched_rooms.discard(kv_chunk.room)
 
             except Exception as e:
-                diagnostic_error = e
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )
-            finally:
-                if (diag := pd_diag.get()) is not None and diagnostic_previous is not None:
-                    diag.end(diagnostic_token, diagnostic_error)
-                    diag.local.context = diagnostic_previous
 
     def start_prefill_thread(self):
         def bootstrap_thread():
@@ -1858,7 +1839,6 @@ class MooncakeKVManager(CommonKVManager):
                 # Decode-side abort notification: mark room as failed and ACK
                 if room == "ABORT":
                     room_to_be_aborted = int(waiting_req_bytes[1].decode("ascii"))
-                    pd_diag.request(room_to_be_aborted, "FAILURE", "peer ABORT received", progress=True)
                     decode_ip = waiting_req_bytes[2].decode("ascii")
                     decode_port = int(waiting_req_bytes[3].decode("ascii"))
                     # No need to abort the room if it has already succeeded
@@ -1927,11 +1907,6 @@ class MooncakeKVManager(CommonKVManager):
                     self.transfer_infos[room][mooncake_session_id] = (
                         TransferInfo.from_zmq(waiting_req_bytes)
                     )
-                    pd_diag.request(room, "METADATA", "P received D metadata",
-                                    seen=len(self.transfer_infos[room]), need=required_dst_info_num)
-                    if pd_diag.get() is not None:
-                        pd_diag.emit("METADATA_SESSION", pd_diag.get().room_context(room),
-                                     reason=mooncake_session_id)
                     # NOTE: after bootstrapping we can mark the req as waiting for input
                     if len(self.transfer_infos[room]) == required_dst_info_num:
                         self.resolve_kv_replica_factor(self.transfer_infos[room])
@@ -1985,9 +1960,6 @@ class MooncakeKVManager(CommonKVManager):
                 if msg[0] == b"ABORT_ACK":
                     # TODO(shangming): use this info to implement the deferred release mechanism if needed
                     ack_aborted_room = int(msg[1].decode("ascii"))
-                    if pd_diag.get() is not None:
-                        pd_diag.emit("ABORT_ACK", pd_diag.get().room_context(ack_aborted_room),
-                                     reason="ACK does not prove native drain")
                     logger.debug(f"Received ABORT_ACK for room {ack_aborted_room}")
                     continue
 
@@ -2005,13 +1977,6 @@ class MooncakeKVManager(CommonKVManager):
                         arrived_response_num = len(
                             self.prefill_response_tracker[bootstrap_room]
                         )
-                        if pd_diag.get() is not None:
-                            source_mask = sum(1 << rank for rank in
-                                              self.prefill_response_tracker[bootstrap_room]
-                                              if 0 <= rank < 63)
-                            pd_diag.request(bootstrap_room, "COMPLETION", "D received P done",
-                                            done=arrived_response_num, need_done=expected_response_num,
-                                            source_mask=source_mask)
                         if arrived_response_num == expected_response_num:
                             if self.enable_staging:
                                 handler = self._staging_handler
@@ -2068,12 +2033,6 @@ class MooncakeKVManager(CommonKVManager):
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
 
-        diagnostic_context = None
-        if (diag := pd_diag.get()) is not None:
-            diagnostic_context = diag.room_context(bootstrap_room)._replace(
-                batch=diag.context().batch, call=time.monotonic_ns(), parent=diag.context().call)
-            diag.request(diagnostic_context, "QUEUED", "KV chunk queued", progress=True,
-                         start=index_slice.start, end=index_slice.stop, extra=shard_idx)
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(
                 room=bootstrap_room,
@@ -2084,7 +2043,6 @@ class MooncakeKVManager(CommonKVManager):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=trace_ctx,
-                diagnostic_context=diagnostic_context,
             )
         )
 
@@ -2341,7 +2299,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 return False
         return True
 
-    @pd_diag.traced("METADATA_SEND", room=True)
     def send_metadata(
         self,
         kv_indices: npt.NDArray[np.int32],
@@ -2367,14 +2324,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 self.bootstrap_room, self.bootstrap_infos, self
             )
 
-        diagnostic_sent = 0
         for bootstrap_info in self.bootstrap_infos:
-            if pd_diag.get() is not None:
-                pd_diag.emit("METADATA_TARGET_ENTER",
-                             reason=f"{bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')}")
-                pd_diag.request(self.bootstrap_room, "TRANSFER", "D sending metadata",
-                                sent=diagnostic_sent, need_sent=len(self.bootstrap_infos),
-                                need_done=self.required_prefill_response_num)
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
             try:
@@ -2406,14 +2356,9 @@ class MooncakeKVReceiver(CommonKVReceiver):
                     self.bootstrap_room,
                     f"send_metadata to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
                 )
-                pd_diag.emit("METADATA_TARGET_EXCEPTION", reason="ZMQError")
                 self.conclude_state = KVPoll.Failed
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 return
-            diagnostic_sent += 1
-            pd_diag.emit("METADATA_TARGET_RETURN", sent=diagnostic_sent)
-            pd_diag.request(self.bootstrap_room, "TRANSFER", "D metadata send returned",
-                            sent=diagnostic_sent, need_sent=len(self.bootstrap_infos))
         self.init_time = time.time()
 
     def poll(self) -> KVPoll:

@@ -2,7 +2,9 @@
 """CPU-only recorder/collector contract checks; no torch, NPU, or live attach."""
 
 import concurrent.futures
+import asyncio
 import importlib.util
+import io
 import json
 import tempfile
 import threading
@@ -27,6 +29,81 @@ def main():
         recorder = core.Recorder(directory, "prefill", 0, 0)
         core._instance = recorder
         recorder.set_ready()
+        # Low-frequency records survive an execution-ring wrap before collection.
+        recorder.emit("FRONT_HTTP_ENTER", core.Context(room=42, rid="edge-survives"))
+        for _ in range(core.RING * 2):
+            recorder.emit("PD_MODEL", core.Context(room=42), reason="batch entered")
+        first_reader = collect.Worker(recorder.path)
+        first_records, first_state = first_reader.read()
+        assert any(r["kind"] == "FRONT_HTTP_ENTER" for r in first_records)
+        assert first_state["coverage"]["ring_lost"] > 0
+        assert first_state["coverage"]["lifecycle_ring_lost"] == 0
+        first_reader.buf.close()
+        first_reader.file.close()
+        assert not collect.lifecycle_record(dict(kind="PD_MODEL"))
+
+        # procfs streams reject SEEK_END even though ordinary files support it.
+        class NoSeek(io.BytesIO):
+            def seek(self, *args):
+                raise OSError(22, "Invalid argument")
+        with patch.object(Path, "open", return_value=NoSeek(b"Name:\tscheduler\n")):
+            assert collect.read_proc("/proc/fake/status") == "Name:\tscheduler\n"
+        with patch.object(Path, "open", side_effect=PermissionError("denied")):
+            assert collect.read_proc("/proc/fake/status").startswith("UNAVAILABLE:")
+
+        # ASGI pass-through: no eager body consumption, same messages, request
+        # context isolated between concurrent tasks, and exceptions unchanged.
+        async def exercise_frontend():
+            seen = []
+            async def app(scope, receive, send):
+                message = await receive()
+                assert message["body"] == b"opaque prompt never logged"
+                obj = SimpleNamespace(bootstrap_room=int(scope["room"]), rid=scope["rid"])
+                core.frontend_request("FRONT_GENERATE", obj)
+                await asyncio.sleep(0)
+                core.frontend_request("FRONT_IPC_RETURN", obj)
+                await send({"type": "http.response.start", "status": 200, "headers": []})
+                await send({"type": "http.response.body", "body": b"ok"})
+            middleware = core.FrontendMiddleware(app)
+            async def one(room):
+                messages = []
+                receives = 0
+                async def receive():
+                    nonlocal receives
+                    receives += 1
+                    return {"type": "http.request", "body": b"opaque prompt never logged"}
+                async def send(message):
+                    messages.append(message)
+                await middleware({"type": "http", "method": "POST", "path": "/v1/chat/completions",
+                                  "headers": [(b"x-request-id", f"trace-{room}".encode())],
+                                  "room": room, "rid": f"http-{room}"}, receive, send)
+                assert receives == 1 and messages[-1]["body"] == b"ok"
+                assert core._http_context.get() is None
+                seen.extend(messages)
+            await asyncio.gather(one(401), one(402))
+            failure = asyncio.CancelledError("test cancellation")
+            async def failing(scope, receive, send):
+                raise failure
+            try:
+                await core.FrontendMiddleware(failing)(
+                    {"type": "http", "method": "POST", "path": "/generate"}, None, None)
+            except asyncio.CancelledError as exc:
+                assert exc is failure
+            else:
+                assert False, "middleware swallowed cancellation"
+            assert core._http_context.get() is None
+        asyncio.run(exercise_frontend())
+        front_reader = collect.Worker(recorder.path)
+        front_records, _ = front_reader.read()
+        contexts = {}
+        for entry in front_records:
+            if entry.get("rid") in ("http-401", "http-402"):
+                contexts.setdefault(entry["rid"], set()).add(entry["call"])
+        assert len(contexts) == 2 and all(len(calls) == 1 for calls in contexts.values())
+        assert contexts["http-401"] != contexts["http-402"]
+        assert not any("opaque prompt" in str(entry) for entry in front_records)
+        front_reader.buf.close()
+        front_reader.file.close()
         # IPC msgspec.Struct messages reject undeclared attributes, unlike Req.
         class SlottedRequest:
             __slots__ = ("rid", "bootstrap_room")
@@ -169,7 +246,7 @@ def main():
         journal.append({"check": "selftest"})
         for _ in range(3):
             collect.save_incident(output, [worker], [{"kind": "MANUAL"}], journal, False, [])
-        assert len(list(output.glob("incident-*"))) == 2
+        assert len(list(output.glob("incident-*"))) == 3
         for report in output.glob("incident-*/report.json"):
             assert json.loads(report.read_text())["workers"]
         journal.file.close()
@@ -213,11 +290,13 @@ def main():
             worker.read()
         collect.save_incident(output, list(workers.values()), [{"kind": "MANUAL"}],
                               journal, False, [], lifecycle=lifecycle)
-        report = json.loads((output / "incident-0/report.json").read_text())
+        incident = next(output.glob("incident-*"))
+        report = json.loads((incident / "report.json").read_text())
         assert report["raw_complete"] and len(report["raw_artifacts"]) == 8
         assert report["raw_expected_bytes"] == 8 * core.SIZE
-        assert len(list((output / "incident-0").glob("*.mmap"))) == 8
-        assert len(list((output / "incident-0").glob("decode-*.json"))) == 4
+        assert len(list(incident.glob("*.mmap"))) == 8
+        assert len(list(incident.glob("decode-*.json"))) == 4
+        assert report["journals"]["lifecycle"]
 
         # Initial warmup markers cannot fill every observation snapshot.
         warm = core._pack("EVENT_PENDING", core.Context(), reason="EVENT_WARM")
@@ -239,24 +318,41 @@ def main():
         assert not guard.update([first], workers), "same pending request replaced first snapshot"
         assert not guard.update([first, second], workers)
         worker.terminals[(123, 1)] = time.monotonic_ns()
-        assert guard.update([second], workers)
+        assert not guard.update([second], workers), "overlapping waiter lost the initial snapshot"
         assert not guard.update([], workers)
+        worker.terminals[(456, 2)] = time.monotonic_ns()
+        third = dict(first, key=[789, 3])
+        assert guard.update([third], workers)
         collect.save_incident(output, [worker], [first], journal, False, [],
                               lifecycle=lifecycle, first_wait=True)
-        pinned = (output / "incident-first-wait/report.json").read_bytes()
+        pinned_path = next(output.glob("incident-*-first-wait/report.json"))
+        pinned = pinned_path.read_bytes()
         collect.save_incident(output, [worker], [{"kind": "MANUAL"}], journal, False, [])
         collect.save_incident(output, [worker], [{"kind": "MANUAL"}], journal, False, [])
-        assert (output / "incident-first-wait/report.json").read_bytes() == pinned
+        assert pinned_path.read_bytes() == pinned
 
         # High-frequency execution history must not evict PD lifecycle evidence.
         entry = dict(kind="PD_TERMINAL", room=123, reason="failed before peer arrived")
         assert collect.lifecycle_record(entry)
         assert not collect.lifecycle_record(dict(kind="EVENT_QUERY_RETURN"))
+        assert not collect.lifecycle_record(dict(kind="PD_MODEL"))
         lifecycle.append(dict(event=entry))
         lifecycle.flush()
         for i in range(100):
             journal.append(dict(kind="EVENT_QUERY_RETURN", tick=i))
         assert "failed before peer arrived" in lifecycle.path.read_text()
+        # More than four segments, including across a collector restart: no
+        # old file may be renamed, overwritten, or deleted.
+        archival = collect.Journal(output, limit=64, prefix="archive-test")
+        for i in range(20):
+            archival.append({"i": i, "data": "x" * 64})
+        archival.file.close()
+        archival = collect.Journal(output, limit=64, prefix="archive-test")
+        archival.append({"i": 20})
+        archival.file.close()
+        rows = [json.loads(line) for path in output.glob("archive-test-*.jsonl")
+                for line in path.read_text().splitlines()]
+        assert sorted(row["i"] for row in rows) == list(range(21))
 
         # A mounted foreign namespace is unknown, not dead: keep reading it
         # and never attach to a coincidentally matching local PID.
@@ -285,7 +381,7 @@ def main():
         worker.buf = UnreadableBuffer()
         collect.save_incident(output, [worker], [{"kind": "MANUAL"}], journal, False, [])
         worker.buf = original_buffer
-        reports = [json.loads(p.read_text()) for p in output.glob("incident-[01]/report.json")]
+        reports = [json.loads(p.read_text()) for p in output.glob("incident-*/report.json")]
         assert any(not r["raw_complete"] and "error" in r["raw_artifacts"][0] for r in reports)
         journal.file.close()
         lifecycle.file.close()
@@ -296,10 +392,11 @@ def main():
             writer.buf.close()
     print("PASS: retention, duplicate progress, health exclusion, ring wrap, abort/native lifetime,")
     print("      room reuse, executor context/cancel, Event non-reuse/query-inflight, torn reads,")
-    print("      disabled identity, bounded incident persistence/rotation")
+    print("      disabled identity, append-only journals and incident retention")
     print("      slotted IPC input/retry, P4+D4 complete raw maps, old-run filtering,")
     print("      warmup exclusion, first-wait protection, independent lifecycle retention")
     print("      unknown peer namespace/permissions, explicit raw copy failure")
+    print("      procfs without seek, isolated lifecycle ring, concurrent ASGI identity/cancellation")
 
 
 if __name__ == "__main__":

@@ -2,6 +2,8 @@
 
 这是 opt-in 诊断，不是故障修复。默认关闭；不修改 MF、绑核、传输额度、业务 timeout、KV 分配、模型算子或既有 stream wait。
 
+**当前落盘策略：不设置总容量/保留份数上限，不自动删除或覆盖历史。** history、lifecycle 只按文件大小分段，所有旧分段保留；每次现场使用新的时间戳目录。内存 ring 仍有界，覆盖、撕裂和写盘失败必须查看 coverage，不能把“磁盘不限量”理解为绝对零丢失。请使用空间足够的持久化数据盘并监控剩余空间，不要把无限增长的落盘目录放进 `/dev/shm`。本次不改 router、无需重建原生模块。
+
 ## 1. 当前建议
 
 你现在难以复现，先在 P/D 两端使用 `cpu` 长期留痕。它不创建/record/query 诊断 NPU Event，可捕获 bootstrap、预分配、metadata、KV job、MF 调用、完成通知、结果取回 CPU 的进展。
@@ -40,7 +42,9 @@ export SGLANG_NPU_PD_DIAG_DIR=/dev/shm/sglang_pd_diag/run_0920_D
 df -h /dev/shm
 ```
 
-每个 worker 固定约 **22.02 MiB** mmap，8 个 worker 约 177 MiB，另留余量。容器默认 64 MiB `/dev/shm` 不够。初始化会尝试 `posix_fallocate`，空间不足则告警并关闭该 worker 的诊断，不应拿缺失 rank 的结果当作完整现场。也可选用一个容量足够的现有 tmpfs；普通磁盘映射不推荐用于低扰动场景。
+v2 每个 recorder 固定约 **38.03 MiB** mmap，含独立低频生命周期环。P4+D4 加两个单进程 HTTP/Tokenizer recorder，共 10 份约 **380.3 MiB**，另留余量；多 HTTP worker 会增加份数。容器默认 64 MiB `/dev/shm` 不够。初始化会尝试 `posix_fallocate`，空间不足则告警并关闭该进程的诊断，不应拿缺失进程的结果当作完整现场。也可选用一个容量足够的现有 tmpfs；普通磁盘映射不推荐用于低扰动场景。
+
+新增 `prefill_api` / `decode_api` recorder 始终为 CPU 模式，记录 HTTP、请求转换/分词、IPC 提交和取消，使用 task-local context 关联并发请求，不读取/缓存请求正文，不创建 NPU Event。原 scheduler 的 `ARRIVED` 接上 IPC 后半段。`FRONT_IPC_RETURN` 只说明本地提交返回，不代表 scheduler 已收到。
 
 ## 3. 独立运行 collector
 
@@ -75,7 +79,7 @@ nohup python scripts/npu_pd_diag_collect.py \
 
 不要让两个 collector 使用同一个 output 目录。`collector.lock` 防止重复运行；若 collector 被 SIGKILL 遗留该文件，先确认文件中 PID 的进程确实已退出，再手动移走锁文件，或用新的 output 目录。
 
-为了保存服务日志尾部，可追加 `--log-file /绝对路径/P.log`，最多 8 个，每个截取末尾 1 MiB。不自动猜测/扫描整个日志盘。服务日志可能含业务内容，请注意现场目录权限。
+为了同时保存服务日志，可追加 `--log-file /绝对路径/P.log`。每次现场完整复制显式指定的文件，不再限制个数或只留末尾 1 MiB；很大的服务日志会增加采集 I/O，也可以不传此参数，单独保留原始服务日志。不自动扫描日志盘。服务日志可能含业务内容，请注意现场目录权限。
 
 ## 4. 触发规则
 
@@ -88,7 +92,7 @@ nohup python scripts/npu_pd_diag_collect.py \
 
 collector 每秒扫描；所以实际触发通常在阈值后的约一个扫描周期内。抓栈每个子命令最多约 5 秒，总预算约 20 秒，超时只结束 collector 自己的 py-spy 子进程，不杀 SGLang。抓栈期间可能出现一段采集间隔，ring 覆盖会明确标记缺口；抓栈前的证据已经落盘。
 
-首次 PD 长等待另外保存到 `incident-first-wait`。这组请求在明确记录 PD 终态/清理或确认 worker 退出前，后续轮询不会覆盖首次现场；短暂取得进展、暂时不触发超时或读取撕裂都不解除保护。这组等待全部结束后，下一组长等待可以替换它。这不是为每个并发 room 保留无限份完整 mmap；其他请求仍有滚动现场和独立 lifecycle 记录。滚动等待快照仍按 `--pd-wait-after` 节流，不因不断出现新的慢请求而每秒备份全部 raw。正常等待也可能达到阈值，触发本身不表示故障。
+首次 PD 长等待保存到 `incident-<时间戳>-first-wait`；后续现场保存到新的 `incident-<时间戳>-snapshot`。旧目录永久保留，不再覆盖。重叠出现的等待请求属于同一组，原始请求取消不会让尚未结束的其他等待失去最初现场。常规等待快照仍按 `--pd-wait-after` 节流，不因新慢请求每秒复制全部 raw。节流是采集频率，不是日志保留容量限制。正常等待也可能触发，触发本身不表示故障。
 
 `py-spy` 必须已经在 collector 的 PATH 中，且当前用户/容器具有合法 attach 权限。工具不会修改 ptrace、容器 capability、cpuset 或安全策略。未安装或权限不足会记录原因，其他采集继续。完全不希望自动 attach 时追加 `--no-stack`。
 
@@ -111,10 +115,10 @@ ls -lh /dev/shm/sglang_pd_diag/run_0920_D
 ls -lh /data2/pd_diag_artifacts/run_0920
 ```
 
-每个 worker 应有一对 `.json` manifest 和 `.mmap`；TP4 的 P 应有 4 对，D 同理。collector 约每 5 秒 flush：
+每个 recorder 应有一对 `.json` manifest 和 `.mmap`；TP4 单 HTTP worker 的 P 应有 5 对（4 scheduler + 1 API），D 同理。collector 约每 5 秒 flush：
 
-- `history-*.jsonl`：4 个 64 MiB 段，保存执行事件及发生变化的精简 observation；不再每秒重复写完整设备事件/请求片段。
-- `lifecycle-*.jsonl`：独立的 4 个 16 MiB 段，保存 PD 阶段、metadata、终态、取消及覆盖缺口。高频设备事件不会挤掉这个文件中的请求记录；它仍是按容量轮转，不保证任意 QPS 下固定的保留时长。
+- `history-*.jsonl`：每段约 64 MiB，段号不断增加，旧段不删除；保存执行事件及变化的精简 observation。
+- `lifecycle-*.jsonl`：每段约 16 MiB，段号不断增加，旧段不删除。保存请求入口、PD 阶段、metadata、终态、取消及覆盖缺口；`PD_MODEL` 只进 history，不进 lifecycle。v2 在 producer mmap 中也使用独立低频环，避免 collector 读取前就被逐 token 事件覆盖。
 - startup `EVENT_WARM` 不作为活动设备工作反复写入 observation；原始 mmap 中的数据仍然保留。
 
 可在另一个 output 目录做一次只读快照，不抓栈：
@@ -126,17 +130,19 @@ python scripts/npu_pd_diag_collect.py \
   --output /data2/pd_diag_artifacts/manual_check_01 --once
 ```
 
-滚动快照保留在 `incident-0` / `incident-1`，优先保留最近一次带栈的现场；首次等待现场见 `incident-first-wait`。每份包含 `report.json`、近期 history、独立 lifecycle、**全部已发现 worker 的原始 mmap 及配套 manifest**、`/proc` 线程状态、可选日志尾部和栈。不再使用先复制 P、额度耗尽后漏掉 D 的 160 MiB 总预算。
+每份时间戳现场包含 `report.json`、**全部已发现 recorder 的原始 mmap 及配套 manifest**、完整的选定 `/proc` 文本、线程列表、可选服务日志及栈。`/proc` 从头读取，不再 SEEK_END。堆栈输出和 report 不再按大小截断，但抓栈的时间上限保留，以避免长时间 attach。
 
-P4+D4 每份 raw 合计约 **176.2 MiB**；三份现场的 raw 约 **528.5 MiB**，另加 history/lifecycle、日志和栈，建议 output 所在磁盘至少预留 **2 GiB**。最多 64 个当前 recorder，更多 rank 的空间需求按实际数量增加。只有发生采集触发才复制 raw，不在正常每秒扫描时重复备份。复制是运行中 best-effort 快照，不会暂停模型/设备，记录自身的 CRC/sequence 用于检测撕裂。
+完整 history/lifecycle 保留在 output 根目录。report 的 `journals` 字段记录相对路径和快照时文件长度，避免每次现场重复复制全部增长中的历史。**交付现场要带整个 output 目录，不能只拷贝一个 incident 子目录。** 新 collector 可以读取 v1 旧 mmap，但旧 recorder 本身没有独立低频环；要启用隔离和前端补点，必须重启升级后的服务。
 
-检查每份 `report.json`：`raw_complete=true`，`raw_artifacts` 对 P4+D4 应有 8 项且 `saved=true`，每项都带对应源路径；保存失败会记录错误并打印告警，不再静默漏掉 D。这只表示已发现文件的复制完整，不保证未接入 collector 的 peer/rank 已被采集，也不消除原 recorder 的 coverage gap。
+P4+D4 加两个单进程 API，每份 raw 约 **380.3 MiB**；如果持续等待、每 30 秒保存一次，单 raw 就约 **44.6 GiB/小时**，还不包含日志和栈。没有自动容量上限或清理：务必监控数据盘，空间不足时会明确报错，不能继续声称采集完整。最多 64 个当前 recorder，更多 rank 的空间按实际数量增加。复制不暂停模型/设备，CRC/sequence 检测撕裂；现场复制及抓栈可能延迟下一次 ring 读取，覆盖会记录在 coverage 中。
+
+检查每份 `report.json`：`raw_complete=true`，`raw_artifacts` 对 P4+D4 加两个单进程 API 应有 10 项且 `saved=true`，每项带源路径；保存失败会记录错误并告警。这只表示已发现文件复制完整，不保证未接入的 peer/进程已采集，也不消除 ring coverage gap。注意 `lifecycle_ring_lost`、`lifecycle_torn_reads` 和 `lifecycle_isolated`；新增丢失会在 collector.log 告警。
 
 离线查看概要，无需连接 NPU：
 
 ```bash
 python scripts/npu_pd_diag_collect.py \
-  --report /data2/pd_diag_artifacts/run_0920/incident-0/report.json
+  --report /data2/pd_diag_artifacts/run_0920/incident-实际时间戳-snapshot/report.json
 ```
 
 复现后保留 **P/D 两端**整个 output 目录及相应 run 的 manifest/mmap、服务日志、底层 plog。不要只截取最后一条 ERROR。跨机器的 monotonic 时间不能直接比较，manifest 同时记录墙钟和 monotonic 锚点；配对依赖 room/rid，而不是 PID 或本地 attempt 数字相同。
@@ -155,6 +161,21 @@ python scripts/npu_pd_diag_collect.py \
 - `PD_WAIT_LONG` 是长等待，不是“RDMA 死锁”判决。预分配预算不足、metadata 不齐、完成通知不足，要看各自字段及另一端现场。
 - `UNKNOWN`、`coverage` 的 table overflow、ring lost、torn read、Event 池不足/观察过期不能解读成“正常空闲”或“对端没发送”。
 
+## 6.1 不改 router 的请求链路定位
+
+保留现有 router 启动方式和原生模块，不需要给 router 设置新的环境变量或重新安装。新增记录全部位于 P/D Python 侧：
+
+- `FRONT_HTTP_ENTER/PEER`：进入服务端 ASGI，以及本地/对端地址。
+- `FRONT_CLIENT_TRACE/TRACEPARENT`：只记录已收到的 `x-request-id` / `traceparent`，不读取其他 header。
+- `FRONT_GENERATE`：请求已规范化，记录实际 `rid` / `bootstrap_room`。
+- `FRONT_TOKENIZE_ENTER/RETURN/ERROR`：分词前处理开始、返回、异常。
+- `FRONT_IPC_ENTER/RETURN/ERROR`：提交 Scheduler 的调用边界。
+- `FRONT_HTTP_HEADERS/DISCONNECT/ERROR/END`、`FRONT_ABORT/ABORT_CAUSE`：响应头、断开观察、异常、结束和取消来源。
+
+同一 API 进程内用 `call` 关联 HTTP、分词和 IPC，跨 P/D 用 `bootstrap_room`；`rid` 不要求相同。若客户端能够为每次请求附加唯一 `x-request-id`，并且现有 router 确实透传，两端会记录它；应先用一条测试请求确认透传，不能仅凭客户端设置就假设服务端已收到。不修改或解析原始 body，不改原 rid/room。
+
+边界：未经 router 补点，不能直接知道两路 future 是否被执行、router 是否在等连接池或提前收到另一侧错误；这部分保留现有 router 日志辅助判断。HTTP 校验失败发生在 `FRONT_GENERATE` 之前时可能没有 room，但仍有 HTTP call、状态码及已收到的关联 header。`HTTP_HEADERS=200` 不代表流式响应全部完成；`HTTP_END.done=1` 只表示 ASGI 应用正常返回，不证明业务成功。
+
 ## 7. 覆盖边界与验证
 
 当前设备标记针对 eager、非 MTP；Graph/MTP 开启时只做 CPU 留痕，并记录 `EVENT_UNSUPPORTED`，不插入 capture/replay。当前事故的 P4+EP4、无 MTP、无 Graph、无 scheduler overlap 是主要定位范围。普通 decode 及既有内部副流不增加新的 wait。
@@ -167,7 +188,7 @@ python scripts/npu_pd_diag_collect.py \
 python scripts/npu_pd_diag_selftest.py
 ```
 
-已覆盖：5000 正常请求后的等待记录保留、跨 producer 完成回收、健康检查排除、重复轮询不推进时钟、room 重用、取消与 native 生命周期分离、线程池上下文、假 Event 未完成不复用/query 进入可见、撕裂检测、关闭模式 decorator 保留原函数、现场轮转，以及无动态属性的 IPC 请求/重试、一个 collector 保存 P4+D4 全部 raw、旧轮次过滤、首次等待保护和 lifecycle 独立轮转。该脚本不替代真实 Ascend 验证。
+已覆盖：5000 正常请求后的等待记录保留、跨 producer 完成回收、健康检查排除、重复轮询不推进时钟、room 重用、取消与 native 生命周期分离、线程池上下文、假 Event 未完成不复用/query 进入可见、撕裂检测、关闭模式 decorator 保留原函数、无动态属性的 IPC 请求/重试、P4+D4 全部 raw、旧轮次过滤、重叠等待保护、独立低频 ring、日志超过四段及重启后不丢旧段、现场不覆盖、不可 seek 的 procfs、并发 ASGI context 隔离和取消原样传播。该脚本不替代真实 Ascend 验证。
 
 远端建议先 `cpu` 小流量确认所有 rank 和文件增长，再做与关闭诊断的 TTFT/吞吐对照。之后选择一个短时 `coarse` 验证 `event_flags` ready、Event 能完成、没有持续 `EVENT_POOL_FULL`/coverage gap。真实 NPU Event ABI、record/query 开销、GIL 行为和吞吐损耗尚需远端实测；不能承诺零扰动。
 

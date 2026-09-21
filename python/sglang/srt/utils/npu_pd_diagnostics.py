@@ -7,6 +7,7 @@ See scripts/npu_pd_diag.md for coverage, costs, and the independent collector.
 """
 
 import contextlib
+import contextvars
 import functools
 import json
 import mmap
@@ -20,7 +21,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 REQUESTED = os.getenv("SGLANG_NPU_PD_DIAG", "0") == "1"
-VERSION = 1
+VERSION = 2
 SLOT = 512
 HEADER = 4096
 WRITERS = 32
@@ -32,7 +33,12 @@ JOBS = 1024
 STRIDE = 1 + RING + REQUESTS + CALLS
 EVENT_BASE = HEADER + WRITERS * STRIDE * SLOT
 JOB_BASE = EVENT_BASE + EVENTS * SLOT
-SIZE = JOB_BASE + JOBS * SLOT
+V1_SIZE = JOB_BASE + JOBS * SLOT
+# Separate publication ring: model/token events cannot overwrite request edges
+# before the collector reads them. Existing v1 offsets remain unchanged.
+LIFECYCLE_RING = 1024
+LIFECYCLE_BASE = V1_SIZE
+SIZE = LIFECYCLE_BASE + WRITERS * (1 + LIFECYCLE_RING) * SLOT
 PAYLOAD = struct.Struct("<QQQQqqqqq40s80s96s16q")
 U64 = struct.Struct("<Q")
 CRC = struct.Struct("<I")
@@ -42,6 +48,13 @@ VALUE_NAMES = (
     "start", "end", "extra",
 )
 _instance = None
+_http_context = contextvars.ContextVar("pd_diag_http_context", default=None)
+
+
+def is_lifecycle(kind):
+    return ((kind.startswith("PD_") and kind != "PD_MODEL")
+            or kind.startswith(("METADATA_", "FRONT_"))
+            or kind in ("COVERAGE_GAP", "ABORT_REQ", "SCHEDULER_EXCEPTION", "WATCHDOG"))
 
 
 class Context(NamedTuple):
@@ -124,6 +137,8 @@ class _Writer:
         self.recorder = recorder
         self.base = HEADER + index * STRIDE * SLOT
         self.sequence = 0
+        self.lifecycle_base = LIFECYCLE_BASE + index * (1 + LIFECYCLE_RING) * SLOT
+        self.lifecycle_sequence = 0
         self.requests = OrderedDict()
         self.closed_hints = set()
         self.calls = {}
@@ -138,6 +153,15 @@ class _Writer:
         write_slot(self.recorder.buf, self.base, self.sequence,
                    _pack("WRITER", Context(), values={"status": self.drops,
                          "slot": self.tid, "extra": self.sequence}))
+        if is_lifecycle(kind):
+            self.lifecycle_sequence += 1
+            seq = self.lifecycle_sequence
+            write_slot(self.recorder.buf,
+                       self.lifecycle_base + (1 + (seq - 1) % LIFECYCLE_RING) * SLOT,
+                       seq, payload)
+            write_slot(self.recorder.buf, self.lifecycle_base, seq,
+                       _pack("LIFECYCLE_WRITER", Context(),
+                             values={"slot": self.tid, "extra": seq}))
         return payload
 
     def request(self, ctx, phase, reason, progress, values):
@@ -209,7 +233,7 @@ class Recorder:
                 os.posix_fallocate(f.fileno(), 0, SIZE)
             self.buf = mmap.mmap(f.fileno(), SIZE, access=mmap.ACCESS_WRITE)
         self.buf[:] = bytes(SIZE)
-        self.buf[:16] = b"SGLANG_PD_DIAG1\0"
+        self.buf[:16] = b"SGLANG_PD_DIAG2\0"
         manifest = dict(version=VERSION, pid=self.pid, role=role, rank=rank,
                         device=device, level=level, identity=identity,
                         pid_namespace=pid_namespace(),
@@ -449,6 +473,123 @@ def initialize(server_args, rank, device):
         # Startup only. Diagnostics must never prevent serving.
         import logging
         logging.getLogger(__name__).warning("PD diagnostic initialization disabled: %s", exc)
+
+
+def initialize_frontend(server_args):
+    """A separate CPU-only recorder in each HTTP/tokenizer process."""
+    global _instance
+    if (not REQUESTED or getattr(server_args, "device", None) != "npu"
+            or getattr(server_args, "disaggregation_mode", None) not in ("prefill", "decode")
+            or get() is not None):
+        return
+    try:
+        _instance = Recorder(os.getenv("SGLANG_NPU_PD_DIAG_DIR", "/dev/shm/sglang_pd_diag"),
+                             server_args.disaggregation_mode + "_api", -1, -1, "cpu")
+        _instance.set_ready()
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("PD frontend diagnostic initialization disabled: %s", exc)
+
+
+def frontend_request(kind, obj, reason="", **values):
+    """Stateless edges, not active request rows; safe across interleaved async tasks."""
+    recorder = get()
+    if recorder is None:
+        return
+    try:
+        batch = getattr(obj, "batch", None)
+        if isinstance(batch, (tuple, list)):
+            for item in batch:
+                frontend_request(kind, item, reason, **values)
+            return
+        room, rid = getattr(obj, "bootstrap_room", None), getattr(obj, "rid", "")
+        if room is None and not rid and _http_context.get() is None:
+            return
+        if isinstance(rid, (list, tuple)):
+            for i, request_id in enumerate(rid):
+                item_room = room[i] if isinstance(room, (list, tuple)) and i < len(room) else room
+                ctx = (_http_context.get() or Context())._replace(room=_int(item_room), rid=request_id)
+                recorder.emit(kind, ctx, reason, **values)
+            return
+        if not isinstance(rid, str) or rid.startswith("HEALTH_CHECK"):
+            return
+        ctx = _http_context.get() or Context()
+        ctx = ctx._replace(room=_int(room) if room is not None else ctx.room, rid=rid)
+        recorder.emit(kind, ctx, reason, **values)
+    except Exception:
+        recorder.emit("COVERAGE_GAP", reason="frontend request hook failed")
+
+
+def frontend_tokenize(fn):
+    if not REQUESTED:
+        return fn
+
+    @functools.wraps(fn)
+    async def wrapped(self, obj, *args, **kwargs):
+        frontend_request("FRONT_TOKENIZE_ENTER", obj)
+        try:
+            result = await fn(self, obj, *args, **kwargs)
+        except BaseException as exc:
+            frontend_request("FRONT_TOKENIZE_ERROR", obj, type(exc).__name__)
+            raise
+        frontend_request("FRONT_TOKENIZE_RETURN", obj)
+        return result
+    return wrapped
+
+
+class FrontendMiddleware:
+    """Pure ASGI pass-through: never read/replay bodies or add a streaming task."""
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        recorder = get()
+        if (recorder is None or scope["type"] != "http" or scope.get("method") != "POST"
+                or scope.get("path") not in ("/generate", "/v1/chat/completions", "/v1/completions")):
+            return await self.app(scope, receive, send)
+        call = time.monotonic_ns()
+        ctx = Context(call=call, attempt=call)
+        traceparent = client_trace = ""
+        try:
+            for name, value in scope.get("headers", ()):
+                if name == b"x-request-id":
+                    client_trace = value[:96].decode("ascii", errors="replace")
+                elif name == b"traceparent":
+                    traceparent = value[:96].decode("ascii", errors="replace")
+        except (ValueError, TypeError):
+            pass  # Malformed diagnostic headers never affect the request.
+        token = _http_context.set(ctx)
+        recorder.emit("FRONT_HTTP_ENTER", ctx, scope["path"])
+        if traceparent:
+            recorder.emit("FRONT_TRACEPARENT", ctx, traceparent)
+        if client_trace:
+            recorder.emit("FRONT_CLIENT_TRACE", ctx, client_trace)
+        recorder.emit("FRONT_HTTP_PEER", ctx,
+                      f"client={scope.get('client')} server={scope.get('server')}")
+        status, completed = -1, False
+
+        async def traced_receive():
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                recorder.emit("FRONT_HTTP_DISCONNECT", ctx)
+            return message
+
+        async def traced_send(message):
+            nonlocal status
+            if message["type"] == "http.response.start":
+                status = message["status"]
+                recorder.emit("FRONT_HTTP_HEADERS", ctx, status=status)
+            await send(message)
+
+        try:
+            await self.app(scope, traced_receive, traced_send)
+            completed = True
+        except BaseException as exc:
+            recorder.emit("FRONT_HTTP_ERROR", ctx, type(exc).__name__, status=status)
+            raise
+        finally:
+            recorder.emit("FRONT_HTTP_END", ctx, status=status, done=int(completed))
+            _http_context.reset(token)
 
 
 def request(req_or_room, phase, reason="", progress=False, **values):

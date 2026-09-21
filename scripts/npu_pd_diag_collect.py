@@ -21,24 +21,24 @@ spec.loader.exec_module(core)
 
 
 class Journal:
-    """Four bounded segments; rotation only touches collector-owned files."""
+    """Append-only segments. Segment size is not a retention/capacity limit."""
     def __init__(self, directory, limit=64 * 1024 * 1024, prefix="history"):
         self.directory, self.limit, self.prefix = directory, limit, prefix
-        self.path = directory / f"{prefix}-0.jsonl"
-        self.file = self.path.open("a", encoding="utf-8")
-        self.size = self.path.stat().st_size
+        indices = [int(p.stem.rsplit("-", 1)[1]) for p in directory.glob(f"{prefix}-*.jsonl")
+                   if p.stem.rsplit("-", 1)[1].isdigit()]
+        self.index = max(indices, default=-1) + 1
+        self.path = directory / f"{prefix}-{self.index}.jsonl"
+        self.file = self.path.open("x", encoding="utf-8")
+        self.size = 0
 
     def append(self, data):
         line = json.dumps(data, ensure_ascii=False, separators=(",", ":")) + "\n"
         size = len(line.encode("utf-8"))
         if self.size + size > self.limit:
             self.file.close()
-            (self.directory / f"{self.prefix}-3.jsonl").unlink(missing_ok=True)
-            for i in (2, 1, 0):
-                src = self.directory / f"{self.prefix}-{i}.jsonl"
-                if src.exists():
-                    src.replace(self.directory / f"{self.prefix}-{i + 1}.jsonl")
-            self.file = self.path.open("a", encoding="utf-8")
+            self.index += 1
+            self.path = self.directory / f"{self.prefix}-{self.index}.jsonl"
+            self.file = self.path.open("x", encoding="utf-8")
             self.size = 0
         self.file.write(line)
         self.size += size
@@ -48,9 +48,7 @@ class Journal:
 
 
 def lifecycle_record(record):
-    kind = record["kind"]
-    return (kind.startswith(("PD_", "METADATA_")) or
-            kind in ("COVERAGE_GAP", "ABORT_REQ", "SCHEDULER_EXCEPTION", "WATCHDOG"))
+    return core.is_lifecycle(record["kind"])
 
 
 def compact_observation(snapshot):
@@ -80,6 +78,10 @@ class WaitSnapshot:
         if waiting and not self.protected:
             self.protected = waiting
             return True
+        # Retain overlapping waiters as part of the same episode. They remain
+        # protected when the original request subsequently times out.
+        if self.protected:
+            self.protected.update(waiting)
         return False
 
 
@@ -112,11 +114,15 @@ class Worker:
     def __init__(self, path):
         self.path = path
         self.manifest = json.loads(path.with_suffix(".json").read_text())
-        if self.manifest["version"] != core.VERSION or path.stat().st_size != core.SIZE:
+        self.version = self.manifest["version"]
+        self.size = core.V1_SIZE if self.version == 1 else core.SIZE
+        if self.version not in (1, core.VERSION) or path.stat().st_size != self.size:
             raise ValueError("unsupported recorder format")
         self.file = path.open("rb")
         self.buf = mmap.mmap(self.file.fileno(), 0, access=mmap.ACCESS_READ)
         self.cursors = [0] * core.WRITERS
+        self.lifecycle_cursors = [0] * core.WRITERS
+        self.lifecycle_lost = self.lifecycle_torn = 0
         self.lost = 0
         self.torn = 0
         self.progress = OrderedDict()
@@ -125,6 +131,7 @@ class Worker:
         self.last_snapshot = None
         self.last_observation = None
         self.identity_verified = False
+        self.warned_coverage = None
 
     def same_process(self):
         return worker_liveness(self.manifest, self.identity_verified) is True
@@ -152,7 +159,9 @@ class Worker:
                     continue
                 entry["writer"] = i
                 entry["tid"] = head["slot"]
-                records.append(entry)
+                # v2 reads low-frequency edges from their independent ring.
+                if self.version == 1 or not lifecycle_record(entry):
+                    records.append(entry)
                 key = (i, entry["batch"])
                 self.progress[key] = max(entry["ts"], self.progress.get(key, 0))
                 self.progress.move_to_end(key)
@@ -161,6 +170,30 @@ class Worker:
                 if entry["kind"] in ("PD_TERMINAL", "PD_CLEARED"):
                     self.terminals[(entry["room"], entry["attempt"])] = entry["ts"]
             self.cursors[i] = sequence
+            if self.version >= 2:
+                life_base = core.LIFECYCLE_BASE + i * (1 + core.LIFECYCLE_RING) * core.SLOT
+                life_head = core.read_slot(self.buf, life_base)
+                if life_head and not life_head.get("torn"):
+                    life_seq = life_head["seq"]
+                    cursor = self.lifecycle_cursors[i]
+                    if life_seq - cursor > core.LIFECYCLE_RING:
+                        lost = life_seq - cursor - core.LIFECYCLE_RING
+                        self.lifecycle_lost += lost
+                        records.append(dict(kind="COVERAGE_GAP", reason="lifecycle ring overwritten",
+                                            writer=i, lost=lost, ts=life_head["ts"]))
+                    for seq in range(max(cursor + 1, life_seq - core.LIFECYCLE_RING + 1), life_seq + 1):
+                        entry = core.read_slot(self.buf, life_base +
+                                               (1 + (seq - 1) % core.LIFECYCLE_RING) * core.SLOT)
+                        if not entry or entry.get("torn") or entry["seq"] != seq:
+                            self.lifecycle_torn += 1
+                            continue
+                        entry["writer"], entry["tid"] = i, head["slot"]
+                        records.append(entry)
+                        if entry["kind"] in ("PD_TERMINAL", "PD_CLEARED"):
+                            self.terminals[(entry["room"], entry["attempt"])] = entry["ts"]
+                    self.lifecycle_cursors[i] = life_seq
+                elif life_head:
+                    self.lifecycle_torn += 1
             for n in range(core.REQUESTS + core.CALLS):
                 entry = core.read_slot(self.buf, base + (1 + core.RING + n) * core.SLOT)
                 if not entry:
@@ -214,6 +247,9 @@ class Worker:
         snapshot = dict(manifest=self.manifest, ready=self.ready,
                         alive=alive, process=current,
                         coverage=dict(registration_or_table_drops=drops, ring_lost=self.lost,
+                                      lifecycle_ring_lost=self.lifecycle_lost,
+                                      lifecycle_torn_reads=self.lifecycle_torn,
+                                      lifecycle_isolated=self.version >= 2,
                                       torn_reads=self.torn, mf_internal="not instrumented",
                                       event_flags=event_flags, observer_stale=observer_stale,
                                       peer_evidence="only sources supplied to this collector"),
@@ -224,7 +260,7 @@ class Worker:
             "EXECUTING_AND_PD_WAITING" if requests and (calls or events or jobs) else
             "PD_WAITING" if requests else
             "EXECUTING" if calls or events or jobs else
-            "UNKNOWN" if alive is None or drops or self.torn or self.lost or observer_stale or event_flags & 2 else
+            "UNKNOWN" if alive is None or drops or self.torn or self.lost or self.lifecycle_lost or self.lifecycle_torn or observer_stale or event_flags & 2 else
             "NO_ACTIVE_WORK_OBSERVED"
         )
         self.last_snapshot = snapshot
@@ -306,12 +342,11 @@ def discover_workers(sources, workers, retired, journal):
         journal.append(dict(worker=key, kind="WORKER_DISCOVERED", manifest=manifest))
 
 
-def tail(path, limit):
+def read_proc(path):
+    """procfs files can report size zero and reject SEEK_END; never tail them."""
     try:
         with Path(path).open("rb") as f:
-            f.seek(0, 2)
-            f.seek(max(0, f.tell() - limit))
-            return f.read(limit).decode("utf-8", errors="replace")
+            return f.read().decode("utf-8", errors="replace")
     except OSError as exc:
         return f"UNAVAILABLE: {exc}"
 
@@ -320,12 +355,12 @@ def proc_snapshot(worker):
     if not worker.same_process():
         return {"error": "PID identity unavailable/reused/different namespace; no attach"}
     pid = worker.manifest["pid"]
-    result = {name: tail(f"/proc/{pid}/{name}", 64 * 1024)
+    result = {name: read_proc(f"/proc/{pid}/{name}")
               for name in ("status", "stat", "limits", "cgroup", "sched", "wchan")}
     tasks = {}
     try:
-        for task in list(Path(f"/proc/{pid}/task").iterdir())[:256]:
-            tasks[task.name] = {name: tail(task / name, 4096)
+        for task in Path(f"/proc/{pid}/task").iterdir():
+            tasks[task.name] = {name: read_proc(task / name)
                                 for name in ("comm", "wchan", "status", "schedstat")}
     except OSError as exc:
         result["tasks_error"] = str(exc)
@@ -353,11 +388,9 @@ def collect_stacks(workers, directory, budget=20):
             try:
                 process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
                 def drain(pipe=process.stdout, path=directory / name):
-                    remaining = 128 * 1024
                     with path.open("wb") as output:
                         while chunk := pipe.read(65536):
-                            output.write(chunk[:remaining])
-                            remaining = max(0, remaining - len(chunk))
+                            output.write(chunk)
                     pipe.close()
                 reader = threading.Thread(target=drain, daemon=True)
                 reader.start()
@@ -376,25 +409,10 @@ def collect_stacks(workers, directory, budget=20):
 
 def save_incident(output, workers, triggers, journal, stacks, logs,
                   lifecycle=None, first_wait=False):
-    # Two owned slots, always save evidence before invoking an external tool.
-    slots = [output / f"incident-{i}" for i in range(2)]
-    index = next((i for i, p in enumerate(slots) if not p.exists()), None)
-    if index is None:
-        candidates = list(range(2))
-        # Keep the most recent stack evidence while a continuing stall emits
-        # further waiting snapshots. It must not rotate away after 30 seconds.
-        with_stacks = [i for i in candidates if (slots[i] / "stack-result.json").exists()]
-        if with_stacks and not stacks:
-            protected = max(with_stacks, key=lambda i: slots[i].stat().st_mtime_ns)
-            candidates.remove(protected)
-        index = min(candidates, key=lambda i: slots[i].stat().st_mtime_ns)
-    directory = output / "incident-first-wait" if first_wait else slots[index]
-    if directory.exists():
-        # Only this tool's flat artifact files; never recursively remove a path.
-        for p in directory.iterdir():
-            if p.is_file() and not p.is_symlink():
-                p.unlink()
-    directory.mkdir(exist_ok=True)
+    # Every incident gets a fresh directory; never overwrite previous evidence.
+    label = "first-wait" if first_wait else "snapshot"
+    directory = output / f"incident-{time.time_ns()}-{label}"
+    directory.mkdir()
     journal.flush()
     if lifecycle is not None:
         lifecycle.flush()
@@ -403,46 +421,39 @@ def save_incident(output, workers, triggers, journal, stacks, logs,
                   interpretation="PD_WAIT_LONG is evidence of waiting, not proof of a deadlock. "
                                  "CPU return/clear/ABORT_ACK do not prove NPU or native drain.",
                   missing_peer="Supply both local P/D dirs; remote peer data is not fetched automatically.")
-    encoded = json.dumps(report, ensure_ascii=False, indent=2)
-    if len(encoded.encode("utf-8")) > 16 * 1024 * 1024:
-        report["artifact_coverage"] = "UNKNOWN: JSON detail exceeded 16 MiB; inspect retained raw maps/history"
-        report["trigger_count_before_truncation"] = len(triggers)
-        report["triggers"] = [{k: v for k, v in t.items() if k != "evidence"} for t in triggers[:2048]]
-        report["workers"] = [{k: v for k, v in w.items() if k not in ("calls", "requests", "events", "jobs")}
-                             for w in report["workers"]]
-        encoded = json.dumps(report, ensure_ascii=False, indent=2)
-    # Copy a recent bounded journal tail; old rings can wrap before the next incident.
-    (directory / "recent-history.jsonl").write_text(tail(journal.path, 16 * 1024 * 1024))
-    if lifecycle is not None:
-        for path in lifecycle.directory.glob(f"{lifecycle.prefix}-*.jsonl"):
-            shutil.copyfile(path, directory / path.name)
-    # The worker limit bounds space. Never spend a fixed global budget on P
-    # first and silently omit D: P4+D4 needs eight maps, about 176.2 MiB.
+    # Journals are retained at the output root. Reference them instead of copying
+    # all growing history into every incident (quadratic I/O). Keep the whole run.
+    report["journals"] = {
+        item.prefix: [dict(file=os.path.relpath(p, directory), bytes_at_snapshot=p.stat().st_size)
+                      for p in sorted(item.directory.glob(f"{item.prefix}-*.jsonl"))]
+        for item in (journal, lifecycle) if item is not None
+    }
     raw_artifacts = []
     for worker in workers:
         prefix = worker.path.stem
         data = json.dumps(proc_snapshot(worker), ensure_ascii=False, indent=2)
-        if len(data.encode("utf-8")) > 256 * 1024:
-            data = json.dumps({"coverage": "truncated proc snapshot", "text": data[:128 * 1024]})
         (directory / f"proc-{prefix}.json").write_text(data)
         artifact = dict(worker=str(worker.path), file=f"{prefix}.mmap", saved=False)
         try:
             (directory / f"{prefix}.json").write_text(json.dumps(worker.manifest, indent=2))
             with (directory / artifact["file"]).open("wb") as raw:
-                for offset in range(0, core.SIZE, 1024 * 1024):
+                for offset in range(0, worker.size, 1024 * 1024):
                     raw.write(worker.buf[offset:offset + 1024 * 1024])
             artifact["saved"] = True
-            artifact["bytes"] = core.SIZE
+            artifact["bytes"] = worker.size
         except OSError as exc:
             artifact["error"] = str(exc)
         raw_artifacts.append(artifact)
     report["raw_artifacts"] = raw_artifacts
     report["raw_complete"] = bool(workers) and all(item["saved"] for item in raw_artifacts)
-    report["raw_expected_bytes"] = len(workers) * core.SIZE
-    report["snapshot_kind"] = "first_pd_wait" if first_wait else "rolling"
+    report["raw_expected_bytes"] = sum(w.size for w in workers)
+    report["snapshot_kind"] = "first_pd_wait" if first_wait else "snapshot"
     (directory / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2))
-    for i, log in enumerate(logs[:8]):
-        (directory / f"log-{i}.txt").write_text(tail(log, 1024 * 1024))
+    for i, log in enumerate(logs):
+        try:
+            shutil.copyfile(log, directory / f"log-{i}.txt")
+        except OSError as exc:
+            (directory / f"log-{i}-error.txt").write_text(str(exc))
     if stacks:
         result = collect_stacks(workers, directory)
         (directory / "stack-result.json").write_text(json.dumps(result, indent=2))
@@ -508,6 +519,13 @@ def main():
             now = time.monotonic_ns()
             for path, worker in workers.items():
                 records, snapshot = worker.read()
+                coverage = snapshot["coverage"]
+                counts = tuple(coverage[k] for k in ("registration_or_table_drops", "ring_lost",
+                               "torn_reads", "lifecycle_ring_lost", "lifecycle_torn_reads"))
+                if any(counts) and counts != worker.warned_coverage:
+                    print(f"WARNING: diagnostic coverage gap worker={path} counts={counts} "
+                          "(registration, execution lost, torn, lifecycle lost, lifecycle torn)", flush=True)
+                    worker.warned_coverage = counts
                 for record in records:
                     journal.append(dict(worker=path, event=record))
                     if lifecycle_record(record):

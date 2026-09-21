@@ -37,6 +37,7 @@ dependencies = [
   "humming-kernels[cu13]==0.1.10",
   "interegular",
   "IPython",
+  "json-repair",
   "kernels>=0.14.1,<0.15",
   "llguidance>=1.7.6,<2.0.0",
   "mistral_common>=1.11.5",

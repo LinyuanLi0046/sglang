@@ -875,7 +875,6 @@ class WelmDpAttentionExecutor:
 
             max_chunks = envs.SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MAX_CHUNKS.get()
             oproj_rs_pipeline_chunks = 0
-            use_fused_oproj_rs = False
             # MAX_LEN may represent a logical decode shard as EXTEND. Only a
             # real target prefill may replace this shard's original OProj path.
             local_forward_mode = (
@@ -905,18 +904,15 @@ class WelmDpAttentionExecutor:
                 actual_chunks = min(max_chunks, local_rows // min_local_rows)
                 if actual_chunks >= 2:
                     oproj_rs_pipeline_chunks = actual_chunks
-                else:
-                    use_fused_oproj_rs = True
-            oproj_output_is_reduce_scattered = (
-                oproj_rs_pipeline_chunks > 0 or use_fused_oproj_rs
-            )
+            # Below the chunk threshold, ordinary OProj returns partial rows;
+            # _finish_attention_and_norm performs the existing attn-TP RS.
+            oproj_output_is_reduce_scattered = oproj_rs_pipeline_chunks > 0
             attn_output = layer.self_attn(
                 positions=positions,
                 hidden_states=state.hidden_states,
                 forward_batch=forward_batch,
                 skip_o_norm=True,
                 skip_o_proj_all_reduce=plan.o_proj_returns_partial,
-                use_o_proj_matmul_reduce_scatter=use_fused_oproj_rs,
                 o_proj_rs_pipeline_chunks=oproj_rs_pipeline_chunks,
                 o_proj_rs_group=(
                     plan.attn_tp_group if oproj_output_is_reduce_scattered else None
@@ -1367,8 +1363,14 @@ class WelmDpAttentionExecutor:
             invalid_mask = welm_dp_attn_scattered_invalid_mask(active_view)
             assert state.residual is not None
             megamoe = layer.mlp.welm_prefill_megamoe
-            use_megamoe = (
+            megamoe_length_matched = (
                 megamoe is not None
+                # Ordinary-prefill EP uses equal padded slots across DP ranks,
+                # including idle participants. Never select by local real rows.
+                and megamoe.meets_prefill_threshold(active_view.local_slot_rows)
+            )
+            use_megamoe = (
+                megamoe_length_matched
                 and forward_batch.welm_dp_all_active_ordinary_prefill
                 and megamoe.can_run(active_view.local_slot_rows // plan.attn_tp_size)
             )
@@ -1400,7 +1402,7 @@ class WelmDpAttentionExecutor:
                 use_welm_prefill_megamoe=use_megamoe,
                 megamoe_num_valid_rows=megamoe_num_valid_rows,
                 force_serial_shared_expert=(
-                    megamoe is not None
+                    megamoe_length_matched
                     and (original_mode == ForwardMode.EXTEND or use_megamoe)
                 ),
                 valid_row_mask=valid_mask,

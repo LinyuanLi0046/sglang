@@ -646,6 +646,9 @@ class Envs:
     # BF16/MXFP8 WeLM target prefill, non-consumer EP; only shared gate/up may
     # overlap TopK with NPU multi-stream enabled. The rest precedes MegaMoE.
     WELM_NPU_USE_MEGAMOE = EnvBool(False)
+    # With MegaMoE enabled, require padded prefill rows before attention-TP
+    # scattering to exceed this threshold. Zero keeps the existing selection.
+    WELM_NPU_MEGAMOE_PREFILL_TOKEN_THRESHOLD = EnvInt(0)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
     # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2
     SGLANG_NPU_FORWARD_NATIVE_GELUTANH = EnvBool(False)
@@ -768,6 +771,8 @@ class Envs:
         EnvInt(None)
     )
     SGLANG_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER = EnvBool(False)
+    # An enabled pipeline with fewer than two chunks uses ordinary MM + RS,
+    # regardless of the fusion switch above. MAX_CHUNKS < 2 keeps the old path.
     SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MIN_CHUNK_TOKENS = EnvInt(1024)
     SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MAX_CHUNKS = EnvInt(0)
     SGLANG_NPU_PREFILL_AG_FUSED_QKV_MIN_CHUNK_TOKENS = EnvInt(1024)

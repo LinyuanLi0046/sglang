@@ -3534,6 +3534,9 @@ class Qwen2MoeDecoderLayer(nn.Module):
             and hidden_states.dtype == torch.bfloat16
             and self.self_attn.o_proj.weight.dtype == torch.bfloat16
         ):
+            # The manual pipeline owns this target path. If fewer than two
+            # chunks fit, use ordinary OProj and let finish_attention do RS.
+            use_fused_oproj_rs = False
             min_chunk_tokens = max(
                 1, envs.SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MIN_CHUNK_TOKENS.get()
             )
@@ -3542,10 +3545,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
             actual_chunks = min(max_chunks, local_rows // min_local_rows)
             if actual_chunks >= 2:
                 oproj_rs_pipeline_chunks = actual_chunks
-            else:
-                # The enabled target path falls back to fused MM+RS, regardless
-                # of the old fusion switch. Other modes keep their old path.
-                use_fused_oproj_rs = True
         oproj_output_is_reduce_scattered = (
             oproj_rs_pipeline_chunks > 0 or use_fused_oproj_rs
         )
@@ -3698,6 +3697,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
             megamoe is not None
             and forward_batch.forward_mode == ForwardMode.EXTEND
             and output_hidden_is_scattered
+            # MoE input is already scattered; recover OProj's padded MM rows.
+            and megamoe.meets_prefill_threshold(hidden_states.shape[0] * tp_size)
         )
         with get_forward().scoped(
             deepep_mode_override=(

@@ -48,6 +48,9 @@ class WelmPrefillMegaMoE:
         self.group = group
         self.weight_mode = weight_mode
         self.max_local_rows = _MAX_LOCAL_ROWS
+        self.prefill_token_threshold = (
+            envs.WELM_NPU_MEGAMOE_PREFILL_TOKEN_THRESHOLD.get()
+        )
         self._mega_moe = mega_moe
         self._closed = False
         # SymmBuffer queries the name with init_comm=False. Initialize on every
@@ -74,6 +77,14 @@ class WelmPrefillMegaMoE:
             combine_quant_mode=0,
             comm_alg="",
             **quant_args,
+        )
+
+    def meets_prefill_threshold(self, num_tokens: int) -> bool:
+        # Match OProj's padded MM rows before attention-TP ReduceScatter, not
+        # per-rank MoE rows or the sequence length including cached prefixes.
+        return (
+            self.prefill_token_threshold <= 0
+            or num_tokens > self.prefill_token_threshold
         )
 
     def can_run(self, num_rows: int) -> bool:

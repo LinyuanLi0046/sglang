@@ -935,11 +935,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.gate.weight.data = self.gate.weight.to(torch.float32)
         self.register_buffer("_npu_router_compute_weight", None, persistent=False)
         self.register_buffer("_npu_router_compute_weight_t", None, persistent=False)
-        self.shared_expert_tp = None
         if config.shared_expert_intermediate_size > 0:
-            # Decode-like execution adds a complete shared result after the
-            # routed sum. Pure TP also retains a sharded copy for ordinary
-            # prefill, preserving its original shared compute and fused sum.
+            use_ep_replicated_shared_expert = (
+                get_moe_a2a_backend().is_deepep()
+                and (runner_plan is None or runner_plan.has_moe_ep)
+            )
             self.shared_expert = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.shared_expert_intermediate_size,
@@ -948,30 +948,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 reduce_results=False,
                 prefix=add_prefix("shared_expert", prefix),
                 swiglu_clamp_limit=shared_clamp_limit,
-                tp_rank=0,
-                tp_size=1,
+                **(
+                    dict(tp_rank=0, tp_size=1)
+                    if use_ep_replicated_shared_expert
+                    else {}
+                ),
             )
-            if self.tp_size > 1 and (
-                (runner_plan is not None and not runner_plan.has_moe_ep)
-                or not get_moe_a2a_backend().is_deepep()
-            ):
-                self.shared_expert_tp = Qwen2MoeMLP(
-                    hidden_size=config.hidden_size,
-                    intermediate_size=config.shared_expert_intermediate_size,
-                    hidden_act=config.hidden_act,
-                    quant_config=quant_config,
-                    reduce_results=False,
-                    # Both copies use the checkpoint's canonical quantization
-                    # prefix, including ModelSlim weight/scale descriptions.
-                    prefix=add_prefix("shared_expert", prefix),
-                    swiglu_clamp_limit=shared_clamp_limit,
-                    tp_rank=(
-                        int(runner_plan.moe_tp_group.rank_in_group)
-                        if runner_plan is not None
-                        else get_parallel().tp_rank
-                    ),
-                    tp_size=self.tp_size,
-                )
         else:
             self.shared_expert = None
 
@@ -999,46 +981,19 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         gate_up: Optional[torch.Tensor] = None,
-        *,
-        use_tp_shard: bool = False,
     ) -> Optional[torch.Tensor]:
-        shared_expert = self.shared_expert_tp if use_tp_shard else self.shared_expert
-        if shared_expert is None:
+        if self.shared_expert is None:
             return None
 
         if gate_up is None:
-            shared_output = shared_expert(hidden_states)
+            shared_output = self.shared_expert(hidden_states)
         else:
-            shared_output = shared_expert.forward_from_gate_up(gate_up)
+            shared_output = self.shared_expert.forward_from_gate_up(gate_up)
         if self.shared_expert_gate is not None:
             shared_output = (
                 F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
             )
         return shared_output
-
-    def _forward_shared_expert_tp(
-        self, hidden_states: torch.Tensor, gate_up: Optional[torch.Tensor] = None
-    ):
-        return self._forward_shared_expert(
-            hidden_states, gate_up=gate_up, use_tp_shard=True
-        )
-
-    def _use_decode_like_shared_expert(
-        self, forward_batch: Optional[ForwardBatch], override: bool = False
-    ) -> bool:
-        return (
-            self.is_nextn
-            or override
-            or forward_batch is None
-            or not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
-                include_draft_extend_v2=True
-            )
-            or (
-                forward_batch.enable_kv_mirror
-                and forward_batch.forward_mode.is_extend_without_speculative()
-                and self.is_kv_mirror_consumer
-            )
-        )
 
     def get_npu_router_compute_weight(
         self, dtype: torch.dtype
@@ -1152,39 +1107,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         shared_output = None
         shared_gate_up = None
         moe_a2a_backend = get_moe_a2a_backend()
-        use_decode_like_stream_policy = self._use_decode_like_shared_expert(
-            forward_batch, use_welm_decode_like_stream_policy
-        )
-        use_tp_shared_expert = (
-            self.shared_expert_tp is not None and not use_decode_like_stream_policy
-        )
-        forward_shared_expert = (
-            self._forward_shared_expert_tp
-            if use_tp_shared_expert
-            else self._forward_shared_expert
-        )
-        if (
-            use_reduce_scatter
-            and self.shared_expert is not None
-            and not use_tp_shared_expert
-        ):
-            raise RuntimeError(
-                "WeLMv4 replicated shared experts require routed outputs to be "
-                "reduced before the shared add; a deferred MoE ReduceScatter "
-                "would sum the shared replica more than once."
-            )
-        use_moe_tp_all_reduce = (
-            not use_welm_local_ep_moe
-            and self.tp_size > 1
-            and not use_reduce_scatter
-            and (
-                (
-                    self.welm_runner_plan is not None
-                    and not self.welm_runner_plan.has_moe_ep
-                )
-                or not moe_a2a_backend.is_deepep()
-            )
-        )
         is_prefill_batch = (
             forward_batch is not None
             and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
@@ -1197,6 +1119,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and forward_batch.forward_mode.is_extend_without_speculative()
             and self.is_kv_mirror_consumer
         )
+        # Preserve the existing dual-stream policy for non-prefill modes and
+        # additionally let mirror prefill use that same policy.
+        use_decode_like_stream_policy = (
+            not is_prefill_batch
+            or is_kv_mirror_prefill
+            or use_welm_decode_like_stream_policy
+        )
         enable_npu_decode_like_dual_stream = (
             _is_npu
             and not force_serial_shared_expert
@@ -1206,10 +1135,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and hidden_states.shape[0] > 0
             and (moe_a2a_backend.is_none() or moe_a2a_backend.is_deepep())
             and use_decode_like_stream_policy
-        )
-        enable_npu_shared_allreduce_overlap = (
-            enable_npu_decode_like_dual_stream
-            and (use_welm_local_ep_moe or use_moe_tp_all_reduce)
         )
         enable_npu_prefill_normal_shared_overlap = (
             _is_npu
@@ -1311,7 +1236,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 and not enable_npu_shared_alt_stream
                 and not enable_npu_megamoe_shared_gate_up_overlap
             ):
-                shared_output = forward_shared_expert(hidden_states)
+                shared_output = self._forward_shared_expert(hidden_states)
             if _is_npu:
                 router_logits = torch.mm(
                     hidden_states,
@@ -1322,14 +1247,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 router_logits = mmq_style_router_linear(
                     hidden_states, self.gate.weight
                 )
-            if (
-                enable_npu_decode_like_dual_stream
-                and not enable_npu_shared_allreduce_overlap
-            ):
-                # Paths without an explicit routed-output all-reduce keep the
-                # existing routing/compute overlap (including single-rank MoE).
+            if enable_npu_decode_like_dual_stream:
+                # Start after the router Cube GEMM. The shared expert overlaps
+                # routing, dispatch, and the routed-expert path until final add;
+                # both paths only read the original hidden_states storage.
                 shared_output = process_shared_expert(
-                    hidden_states, forward_shared_expert
+                    hidden_states, self._forward_shared_expert
                 )
             if enable_npu_megamoe_shared_gate_up_overlap:
                 # The helper makes the shared stream wait for the router GEMM
@@ -1405,7 +1328,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # begins at dispatch. The existing final-add wait remains the
             # consumption boundary, matching decode/mirror behavior.
             shared_output = process_shared_expert(
-                hidden_states, forward_shared_expert
+                hidden_states, self._forward_shared_expert
             )
         if use_welm_prefill_megamoe:
             if enable_npu_megamoe_shared_gate_up_overlap:
@@ -1415,7 +1338,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 shared_gate_up.record_stream(
                     torch.get_device_module().current_stream()
                 )
-                shared_output = forward_shared_expert(
+                shared_output = self._forward_shared_expert(
                     hidden_states, gate_up=shared_gate_up
                 )
             experts_output = self.welm_prefill_megamoe.forward_layer(
@@ -1441,36 +1364,21 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             experts_output = self.experts.forward_local_ep_partial(
                 hidden_states, topk_output
             )
-        else:
-            experts_output = self.experts(hidden_states, topk_output)
-        if enable_npu_shared_allreduce_overlap:
-            # local EP/TP has finished both GMMs and token unpermute. Fork BEFORE
-            # submitting the collective: the helper waits on the current-stream
-            # prefix, so calling it after all_reduce would also wait for HCCL.
-            shared_output = process_shared_expert(
-                hidden_states, forward_shared_expert
-            )
-        # Replicated shared output is added after the routed sum. Ordinary TP
-        # prefill instead combines both partial outputs before its single sum.
-        if use_welm_local_ep_moe:
+            # Only routed experts are partial across EP ranks. The shared
+            # expert below is fully replicated under DeepEP and must be added
+            # after this sum, otherwise it would be multiplied by EP size.
             experts_output = (
                 resolved_moe_ep_group.all_reduce(experts_output)
                 if resolved_moe_ep_group is not None
                 else moe_expert_parallel_all_reduce(experts_output)
             )
-        elif use_moe_tp_all_reduce and not use_tp_shared_expert:
-            experts_output = (
-                resolved_moe_tp_group.all_reduce(experts_output)
-                if resolved_moe_tp_group is not None
-                else tensor_model_parallel_all_reduce(experts_output)
-            )
-        if enable_npu_shared_alt_stream and shared_output is not None:
-            # Join after routed communication and before either the final add
-            # or publishing components to the caller. The result was allocated
-            # on the shared stream but will be consumed on this stream.
-            wait_share_stream()
-            shared_output.record_stream(torch.get_device_module().current_stream())
-        if return_components and skip_component_output and not use_tp_shared_expert:
+        else:
+            experts_output = self.experts(hidden_states, topk_output)
+        if return_components and skip_component_output:
+            if enable_npu_shared_alt_stream:
+                # This early return hands shared_output to the caller, so it is
+                # the consumption boundary.
+                wait_share_stream()
             return (
                 experts_output.view(num_tokens, hidden_dim),
                 experts_output.view(num_tokens, hidden_dim),
@@ -1490,16 +1398,30 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             ):
                 self.last_final_experts_output = experts_output
                 self.last_final_shared_output = shared_output
+            if enable_npu_shared_alt_stream:
+                # Normal inference first consumes shared_output in this add.
+                wait_share_stream()
             if allow_inplace_expert_shared_merge:
                 final_hidden_states.add_(shared_output)
             else:
                 final_hidden_states = final_hidden_states + shared_output
-        if use_moe_tp_all_reduce and use_tp_shared_expert:
+        if (
+            self.tp_size > 1
+            and not use_reduce_scatter
+            and (
+                (
+                    self.welm_runner_plan is not None
+                    and not self.welm_runner_plan.has_moe_ep
+                )
+                or not get_moe_a2a_backend().is_deepep()
+            )
+        ):
             final_hidden_states = (
                 resolved_moe_tp_group.all_reduce(final_hidden_states)
                 if resolved_moe_tp_group is not None
                 else tensor_model_parallel_all_reduce(final_hidden_states)
             )
+
         final_hidden_states = final_hidden_states.view(num_tokens, hidden_dim)
         if return_components:
             return (
@@ -3110,13 +3032,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
-            # Sharded prefill may retain the original deferred sum. The forward
-            # path excludes phases that use the complete shared replica.
-            allow_reduce_scatter=(
-                not self.is_layer_sparse
-                or self.mlp.shared_expert is None
-                or self.mlp.shared_expert_tp is not None
-            ),
+            allow_reduce_scatter=True,
             is_last_layer=self.is_final_layer,
         )
         self._welm_runner_plan = get_welm_runner_build_plan_for_init()
@@ -3723,15 +3639,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         # request-row set.  Neither layout needs a second framework RS.
         use_reduce_scatter = (
             False
-            if (
-                output_hidden_is_scattered
-                or use_full_mirror_layout
-                or (
-                    self.is_layer_sparse
-                    and self.mlp.shared_expert is not None
-                    and self.mlp._use_decode_like_shared_expert(forward_batch)
-                )
-            )
+            if output_hidden_is_scattered or use_full_mirror_layout
             else self.layer_communicator.should_use_reduce_scatter(forward_batch)
         )
         self.final_mlp_experts_output = None
@@ -3808,10 +3716,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 forward_batch,
                 use_reduce_scatter,
                 use_welm_local_ep_moe=use_welm_local_ep_moe,
-                # NextN EXTEND/DRAFT_EXTEND_V2 also use the local-sort path.
-                # Their forward modes are prefill-like, so explicitly opt in
-                # even without mirror query pruning. Verify opts in by mode.
-                use_welm_decode_like_stream_policy=self.is_nextn,
                 use_welm_prefill_megamoe=(
                     use_megamoe_prefill and megamoe.can_run(hidden_states.shape[0])
                 ),
@@ -4814,22 +4718,6 @@ class WeLMV4MoeForCausalLM(nn.Module):
     def end_layer(self):
         return self.model.end_layer
 
-    @staticmethod
-    def _load_parameter_with_shared_tp_copy(
-        params_dict, name: str, loaded_weight: torch.Tensor, *loader_args
-    ):
-        names = [name]
-        if ".shared_expert." in name:
-            tp_name = name.replace(".shared_expert.", ".shared_expert_tp.", 1)
-            if tp_name in params_dict:
-                names.append(tp_name)
-        for parameter_name in names:
-            param = params_dict[parameter_name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            # Each module's loader applies its own TP slicing to weights and
-            # quantization scales. Never slice already postprocessed weights.
-            weight_loader(param, loaded_weight, *loader_args)
-
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
@@ -4997,9 +4885,9 @@ class WeLMV4MoeForCausalLM(nn.Module):
                 if name == "model.oe_gate_up_proj.weight":
                     continue
 
-                self._load_parameter_with_shared_tp_copy(
-                    params_dict, name, loaded_weight, shard_id
-                )
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 for mapping in expert_params_mapping:
@@ -5032,9 +4920,10 @@ class WeLMV4MoeForCausalLM(nn.Module):
                                 loaded_weight[start : start + param.numel()]
                             )
                         else:
-                            self._load_parameter_with_shared_tp_copy(
-                                params_dict, name, loaded_weight
+                            weight_loader = getattr(
+                                param, "weight_loader", default_weight_loader
                             )
+                            weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
         self.post_init_after_load_weights(is_nextn=is_nextn)

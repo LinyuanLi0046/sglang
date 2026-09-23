@@ -394,15 +394,11 @@ def inspect_welm_layer_capabilities(
     shared = getattr(mlp, "shared_expert", None)
     shared_expert_ep_replicated = True
     if shared is not None:
-        expected_shared_tp_size = 1 if plan.has_moe_ep else plan.moe_tp_size
         shared_tp_sizes = (
             int(getattr(shared.gate_up_proj, "tp_size", -1)),
             int(getattr(shared.down_proj, "tp_size", -1)),
         )
-        expected_shared_tp_sizes = (
-            expected_shared_tp_size,
-            expected_shared_tp_size,
-        )
+        expected_shared_tp_sizes = (1, 1)
         if shared_tp_sizes != expected_shared_tp_sizes:
             raise RuntimeError(
                 "WeLMv4 shared-expert weight coverage does not match the "
@@ -411,10 +407,36 @@ def inspect_welm_layer_capabilities(
             )
         if bool(getattr(shared.down_proj, "reduce_results", False)):
             raise RuntimeError(
-                "WeLMv4 DP execution requires shared down-projection to "
-                "return a partial output"
+                "WeLMv4 shared down-projection must not issue a collective; "
+                "its complete replicated output is added after routed reduction"
             )
         shared_expert_ep_replicated = shared_tp_sizes == (1, 1)
+
+    shared_tp = getattr(mlp, "shared_expert_tp", None)
+    needs_shared_tp = shared is not None and not plan.has_moe_ep and plan.moe_tp_size > 1
+    if needs_shared_tp != (shared_tp is not None):
+        raise RuntimeError(
+            "WeLMv4 ordinary prefill requires a second TP-sharded shared expert "
+            "exactly when a shared expert is present in multi-rank pure MoE TP"
+        )
+    if shared_tp is not None:
+        expected_shard = (plan.moe_tp_size, int(plan.moe_tp_group.rank_in_group))
+        for projection in (shared_tp.gate_up_proj, shared_tp.down_proj):
+            actual_shard = (
+                int(getattr(projection, "tp_size", -1)),
+                int(getattr(projection, "tp_rank", -1)),
+            )
+            if actual_shard != expected_shard:
+                raise RuntimeError(
+                    "WeLMv4 TP-sharded shared-expert weight coverage does not "
+                    f"match the resolved MoE-TP group: actual={actual_shard}, "
+                    f"expected={expected_shard}"
+                )
+        if bool(getattr(shared_tp.down_proj, "reduce_results", False)):
+            raise RuntimeError(
+                "WeLMv4 TP-sharded shared down-projection must leave its sum "
+                "to the combined routed/shared output collective"
+            )
 
     local_ep_kernel_available = bool(
         getattr(mlp, "welm_local_ep_kernel_available", False)

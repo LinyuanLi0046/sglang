@@ -1683,6 +1683,68 @@ def _welmv4_inplace_rope_head_parallel_mirror_kernel_npu(
             )
 
 
+def welmv4_inplace_rope_single_npu(
+    tensor: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    *,
+    head_dim: int,
+    rope_dim: int,
+    segment_tile_starts: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Rotate one operand using existing kernels, without a dummy Q/K tensor.
+
+    The unused operand has zero heads: its stores are masked in the generic
+    kernel, and its Q head loop is empty in the segmented kernel. Passing the
+    same pointer therefore does NOT rotate the live operand twice.
+    """
+    rows, heads = tensor.shape[0], tensor.shape[-1] // head_dim
+    if positions.numel() != rows:
+        raise ValueError("WeLM single-operand RoPE positions must match its rows")
+    if segment_tile_starts is not None and heads in (1, 2):
+        tiles = segment_tile_starts.numel() - 1
+        _welmv4_inplace_rope_segmented_prefill_kernel_npu[
+            (min(tiles, _get_num_sms()),)
+        ](
+            tensor,
+            tensor,
+            positions,
+            cos_sin_cache,
+            segment_tile_starts,
+            tiles,
+            rows,
+            tensor.stride(0),
+            tensor.stride(0),
+            head_dim,
+            rope_dim,
+            _WELMV4_ROPE_PREFILL_TOKEN_BLOCK,
+            _WELMV4_ROPE_PREFILL_NUM_STAGES,
+            0,
+            heads,
+            multibuffer=True,
+        )
+    else:
+        _welmv4_inplace_rope_kernel_npu[(min(rows, _get_num_sms(multiplier=8)),)](
+            tensor,
+            tensor,
+            positions,
+            cos_sin_cache,
+            None,
+            rows,
+            0,
+            tensor.stride(0),
+            tensor.stride(0),
+            head_dim,
+            rope_dim,
+            4,
+            heads,
+            0,
+            triton.next_power_of_2(heads),
+            1,
+        )
+    return tensor
+
+
 def welmv4_inplace_rope_npu(
     query: torch.Tensor,
     key: torch.Tensor,

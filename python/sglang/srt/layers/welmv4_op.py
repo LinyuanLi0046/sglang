@@ -984,6 +984,18 @@ class WelmV4InplaceRotaryEmbedding(RotaryEmbedding):
             segment_tile_starts=segment_tile_starts,
         )
 
+    def forward_npu_single(self, positions, tensor, *, segment_tile_starts=None):
+        from sglang.srt.layers.welmv4_npu_op import welmv4_inplace_rope_single_npu
+
+        return welmv4_inplace_rope_single_npu(
+            tensor,
+            positions,
+            self.cos_sin_cache,
+            head_dim=self.head_size,
+            rope_dim=self.rotary_dim,
+            segment_tile_starts=segment_tile_starts,
+        )
+
     def extra_repr(self) -> str:
         s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"
         s += f", max_position_embeddings={self.max_position_embeddings}"

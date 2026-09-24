@@ -777,6 +777,14 @@ class Envs:
     SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MAX_CHUNKS = EnvInt(0)
     SGLANG_NPU_PREFILL_AG_FUSED_QKV_MIN_CHUNK_TOKENS = EnvInt(1024)
     SGLANG_NPU_PREFILL_AG_FUSED_QKV_MAX_CHUNKS = EnvInt(0)
+    # Exact request counts B for the WeLM BF16 KV-mirror suffix graph, whose
+    # Q/hidden/MoE have B rows. Prompt graphs (including mirror K/V preparation)
+    # use only the token buckets in cuda_graph_config.prefill.bs: T + B captures,
+    # not T x B. max(B) also sizes the fixed tail-index/RoPE metadata handoff.
+    # With pruning enabled, unlisted B falls back for the ENTIRE body (B=3 is
+    # not padded to 4); mixed eager-prompt/graph-mirror execution is unsupported.
+    # Without pruning there is only the T graph, with request count <= max(B).
+    SGLANG_WELMV4_PREFILL_GRAPH_BATCH_SIZES = EnvStr("1,2,4,8")
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     # Force dynamic Waterfill with runtime EP all-reduce instead of the default

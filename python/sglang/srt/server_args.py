@@ -5141,18 +5141,34 @@ class ServerArgs:
                     "CUDA implementation."
                 )
                 self.cuda_graph_config.decode.backend = Backend.FULL
-            if self.cuda_graph_config.prefill.backend != Backend.DISABLED:
+            welm_bf16_breakable = (
+                is_npu()
+                and self.cuda_graph_config.prefill.backend == Backend.BREAKABLE
+                and not self.enable_dp_attention
+                and self._resolved().attn_cp_size == 1
+                and self.dcp_size == 1
+                and self.dtype in ("auto", "bfloat16")
+                and self.kv_cache_dtype in ("auto", "bf16", "bfloat16")
+                and self.quantization is None
+                and not self.enable_lora
+                and os.environ.get("WELM_NPU_USE_FLASH_ATTN", "0") == "1"
+            )
+            if (
+                self.cuda_graph_config.prefill.backend != Backend.DISABLED
+                and not welm_bf16_breakable
+            ):
                 logger.warning(
-                    "Prefill CUDA Graph is disabled for WeLMv4 because the "
-                    "latest prefill graph buffers do not yet carry its request "
-                    "ngram token-table metadata. Decode CUDA Graph remains enabled."
+                    "WeLMv4 prefill graph requires NPU breakable, BF16 model/KV, "
+                    "DP attention off, CP=DCP=1, no LoRA/quantization and "
+                    "WELM_NPU_USE_FLASH_ATTN=1. Disabling this unsupported "
+                    "prefill profile; decode graph settings are unchanged."
                 )
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
             if is_npu() and self.cuda_graph_config.decode.backend != Backend.DISABLED:
                 logger.info(
                     "Decode NPU Graph is enabled for WeLMv4. Spec V2 MTP "
-                    "uses the WeLM Triton attention path. Torch Compile and "
-                    "Prefill NPU Graph remain disabled."
+                    "uses the WeLM Triton attention path. Torch Compile "
+                    "remains disabled; prefill follows its configured backend."
                 )
             if self.enable_over_encoding:
                 if is_npu() and self.load_format == "dummy":

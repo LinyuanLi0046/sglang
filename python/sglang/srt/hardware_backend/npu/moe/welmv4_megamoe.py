@@ -106,13 +106,16 @@ class WelmPrefillMegaMoE:
         num_valid_rows: int,
         *,
         zero_output_padding: bool = True,
+        valid_row_mask: torch.Tensor | None = None,
     ):
         # The caller skips DeepEP's -1 masking. TopK IDs are already legal and
         # distinct, including padding rows; only their mixture weights need 0.
         ids = topk_output.topk_ids.to(torch.int32)
         weights = topk_output.topk_weights.to(torch.bfloat16)
         has_padding = num_valid_rows < hidden_states.shape[0]
-        if has_padding:
+        if valid_row_mask is not None:
+            weights.masked_fill_(~valid_row_mask[:, None], 0)
+        elif has_padding:
             # TopK returns FP32: the cast above owns a new BF16 tensor. Clear
             # only its suffix, without another full tensor copy or mask kernel.
             weights[num_valid_rows:].zero_()
@@ -137,7 +140,9 @@ class WelmPrefillMegaMoE:
             self.symm_buffer,
             **quant_args,
         )
-        if has_padding and zero_output_padding:
+        if valid_row_mask is not None and zero_output_padding:
+            output.masked_fill_(~valid_row_mask[:, None], 0)
+        elif has_padding and zero_output_padding:
             output[num_valid_rows:].zero_()
         return output
 

@@ -504,7 +504,9 @@ class AscendAttnBackend(AttentionBackend):
             and not self.use_welm_flash_attn
         )
 
-    def _prepare_welm_flash_metadata_inputs(self, forward_batch: ForwardBatch) -> None:
+    def _prepare_welm_flash_metadata_inputs(
+        self, forward_batch: ForwardBatch, *, pin_memory: bool = False
+    ) -> None:
         """Build eager FlashAttn lengths from the pre-collective local batch.
 
         KV lengths have already been normalized for the forward mode. Keep
@@ -531,8 +533,14 @@ class AscendAttnBackend(AttentionBackend):
                 max(1, int(q_lens_cpu.max().item())) if bs else 1
             )
         metadata.extend_seq_lens_cpu_int = q_lens_cpu
+        if pin_memory:
+            # Fresh staging; async copies may outlive this Python call under
+            # scheduler overlap. Never refill an in-flight pinned CPU buffer.
+            q_lens_cpu = q_lens_cpu.pin_memory()
         metadata.welm_flash_seqused_q = q_lens_cpu.to(self.device, non_blocking=True)
-        cu_q_cpu = torch.zeros(bs + 1, dtype=torch.int32, device="cpu")
+        cu_q_cpu = torch.zeros(
+            bs + 1, dtype=torch.int32, device="cpu", pin_memory=pin_memory
+        )
         torch.cumsum(q_lens_cpu, dim=0, out=cu_q_cpu[1:])
         metadata.welm_flash_cu_seqlens_q = cu_q_cpu.to(self.device, non_blocking=True)
         metadata.welm_flash_seqused_kv = torch.where(
@@ -1293,7 +1301,23 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
-        seq_lens_max = forward_batch.seq_lens.max()
+        # Ordinary WeLM prefill already has authoritative CPU lengths. Avoid
+        # a device scalar as a Python slice bound and an extend-lens D2H: both
+        # would drain pending forward-stream work under scheduler overlap.
+        welm_cpu_prefill = (
+            self.use_welm_flash_attn
+            and self.model_dtype == torch.bfloat16
+            and not get_parallel().enable_dp_attention
+            and self.attn_cp_size == 1
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and forward_batch.seq_lens_cpu is not None
+            and forward_batch.extend_seq_lens_cpu is not None
+        )
+        seq_lens_max = (
+            int(forward_batch.seq_lens_cpu.max().item())
+            if welm_cpu_prefill
+            else forward_batch.seq_lens.max()
+        )
         if forward_batch.forward_mode.is_target_verify():
             seq_lens_max += self.speculative_num_draft_tokens
         elif (
@@ -1328,7 +1352,11 @@ class AscendAttnBackend(AttentionBackend):
         if forward_batch.extend_seq_lens is not None:
             self.forward_metadata.extend_seq_lens = forward_batch.extend_seq_lens
             self.forward_metadata.extend_seq_lens_cpu_int = (
-                forward_batch.extend_seq_lens.cpu().int()
+                torch.tensor(
+                    forward_batch.extend_seq_lens_cpu, dtype=torch.int32, device="cpu"
+                )
+                if welm_cpu_prefill
+                else forward_batch.extend_seq_lens.cpu().int()
             )
         if forward_batch.seq_lens is not None:
             self.forward_metadata.seq_lens = forward_batch.seq_lens.int()
@@ -1363,7 +1391,9 @@ class AscendAttnBackend(AttentionBackend):
                 self.forward_metadata.seq_lens = (
                     self.forward_metadata.seq_lens + self.speculative_step_id + 1
                 )
-            self._prepare_welm_flash_metadata_inputs(forward_batch)
+            self._prepare_welm_flash_metadata_inputs(
+                forward_batch, pin_memory=welm_cpu_prefill
+            )
 
         self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
         if (

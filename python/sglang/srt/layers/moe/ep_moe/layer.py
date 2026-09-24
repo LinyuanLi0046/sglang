@@ -211,8 +211,27 @@ class DeepEPMoE(FusedMoE):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
-        # DeepEP NORMAL mode is not capturable; run it as an eager node.
+        # Keep the generic DeepEP eager protection. Only the explicitly
+        # selected WeLM NPU BF16 NORMAL AllGather implementation opts in.
         if is_in_breakable_cuda_graph():
+            if _is_npu:
+                from sglang.srt.model_executor.runner.welm_prefill_graph import (
+                    welm_normal_graph_scope,
+                )
+
+                if welm_normal_graph_scope.get():
+                    if not (
+                        hidden_states.dtype == torch.bfloat16
+                        and self.deprecate_flag
+                        and envs.SGLANG_DEEPEP_NORMAL_USE_ALLGATHER.get()
+                        and not envs.SGLANG_DEEPEP_NORMAL_USE_ALLTOALL.get()
+                        and get_is_extend_in_batch()
+                    ):
+                        raise RuntimeError(
+                            "WeLM graph NORMAL capability changed during capture; "
+                            "refusing to move decoder communication into eager"
+                        )
+                    return self.forward_impl(hidden_states, topk_output)
             assert TopKOutputChecker.format_is_standard(
                 topk_output
             ), "Only standard topk output is supported for breakable cuda graph"

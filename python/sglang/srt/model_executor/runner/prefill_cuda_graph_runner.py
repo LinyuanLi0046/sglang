@@ -251,6 +251,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     # serves any prefix and the MHA-prefix ban does not apply. Class
     # default keeps __new__-built test instances on the ban.
     dsa_sparse_prefill_forced: bool = False
+    welm_adapter = None
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
@@ -522,6 +523,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- aiter chip info pre-warming (AMD) -------------------------
         maybe_pre_warm_aiter_chip_info()
 
+        if (
+            is_npu()
+            and isinstance(self.backend, BreakableCudaGraphBackend)
+            and hasattr(self.layer_model, "_compute_oe_hashed_ids")
+        ):
+            from sglang.srt.model_executor.runner.welm_prefill_graph import (
+                WelmPrefillGraphAdapter,
+            )
+
+            self.welm_adapter = WelmPrefillGraphAdapter(self)
+
         # --- capture --------------------------------------------------
         self.device_module.synchronize()
         self.model_runner.tp_group.barrier()
@@ -656,7 +668,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch.dp_padding_mode.is_max_len(),
             forward_batch.global_num_tokens_cpu,
         )
-        set_is_extend_in_batch(False)
+        set_is_extend_in_batch(self.welm_adapter is not None)
 
         with self._prefill_forward_context(forward_batch):
             if self._uses_eager_prefill_tail():
@@ -813,6 +825,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return next((n for n in self._prefix_capture_variants if n >= real_n), None)
 
     def _shape_key(self, num_tokens: int, forward_batch: ForwardBatch) -> ShapeKey:
+        if self.welm_adapter is not None:
+            return self.welm_adapter.key(num_tokens, forward_batch.batch_size)
         variant = None
         if self._capture_chunked_prefix and self._has_prefix_hit(forward_batch):
             captured_n = self._select_prefix_capture_chunks(forward_batch)
@@ -1131,6 +1145,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # layer_model.forward monkey-patch in replay(): the captured graph runs
         # the transformer stack, then the outer model.forward runs
         # logits_processor eagerly on top with live request metadata.
+        if self.welm_adapter is not None:
+            capacity = self._pad_to_bucket(
+                len(forward_batch.input_ids), self.capture_num_tokens
+            )
+            return self.welm_adapter.can_run(forward_batch, capacity)
         return True
 
     def _build_capture_spec_info(self, num_tokens: int):
@@ -1156,6 +1175,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Slot 0 carries num_tokens; slots 1..bs-1 are zero-length sentinels.
         lens_cpu = [num_tokens] + [0] * (bs - 1)
         start_loc_cpu = [0] + [num_tokens] * (bs - 1)
+        if self.welm_adapter is not None:
+            from sglang.srt.model_executor.runner.welm_prefill_graph import (
+                capture_request_lengths,
+            )
+
+            lens_cpu = capture_request_lengths(num_tokens, bs)
+            start_loc_cpu = [sum(lens_cpu[:i]) for i in range(bs)]
 
         with torch.device(self.device):
             shape_inputs = {
@@ -1268,6 +1294,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
+        if self.welm_adapter is not None:
+            self.welm_adapter.prepare_capture(forward_batch, num_tokens)
         return forward_batch, self.model_runner.attn_backend
 
     def capture(self) -> None:
@@ -1301,16 +1329,31 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 capture_range.set_description(
                     f"Capturing num tokens ({num_tokens=} {avail_mem=:.2f} GB)"
                 )
+            if self.welm_adapter is not None:
+                self._capture_req_slots = 1
             self.capture_one_shape(num_tokens)
             if self._capture_chunked_prefix:
                 for captured_n in self._prefix_capture_variants:
                     self.capture_one_shape(num_tokens, prefix_num_chunks=captured_n)
 
-    def capture_one_shape(self, size: int, *, prefix_num_chunks: int = 0) -> None:
+        if self.welm_adapter is not None and self.welm_adapter.prune:
+            # Prompt outputs only persistent handoff buffers (no backend
+            # output). Allocate the final shared output at the largest B first.
+            for bs in reversed(self.welm_adapter.batch_sizes):
+                self._capture_req_slots = bs
+                self.capture_one_shape(self.max_num_tokens, welm_mirror_bs=bs)
+            self._capture_req_slots = 1
+            self.welm_adapter.capture_phase = "prompt"
+
+    def capture_one_shape(
+        self, size: int, *, prefix_num_chunks: int = 0, welm_mirror_bs: int = 0
+    ) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
         delegate to backend. size is the prefill token count.
         """
         num_tokens = size
+        if self.welm_adapter is not None:
+            self.welm_adapter.capture_phase = "mirror" if welm_mirror_bs else "prompt"
         forward_batch, attn_backend = self.capture_prepare(num_tokens)
         if self.enable_cp_v2_bcg_capture:
             assert self.prefill_cp_bcg_input is not None
@@ -1338,6 +1381,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 else None
             ),
         )
+        if self.welm_adapter is not None:
+            shape_key = (
+                self.welm_adapter.mirror_key(welm_mirror_bs)
+                if welm_mirror_bs
+                else self.welm_adapter.key(num_tokens)
+            )
         if prefix_num_chunks:
             self._prepare_chunked_prefix_capture(
                 forward_batch, shape_key, prefix_num_chunks
@@ -1355,6 +1404,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self._init_forward_metadata_for_capture(forward_batch, num_tokens)
 
         def run_once():
+            if self.welm_adapter is not None:
+                from sglang.srt.model_executor.runner.welm_prefill_graph import (
+                    welm_normal_graph_scope,
+                )
+
+                self.welm_adapter.before_capture_forward(forward_batch)
+                token = welm_normal_graph_scope.set(True)
+                try:
+                    return self._run_forward(forward_batch, num_tokens)
+                finally:
+                    welm_normal_graph_scope.reset(token)
             return self._run_forward(forward_batch, num_tokens)
 
         # Main's monolithic BCG runner never invokes
@@ -1379,6 +1439,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             capture_inputs=forward_batch,
             post_warmup_hook=post_warmup_hook,
         )
+        if self.welm_adapter is not None:
+            self.welm_adapter.after_capture(shape_key, forward_batch)
 
     def load_batch(self, forward_batch: ForwardBatch, **kwargs) -> ForwardBatch:
         """Pad, populate static buffers, and build the static_forward_batch
@@ -1571,6 +1633,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             metadata_forward_batch, static_forward_batch, static_num_tokens
         )
 
+        if self.welm_adapter is not None:
+            self.welm_adapter.prepare_replay(
+                forward_batch, static_forward_batch, static_num_tokens
+            )
+
         return static_forward_batch
 
     def _execute_body_capture(
@@ -1604,7 +1671,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     self.buffer_registry.get_slot("input_embeds").slice_for(
                         1, static_num_tokens
                     )[: ie.shape[0]].copy_(ie)
-            hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
+            if self.welm_adapter is not None:
+                hs = self.welm_adapter.replay(
+                    shape_key, static_forward_batch, **kwargs
+                )
+            else:
+                hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
 
         original_layer_forward = self.layer_model.forward
@@ -1674,6 +1746,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             input_token_ids_logprobs_val=output.input_token_ids_logprobs_val,
             input_token_ids_logprobs_idx=output.input_token_ids_logprobs_idx,
             mm_input_embeds=mm_input_embeds,
+            model_specific_states=output.model_specific_states,
         )
 
     def _finalize_execute_output(
@@ -1704,8 +1777,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             static_num_tokens = len(static_forward_batch.input_ids)
             raw_num_tokens = self.raw_num_tokens
             shape_key = self._shape_key(static_num_tokens, forward_batch)
-            # The only variants this runner records are chunked-prefix ones.
-            if shape_key.variant_label is not None:
+            if (shape_key.variant_label or "").startswith("chunked_prefix:"):
                 self._prepare_chunked_prefix_replay(shape_key, forward_batch)
 
             if self.enable_cp_v2_bcg_capture:

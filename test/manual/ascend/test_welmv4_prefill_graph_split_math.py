@@ -29,7 +29,21 @@ class Tensor:
         return self.data.size
 
     def __getitem__(self, item):
+        if isinstance(item, tuple):
+            item = tuple(x.data if isinstance(x, Tensor) else x for x in item)
+        elif isinstance(item, Tensor):
+            item = item.data
         return Tensor(self.data[item])
+
+    @property
+    def device(self):
+        return "cpu"
+
+    def __floordiv__(self, other):
+        return Tensor(self.data // other)
+
+    def __gt__(self, other):
+        return Tensor(self.data > other)
 
     def __sub__(self, other):
         return Tensor(self.data - other)
@@ -43,9 +57,37 @@ class Tensor:
     def index_select(self, dim, indices):
         return Tensor(np.take(self.data, indices.data, axis=dim))
 
-    def copy_(self, source):
+    def copy_(self, source, non_blocking=False):
         self.data[...] = source.data
         return self
+
+    def zero_(self):
+        self.data.fill(0)
+        return self
+
+    def fill_(self, value):
+        self.data.fill(value)
+        return self
+
+    def max(self):
+        return Tensor(self.data.max())
+
+    def sum(self):
+        return Tensor(self.data.sum())
+
+    def item(self):
+        return self.data.item()
+
+    def reshape(self, *shape):
+        return Tensor(self.data.reshape(*shape))
+
+    view = reshape
+
+    def contiguous(self):
+        return Tensor(np.ascontiguousarray(self.data))
+
+    def float(self):
+        return self.to(np.float32)
 
     def clone(self):
         return Tensor(self.data.copy())
@@ -145,6 +187,14 @@ class TestSplitMath(unittest.TestCase):
         adapter.capture_keys = set()
         adapter.prune, adapter.ep = True, False
         seen = []
+        cache_writes = []
+        adapter.full_write_locs = Tensor(np.arange(16) + 64)
+        adapter.swa_write_locs = Tensor(np.arange(16) + 128)
+        adapter.backend = types.SimpleNamespace(
+            write_welm_prefill_graph_kv=lambda layer, k, v, full, swa: cache_writes.append(
+                (k.clone(), v.clone(), full.clone(), swa.clone())
+            )
+        )
 
         def prepare_key(positions, key, batch):
             seen.append(key.shape[0])
@@ -179,6 +229,11 @@ class TestSplitMath(unittest.TestCase):
                 adapter.after_capture(adapter.key(capacity), batch)
                 np.testing.assert_array_equal(raw.data, saved)
                 np.testing.assert_array_equal(adapter.mirror_kv[7][0].data[:capacity], saved + positions.data[:, None])
+                written_k, written_v, full, swa = cache_writes[-1]
+                np.testing.assert_array_equal(written_k.data, saved + positions.data[:, None])
+                np.testing.assert_array_equal(written_v.data, saved)
+                np.testing.assert_array_equal(full.data, np.arange(capacity) + 64)
+                np.testing.assert_array_equal(swa.data, np.arange(capacity) + 128)
                 np.testing.assert_array_equal(batch.model_specific_states["mtp"][2][0].data, saved)
                 current = tuple(t.data.ctypes.data for t in (
                     adapter.mirror_hidden, adapter.mirror_residual,
@@ -193,6 +248,7 @@ class TestSplitMath(unittest.TestCase):
                 r.data.fill(-99)
                 np.testing.assert_array_equal(adapter.mirror_residual.data[:len(tails)], saved[tails])
         self.assertEqual(seen, [8, 16, 8])
+        self.assertEqual(len(cache_writes), 3)
 
 
 if __name__ == "__main__":

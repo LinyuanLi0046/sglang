@@ -12,8 +12,8 @@
 # limitations under the License.
 """WeLM BF16 target-prefill inputs for the existing breakable graph runner.
 
-Only the transformer body is captured. Native Flash and the ordinary logits
-tail remain eager. No communication is moved into the Flash callback.
+The transformer body, including native Flash, is captured in independent
+Prompt[T] and Mirror[B] graphs. The ordinary logits tail remains eager.
 """
 
 from __future__ import annotations
@@ -28,9 +28,6 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
-    eager_on_graph,
-)
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
@@ -59,6 +56,30 @@ def capture_request_lengths(num_tokens: int, batch_size: int) -> list[int]:
         raise ValueError("WeLM capture requires 0 < batch_size <= num_tokens")
     quotient, remainder = divmod(num_tokens, batch_size)
     return [quotient + (i < remainder) for i in range(batch_size)]
+
+
+def padded_flash_cu_seqlens(
+    lengths: list[int], capacity: int, max_requests: int
+) -> list[int]:
+    """Physical TND offsets; seqused_q separately carries the real lengths.
+
+    Give the last metadata slot the trailing physical padding, even when it
+    is a real request. Flash uses seqused_q, not that span, for causal lengths.
+    The final offset must cover the entire output, including its zeroed tail.
+    """
+    if (
+        not lengths
+        or len(lengths) > max_requests
+        or any(length <= 0 for length in lengths)
+        or sum(lengths) > capacity
+    ):
+        raise ValueError("Invalid WeLM Flash graph request lengths")
+    offsets = [0]
+    for length in lengths:
+        offsets.append(offsets[-1] + length)
+    offsets.extend([offsets[-1]] * (max_requests - len(lengths)))
+    offsets[-1] = capacity
+    return offsets
 
 
 def padded_rope_tiles(
@@ -141,6 +162,14 @@ class WelmPrefillGraphAdapter:
             min(runner.max_bs, self.max_tokens),
         )
         self.max_requests = max(self.batch_sizes)
+        # Allocated outside either graph pool and never shared with decode.
+        # Page tables / KV lengths can be shared by T and B graphs: both
+        # replays consume the same batch, in order on the forward stream.
+        self.flash_inputs = self.backend.create_welm_prefill_graph_metadata(
+            self.max_requests
+        )
+        self.flash_metadata = {}
+        self.current_flash_metadata = None
         self.capture_phase = "prompt"
         self.first_mirror = (
             self.model.layers[0].first_target_kv_mirror_layer if self.prune else None
@@ -188,7 +217,7 @@ class WelmPrefillGraphAdapter:
         logger.info(
             "WeLM BF16 breakable prefill: T-only prompt graphs, exact mirror "
             "batches %s, mirror=%s, "
-            "MoE=%s; native Flash and LM head/logits stay eager; Gate side "
+            "MoE=%s; native Flash is captured, LM head/logits stay eager; Gate side "
             "stream and CMO weight prefetch are disabled for graph prefill",
             self.batch_sizes,
             self.prune,
@@ -219,8 +248,13 @@ class WelmPrefillGraphAdapter:
             return self.reject("prompt token bucket was not captured")
         if self.prune and self.mirror_key(batch.batch_size) not in self.capture_keys:
             return self.reject("exact mirror request count was not captured")
-        if batch.batch_size > self.max_requests:
+        if not 0 < batch.batch_size <= self.max_requests:
             return self.reject("request count exceeds fixed metadata capacity")
+        if (
+            batch.seq_lens_cpu is None
+            or int(batch.seq_lens_cpu.max().item()) > self.backend.max_context_len
+        ):
+            return self.reject("KV length exceeds fixed Flash page-table capacity")
         lengths = batch.extend_seq_lens_cpu
         if (
             lengths is None
@@ -259,19 +293,59 @@ class WelmPrefillGraphAdapter:
         batch.positions.copy_(torch.tensor(positions, device=self.device))
         self.oe_ids.zero_()
         self.valid_rows[:capacity].fill_(True)
-        self.full_write_locs[:capacity].zero_()
-        self.swa_write_locs[:capacity].zero_()
+        # Dummy attention reads the reserved zero page. Never race writes to
+        # that page during capture, including the fused-QKV cache writer.
+        self.full_write_locs[:capacity].fill_(-1)
+        self.swa_write_locs[:capacity].fill_(-1)
         if batch.num_token_non_padded is not None:
             self.local_valid_rows.copy_(batch.num_token_non_padded)
         else:
             self.local_valid_rows.fill_(capacity)
         self._prepare_tiles(batch, capacity)
+        self.backend.prepare_welm_prefill_graph_metadata(
+            self.flash_inputs, batch, capture=True
+        )
+        mirror = batch.welm_prefill_graph_phase == "mirror"
+        key = self.mirror_key(batch.batch_size) if mirror else self.key(capacity)
+        metadata = copy.copy(self.flash_inputs)
+        metadata.welm_flash_schedules = {}
+        if mirror:
+            bs = batch.batch_size
+            metadata.block_tables = metadata.block_tables[:bs]
+            if metadata.block_tables_swa is not None:
+                metadata.block_tables_swa = metadata.block_tables_swa[:bs]
+            metadata.welm_flash_seqused_kv = metadata.welm_flash_seqused_kv[:bs]
+            metadata.welm_flash_cu_seqlens_q = torch.arange(
+                bs + 1, dtype=torch.int32, device=self.device
+            )
+            metadata.welm_flash_seqused_q = torch.ones(
+                bs, dtype=torch.int32, device=self.device
+            )
+            metadata.welm_flash_max_seqlen_q = 1
+            metadata.welm_flash_mirror_q_lengths = (
+                metadata.welm_flash_cu_seqlens_q,
+                metadata.welm_flash_seqused_q,
+            )
+        else:
+            metadata.welm_flash_cu_seqlens_q = torch.empty(
+                self.max_requests + 1, dtype=torch.int32, device=self.device
+            )
+            self._prepare_flash_offsets(metadata, batch, capacity)
+        self.flash_metadata[key] = metadata
+        self.current_flash_metadata = metadata
         self._capture_templates[id(batch)] = (
             batch.num_token_non_padded_cpu,
             batch.global_dp_buffer_len,
             copy.copy(batch.global_num_tokens_cpu),
         )
         self.current_batch = batch
+
+    def _prepare_flash_offsets(self, metadata, batch, capacity):
+        offsets = padded_flash_cu_seqlens(
+            batch.extend_seq_lens_cpu, capacity, self.max_requests
+        )
+        staging = torch.tensor(offsets, dtype=torch.int32, device="cpu", pin_memory=True)
+        metadata.welm_flash_cu_seqlens_q.copy_(staging, non_blocking=True)
 
     def _prepare_tiles(self, batch: ForwardBatch, capacity: int):
         values = padded_rope_tiles(
@@ -305,6 +379,15 @@ class WelmPrefillGraphAdapter:
         from sglang.srt.models.welmv4 import KVMirrorManager
 
         KVMirrorManager.activations_dict_kv.clear()
+        # Record schedule producers on EVERY warmup and actual capture. A
+        # warmup schedule is not a valid substitute for an in-graph producer.
+        key = (
+            self.mirror_key(batch.batch_size)
+            if batch.welm_prefill_graph_phase == "mirror"
+            else self.key(batch.positions.numel())
+        )
+        self.current_flash_metadata = self.flash_metadata[key]
+        self.current_flash_metadata.welm_flash_schedules.clear()
         batch.model_specific_states = None
         batch.__dict__.pop("custom_last_index", None)
         batch.welmv4_npu_deepep_scattered = False
@@ -349,10 +432,15 @@ class WelmPrefillGraphAdapter:
             self.local_valid_rows.fill_(real_rows)
         self.full_write_locs[real_rows:capacity].fill_(-1)
         self.full_write_locs[:real_rows].copy_(live.out_cache_loc[:real_rows])
-        swa = self.backend.forward_metadata.swa_out_cache_loc
         self.swa_write_locs[real_rows:capacity].fill_(-1)
-        if swa is not None:
-            self.swa_write_locs[:real_rows].copy_(swa[:real_rows])
+        if self.backend.use_sliding_window_kv_pool:
+            swa = self.backend.token_to_kv_pool.translate_loc_from_full_to_swa(
+                live.out_cache_loc[:real_rows]
+            )
+            self.swa_write_locs[:real_rows].copy_(swa)
+        self.backend.prepare_welm_prefill_graph_metadata(self.flash_inputs, live)
+        self.current_flash_metadata = self.flash_metadata[self.key(capacity)]
+        self._prepare_flash_offsets(self.current_flash_metadata, live, capacity)
         self._prepare_tiles(static, capacity)
         # Arbitrary-position fused QKV may load padded positions as well.
         static.positions[real_rows:capacity].zero_()
@@ -377,6 +465,15 @@ class WelmPrefillGraphAdapter:
             dst_k[:capacity].copy_(k)
             dst_v[:capacity].copy_(v)
             attn.prepare_graph_mirror_key(positions, dst_k[:capacity], batch)
+            # Cache writes depend on T, not on the consumer's B-row Q. Finish
+            # them here so Mirror[B] only reads its layer's paged cache.
+            self.backend.write_welm_prefill_graph_kv(
+                attn.attn,
+                dst_k[:capacity],
+                dst_v[:capacity],
+                self.full_write_locs[:capacity],
+                self.swa_write_locs[:capacity],
+            )
 
         first = self.model.layers[self.first_mirror]
         hidden_states, residual, partial = first.prepare_graph_mirror_input(
@@ -449,42 +546,24 @@ class WelmPrefillGraphAdapter:
         # its replay; preserve the existing serial target->draft lifetime.
         batch.model_specific_states = self.captured_states.get(key)
 
-    @eager_on_graph(True)
-    def flash(self, layer, q, k, v, *, mirror: bool, save_kv_cache: bool, **kwargs):
-        from sglang.srt.layers.radix_attention import force_eager_attention
-
-        batch = copy.copy(self.current_batch)
-        kv_rows = sum(batch.extend_seq_lens_cpu)
-        q_rows = batch.batch_size if mirror else kv_rows
-        batch.num_token_non_padded_cpu = q_rows
-        batch.out_cache_loc = batch.out_cache_loc[:kv_rows]
-        if mirror:
-            if k is None:
-                # Selected live T, never the dummy T used to capture Mirror[B].
-                k, v = self.mirror_kv[layer.layer_id]
-            # Native WeLM Flash only checks presence. RoPE/last-query indexing
-            # ran in the graph, so avoid an extra per-layer eager cumsum.
-            batch.custom_last_index = None
-        else:
-            batch.__dict__.pop("custom_last_index", None)
-        metadata = self.backend.forward_metadata
-        original_swa = metadata.swa_out_cache_loc
-        if original_swa is not None:
-            metadata.swa_out_cache_loc = original_swa[:kv_rows]
-        try:
-            with force_eager_attention():
-                result = layer(
-                    q[:q_rows],
-                    None if k is None else k[:kv_rows],
-                    None if v is None else v[:kv_rows],
-                    batch,
-                    save_kv_cache=save_kv_cache,
-                    **kwargs,
-                )
-        finally:
-            metadata.swa_out_cache_loc = original_swa
-        if q_rows == q.shape[0]:
-            return result
-        output = result.new_zeros((q.shape[0], *result.shape[1:]))
-        output[:q_rows].copy_(result)
-        return output
+    def flash(self, layer, q, k, v, *, mirror: bool, save_kv_cache: bool, sinks=None):
+        # Bypass RadixAttention's generic breakable eager wrapper. Explicit
+        # metadata avoids changing the backend's eager/decode state at all.
+        if save_kv_cache and not mirror:
+            self.backend.write_welm_prefill_graph_kv(
+                layer,
+                k,
+                v,
+                self.full_write_locs[: q.shape[0]],
+                self.swa_write_locs[: q.shape[0]],
+            )
+        pool = self.backend.token_to_kv_pool
+        return self.backend._forward_welm_flash_attention(
+            q,
+            pool.get_key_buffer(layer.layer_id),
+            pool.get_value_buffer(layer.layer_id),
+            layer,
+            sinks,
+            mirror_prefill=mirror,
+            graph_metadata=self.current_flash_metadata,
+        )

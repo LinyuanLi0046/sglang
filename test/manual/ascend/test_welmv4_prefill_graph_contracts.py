@@ -74,7 +74,8 @@ ShapeKey = key_module.ShapeKey
 
 ADAPTER = load_nodes(
     SRT / "model_executor/runner/welm_prefill_graph.py",
-    ["parse_capture_batch_sizes", "capture_request_lengths", "padded_rope_tiles", "WelmPrefillGraphAdapter"],
+    ["parse_capture_batch_sizes", "capture_request_lengths", "padded_flash_cu_seqlens",
+     "padded_rope_tiles", "WelmPrefillGraphAdapter"],
     {
         "copy": copy,
         "logger": logging.getLogger(__name__),
@@ -92,6 +93,9 @@ class Rows:
 
     def __getitem__(self, item):
         return Rows(len(range(self.shape[0])[item]), self.shape[1])
+
+    def numel(self):
+        return self.shape[0] * self.shape[1]
 
     def new_zeros(self, shape):
         return Rows(*shape)
@@ -181,77 +185,119 @@ class TestInputContracts(unittest.TestCase):
         adapter.prune = True
         adapter._warned = set()
         adapter.max_requests = 8
+        adapter.backend = types.SimpleNamespace(max_context_len=4096)
         adapter.capture_keys = {adapter.key(128), adapter.mirror_key(2)}
         adapter.model = types.SimpleNamespace(oe_grams=[2, 2, 3, 3], layers_to_capture=[])
         batch = types.SimpleNamespace(
             forward_mode=1, enable_kv_mirror=True, batch_size=2,
             extend_seq_lens_cpu=[63, 62], input_ids=list(range(128)),
             extend_num_tokens=128, ngram_embedding_info=object(),
+            seq_lens_cpu=types.SimpleNamespace(
+                max=lambda: types.SimpleNamespace(item=lambda: 2000)
+            ),
         )
         self.assertTrue(adapter.can_run(batch, 128))
+        adapter.backend.max_context_len = 1024
+        self.assertFalse(adapter.can_run(batch, 128))
+        adapter.backend.max_context_len = 4096
         batch.batch_size = 3
         self.assertFalse(adapter.can_run(batch, 128))
         batch.batch_size = 2
         batch.ngram_embedding_info = None
         self.assertFalse(adapter.can_run(batch, 128))
 
+    def test_flash_physical_offsets_preserve_causal_lengths_and_cover_padding(self):
+        offsets = ADAPTER["padded_flash_cu_seqlens"]
+        self.assertEqual(offsets([300, 500], 1024, 4), [0, 300, 800, 800, 1024])
+        self.assertEqual(offsets([300, 500], 1024, 2), [0, 300, 1024])
+        rng = random.Random(513)
+        for _ in range(300):
+            bcap = rng.randint(1, 10)
+            lengths = [rng.randint(1, 90) for _ in range(rng.randint(1, bcap))]
+            capacity = sum(lengths) + rng.randint(0, 127)
+            cu = offsets(lengths, capacity, bcap)
+            self.assertEqual((len(cu), cu[0], cu[-1]), (bcap + 1, 0, capacity))
+            used = lengths + [0] * (bcap - len(lengths))
+            visited = []
+            for i, length in enumerate(used):
+                self.assertGreaterEqual(cu[i + 1] - cu[i], length)
+                visited.extend(range(cu[i], cu[i] + length))
+            self.assertEqual(visited, list(range(sum(lengths))))
+        for lengths, t, b in (([], 8, 4), ([0], 8, 4), ([9], 8, 4), ([1, 1], 8, 1)):
+            with self.assertRaises(ValueError):
+                offsets(lengths, t, b)
+
 
 class TestFlashAndStateContracts(unittest.TestCase):
     def setUp(self):
         self.adapter = Adapter.__new__(Adapter)
+        self.adapter.prune = True
+        self.adapter.full_write_locs = Rows(128)
+        self.adapter.swa_write_locs = Rows(128)
+        self.adapter.current_flash_metadata = object()
         self.swa = Rows(128)
+        self.cache = Rows(4096)
+        self.seen = []
         self.adapter.backend = types.SimpleNamespace(
-            forward_metadata=types.SimpleNamespace(swa_out_cache_loc=self.swa)
+            forward_metadata=types.SimpleNamespace(swa_out_cache_loc=self.swa),
+            graph_mode=False,
+            token_to_kv_pool=types.SimpleNamespace(
+                get_key_buffer=lambda _: self.cache, get_value_buffer=lambda _: self.cache
+            ),
+            write_welm_prefill_graph_kv=lambda layer, k, v, full, swa: self.seen.append(
+                ("write", k.shape[0], v.shape[0], full.shape[0], swa.shape[0])
+            ),
+            _forward_welm_flash_attention=self.attention,
         )
         self.batch = types.SimpleNamespace(
             extend_seq_lens_cpu=[63, 62], batch_size=2,
             num_token_non_padded_cpu=125, out_cache_loc=Rows(128),
             custom_last_index=object(), enable_kv_mirror=True,
+            welm_prefill_graph_phase="prompt", positions=Rows(128, 1),
         )
         self.adapter.current_batch = self.batch
-        self.seen = []
-        self.radix_module = types.ModuleType("sglang.srt.layers.radix_attention")
-        self.radix_module.force_eager_attention = nullcontext
-        self.patch = patch.dict(sys.modules, {self.radix_module.__name__: self.radix_module})
-        self.patch.start()
-        self.addCleanup(self.patch.stop)
+        self.layer = types.SimpleNamespace(layer_id=7)
 
-    def layer(self, q, k, v, batch, **kwargs):
-        self.seen.append((q.shape[0], k.shape[0], v.shape[0], batch.out_cache_loc.shape[0],
-                          hasattr(batch, "custom_last_index"), kwargs["save_kv_cache"],
-                          self.adapter.backend.forward_metadata.swa_out_cache_loc.shape[0]))
+    def attention(self, q, k, v, layer, sinks, **kwargs):
+        self.assertIs(k, self.cache)
+        self.assertIs(v, self.cache)
+        self.assertIs(kwargs["graph_metadata"], self.adapter.current_flash_metadata)
+        self.seen.append(("flash", q.shape[0], kwargs["mirror_prefill"]))
         return Rows(q.shape[0])
 
-    def test_mirror_keeps_all_new_kv_rows(self):
-        output = self.adapter.flash(self.layer, Rows(2), Rows(128), Rows(128),
+    def test_mirror_reads_cache_without_t_dependent_write(self):
+        output = self.adapter.flash(self.layer, Rows(2), None, None,
                                     mirror=True, save_kv_cache=True)
-        self.assertEqual(self.seen[-1], (2, 125, 125, 125, True, True, 125))
+        self.assertEqual(self.seen, [("flash", 2, True)])
         self.assertEqual(output.shape[0], 2)
         self.assertIs(self.adapter.backend.forward_metadata.swa_out_cache_loc, self.swa)
 
-    def test_prefix_hides_stale_mirror_flag_and_restores_padding(self):
+    def test_fused_prompt_preserves_capacity_without_double_cache_write(self):
         output = self.adapter.flash(self.layer, Rows(128), Rows(128), Rows(128),
                                     mirror=False, save_kv_cache=False)
-        self.assertEqual(self.seen[-1], (125, 125, 125, 125, False, False, 125))
+        self.assertEqual(self.seen, [("flash", 128, False)])
         self.assertEqual(output.shape[0], 128)
         self.assertTrue(hasattr(self.batch, "custom_last_index"))
 
-    def test_flash_reads_the_new_batch_on_every_call(self):
+    def test_nonfused_prompt_writes_fixed_rows_before_flash(self):
         for lengths in ([63, 62], [1, 7], [64, 64]):
             self.adapter.current_batch = copy.copy(self.batch)
             self.adapter.current_batch.extend_seq_lens_cpu = lengths
-            self.adapter.flash(self.layer, Rows(2), Rows(128), Rows(128),
-                               mirror=True, save_kv_cache=True)
-            self.assertEqual(self.seen[-1][1], sum(lengths))
+            self.adapter.flash(self.layer, Rows(128), Rows(128), Rows(128),
+                               mirror=False, save_kv_cache=True)
+            self.assertEqual(self.seen[-2:], [("write", 128, 128, 128, 128),
+                                             ("flash", 128, False)])
 
-    def test_flash_exception_restores_swa_metadata(self):
+    def test_flash_exception_does_not_modify_eager_decode_state(self):
         def broken(*args, **kwargs):
             raise RuntimeError("flash failed")
 
+        self.adapter.backend._forward_welm_flash_attention = broken
         with self.assertRaisesRegex(RuntimeError, "flash failed"):
-            self.adapter.flash(broken, Rows(2), Rows(128), Rows(128),
+            self.adapter.flash(self.layer, Rows(2), None, None,
                                mirror=True, save_kv_cache=True)
         self.assertIs(self.adapter.backend.forward_metadata.swa_out_cache_loc, self.swa)
+        self.assertFalse(self.adapter.backend.graph_mode)
 
     def test_each_warmup_restores_prefix_state_and_live_scalar(self):
         module = types.ModuleType("sglang.srt.models.welmv4")
@@ -261,8 +307,11 @@ class TestFlashAndStateContracts(unittest.TestCase):
         batch.global_num_tokens_gpu = Scalar(2)
         self.adapter.local_valid_rows = Scalar(31)
         self.adapter._capture_templates = {id(batch): (125, 128, [128])}
+        metadata = types.SimpleNamespace(welm_flash_schedules={})
+        self.adapter.flash_metadata = {self.adapter.key(128): metadata}
         with patch.dict(sys.modules, {module.__name__: module}):
             for _ in range(3):
+                metadata.welm_flash_schedules["stale"] = object()
                 batch.custom_last_index = object()
                 batch.welmv4_npu_deepep_full_mirror = True
                 batch.welmv4_npu_deepep_scattered = True
@@ -277,9 +326,30 @@ class TestFlashAndStateContracts(unittest.TestCase):
                 self.assertEqual(batch.num_token_non_padded_cpu, 125)
                 self.assertEqual(batch.global_num_tokens_gpu.value, 128)
                 self.assertEqual(module.KVMirrorManager.activations_dict_kv, {})
+                self.assertIs(self.adapter.current_flash_metadata, metadata)
+                self.assertEqual(metadata.welm_flash_schedules, {})
 
 
 class TestSplitGraphContracts(unittest.TestCase):
+    def test_generic_metadata_hooks_only_bypassed_for_welm_adapter(self):
+        path = SRT / "model_executor/runner/prefill_cuda_graph_runner.py"
+        capture = load_method(path, "PrefillCudaGraphRunner", "_init_forward_metadata_for_capture", {})
+        replay = load_method(path, "PrefillCudaGraphRunner", "_prepare_forward_metadata_for_replay", {})
+        calls = []
+        backend = types.SimpleNamespace(init_forward_metadata=lambda b: calls.append(b))
+        runner = types.SimpleNamespace(
+            welm_adapter=object(), model_runner=types.SimpleNamespace(attn_backend=backend),
+            use_captured_attn_metadata=False, _is_full_backend=False,
+        )
+        batch = object()
+        capture(runner, batch, 128)
+        replay(runner, batch, object(), 128)
+        self.assertEqual(calls, [])
+        runner.welm_adapter = None
+        capture(runner, batch, 128)
+        replay(runner, batch, object(), 128)
+        self.assertEqual(calls, [batch, batch])
+
     def test_model_phase_entry_runs_embedding_only_in_prompt_and_stops_at_consumer(self):
         events = []
         forward = load_method(
@@ -389,32 +459,21 @@ class TestSplitGraphContracts(unittest.TestCase):
         with self.assertRaises(ValueError):
             tiles([1, 1, 1], 8, 2)
 
-    def test_mirror_callback_fetches_live_t_kv_without_captured_t_argument(self):
+    def test_mirror_does_not_access_raw_t_kv_or_live_lengths(self):
         adapter = Adapter.__new__(Adapter)
-        adapter.mirror_kv = {7: (Rows(256), Rows(256))}
         seen = []
-
-        class Attention:
-            layer_id = 7
-
-            def __call__(self, q, k, v, batch, **kw):
-                seen.append((q.shape[0], k.shape[0], v.shape[0],
-                             batch.out_cache_loc.shape[0]))
-                return Rows(q.shape[0])
-
-        module = types.ModuleType("sglang.srt.layers.radix_attention")
-        module.force_eager_attention = nullcontext
-        with patch.dict(sys.modules, {module.__name__: module}):
-            for lengths in ([3, 5], [80, 73], [1, 1]):
-                adapter.current_batch = types.SimpleNamespace(
-                    batch_size=2, extend_seq_lens_cpu=lengths, out_cache_loc=Rows(256)
-                )
-                adapter.backend = types.SimpleNamespace(
-                    forward_metadata=types.SimpleNamespace(swa_out_cache_loc=Rows(256))
-                )
-                adapter.flash(Attention(), Rows(2), None, None,
-                              mirror=True, save_kv_cache=True)
-        self.assertEqual(seen, [(2, 8, 8, 8), (2, 153, 153, 153), (2, 2, 2, 2)])
+        adapter.current_flash_metadata = object()
+        adapter.backend = types.SimpleNamespace(
+            token_to_kv_pool=types.SimpleNamespace(
+                get_key_buffer=lambda _: Rows(4096), get_value_buffer=lambda _: Rows(4096)
+            ),
+            _forward_welm_flash_attention=lambda q, *a, **kw: seen.append(q.shape[0]),
+        )
+        # No current_batch, mirror_kv or writer: the B graph must need none.
+        for bs in (1, 2, 4):
+            adapter.flash(types.SimpleNamespace(layer_id=7), Rows(bs), None, None,
+                          mirror=True, save_kv_cache=True)
+        self.assertEqual(seen, [1, 2, 4])
 
 
 class TestOverlapPreparation(unittest.TestCase):

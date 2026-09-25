@@ -1,8 +1,8 @@
-"""Ascend smoke test for real segmented replay and the WeLM live Flash bridge.
+"""Ascend smoke test for captured WeLM attention and phase handoff lifetimes.
 
 The attention callable below deliberately uses small tensor operations: this
-checks NPU graph/side-stream/bridge lifetimes, not native Flash numerics or HCCL.
-The full-model TP/EP and native Flash matrix is in IMPLEMENTATION_STATUS.md.
+checks NPU graph/side-stream lifetimes, not native Flash numerics or HCCL.
+Native operators are covered by test_welmv4_prefill_flash_graph_npu.py.
 Run in an installed SGLang Ascend environment: python <this file>.
 """
 
@@ -12,6 +12,7 @@ import unittest
 try:
     import torch
     import torch_npu  # noqa: F401
+    from torch_npu.contrib import transfer_to_npu  # noqa: F401
 
     HAS_NPU = torch.npu.is_available()
 except ImportError:
@@ -33,7 +34,7 @@ if HAS_NPU:
 
 
 @unittest.skipUnless(HAS_NPU, "requires torch_npu and an Ascend device")
-class TestWeLMNpuBridge(unittest.TestCase):
+class TestWeLMNpuCapturedAttention(unittest.TestCase):
     def test_replay_reads_live_rows_and_metadata_with_captured_side_stream(self):
         for mirror in (False, True):
             with self.subTest(mirror=mirror):
@@ -46,13 +47,24 @@ class TestWeLMNpuBridge(unittest.TestCase):
         kv_input = torch.ones_like(x)
         weight = torch.eye(width, device=device, dtype=x.dtype)
         swa = torch.arange(capacity, device=device, dtype=torch.int64)
+        valid = torch.zeros((capacity, 1), device=device, dtype=torch.bool)
+        kv_cache = torch.zeros_like(x)
+        flash_state = types.SimpleNamespace(bias=torch.zeros(1, device=device))
         adapter = WelmPrefillGraphAdapter.__new__(WelmPrefillGraphAdapter)
         adapter.device = device
         adapter.rope_tiles = {}
         adapter.max_requests = batch_size
         adapter.tail_indices = torch.zeros(batch_size, dtype=torch.int64, device=device)
+        adapter.full_write_locs = adapter.swa_write_locs = swa
+        adapter.current_flash_metadata = flash_state
         adapter.backend = types.SimpleNamespace(
-            forward_metadata=types.SimpleNamespace(swa_out_cache_loc=swa, bias=0)
+            forward_metadata=types.SimpleNamespace(swa_out_cache_loc=swa),
+            token_to_kv_pool=types.SimpleNamespace(
+                get_key_buffer=lambda _: kv_cache, get_value_buffer=lambda _: kv_cache
+            ),
+            write_welm_prefill_graph_kv=lambda layer, k, v, *slots: kv_cache.copy_(
+                torch.where(valid, k, 0)
+            ),
         )
 
         def set_batch(lengths, bias):
@@ -62,21 +74,16 @@ class TestWeLMNpuBridge(unittest.TestCase):
                 out_cache_loc=swa,
                 num_token_non_padded_cpu=sum(lengths),
             )
-            adapter.backend.forward_metadata = types.SimpleNamespace(
-                swa_out_cache_loc=swa, bias=bias
-            )
+            flash_state.bias.fill_(bias)
+            valid[:sum(lengths)].fill_(True)
+            valid[sum(lengths):].fill_(False)
 
-        def attention(q, k, v, batch, **kwargs):
-            real = sum(batch.extend_seq_lens_cpu)
-            self.assertEqual(k.shape[0], real)
-            self.assertEqual(v.shape[0], real)
-            self.assertEqual(q.shape[0], batch_size if mirror else real)
-            self.assertEqual(batch.out_cache_loc.numel(), real)
-            self.assertEqual(hasattr(batch, "custom_last_index"), mirror)
-            self.assertEqual(
-                adapter.backend.forward_metadata.swa_out_cache_loc.numel(), real
-            )
-            return q + k.sum(dim=0) + adapter.backend.forward_metadata.bias
+        def attention(q, k, v, layer, sinks, *, graph_metadata, mirror_prefill):
+            out = q + k.sum(dim=0) + graph_metadata.bias
+            return out if mirror_prefill else torch.where(valid, out, 0)
+
+        adapter.backend._forward_welm_flash_attention = attention
+        layer = types.SimpleNamespace(layer_id=0)
 
         side = torch.npu.Stream()
 
@@ -89,9 +96,11 @@ class TestWeLMNpuBridge(unittest.TestCase):
             main.wait_stream(side)
             k.record_stream(main)
             if mirror:
+                # Stand-in for the T graph's consumer cache write.
+                kv_cache.copy_(torch.where(valid, k, 0))
                 q = q[:batch_size]
             return adapter.flash(
-                attention, q, k, k, mirror=mirror, save_kv_cache=True
+                layer, q, k, k, mirror=mirror, save_kv_cache=True
             ) * 2
 
         set_batch([3, 5], 0)
@@ -266,30 +275,30 @@ class TestSplitPrefillGraphs(unittest.TestCase):
         adapter.prune = True
         adapter.capture_keys, adapter.captured_states = set(), {}
         adapter.runner = types.SimpleNamespace(backend=backend)
-        adapter.mirror_kv = {0: (kv, kv)}
+        valid = torch.zeros((128, 1), dtype=torch.bool, device=device)
+        adapter.current_flash_metadata = object()
         adapter.backend = types.SimpleNamespace(
-            forward_metadata=types.SimpleNamespace(swa_out_cache_loc=None)
+            token_to_kv_pool=types.SimpleNamespace(
+                get_key_buffer=lambda _: kv, get_value_buffer=lambda _: kv
+            ),
+            _forward_welm_flash_attention=lambda q, k, *args, **kw: q + k.sum(0),
         )
-
-        class Attention:
-            layer_id = 0
-
-            def __call__(self, q, k, v, batch, **kw):
-                return q + k.sum(0)
-
-        attention = Attention()
+        attention = types.SimpleNamespace(layer_id=0)
 
         def set_batch(lengths):
             adapter.current_batch = types.SimpleNamespace(
                 batch_size=len(lengths), extend_seq_lens_cpu=list(lengths),
                 out_cache_loc=torch.zeros(128, dtype=torch.int64, device=device),
             )
+            valid[:sum(lengths)].fill_(True)
+            valid[sum(lengths):].fill_(False)
 
         for capacity in (128, 64):
             set_batch([capacity])
 
             def prompt(capacity=capacity):
-                kv[:capacity].copy_(x[:capacity] * 2)
+                kv.zero_()
+                kv[:capacity].copy_(torch.where(valid[:capacity], x[:capacity] * 2, 0))
                 handoff.copy_(x[:capacity].index_select(0, tails))
                 return None
 

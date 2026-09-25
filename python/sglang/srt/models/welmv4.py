@@ -2681,8 +2681,8 @@ class Qwen2MoeAttention(nn.Module):
                     self.kv_mirror_layers.index(self.kv_mirror_layer_idx)
                 ]
                 if forward_batch.welm_prefill_graph_phase == "mirror":
-                    # T-row K norm/RoPE ran in Prompt[T]. Flash retrieves the
-                    # persistent K/V using the live batch, outside the B graph.
+                    # T-row K norm/RoPE and consumer cache writes ran in
+                    # Prompt[T]. Mirror[B] reads only the paged cache.
                     k = v = None
                 else:
                     k, v = KVMirrorManager.get_kv_activation(
@@ -2729,8 +2729,8 @@ class Qwen2MoeAttention(nn.Module):
         )
         enable_npu_gate_alt_stream = (
             _is_npu
-            # Graph prefill keeps Gate on the main stream after Flash. Avoid
-            # carrying a Gate side stream across the eager Flash boundary.
+            # Keep the phase-one graph policy: Gate stays on the main stream
+            # after Flash, including when native Flash itself is captured.
             and forward_batch.welm_prefill_graph is None
             and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             and self.alt_stream is not None

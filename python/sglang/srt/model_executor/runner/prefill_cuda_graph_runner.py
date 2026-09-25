@@ -974,6 +974,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         contract. For opt-in backends (DSV4), call the BCG-specific entry
         and stash the returned per-bucket metadata object; otherwise fall
         back to the generic eager init that BCG/TC_PIECEWISE use today."""
+        if self.welm_adapter is not None:
+            # The adapter owns phase-specific Flash inputs, prepared by
+            # capture_prepare. Do not allocate/rebind eager or decode state.
+            return
         attn_backend = self.model_runner.attn_backend
         if not self.use_captured_attn_metadata:
             attn_backend.init_forward_metadata(forward_batch)
@@ -997,6 +1001,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         capture-stable wrapper state planned at capture time with the
         real seq_lens / prefix_lens; the captured kernels read the
         updated state at replay."""
+        if self.welm_adapter is not None:
+            # prepare_replay updates the private T/B Flash inputs once below.
+            return
         attn_backend = self.model_runner.attn_backend
         if self._is_full_backend:
             # Slot-padded shallow view: plan() must see exactly req_slots

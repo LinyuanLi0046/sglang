@@ -45,6 +45,12 @@ class TestNativeFlashPrefillGraph(unittest.TestCase):
             with self.subTest(swa=swa):
                 self._check(swa=swa, mirror=True)
 
+    def test_padded_mirror_full_and_swa_with_variable_b(self):
+        for swa in (False, True):
+            for with_sinks in (False, True):
+                with self.subTest(swa=swa, sinks=with_sinks):
+                    self._check(swa=swa, mirror=True, padded=True, with_sinks=with_sinks)
+
     @staticmethod
     def _reference(q, key, value, req_tokens, lengths, kv_lengths, layer, sinks, mirror):
         nq, nkv, dim = layer.tp_q_head_num, layer.tp_k_head_num, layer.qk_head_dim
@@ -65,19 +71,22 @@ class TestNativeFlashPrefillGraph(unittest.TestCase):
                 visible &= kp[None, :] >= qp[:, None] - layer.sliding_window_size
             scores.masked_fill_(~visible[None], float("-inf"))
             # Attention sinks contribute to the denominator, with zero V.
-            sink_column = sinks[:, None, None].expand(nq, width, 1)
-            probs = torch.cat((scores, sink_column), dim=-1).softmax(-1)[..., :-1]
+            if sinks is None:
+                probs = scores.softmax(-1)
+            else:
+                sink_column = sinks[:, None, None].expand(nq, width, 1)
+                probs = torch.cat((scores, sink_column), dim=-1).softmax(-1)[..., :-1]
             result = torch.einsum("hqk,khd->qhd", probs, vr)
             out[start : start + width] = result.reshape(width, -1).to(out.dtype)
             offset += e
         return out
 
-    def _check(self, *, swa, mirror):
+    def _check(self, *, swa, mirror, padded=False, with_sinks=True):
         device = torch.device("npu", torch.npu.current_device())
         torch.manual_seed(17)
         capacity, bcap, page, context = 128, 4, 64, 256
         nq, nkv, dim = 6, 1, 256
-        qrows = 2 if mirror else capacity
+        qrows = (bcap if padded else 2) if mirror else capacity
         q = torch.randn(qrows, nq * dim, device=device, dtype=torch.bfloat16)
         k = torch.randn(capacity, nkv * dim, device=device, dtype=q.dtype)
         v = torch.randn_like(k)
@@ -120,18 +129,19 @@ class TestNativeFlashPrefillGraph(unittest.TestCase):
             sliding_window_size=63 if swa else -1,
             scaling=dim**-0.5,
         )
-        sinks = torch.linspace(-1, 1, nq, device=device, dtype=torch.float32)
+        sinks = (torch.linspace(-1, 1, nq, device=device, dtype=torch.float32)
+                 if with_sinks else None)
         base = backend.create_welm_prefill_graph_metadata(bcap)
         state = copy.copy(base)
         state.welm_flash_schedules = {}
         if mirror:
-            state.block_tables = base.block_tables[:2]
-            state.block_tables_swa = base.block_tables_swa[:2]
-            state.welm_flash_seqused_kv = base.welm_flash_seqused_kv[:2]
+            state.block_tables = base.block_tables[:qrows]
+            state.block_tables_swa = base.block_tables_swa[:qrows]
+            state.welm_flash_seqused_kv = base.welm_flash_seqused_kv[:qrows]
             state.welm_flash_cu_seqlens_q = torch.arange(
-                3, dtype=torch.int32, device=device
+                qrows + 1, dtype=torch.int32, device=device
             )
-            state.welm_flash_seqused_q = torch.ones(2, dtype=torch.int32, device=device)
+            state.welm_flash_seqused_q = torch.ones(qrows, dtype=torch.int32, device=device)
             state.welm_flash_mirror_q_lengths = (
                 state.welm_flash_cu_seqlens_q,
                 state.welm_flash_seqused_q,
@@ -142,6 +152,8 @@ class TestNativeFlashPrefillGraph(unittest.TestCase):
             )
         adapter = WelmPrefillGraphAdapter.__new__(WelmPrefillGraphAdapter)
         adapter.backend, adapter.current_flash_metadata = backend, state
+        adapter.pad_mirror = padded
+        adapter.mirror_q_used = state.welm_flash_seqused_q
         adapter.full_write_locs, adapter.swa_write_locs = full_locs, swa_locs
 
         def prepare(lengths, kv_lengths):
@@ -153,6 +165,7 @@ class TestNativeFlashPrefillGraph(unittest.TestCase):
                 req_pool_indices=torch.arange(len(lengths), device=device),
             )
             backend.prepare_welm_prefill_graph_metadata(base, fb)
+            adapter._prepare_mirror_requests(len(lengths))
             if not mirror:
                 host = torch.tensor(
                     padded_flash_cu_seqlens(lengths, capacity, bcap),
@@ -214,6 +227,14 @@ class TestNativeFlashPrefillGraph(unittest.TestCase):
                 ([1, 1], [193, 129]),
                 ([17, 23], [145, 177]),
             )
+            if padded:
+                cases = (
+                    ([17, 1, 1, 1], [145, 63, 64, 65]),
+                    ([61, 1, 1], [189, 170, 65]),
+                    ([1], [193]),
+                    ([17, 23, 1, 1], [145, 177, 64, 65]),
+                    ([1, 1], [64, 65]),
+                )
         else:
             cases = (
                 ([17, 23], [145, 177]),
@@ -234,6 +255,10 @@ class TestNativeFlashPrefillGraph(unittest.TestCase):
             expected_value.view(-1, nkv, dim)[slots[:real]] = v[:real].view(real, nkv, dim)
             if mirror:
                 writers[64 if real <= 64 else 128].replay()
+            if padded:
+                # A replay must initialize every physical row, including a
+                # request that was real in the preceding batch but is now idle.
+                output.fill_(float("nan"))
             graph.replay()
             reference = self._reference(
                 q,

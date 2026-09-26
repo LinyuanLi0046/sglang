@@ -14,6 +14,7 @@ import random
 import sys
 import types
 import unittest
+from bisect import bisect_left
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -78,13 +79,18 @@ ADAPTER = load_nodes(
      "padded_rope_tiles", "WelmPrefillGraphAdapter"],
     {
         "copy": copy,
+        "bisect_left": bisect_left,
         "logger": logging.getLogger(__name__),
         "ShapeKey": ShapeKey,
-        "ForwardMode": types.SimpleNamespace(EXTEND=1),
+        "ForwardMode": types.SimpleNamespace(EXTEND=1, MIXED=3),
         "eager_on_graph": lambda enabled: lambda fn: fn,
     },
 )
 Adapter = ADAPTER["WelmPrefillGraphAdapter"]
+# Existing fixtures construct only the buffers needed by each contract, not
+# the hardware-dependent __init__. Their default profile has mixed disabled.
+Adapter.mixed_chunk = False
+Adapter.pad_mirror = False
 
 
 class Rows:
@@ -555,7 +561,7 @@ class TestOverlapPreparation(unittest.TestCase):
             "AscendAttnBackend", "init_forward_metadata",
             {
                 "ForwardMetadata": types.SimpleNamespace,
-                "ForwardMode": types.SimpleNamespace(EXTEND=mode),
+                "ForwardMode": types.SimpleNamespace(EXTEND=mode, MIXED="mixed"),
                 "torch": types.SimpleNamespace(
                     int32="int32", bfloat16="bf16",
                     tensor=lambda values, **kwargs: CpuLengths(values),
@@ -584,6 +590,13 @@ class TestOverlapPreparation(unittest.TestCase):
         self.assertEqual(backend.forward_metadata.extend_seq_lens_cpu_int, [2, 7])
         self.assertEqual(pinned, [True])
         self.assertFalse(backend.graph_mode)
+
+        # The same CPU-only preparation is required for MIXED, even when
+        # scheduler overlap has device work outstanding.
+        init.__globals__["ForwardMode"] = types.SimpleNamespace(EXTEND="extend", MIXED=mode)
+        init(backend, batch)
+        self.assertEqual(stops, [17, 17])
+        self.assertEqual(pinned, [True, True])
 
     def test_output_trim_preserves_model_state_reference(self):
         trim = load_method(
@@ -642,7 +655,7 @@ class TestNgramHistoryStaging(unittest.TestCase):
                 "__name__": __name__,
                 "dataclass": dataclass,
                 "is_npu": lambda: True,
-                "ForwardMode": types.SimpleNamespace(EXTEND=1),
+                "ForwardMode": types.SimpleNamespace(EXTEND=1, MIXED=3),
                 "torch": types.SimpleNamespace(
                     tensor=tensor, int32="int32", int64="int64", bool="bool",
                     zeros=lambda n, **kw: types.SimpleNamespace(values=[0] * n),
@@ -739,6 +752,48 @@ class TestNgramHistoryStaging(unittest.TestCase):
         for operation in self.pending:
             operation()
         self.assertEqual(self.table.values[4], [11, 12, 13] + [-1] * 13)
+
+    def test_mixed_only_stages_prefill_and_preserves_device_decode_history(self):
+        manager = self.ns["NgramEmbeddingManager"](
+            enabled=True, table=self.table, n=3, k=0, welm_mixed_chunk=True
+        )
+
+        class RowIndices:
+            def __init__(self, values):
+                self.values = values
+
+            def __getitem__(self, item):
+                return RowIndices(self.values[item])
+
+        class DecodeRequest:
+            # Decode history must never be reconstructed from lagging CPU IDs.
+            @property
+            def prefix_indices(self):
+                raise AssertionError("decode prefix read by CPU history staging")
+
+        reqs = [self.request(6, 2, range(30, 38)), self.request(0, 1, [11]),
+                DecodeRequest(), DecodeRequest()]
+        batch = types.SimpleNamespace(
+            reqs=reqs, decoding_reqs=reqs[2:], forward_mode=3,
+            req_pool_indices=RowIndices([1, 3, 5, 7]),
+        )
+        self.table.values[5] = list(range(100, 116))
+        self.table.values[7] = list(range(200, 216))
+        decode_before = copy.deepcopy([self.table.values[5], self.table.values[7]])
+        manager.prepare_for_forward(batch, chunked_req=reqs[0])
+        for operation in self.pending:
+            operation()
+        self.assertEqual(self.kernel_calls[0][1].values, [1, 3])
+        self.assertEqual(batch.ne_skip_token_table_update.values, [True, False, False, False])
+        self.assertEqual(self.table.values[1][4:8], [34, 35, 36, 37])
+        self.assertEqual(self.table.values[3][0], 11)  # E=1 prefill is not decode.
+        self.assertEqual([self.table.values[5], self.table.values[7]], decode_before)
+
+    def test_mixed_disabled_does_not_change_other_managers(self):
+        batch = types.SimpleNamespace(reqs=[], forward_mode=3)
+        self.manager.prepare_for_forward(batch, chunked_req=None)
+        self.assertEqual(self.pending, [])
+        self.assertIsNone(batch.ne_skip_token_table_update)
 
     def test_decode_sample_update_passes_device_inputs_without_host_reads(self):
         info = types.SimpleNamespace(token_table=self.table, skip_token_table_update=None)

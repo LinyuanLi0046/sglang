@@ -1206,10 +1206,23 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and is_kv_mirror_prefill
             and forward_batch.welmv4_npu_deepep_full_mirror
         ):
-            # FULL mirror prefill has exactly B valid request rows, with no
-            # padded suffix. Skip the all-false scalar mask without changing
-            # batch metadata or the explicit segmented masks used by DP.
+            # Preserve the original FULL mirror routing policy. Padded graph
+            # Mirror below additionally covers MoE TP; its dummy rows also
+            # use legal routes rather than NORMAL's negative expert IDs.
             num_token_non_padded = None
+        if (
+            _is_npu
+            and forward_batch is not None
+            and forward_batch.welm_prefill_graph is not None
+            and forward_batch.welm_prefill_graph.pad_mirror
+            and forward_batch.welm_prefill_graph_phase == "mirror"
+        ):
+            # Both MoE TP and local EP process all physical Bcap rows with
+            # legal routes. Prompt's TP-local token count is not a request
+            # mask (Bcap can even exceed Tcap). Dummy outputs are trimmed
+            # before the eager LM head; Flash has its own request mask.
+            num_token_non_padded = None
+            valid_row_mask = None
         if use_welm_prefill_megamoe:
             if forward_batch.welm_prefill_graph is not None:
                 # The CPU real-row count belongs to the capture dummy. Use
@@ -1941,9 +1954,10 @@ class Qwen2MoeAttention(nn.Module):
             return None
         mode = forward_batch.forward_mode
         cos_sin_cache = self.rotary_emb.cos_sin_cache
-        if mode == ForwardMode.EXTEND:
+        if mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
             if (
-                forward_batch.batch_size == 1
+                mode == ForwardMode.EXTEND
+                and forward_batch.batch_size == 1
                 and forward_batch.welm_prefill_graph is None
             ):
                 # EP's suffix padding need not have the same RoPE as position 0:
@@ -2091,6 +2105,7 @@ class Qwen2MoeAttention(nn.Module):
         # Keep the original FULL padded extent for the table-tail safety check.
         bulk_rope_safe = (
             forward_batch.welm_prefill_graph is None
+            and forward_batch.forward_mode == ForwardMode.EXTEND
             and forward_batch.batch_size == 1
             and forward_batch.extend_prefix_lens_cpu[0] + num_tokens
             <= cos_sin_cache.shape[0]
@@ -3521,7 +3536,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         if (
             input_hidden_is_scattered
             and self.self_attn.use_npu_fused_qkv
-            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
             and is_non_consumer_attention_layer
             and not reuse_prefill_mxfp8_input
         ):
@@ -3820,7 +3835,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         megamoe = self.mlp.welm_prefill_megamoe
         use_megamoe_prefill = (
             megamoe is not None
-            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
             and output_hidden_is_scattered
             # MoE input is already scattered; recover OProj's padded MM rows.
             and megamoe.meets_prefill_threshold(hidden_states.shape[0] * tp_size)

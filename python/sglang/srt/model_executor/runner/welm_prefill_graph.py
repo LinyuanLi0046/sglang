@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import copy
 import logging
+from bisect import bisect_left
 from contextvars import ContextVar
 from typing import TYPE_CHECKING
 
@@ -139,6 +140,10 @@ class WelmPrefillGraphAdapter:
         if self.model.scale_seq_times > 0:
             raise ValueError("WeLM breakable prefill does not capture scale-seq expansion")
         self.prune = bool(args.enable_kv_mirror)
+        self.mixed_chunk = bool(args.enable_mixed_chunk)
+        # Keep the validated exact-B path, including its capture topology,
+        # unchanged unless mixed chunk was explicitly enabled.
+        self.pad_mirror = self.prune and self.mixed_chunk
         self.ep = parallel.moe_ep_size > 1
         if self.ep:
             from sglang.srt.layers.moe import get_moe_a2a_backend
@@ -196,6 +201,13 @@ class WelmPrefillGraphAdapter:
             self.max_requests, dtype=torch.int64, device=self.device
         )
         self.mirror_positions = torch.zeros_like(self.tail_indices)
+        # Prompt q_used contains E_i, whereas Mirror has one real Q/request.
+        # This fixed buffer also supplies the handoff validity mask in graph.
+        self.mirror_q_used = (
+            torch.zeros(self.max_requests, dtype=torch.int32, device=self.device)
+            if self.pad_mirror
+            else None
+        )
         self.mirror_hidden = None
         self.mirror_residual = None
         self.mirror_residual_is_partial = False
@@ -215,10 +227,11 @@ class WelmPrefillGraphAdapter:
         self.capture_keys = set()
         self._capture_templates = {}
         logger.info(
-            "WeLM BF16 breakable prefill: T-only prompt graphs, exact mirror "
+            "WeLM BF16 breakable prefill: T-only prompt graphs, %s mirror "
             "batches %s, mirror=%s, "
             "MoE=%s; native Flash is captured, LM head/logits stay eager; Gate side "
             "stream and CMO weight prefetch are disabled for graph prefill",
+            "padded capacity" if self.pad_mirror else "exact",
             self.batch_sizes,
             self.prune,
             "EP NORMAL AllGather/local AR" if self.ep else "TP",
@@ -233,6 +246,21 @@ class WelmPrefillGraphAdapter:
     def mirror_key(self, batch_size: int) -> ShapeKey:
         return ShapeKey(size=batch_size, variant_label="welm:mirror")
 
+    def select_mirror_key(self, batch_size: int) -> ShapeKey | None:
+        if self.pad_mirror:
+            index = bisect_left(self.batch_sizes, batch_size)
+            if index == len(self.batch_sizes):
+                return None
+            batch_size = self.batch_sizes[index]
+        return self.mirror_key(batch_size)
+
+    def _prepare_mirror_requests(self, batch_size: int) -> None:
+        if self.pad_mirror:
+            # CPU-known count; async device fills, no scalar readback. Clear
+            # Bmax, not just the selected bucket, for large/small/large replays.
+            self.mirror_q_used.zero_()
+            self.mirror_q_used[:batch_size].fill_(1)
+
     def reject(self, reason: str) -> bool:
         if reason not in self._warned:
             logger.info("WeLM prefill graph fallback before forward: %s", reason)
@@ -240,14 +268,16 @@ class WelmPrefillGraphAdapter:
         return False
 
     def can_run(self, batch: ForwardBatch, capacity: int) -> bool:
-        if batch.forward_mode != ForwardMode.EXTEND:
-            return self.reject("only ordinary target EXTEND is captured")
+        if batch.forward_mode != ForwardMode.EXTEND and not (
+            self.mixed_chunk and batch.forward_mode == ForwardMode.MIXED
+        ):
+            return self.reject("only target EXTEND or enabled MIXED is captured")
         if batch.enable_kv_mirror != self.prune:
             return self.reject("mirror setting differs from the captured profile")
         if self.key(capacity) not in self.capture_keys:
             return self.reject("prompt token bucket was not captured")
-        if self.prune and self.mirror_key(batch.batch_size) not in self.capture_keys:
-            return self.reject("exact mirror request count was not captured")
+        if self.prune and self.select_mirror_key(batch.batch_size) not in self.capture_keys:
+            return self.reject("mirror request bucket was not captured")
         if not 0 < batch.batch_size <= self.max_requests:
             return self.reject("request count exceeds fixed metadata capacity")
         if (
@@ -282,6 +312,7 @@ class WelmPrefillGraphAdapter:
 
     def prepare_capture(self, batch: ForwardBatch, capacity: int):
         self._bind(batch, capacity)
+        self._prepare_mirror_requests(batch.batch_size)
         # Capture is startup-only. Page zero is the existing reserved dummy
         # page; all real request/cache allocations remain outside this adapter.
         batch.out_cache_loc.zero_()
@@ -318,8 +349,10 @@ class WelmPrefillGraphAdapter:
             metadata.welm_flash_cu_seqlens_q = torch.arange(
                 bs + 1, dtype=torch.int32, device=self.device
             )
-            metadata.welm_flash_seqused_q = torch.ones(
-                bs, dtype=torch.int32, device=self.device
+            metadata.welm_flash_seqused_q = (
+                self.mirror_q_used[:bs]
+                if self.pad_mirror
+                else torch.ones(bs, dtype=torch.int32, device=self.device)
             )
             metadata.welm_flash_max_seqlen_q = 1
             metadata.welm_flash_mirror_q_lengths = (
@@ -412,6 +445,7 @@ class WelmPrefillGraphAdapter:
 
     def prepare_replay(self, live: ForwardBatch, static: ForwardBatch, capacity: int):
         self._bind(static, capacity)
+        self._prepare_mirror_requests(live.batch_size)
         static.welm_prefill_graph_phase = "prompt"
         static.ngram_embedding_info = live.ngram_embedding_info
         static.global_num_tokens_cpu = copy.copy(live.global_num_tokens_cpu)
@@ -492,6 +526,15 @@ class WelmPrefillGraphAdapter:
         self.mirror_residual.copy_(residual)
         self.mirror_residual_is_partial = partial
         self.mirror_positions.copy_(positions.index_select(0, self.tail_indices))
+        if self.pad_mirror:
+            # Unused tail indices safely select token zero. Mask the resulting
+            # Bmax rows with LIVE data, not a capture-time Python B slice.
+            # Position zero is legal for Q RoPE, which runs before Flash skips
+            # the dummy requests. masked_fill also removes stale NaNs.
+            padding = self.mirror_q_used == 0
+            self.mirror_hidden.masked_fill_(padding[:, None], 0)
+            self.mirror_residual.masked_fill_(padding[:, None], 0)
+            self.mirror_positions.masked_fill_(padding, 0)
 
         states = batch.model_specific_states
         if states and WELMV4_MTP_MIRROR_STATES_KEY in states:
@@ -515,6 +558,10 @@ class WelmPrefillGraphAdapter:
         return None
 
     def begin_mirror(self, batch):
+        # This is the private capture batch: bs is the graph's physical Bcap.
+        # All rows do legal MoE work; the helper's legacy "real rows" fields
+        # describe that work, not the serving batch's Breal. Never mutate the
+        # live batch to Bcap. Output is trimmed before the eager LM head.
         bs = batch.batch_size
         if self.ep:
             self.model.layers[self.first_mirror]._update_pure_tp_kv_mirror_full_metadata(
@@ -528,10 +575,10 @@ class WelmPrefillGraphAdapter:
         )
 
     def replay(self, key, batch, **kwargs):
-        mirror_key = self.mirror_key(batch.batch_size) if self.prune else None
+        mirror_key = self.select_mirror_key(batch.batch_size) if self.prune else None
         # Both checks precede either replay. Never run a mixed eager/graph body.
         if key not in self.capture_keys or (
-            mirror_key is not None and mirror_key not in self.capture_keys
+            self.prune and mirror_key not in self.capture_keys
         ):
             raise RuntimeError("WeLM graph eligibility changed before replay")
         result = self.runner.backend.replay(key, batch, **kwargs)

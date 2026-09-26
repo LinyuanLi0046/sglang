@@ -19,6 +19,7 @@ except ImportError:
     HAS_NPU = False
 
 if HAS_NPU:
+    from sglang.srt.layers.welmv4_npu_op import welmv4_inplace_rope_single_npu
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
     from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (
         NgramEmbeddingManager,
@@ -142,6 +143,70 @@ class TestWeLMNpuCapturedAttention(unittest.TestCase):
         for actual, expected, tiles, expected_tiles in snapshots:
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
             self.assertEqual(tiles.cpu().tolist(), expected_tiles)
+
+
+@unittest.skipUnless(HAS_NPU, "requires torch_npu and an Ascend device")
+class TestMirrorRopeGraph(unittest.TestCase):
+    def test_padded_q_uses_live_absolute_positions_and_preserves_handoff(self):
+        device = torch.device("npu", torch.npu.current_device())
+        bcap, heads, head_dim, rope_dim = 8, 4, 128, 64
+        torch.manual_seed(23)
+        adapter = WelmPrefillGraphAdapter.__new__(WelmPrefillGraphAdapter)
+        adapter.ep = False
+        adapter.mirror_hidden = torch.randn(
+            bcap, heads * head_dim, dtype=torch.bfloat16, device=device
+        )
+        adapter.mirror_residual = torch.zeros(
+            bcap, heads * head_dim, dtype=torch.float32, device=device
+        )
+        adapter.mirror_positions = torch.zeros(bcap, dtype=torch.int64, device=device)
+        frequencies = 1.0 / (10000 ** (
+            torch.arange(rope_dim // 2, device=device, dtype=torch.float32) * 2 / rope_dim
+        ))
+        angles = torch.arange(43008, device=device, dtype=torch.float32)[:, None] * frequencies
+        cache = torch.cat((angles.cos(), angles.sin()), dim=-1)
+        capture_batch = types.SimpleNamespace(batch_size=bcap)
+
+        def body():
+            q, _, positions = adapter.begin_mirror(capture_batch)
+            return welmv4_inplace_rope_single_npu(
+                q, positions, cache, head_dim=head_dim, rope_dim=rope_dim
+            )
+
+        for _ in range(2):
+            body()
+        torch.npu.synchronize()
+        graph = BreakableCUDAGraph()
+        with BreakableCUDAGraphCapture(graph, pool=torch.npu.graph_pool_handle()):
+            output = body()
+        self.assertEqual(len(graph._break_fns), 0)
+        checks = []
+        for positions in ([3000, 63, 42999], [64], [100, 64, 65, 127, 2048, 3099, 41999, 255],
+                          [3000, 63, 42999]):
+            b = len(positions)
+            adapter.mirror_hidden.copy_(torch.randn_like(adapter.mirror_hidden))
+            adapter.mirror_hidden[b:].zero_()
+            adapter.mirror_positions.copy_(torch.tensor(
+                positions + [0] * (bcap-b), dtype=torch.int64, device=device
+            ))
+            before = adapter.mirror_hidden.clone()
+            graph.replay()
+            expected = before.view(bcap, heads, head_dim).float()
+            cos, sin = cache[adapter.mirror_positions].chunk(2, dim=-1)
+            start = head_dim - rope_dim  # WeLM rotates the suffix of each head.
+            x1 = expected[..., start:start + rope_dim // 2].clone()
+            x2 = expected[..., start + rope_dim // 2:].clone()
+            expected[..., start:start + rope_dim // 2] = x1*cos[:, None] - x2*sin[:, None]
+            expected[..., start + rope_dim // 2:] = x1*sin[:, None] + x2*cos[:, None]
+            checks.append((output.clone(), expected.reshape(bcap, -1).to(before.dtype),
+                           adapter.mirror_hidden.clone(), before, b))
+        # Queued small/large/small changes must not freeze positions or mutate
+        # the Prompt-owned handoff input through the in-place Q RoPE kernel.
+        torch.npu.synchronize()
+        for actual, expected, handoff, before, b in checks:
+            torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
+            torch.testing.assert_close(handoff, before, atol=0, rtol=0)
+            torch.testing.assert_close(actual[b:], torch.zeros_like(actual[b:]), atol=0, rtol=0)
 
 
 @unittest.skipUnless(HAS_NPU, "requires torch_npu and an Ascend device")

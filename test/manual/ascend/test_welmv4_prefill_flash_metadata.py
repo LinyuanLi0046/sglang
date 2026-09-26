@@ -169,8 +169,17 @@ class TestFlashMetadata(unittest.TestCase):
             self.assertEqual(writes[-1][2].shape, (16, 64, 2, 4))
 
     def test_real_capture_preparation_has_t_only_and_exact_b_metadata(self):
+        self._check_capture_preparation(pad_mirror=False)
+
+    def test_padded_mirror_metadata_tracks_b_without_changing_addresses(self):
+        self._check_capture_preparation(pad_mirror=True)
+
+    def _check_capture_preparation(self, pad_mirror):
         backend, _, _ = make_backend()
         adapter = Adapter.__new__(Adapter)
+        adapter.pad_mirror = pad_mirror
+        adapter.mirror_q_used = tensor([0] * 4)
+        mirror_bs = 4 if pad_mirror else 2
         adapter.backend, adapter.device, adapter.prune = backend, "cpu", True
         adapter.max_requests, adapter.max_tokens = 4, 16
         adapter.flash_inputs = backend.create_welm_prefill_graph_metadata(4)
@@ -183,7 +192,7 @@ class TestFlashMetadata(unittest.TestCase):
         adapter.tail_indices = tensor(np.zeros(4))
         with patch.dict(ADAPTER, torch=TORCH):
             for phase, capacity, lengths in (("prompt", 16, [16]), ("prompt", 8, [8]),
-                                              ("mirror", 16, [8, 8])):
+                                              ("mirror", 16, [16 // mirror_bs] * mirror_bs)):
                 adapter.capture_phase = phase
                 fb = batch(lengths, lengths)
                 fb.out_cache_loc = tensor(np.zeros(capacity))
@@ -195,11 +204,11 @@ class TestFlashMetadata(unittest.TestCase):
                 fb.global_num_tokens_cpu = [capacity]
                 adapter.prepare_capture(fb, capacity)
             p8, p16, m2 = (adapter.flash_metadata[k] for k in
-                           (adapter.key(8), adapter.key(16), adapter.mirror_key(2)))
+                           (adapter.key(8), adapter.key(16), adapter.mirror_key(mirror_bs)))
             self.assertEqual(len(adapter.flash_metadata), 3)
             self.assertEqual(p8.welm_flash_cu_seqlens_q.shape, (5,))
-            self.assertEqual(m2.welm_flash_cu_seqlens_q.shape, (3,))
-            self.assertEqual(m2.welm_flash_seqused_kv.shape, (2,))
+            self.assertEqual(m2.welm_flash_cu_seqlens_q.shape, (mirror_bs + 1,))
+            self.assertEqual(m2.welm_flash_seqused_kv.shape, (mirror_bs,))
             self.assertIs(p8.block_tables, p16.block_tables)
             self.assertIsNot(p8.welm_flash_schedules, m2.welm_flash_schedules)
             before = m2.welm_flash_cu_seqlens_q.data.copy()
@@ -210,8 +219,13 @@ class TestFlashMetadata(unittest.TestCase):
             adapter.model = types.SimpleNamespace(oe_grams=[])
             adapter.capture_phase = "prompt"
             original = backend.forward_metadata
-            for t, lengths, kv_lengths in ((8, [2, 3], [70, 130]),
-                                           (16, [10], [202]), (8, [1, 2], [193, 131])):
+            q_pointer = m2.welm_flash_seqused_q.data.ctypes.data
+            cases = [(8, [2, 3], [70, 130]), (16, [10], [202]),
+                     (8, [1, 2], [193, 131])]
+            if pad_mirror:
+                cases += [(8, [1, 1, 1, 1], [63, 64, 65, 200]),
+                          (8, [1], [65]), (16, [7, 1, 1], [133, 201, 64])]
+            for t, lengths, kv_lengths in cases:
                 live = batch(lengths, kv_lengths)
                 real = sum(lengths)
                 live.out_cache_loc = tensor(np.arange(real) + 200)
@@ -227,7 +241,15 @@ class TestFlashMetadata(unittest.TestCase):
                 np.testing.assert_array_equal(adapter.swa_write_locs.data[:t],
                                               list(range(328, 328+real)) + [-1]*(t-real))
                 np.testing.assert_array_equal(m2.welm_flash_seqused_kv.data,
-                                              (kv_lengths + [0]*4)[:2])
+                                              (kv_lengths + [0]*4)[:mirror_bs])
+                if pad_mirror:
+                    np.testing.assert_array_equal(m2.welm_flash_seqused_q.data,
+                                                  [1]*len(lengths) + [0]*(4-len(lengths)))
+                    np.testing.assert_array_equal(m2.welm_flash_cu_seqlens_q.data, range(5))
+                    self.assertEqual(m2.welm_flash_seqused_q.data.ctypes.data, q_pointer)
+                    # Prompt and Mirror lengths share neither values nor storage.
+                    np.testing.assert_array_equal(adapter.flash_inputs.welm_flash_seqused_q.data,
+                                                  lengths + [0]*(4-len(lengths)))
                 self.assertIs(backend.forward_metadata, original)
                 self.assertFalse(backend.graph_mode)
 

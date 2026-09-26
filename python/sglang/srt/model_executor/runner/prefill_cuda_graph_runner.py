@@ -1517,6 +1517,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if forward_batch.global_forward_mode == ForwardMode.MIXED
             else forward_batch.global_forward_mode
         )
+        # NPU breakable graphs retain the live mode for eager dispatch/tails.
+        # The captured WeLM Flash body itself reads fixed tensor metadata.
+        if is_npu() and self.prefill_backend_name == Backend.BREAKABLE:
+            pcg_forward_mode = forward_batch.forward_mode
+            pcg_global_forward_mode = forward_batch.global_forward_mode
 
         static_forward_batch = ForwardBatch(
             forward_mode=pcg_forward_mode,
@@ -1682,6 +1687,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 hs = self.welm_adapter.replay(
                     shape_key, static_forward_batch, **kwargs
                 )
+                if self.welm_adapter.pad_mirror:
+                    # Mirror produces Bcap rows, while the eager LM head and
+                    # sampler must see only Breal. raw_num_tokens is R, not B.
+                    hs = _slice_output_rows(hs, static_forward_batch.batch_size)
             else:
                 hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs

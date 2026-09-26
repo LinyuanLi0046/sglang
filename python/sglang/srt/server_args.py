@@ -5072,6 +5072,8 @@ class ServerArgs:
         model_arch = hf_config.architectures[0]
 
         if model_arch == "WeLMV4MoeForCausalLM":
+            import torch
+
             raw_spec_algorithm = (self.speculative_algorithm or "").upper()
             if (
                 is_npu()
@@ -5110,10 +5112,30 @@ class ServerArgs:
                     "TRT-LLM MHA, or Ascend as appropriate for the device."
                 )
 
-            # The model keeps imitated-layer KV activations in process-local
-            # forward state, so mixed chunks and two-batch overlap would
-            # interleave two independent requests through the same state.
-            self.enable_mixed_chunk = False
+            # Mixed chunk is one ragged forward, not two interleaved forwards.
+            # Only the native BF16 Flash path has unified prefill/decode Q/KV
+            # lengths, positions and OE history handling.
+            if self.enable_mixed_chunk and not (
+                is_npu()
+                and os.environ.get("WELM_NPU_USE_FLASH_ATTN", "0") == "1"
+                and not self.enable_dp_attention
+                and self.pp_size == 1
+                and self._resolved().attn_cp_size == 1
+                and self.dcp_size == 1
+                and self.get_model_config().dtype == torch.bfloat16
+                and self.kv_cache_dtype in ("auto", "bf16", "bfloat16")
+                and self.quantization is None
+                and not self.enable_lora
+                and not raw_spec_algorithm
+            ):
+                logger.warning(
+                    "WeLMv4 mixed chunk requires native NPU Flash, BF16 model/KV, "
+                    "DP attention off, PP=CP=DCP=1, no quantization/LoRA or "
+                    "speculative decoding. Disabling --enable-mixed-chunk."
+                )
+                self.enable_mixed_chunk = False
+            # KV activations are process-local: independent forward passes
+            # still cannot interleave through TBO or PDMux.
             self.enable_two_batch_overlap = False
             if self.enable_pdmux:
                 raise ValueError(

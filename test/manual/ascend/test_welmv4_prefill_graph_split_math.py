@@ -69,6 +69,10 @@ class Tensor:
         self.data.fill(value)
         return self
 
+    def masked_fill_(self, mask, value):
+        np.copyto(self.data, value, where=np.broadcast_to(mask.data, self.shape))
+        return self
+
     def max(self):
         return Tensor(self.data.max())
 
@@ -176,7 +180,14 @@ class TestSplitMath(unittest.TestCase):
             np.testing.assert_array_equal(out_r.data, (r.data + 3)[indices.data])
 
     def test_prompt_outputs_keep_addresses_and_preserve_raw_mtp_across_t_b_changes(self):
+        for pad_mirror in (False, True):
+            with self.subTest(pad_mirror=pad_mirror):
+                self._check_handoff(pad_mirror)
+
+    def _check_handoff(self, pad_mirror):
         adapter = Adapter.__new__(Adapter)
+        adapter.pad_mirror = pad_mirror
+        adapter.mirror_q_used = Tensor(np.zeros(4, dtype=np.int32))
         adapter.max_tokens = 16
         adapter.first_mirror = 1
         adapter.mirror_hidden = adapter.mirror_residual = None
@@ -221,11 +232,16 @@ class TestSplitMath(unittest.TestCase):
                 module.KVMirrorManager = types.SimpleNamespace(get_kv_activation=lambda source: (raw, raw))
                 positions = Tensor(np.arange(capacity) + 23)
                 adapter.tail_indices = Tensor(np.array(tails + [0] * (4 - len(tails))))
+                adapter._prepare_mirror_requests(len(tails))
                 batch = types.SimpleNamespace(
                     model_specific_states={"mtp": {2: (raw, raw)}},
                     welm_prefill_graph_phase="prompt",
                 )
                 self.assertIsNone(adapter.finish_prompt(raw, raw, positions, batch))
+                if pad_mirror:
+                    for buffer in (adapter.mirror_hidden, adapter.mirror_residual,
+                                   adapter.mirror_positions):
+                        np.testing.assert_array_equal(buffer.data[len(tails):], 0)
                 adapter.after_capture(adapter.key(capacity), batch)
                 np.testing.assert_array_equal(raw.data, saved)
                 np.testing.assert_array_equal(adapter.mirror_kv[7][0].data[:capacity], saved + positions.data[:, None])

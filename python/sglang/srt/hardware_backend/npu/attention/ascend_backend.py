@@ -739,9 +739,11 @@ class AscendAttnBackend(AttentionBackend):
                 [
                     output,
                     output.new_zeros(
-                        padded_tokens - num_tokens,
-                        layer.tp_q_head_num,
-                        layer.v_head_dim,
+                        (
+                            padded_tokens - num_tokens,
+                            layer.tp_q_head_num,
+                            layer.v_head_dim,
+                        )
                     ),
                 ],
                 dim=0,
@@ -1391,7 +1393,7 @@ class AscendAttnBackend(AttentionBackend):
             and self.model_dtype == torch.bfloat16
             and not get_parallel().enable_dp_attention
             and self.attn_cp_size == 1
-            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
             and forward_batch.seq_lens_cpu is not None
             and forward_batch.extend_seq_lens_cpu is not None
         )
@@ -4309,7 +4311,26 @@ class AscendAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
+        slopes: Optional[torch.Tensor] = None,
     ):
+        if self.use_welm_flash_attn:
+            # One ragged native Flash call covers prefill and one-Q decode
+            # requests, including mirror consumers and their Full/SWA sinks.
+            # forward_extend owns KV writes; do not write twice here.
+            return self.forward_extend(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+                q_rope=q_rope,
+                k_rope=k_rope,
+                topk_indices=topk_indices,
+                sinks=sinks,
+                slopes=slopes,
+            )
         if (
             topk_indices is not None
             or self.use_mla

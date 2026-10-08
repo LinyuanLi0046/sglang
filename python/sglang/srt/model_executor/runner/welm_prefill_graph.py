@@ -121,9 +121,8 @@ class WelmPrefillGraphAdapter:
         if (
             runner.model_runner.dtype != torch.bfloat16
             or runner.model_runner.kv_cache_dtype != torch.bfloat16
-            or runner.quant_config is not None
         ):
-            raise ValueError("WeLM breakable prefill currently requires unquantized BF16")
+            raise ValueError("WeLM breakable prefill requires BF16 compute and KV cache")
         if (
             parallel.enable_dp_attention
             or parallel.pp_size != 1

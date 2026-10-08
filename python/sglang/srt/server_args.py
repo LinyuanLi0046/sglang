@@ -5171,7 +5171,6 @@ class ServerArgs:
                 and self.dcp_size == 1
                 and self.dtype in ("auto", "bfloat16")
                 and self.kv_cache_dtype in ("auto", "bf16", "bfloat16")
-                and self.quantization is None
                 and not self.enable_lora
                 and os.environ.get("WELM_NPU_USE_FLASH_ATTN", "0") == "1"
             )
@@ -5180,8 +5179,8 @@ class ServerArgs:
                 and not welm_bf16_breakable
             ):
                 logger.warning(
-                    "WeLMv4 prefill graph requires NPU breakable, BF16 model/KV, "
-                    "DP attention off, CP=DCP=1, no LoRA/quantization and "
+                    "WeLMv4 prefill graph requires NPU breakable, BF16 compute/KV, "
+                    "DP attention off, CP=DCP=1, no LoRA and "
                     "WELM_NPU_USE_FLASH_ATTN=1. Disabling this unsupported "
                     "prefill profile; decode graph settings are unchanged."
                 )

@@ -115,6 +115,9 @@ class WeLMV4ModelNextN(nn.Module):
             layer.bind_finalized_runner_plan(runner_plan)
         self.runner_parallel_plan = runner_plan
 
+    def _compute_oe_hashed_ids(self, input_ids, forward_batch):
+        return Qwen2MoeModel._compute_oe_hashed_ids(self, input_ids, forward_batch)
+
     def _compute_oe_embedding(
         self,
         input_ids: torch.Tensor,

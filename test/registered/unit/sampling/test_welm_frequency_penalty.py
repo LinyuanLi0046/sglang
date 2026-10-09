@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
+from sglang.srt.sampling.penaltylib import frequency_penalty as frequency_module
 from sglang.srt.sampling.penaltylib.frequency_penalty import BatchedFrequencyPenalizer
 from sglang.srt.sampling.penaltylib.orchestrator import BatchedPenalizerOrchestrator
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -21,6 +21,9 @@ class Batch:
 
 @pytest.fixture(autouse=True)
 def clear_settings(monkeypatch):
+    # Each test represents a fresh worker process with fixed startup settings.
+    monkeypatch.setattr(frequency_module, "_token_penalty_mask", None)
+    monkeypatch.setattr(frequency_module, "_token_penalty_mask_initialized", False)
     for name in (
         "FREQUENCY_PENALTY_EXCLUDE_TOKENS",
         "FREQUENCY_PENALTY_FACTOR_START",
@@ -30,13 +33,14 @@ def clear_settings(monkeypatch):
 
 
 def make_penalizer(frequencies, device="cpu"):
+    # Callers must keep batch and orch alive: the runtime links are weakrefs.
     batch = Batch(frequencies, device)
     orch = BatchedPenalizerOrchestrator(8, batch, {BatchedFrequencyPenalizer})
     return batch, orch, orch.penalizers[BatchedFrequencyPenalizer]
 
 
 def test_default_frequency_penalty_unchanged():
-    batch, orch, pen = make_penalizer([0.5, -0.5])
+    _batch, orch, _pen = make_penalizer([0.5, -0.5])
     for _ in range(3):
         orch.cumulate_output_tokens(torch.tensor([2, 3]))
     logits = torch.zeros(2, 8)
@@ -54,7 +58,7 @@ def test_excluded_tokens_on_batch_device(monkeypatch):
         raise AssertionError("unexpected CUDA initialization")
 
     monkeypatch.setattr(torch.cuda, "device_count", fail_cuda)
-    batch, orch, pen = make_penalizer([0.5, 1.0])
+    _batch, orch, pen = make_penalizer([0.5, 1.0])
     orch.cumulate_output_tokens(torch.tensor([2, 3]))
     orch.cumulate_output_tokens(torch.tensor([4, 2]))
     expected = torch.zeros(2, 8)
@@ -66,7 +70,7 @@ def test_excluded_tokens_on_batch_device(monkeypatch):
 def test_length_scaling_boundaries(monkeypatch):
     monkeypatch.setenv("FREQUENCY_PENALTY_FACTOR_START", "2")
     monkeypatch.setenv("FREQUENCY_PENALTY_FACTOR_OFFSET", "2")
-    batch, orch, pen = make_penalizer([0.5])
+    _batch, orch, pen = make_penalizer([0.5])
     for step, expected in enumerate([0.5, 1.0, 1.5, 2.5, 3.5, 5.0]):
         orch.cumulate_output_tokens(torch.tensor([3]))
         assert pen.cumulated_frequency_penalties[0, 3].item() == expected
@@ -76,7 +80,7 @@ def test_scaling_and_exclusion_together(monkeypatch):
     monkeypatch.setenv("FREQUENCY_PENALTY_EXCLUDE_TOKENS", "[2]")
     monkeypatch.setenv("FREQUENCY_PENALTY_FACTOR_START", "0")
     monkeypatch.setenv("FREQUENCY_PENALTY_FACTOR_OFFSET", "2")
-    batch, orch, pen = make_penalizer([1.0])
+    _batch, orch, pen = make_penalizer([1.0])
     orch.cumulate_output_tokens(torch.tensor([2]))
     orch.cumulate_output_tokens(torch.tensor([3]))
     assert pen.cumulated_frequency_penalties[0, 2].item() == 0
@@ -84,12 +88,13 @@ def test_scaling_and_exclusion_together(monkeypatch):
 
 
 def test_request_lengths_survive_merge_and_filter(monkeypatch):
+    monkeypatch.setenv("FREQUENCY_PENALTY_EXCLUDE_TOKENS", "[2]")
     monkeypatch.setenv("FREQUENCY_PENALTY_FACTOR_START", "0")
     monkeypatch.setenv("FREQUENCY_PENALTY_FACTOR_OFFSET", "2")
     old_batch, old_orch, old = make_penalizer([1.0])
     for _ in range(3):
         old_orch.cumulate_output_tokens(torch.tensor([3]))
-    new_batch, new_orch, new = make_penalizer([1.0, 0.5])
+    new_batch, new_orch, _new = make_penalizer([1.0, 0.5])
     old_orch.merge(new_orch)
     old_batch.reqs.extend(new_batch.reqs)
     old_orch.cumulate_output_tokens(torch.tensor([3, 3, 3]))
@@ -107,6 +112,104 @@ def test_request_lengths_survive_merge_and_filter(monkeypatch):
     old_orch.release()
     assert not hasattr(old, "generation_lengths")
     assert not hasattr(old, "token_penalty_mask")
+
+
+def test_mask_built_on_cpu_once_and_reused_after_release(monkeypatch):
+    monkeypatch.setenv("FREQUENCY_PENALTY_EXCLUDE_TOKENS", "[2, 99, 2]")
+    original_read = frequency_module._read_exclude_tokens
+    original_index_fill = torch.Tensor.index_fill_
+    original_to = torch.Tensor.to
+    reads, fills, copies = [], [], []
+
+    def track_read():
+        reads.append(True)
+        return original_read()
+
+    def cpu_index_fill(tensor, dim, index, value):
+        assert tensor.device.type == index.device.type == "cpu"
+        fills.append(tuple(tensor.shape))
+        return original_index_fill(tensor, dim, index, value)
+
+    def track_to(tensor, *args, **kwargs):
+        copies.append(kwargs)
+        return original_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(frequency_module, "_read_exclude_tokens", track_read)
+    monkeypatch.setattr(torch.Tensor, "index_fill_", cpu_index_fill)
+    monkeypatch.setattr(torch.Tensor, "to", track_to)
+    _batch1, orch1, pen1 = make_penalizer([0.5])
+    mask = pen1.token_penalty_mask
+    orch1.release()
+    _batch2, _orch2, pen2 = make_penalizer([1.0, -0.5])
+    assert pen2.token_penalty_mask is mask
+    assert len(reads) == 1
+    assert fills == [(8,)]
+    assert copies == [{"device": "cpu", "non_blocking": False}]
+    torch.testing.assert_close(mask, torch.tensor([1, 1, 0, 1, 1, 1, 1, 1.0]))
+
+
+def test_shared_mask_does_not_share_request_state(monkeypatch):
+    monkeypatch.setenv("FREQUENCY_PENALTY_EXCLUDE_TOKENS", "[2]")
+    monkeypatch.setenv("FREQUENCY_PENALTY_FACTOR_START", "0")
+    monkeypatch.setenv("FREQUENCY_PENALTY_FACTOR_OFFSET", "2")
+    _batch1, orch1, pen1 = make_penalizer([1.0])
+    _batch2, orch2, pen2 = make_penalizer([-0.5])
+    assert pen1.token_penalty_mask is pen2.token_penalty_mask
+    mask_before = pen1.token_penalty_mask.clone()
+    for token in (2, 3, 3):
+        orch1.cumulate_output_tokens(torch.tensor([token]))
+    orch2.cumulate_output_tokens(torch.tensor([3]))
+    logits1, logits2 = torch.zeros(1, 8), torch.zeros(1, 8)
+    orch1.apply(logits1)
+    orch2.apply(logits2)
+    assert logits1[0, 2].item() == 0
+    assert logits1[0, 3].item() == -4.0
+    assert logits2[0, 3].item() == 0.5
+    assert pen1.generation_lengths.item() == 3
+    assert pen2.generation_lengths.item() == 1
+    orch1.release()
+    torch.testing.assert_close(pen2.token_penalty_mask, mask_before)
+    orch2.cumulate_output_tokens(torch.tensor([3]))
+    assert pen2.cumulated_frequency_penalties[0, 3].item() == -1.5
+
+
+def test_out_of_vocab_exclusions_keep_all_tokens(monkeypatch):
+    monkeypatch.setenv("FREQUENCY_PENALTY_EXCLUDE_TOKENS", "[99]")
+    _batch, orch, pen = make_penalizer([0.5])
+    torch.testing.assert_close(pen.token_penalty_mask, torch.ones(8))
+    orch.cumulate_output_tokens(torch.tensor([3]))
+    assert pen.cumulated_frequency_penalties[0, 3].item() == 0.5
+
+
+@pytest.mark.parametrize("value", ["", "[]"])
+def test_disabled_exclusion_is_initialized_once(monkeypatch, value):
+    monkeypatch.setenv("FREQUENCY_PENALTY_EXCLUDE_TOKENS", value)
+
+    def fail_mask(*args, **kwargs):
+        raise AssertionError("disabled exclusion must not prepare a mask")
+
+    monkeypatch.setattr(torch.Tensor, "index_fill_", fail_mask)
+    monkeypatch.setattr(torch.Tensor, "to", fail_mask)
+    _batch1, orch1, pen1 = make_penalizer([0.5])
+    assert pen1.token_penalty_mask is None
+    assert frequency_module._token_penalty_mask_initialized
+    orch1.release()
+
+    def fail_read():
+        raise AssertionError("disabled exclusion must not be read again")
+
+    monkeypatch.setattr(frequency_module, "_read_exclude_tokens", fail_read)
+    _batch2, _orch2, pen2 = make_penalizer([0.5])
+    assert pen2.token_penalty_mask is None
+
+
+def test_no_mask_work_when_frequency_penalty_is_zero(monkeypatch):
+    monkeypatch.setenv("FREQUENCY_PENALTY_EXCLUDE_TOKENS", "[2]")
+    _batch, orch, pen = make_penalizer([0.0, 0.0])
+    assert not orch.is_required
+    assert not pen.is_prepared()
+    assert not frequency_module._token_penalty_mask_initialized
+    assert frequency_module._token_penalty_mask is None
 
 
 @pytest.mark.parametrize(

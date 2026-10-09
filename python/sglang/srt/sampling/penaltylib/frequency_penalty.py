@@ -2,8 +2,12 @@ import json
 import os
 
 import torch
-
 from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
+
+# Each worker has a fixed model, device and exclusion config until restart.
+# Initialize lazily; None also represents an initialized, disabled mask.
+_token_penalty_mask: torch.Tensor | None = None
+_token_penalty_mask_initialized = False
 
 
 def _read_int_env(name: str, minimum: int):
@@ -50,28 +54,37 @@ class BatchedFrequencyPenalizer(_BatchedPenalizer):
         )
 
     def _prepare(self):
+        global _token_penalty_mask, _token_penalty_mask_initialized
+
         self.frequency_penalty_factor_start = _read_int_env(
             "FREQUENCY_PENALTY_FACTOR_START", minimum=0
         )
         self.frequency_penalty_factor_offset = _read_int_env(
             "FREQUENCY_PENALTY_FACTOR_OFFSET", minimum=1
         )
-        excluded = _read_exclude_tokens()
-        self.token_penalty_mask = None
-        if excluded:
-            # Allocate on the batch's device, including NPU. Do not initialize
-            # CUDA contexts during module import or on other workers' devices.
-            self.token_penalty_mask = torch.ones(
-                self.orchestrator.vocab_size,
-                dtype=torch.float32,
-                device=self.orchestrator.device,
-            )
-            excluded_ids = torch.tensor(
-                [token for token in excluded if token < self.orchestrator.vocab_size],
-                dtype=torch.long,
-                device=self.orchestrator.device,
-            )
-            self.token_penalty_mask.index_fill_(0, excluded_ids, 0)
+        if not _token_penalty_mask_initialized:
+            excluded = _read_exclude_tokens()
+            if excluded:
+                # Build on CPU to avoid NPU index_fill_ reading back indices.
+                mask = torch.ones(
+                    self.orchestrator.vocab_size, dtype=torch.float32, device="cpu"
+                )
+                excluded_ids = torch.tensor(
+                    [
+                        token
+                        for token in excluded
+                        if token < self.orchestrator.vocab_size
+                    ],
+                    dtype=torch.long,
+                    device="cpu",
+                )
+                mask.index_fill_(0, excluded_ids, 0)
+                # Complete the first upload before sharing this read-only table.
+                _token_penalty_mask = mask.to(
+                    device=self.orchestrator.device, non_blocking=False
+                )
+            _token_penalty_mask_initialized = True
+        self.token_penalty_mask = _token_penalty_mask
 
         # Each request has its own age across continuous-batch merges/filters.
         self.generation_lengths = torch.zeros(

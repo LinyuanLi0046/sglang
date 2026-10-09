@@ -2324,6 +2324,7 @@ class Qwen2MoeAttention(nn.Module):
         group: Any,
         *,
         scratch_name: str,
+        graph_workspace: Optional[Any] = None,
     ) -> torch.Tensor:
         if group.world_size == 1:
             return tensor
@@ -2334,32 +2335,32 @@ class Qwen2MoeAttention(nn.Module):
         send_bytes = send.view(torch.uint8).reshape(-1)
         required_bytes = send_bytes.numel() * group.world_size
 
-        # One attention-TP group is shared by all decoder layers, so keep the
-        # grow-only communication buffers on that group instead of storing a
-        # full-size scratch allocation in every layer.  Ordinary prefill is
-        # eager-only and layers consume these buffers serially.
-        scratch = getattr(group, "_welmv4_mxfp8_ag_scratch", None)
-        if scratch is None:
-            scratch = {}
-            group._welmv4_mxfp8_ag_scratch = scratch
-        scratch_key = (
-            scratch_name,
-            send_bytes.device.type,
-            send_bytes.device.index,
-        )
-        gathered_storage = scratch.get(scratch_key)
-        if gathered_storage is None or gathered_storage.numel() < required_bytes:
-            # Geometric capacity avoids another allocation when the next
-            # ordinary-prefill batch is only slightly larger.
-            capacity = 1 << max(required_bytes - 1, 0).bit_length()
-            gathered_storage = torch.empty(
-                capacity,
-                dtype=torch.uint8,
-                device=send_bytes.device,
+        if graph_workspace is not None:
+            gathered_bytes = graph_workspace.get_buffer(group, scratch_name, send_bytes)
+        else:
+            # Eager forwards retain their shared, grow-only group scratch.
+            # It must never replace any prefill graph's receive storage.
+            scratch = getattr(group, "_welmv4_mxfp8_ag_scratch", None)
+            if scratch is None:
+                scratch = {}
+                group._welmv4_mxfp8_ag_scratch = scratch
+            scratch_key = (
+                scratch_name,
+                send_bytes.device.type,
+                send_bytes.device.index,
             )
-            scratch[scratch_key] = gathered_storage
-
-        gathered_bytes = gathered_storage[:required_bytes]
+            gathered_storage = scratch.get(scratch_key)
+            if gathered_storage is None or gathered_storage.numel() < required_bytes:
+                # Geometric capacity avoids another allocation when the next
+                # ordinary-prefill batch is only slightly larger.
+                capacity = 1 << max(required_bytes - 1, 0).bit_length()
+                gathered_storage = torch.empty(
+                    capacity,
+                    dtype=torch.uint8,
+                    device=send_bytes.device,
+                )
+                scratch[scratch_key] = gathered_storage
+            gathered_bytes = gathered_storage[:required_bytes]
         group.all_gather_into_tensor(gathered_bytes, send_bytes)
         gathered_shape = (
             send.shape[0] * group.world_size,
@@ -2371,6 +2372,8 @@ class Qwen2MoeAttention(nn.Module):
     def _npu_all_gather_bf16_gate_input(
         hidden_states: torch.Tensor,
         group: Any,
+        *,
+        graph_workspace: Optional[Any] = None,
     ) -> torch.Tensor:
         """Gather the original Gate input without activation quantization."""
         if group.world_size == 1:
@@ -2380,29 +2383,31 @@ class Qwen2MoeAttention(nn.Module):
         send_flat = send.reshape(-1)
         required_elements = send_flat.numel() * group.world_size
 
-        scratch = getattr(group, "_welmv4_bf16_gate_ag_scratch", None)
-        scratch_key = (
-            send.device.type,
-            send.device.index,
-            send.dtype,
-        )
-        if scratch is None:
-            scratch = {}
-            group._welmv4_bf16_gate_ag_scratch = scratch
-        gathered_storage = scratch.get(scratch_key)
-        if (
-            gathered_storage is None
-            or gathered_storage.numel() < required_elements
-        ):
-            capacity = 1 << max(required_elements - 1, 0).bit_length()
-            gathered_storage = torch.empty(
-                capacity,
-                dtype=send.dtype,
-                device=send.device,
+        if graph_workspace is not None:
+            gathered_flat = graph_workspace.get_buffer(group, "gate-input", send_flat)
+        else:
+            scratch = getattr(group, "_welmv4_bf16_gate_ag_scratch", None)
+            scratch_key = (
+                send.device.type,
+                send.device.index,
+                send.dtype,
             )
-            scratch[scratch_key] = gathered_storage
-
-        gathered_flat = gathered_storage[:required_elements]
+            if scratch is None:
+                scratch = {}
+                group._welmv4_bf16_gate_ag_scratch = scratch
+            gathered_storage = scratch.get(scratch_key)
+            if (
+                gathered_storage is None
+                or gathered_storage.numel() < required_elements
+            ):
+                capacity = 1 << max(required_elements - 1, 0).bit_length()
+                gathered_storage = torch.empty(
+                    capacity,
+                    dtype=send.dtype,
+                    device=send.device,
+                )
+                scratch[scratch_key] = gathered_storage
+            gathered_flat = gathered_storage[:required_elements]
         group.all_gather_into_tensor(gathered_flat, send_flat)
         return gathered_flat.view(
             send.shape[0] * group.world_size,
@@ -2441,6 +2446,8 @@ class Qwen2MoeAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         all_gather_group: Optional[Any],
+        *,
+        graph_workspace: Optional[Any] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.dtype]:
         output_dtype = hidden_states.dtype
         if output_dtype not in (torch.float16, torch.bfloat16):
@@ -2458,11 +2465,13 @@ class Qwen2MoeAttention(nn.Module):
                 quantized_x,
                 all_gather_group,
                 scratch_name="activation",
+                graph_workspace=graph_workspace,
             )
             x_scale = self._npu_all_gather_mxfp8_bytes(
                 x_scale,
                 all_gather_group,
                 scratch_name="scale",
+                graph_workspace=graph_workspace,
             )
         return quantized_x, x_scale, output_dtype
 
@@ -2470,6 +2479,8 @@ class Qwen2MoeAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         all_gather_group: Optional[Any],
+        *,
+        graph_workspace: Optional[Any] = None,
     ) -> Tuple[
         torch.Tensor,
         Optional[torch.Tensor],
@@ -2477,7 +2488,7 @@ class Qwen2MoeAttention(nn.Module):
     ]:
         quantized_x, x_scale, output_dtype = (
             self._npu_prepare_prefill_mxfp8_qkv_input(
-                hidden_states, all_gather_group
+                hidden_states, all_gather_group, graph_workspace=graph_workspace
             )
         )
 
@@ -2497,12 +2508,12 @@ class Qwen2MoeAttention(nn.Module):
                 self.alt_stream.wait_stream(current_stream)
                 with device_module.stream(self.alt_stream):
                     gate_hidden_states = self._npu_all_gather_bf16_gate_input(
-                        hidden_states, all_gather_group
+                        hidden_states, all_gather_group, graph_workspace=graph_workspace
                     )
                 gate_all_gather_on_alt_stream = True
             else:
                 gate_hidden_states = self._npu_all_gather_bf16_gate_input(
-                    hidden_states, all_gather_group
+                    hidden_states, all_gather_group, graph_workspace=graph_workspace
                 )
 
         qkv = self._npu_mxfp8_mm_from_quantized_input(
@@ -2633,7 +2644,13 @@ class Qwen2MoeAttention(nn.Module):
                         prefill_gate_hidden_states,
                         prefill_gate_all_gather_on_alt_stream,
                     ) = self._npu_project_qkv_with_prefill_mxfp8_input(
-                        hidden_states, prefill_mxfp8_all_gather_group
+                        hidden_states,
+                        prefill_mxfp8_all_gather_group,
+                        graph_workspace=(
+                            forward_batch.welm_prefill_graph.mxfp8_ag_workspace
+                            if forward_batch.welm_prefill_graph is not None
+                            else None
+                        ),
                     )
                 else:
                     qkv, _ = self.qkv_proj(hidden_states)
@@ -2718,7 +2735,13 @@ class Qwen2MoeAttention(nn.Module):
                     prefill_gate_hidden_states,
                     prefill_gate_all_gather_on_alt_stream,
                 ) = self._npu_project_qkv_with_prefill_mxfp8_input(
-                    hidden_states, prefill_mxfp8_all_gather_group
+                    hidden_states,
+                    prefill_mxfp8_all_gather_group,
+                    graph_workspace=(
+                        forward_batch.welm_prefill_graph.mxfp8_ag_workspace
+                        if forward_batch.welm_prefill_graph is not None
+                        else None
+                    ),
                 )
             else:
                 qkv, _ = self.qkv_proj(hidden_states)

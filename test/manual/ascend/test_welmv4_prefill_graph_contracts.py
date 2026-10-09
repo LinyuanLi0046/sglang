@@ -91,6 +91,7 @@ Adapter = ADAPTER["WelmPrefillGraphAdapter"]
 # the hardware-dependent __init__. Their default profile has mixed disabled.
 Adapter.mixed_chunk = False
 Adapter.pad_mirror = False
+Adapter.mxfp8_ag_workspace = None
 
 
 class Rows:

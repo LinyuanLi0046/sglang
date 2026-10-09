@@ -215,8 +215,12 @@ class BaseFormatDetector(ABC):
                     current_text[start_idx : start_idx + end_idx]
                 )
 
-                # Validate tool name if present
-                if "name" in obj and obj["name"] not in self._tool_indices:
+                # Match non-streaming behavior when unknown-tool forwarding is enabled.
+                if (
+                    "name" in obj
+                    and obj["name"] not in self._tool_indices
+                    and not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
+                ):
                     # Invalid tool name - reset state
                     self._buffer = ""
                     self.current_tool_id = -1
@@ -246,7 +250,10 @@ class BaseFormatDetector(ABC):
             if not self.current_tool_name_sent:
                 function_name = current_tool_call.get("name")
 
-                if function_name and function_name in self._tool_indices:
+                if function_name and (
+                    function_name in self._tool_indices
+                    or envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
+                ):
                     # If this is a new tool (current_tool_id was -1), initialize it
                     if self.current_tool_id == -1:
                         self.current_tool_id = 0

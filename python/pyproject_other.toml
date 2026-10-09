@@ -33,6 +33,7 @@ runtime_common = [
   "helion==0.2.6",
   "interegular",
   "IPython",
+  "json-repair",
   "llguidance>=1.7.6,<2.0.0",
   "mistral_common>=1.11.5",
   "modelscope",

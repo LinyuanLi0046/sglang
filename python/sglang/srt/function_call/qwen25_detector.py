@@ -3,6 +3,8 @@ import logging
 import re
 from typing import List
 
+import json_repair
+
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
@@ -69,6 +71,11 @@ class Qwen25Detector(BaseFormatDetector):
                 logger.warning(
                     f"Failed to parse JSON part: {match_result}, JSON parse error: {str(e)}"
                 )
+                try:
+                    parsed_call = json_repair.loads(match_result.strip())
+                    calls.extend(self.parse_base_json(parsed_call, tools))
+                except (ValueError, TypeError, AttributeError) as repair_error:
+                    logger.warning("Failed to repair tool call JSON: %s", repair_error)
                 continue
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 

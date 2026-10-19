@@ -319,7 +319,7 @@ class PromptReadySet:
         self._pending = _Replay(self._last_gate)
         self._runtime.wait_event(self._runtime.current_stream(), self._last_gate.event)
 
-    def bind_after_replay(self, tickets=None):
+    def bind_after_replay(self, tickets=None, on_group_bound=None):
         self._check_healthy()
         epoch = self._pending
         if epoch is None:
@@ -338,6 +338,8 @@ class PromptReadySet:
             self._runtime.write(address, 0, self._notify)
             if tickets is not None:
                 tickets[group_id].record(self._notify)
+                if on_group_bound is not None:
+                    on_group_bound(group_id, tickets[group_id])
         if tickets is None:
             # Even no-plan/middle/empty/cancelled replays write the fixed flags.
             epoch.gate.record(self._notify)

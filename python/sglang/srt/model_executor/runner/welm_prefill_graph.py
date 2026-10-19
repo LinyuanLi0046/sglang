@@ -729,10 +729,10 @@ class WelmPrefillGraphAdapter:
                 # Consume captured flags even without transfer work, otherwise a
                 # later replay could mistake an old flag for its own KV readiness.
                 _ = torch.get_device_module().current_stream().npu_stream
-                ready.bind_after_replay(tickets)
-            if committed:
-                layerwise_plan.arm(tickets)
-            if ready is not None:
+                ready.bind_after_replay(
+                    tickets,
+                    on_group_bound=layerwise_plan.publish_group if committed else None,
+                )
                 # Destroy old readiness handles after graph submission and
                 # publication, rather than on the next graph's launch path.
                 ready.after_replay()

@@ -184,12 +184,6 @@ class _LayerwisePrefillPlan:
         # on every Prompt replay, independently of whether it transfers data.
         return has_group_work
 
-    def arm(self, tickets):
-        if len(tickets) != len(self.groups):
-            raise RuntimeError("Layerwise graph ticket/group count mismatch")
-        for group_id, ticket in enumerate(tickets):
-            self.publish_group(group_id, ticket)
-
     def publish_group(self, group_id, ticket):
         """Publish a recorded eager event or a bound graph readiness ticket."""
         for req, reservation in self.reservations.items():

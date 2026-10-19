@@ -26,6 +26,7 @@ class LayerwiseTransfer:
     final_queued: bool = False
     cancelled: bool = False
     queue_idx: int | None = None
+    timing_peers: tuple | None = None
     success_targets: list | None = None
     transport_retired: bool = False
 

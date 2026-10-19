@@ -221,6 +221,11 @@ class MooncakeKVManager(CommonKVManager):
         self.layerwise_enabled = bool(
             self._supports_layerwise_transport and envs.SGLANG_DISAGG_LAYERWISE.get()
         )
+        self._layerwise_timing_state_types = (
+            tuple(str(st) for st in (self.kv_args.state_types or ()))
+            if self.layerwise_enabled and self.pd_timings is not None
+            else None
+        )
         if self.layerwise_enabled and not (
             getattr(args, "layerwise_welm_pool", False)
             and os.environ.get("ASCEND_MF_TRANSFER_PROTOCOL", "sdma").lower()
@@ -2398,9 +2403,12 @@ class MooncakeKVManager(CommonKVManager):
         # NOTE(shangming): sharding according to the dst_infos to make sure
         # requests with the same dst_sessions will be added into the same
         # queue, which enables early abort with failed sessions.
-        dst_infos = self.transfer_infos[bootstrap_room].keys()
-        session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
-        shard_idx = session_port_sum % len(self.transfer_queues)
+        if layerwise_owner is not None and layerwise_owner.queue_idx is not None:
+            shard_idx = layerwise_owner.queue_idx
+        else:
+            dst_infos = self.transfer_infos[bootstrap_room].keys()
+            session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
+            shard_idx = session_port_sum % len(self.transfer_queues)
 
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
@@ -2408,10 +2416,23 @@ class MooncakeKVManager(CommonKVManager):
         request_timing = (
             self.pd_timings.get(bootstrap_room) if self.pd_timings is not None else None
         )
+        if request_timing is not None:
+            if layerwise_owner is not None:
+                # Peers are complete before the first send. Keep only immutable
+                # logging metadata here, never a snapshot of mutable transfer state.
+                if layerwise_owner.timing_peers is None:
+                    layerwise_owner.timing_peers = tuple(
+                        self.transfer_infos[bootstrap_room]
+                    )
+                peers = layerwise_owner.timing_peers
+                state_types = self._layerwise_timing_state_types
+            else:
+                peers = list(dst_infos)
+                state_types = [str(st) for st in (self.kv_args.state_types or [])]
         chunk_timing = (
             request_timing.new_chunk(
                 queue_id=shard_idx,
-                peers=list(dst_infos),
+                peers=peers,
                 page_start=index_slice.start,
                 page_end=index_slice.stop,
                 num_pages=(
@@ -2421,7 +2442,7 @@ class MooncakeKVManager(CommonKVManager):
                 ),
                 num_kv_tokens=num_kv_tokens,
                 is_last_chunk=is_last_chunk,
-                state_types=[str(st) for st in (self.kv_args.state_types or [])],
+                state_types=state_types,
             )
             if request_timing is not None
             else None

@@ -100,6 +100,21 @@ class LayerwisePublisher:
             else:
                 owner.pending.append(job)
                 self.manager._staging_outstanding[owner.room] += 1
+                if (
+                    len(owner.pending) == 1
+                    and owner.groups is None
+                    and owner.next_group == 0
+                    and owner.final is None
+                ):
+                    try:
+                        ready = self._ready(job)
+                    except Exception:
+                        # Keep it registered for the publisher's room-local
+                        # error handling, rather than failing the scheduler.
+                        ready = False
+                    if ready:
+                        self._enqueue(owner, job)
+                        owner.pending.popleft()
             self.wakeup.set()
             return True
 
@@ -118,6 +133,7 @@ class LayerwisePublisher:
                 dropped += 1
                 owner.final = None
             self.manager._staging_outstanding[owner.room] -= dropped
+            self.manager._maybe_ack_drained_abort(owner.room)
             self.wakeup.set()
 
     def cancel_room(self, room):
@@ -200,9 +216,7 @@ class LayerwisePublisher:
         while True:
             self.wakeup.wait(0.001)
             self.wakeup.clear()
-            with self.lock:
-                owners = tuple(self.rooms.values())
-            for owner in owners:
+            for owner in self._poll_candidates():
                 try:
                     self.poll(owner)
                 except Exception as exc:
@@ -217,3 +231,29 @@ class LayerwisePublisher:
                     self.manager.conclude_failure(
                         bootstrap_room=owner.room, failure_reason=str(exc)
                     )
+
+    def _poll_candidates(self):
+        with self.lock:
+            owners = []
+            for owner in self.rooms.values():
+                # Failure must cancel unfilled reservations too. Do this before
+                # excluding owners with no readiness work (or only native work).
+                if (
+                    self.manager.request_status.get(owner.room, KVPoll.Failed)
+                    == KVPoll.Failed
+                ):
+                    self.cancel(owner)
+                if owner.cancelled:
+                    continue
+                groups = owner.groups
+                if (
+                    owner.pending
+                    or (
+                        groups
+                        and owner.next_group < len(groups)
+                        and groups[owner.next_group] is not None
+                    )
+                    or (not groups and owner.final is not None)
+                ):
+                    owners.append(owner)
+            return owners

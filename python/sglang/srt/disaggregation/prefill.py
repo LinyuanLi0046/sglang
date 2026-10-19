@@ -1427,8 +1427,10 @@ class SchedulerDisaggregationPrefillMixin:
         # event now so the transfer worker can wait on those writes before the
         # RDMA read, instead of racing them.
         if _uses_layerwise_transport(req):
-            ev = self.device_module.Event()
-            ev.record(self.forward_stream if self.enable_overlap else None)
+            ev = None
+            if self.enable_overlap:
+                ev = self.device_module.Event()
+                ev.record(self.forward_stream)
             self.send_kv_chunk(
                 req, last_chunk=False, end_idx=cached_end, ready_fence=ev
             )

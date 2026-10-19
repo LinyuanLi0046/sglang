@@ -436,7 +436,7 @@ def mark_poll(pollers, polls, event, success):
 
 def timed_send_prepare(fn):
     @functools.wraps(fn)
-    def wrapped(self, req, last_chunk=False, end_idx=None):
+    def wrapped(self, req, last_chunk=False, end_idx=None, **kwargs):
         timing = getattr(req.disagg_kv_sender, "pd_timing", None)
         if timing is not None:
             # Captured by new_chunk before putting work on the transfer queue.
@@ -456,7 +456,7 @@ def timed_send_prepare(fn):
                     else "cached_prefix" if end_idx is not None else "middle"
                 ),
             )
-        return fn(self, req, last_chunk=last_chunk, end_idx=end_idx)
+        return fn(self, req, last_chunk=last_chunk, end_idx=end_idx, **kwargs)
 
     return wrapped
 

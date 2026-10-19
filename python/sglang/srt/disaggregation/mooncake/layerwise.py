@@ -27,6 +27,7 @@ class LayerwiseTransfer:
     cancelled: bool = False
     queue_idx: int | None = None
     success_targets: list | None = None
+    transport_retired: bool = False
 
 
 class LayerwisePublisher:

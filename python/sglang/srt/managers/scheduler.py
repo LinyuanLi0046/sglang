@@ -4013,7 +4013,14 @@ class Scheduler(
 
         # memory leak check (skipped for hisparse — pool counters intentionally
         # diverge during host-backup, see _get_swa_token_info clamp).
-        if not self.enable_hisparse:
+        # Also skipped while deferred KV releases are pending: they hold pages out
+        # of the allocator by design, so the pool is transiently below `total` and
+        # would trip the idle leak invariant. Resumes once the holds resolve.
+        deferred_pending = (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.disagg_decode_transfer_queue.has_pending_deferred_releases()
+        )
+        if not self.enable_hisparse and not deferred_pending:
             has_leak, messages = self.invariant_checker._check_all_pools(
                 self.pool_stats_observer.get_pool_stats(),
             )
@@ -4073,6 +4080,9 @@ class Scheduler(
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
                 idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
+                idle &= (
+                    not self.disagg_decode_transfer_queue.has_pending_deferred_releases()
+                )
                 if self.decode_offload_manager is not None:
                     idle &= len(self.decode_offload_manager.ongoing_offload) == 0
 

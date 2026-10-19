@@ -111,6 +111,10 @@ class BaseKVManager(ABC):
         """Register prefill server info to the bootstrap server."""
         ...
 
+    # Opt-in per backend: set True once the prefill acks a drained abort
+    # (ABORT_ACK carrying the sender rank). Without it a hold only ends on timeout.
+    supports_deferred_decode_kv_release: bool = False
+
 
 class BaseKVSender(ABC):
     @abstractmethod

@@ -88,11 +88,8 @@ _is_npu = is_npu()
 
 
 def _uses_layerwise_transport(req: Req) -> bool:
-    return bool(
-        getattr(
-            getattr(req.disagg_kv_sender, "kv_mgr", None), "layerwise_enabled", False
-        )
-    )
+    # Warmup's FakeKVSender shares the real manager but does not transfer KV.
+    return bool(getattr(req.disagg_kv_sender, "layerwise_enabled", False))
 
 
 class _LayerwiseReadyFence:

@@ -33,6 +33,7 @@ from sglang.srt.disaggregation.common.staging_handler import (
 from sglang.srt.disaggregation.common.utils import (
     AuxDataCodec,
     FastQueue,
+    FinalReadyQueue,
     TransferKVChunk,
     build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
@@ -224,8 +225,14 @@ class MooncakeKVManager(CommonKVManager):
             if transfer_thread_pool_size is None:
                 transfer_thread_pool_size = min(max(4, int(0.5 * cpu_count) // 8), 12)
             transfer_queue_size = envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.get()
-            self.transfer_queues: List[FastQueue] = [
-                FastQueue() for _ in range(transfer_queue_size)
+            queue_class = (
+                FinalReadyQueue
+                if envs.SGLANG_DISAGG_MOONCAKE_FINAL_READY_PRIORITY.get()
+                and not self.enable_staging
+                else FastQueue
+            )
+            self.transfer_queues: List[Union[FastQueue, FinalReadyQueue]] = [
+                queue_class() for _ in range(transfer_queue_size)
             ]
             assert transfer_thread_pool_size >= transfer_queue_size, (
                 f"The environment variable SGLANG_DISAGGREGATION_THREAD_POOL_SIZE={transfer_thread_pool_size} must be "
@@ -1550,7 +1557,7 @@ class MooncakeKVManager(CommonKVManager):
 
     def transfer_worker(
         self,
-        queue: FastQueue,
+        queue: Union[FastQueue, FinalReadyQueue],
         executor: concurrent.futures.ThreadPoolExecutor,
         staging_buffer=None,
         worker_index=0,

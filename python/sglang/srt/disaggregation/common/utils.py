@@ -2,7 +2,7 @@ import ctypes
 import dataclasses
 import struct
 import threading
-from collections import deque
+from collections import OrderedDict, deque
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
@@ -83,6 +83,53 @@ class FastQueue:
             while not self._buf:
                 self._cond.wait()
             return self._buf.popleft()
+
+
+class FinalReadyQueue:
+    """Single-consumer KV queue with FIFO within each request.
+
+    Publishing a final promotes that room's entire remaining chain. Promoted
+    rooms follow final publication order; otherwise jobs follow global FIFO.
+    Executing transfers are never preempted. Staging requeues use FastQueue.
+    """
+
+    def __init__(self):
+        self._pending = OrderedDict()
+        self._rooms = {}
+        self._ready = OrderedDict()
+        self._next_index = 0
+        self._cond = threading.Condition()
+
+    def put(self, item: TransferKVChunk):
+        with self._cond:
+            index = self._next_index
+            self._next_index += 1
+            self._pending[index] = item
+            room_queue = self._rooms.get(item.room)
+            if room_queue is None:
+                room_queue = self._rooms[item.room] = deque()
+            room_queue.append(index)
+            if item.is_last_chunk:
+                self._ready[item.room] = None
+            self._cond.notify()
+
+    def get(self):
+        with self._cond:
+            while not self._pending:
+                self._cond.wait()
+            if self._ready:
+                room = next(iter(self._ready))
+                index = self._rooms[room][0]
+                item = self._pending.pop(index)
+            else:
+                _, item = self._pending.popitem(last=False)
+            room_queue = self._rooms[item.room]
+            room_queue.popleft()
+            if not room_queue:
+                del self._rooms[item.room]
+            if item.is_last_chunk:
+                del self._ready[item.room]
+            return item
 
 
 class AuxDataCodec:

@@ -181,13 +181,10 @@ class LayerwisePublisher:
                     owner.groups[owner.next_group] = None
                     owner.next_group += 1
                 owner.groups = None
-            # A ready final tail is released only after all earlier native writes
-            # finished. It carries SWA/state and aux, which authorizes decode.
-            if (
-                owner.final is not None
-                and self.manager._staging_outstanding.get(owner.room, 0) == 1
-                and self._ready(owner.final)
-            ):
+            # All predecessors are queued on the same single-worker FIFO. The
+            # worker drains each native call before executing this ready tail;
+            # waiting for their completion here needlessly loses its queue slot.
+            if owner.final is not None and self._ready(owner.final):
                 self._enqueue(owner, owner.final)
                 owner.final = None
                 owner.final_queued = True

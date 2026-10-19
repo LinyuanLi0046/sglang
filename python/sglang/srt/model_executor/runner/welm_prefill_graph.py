@@ -272,6 +272,31 @@ class WelmPrefillGraphAdapter:
                 )
         self.capture_keys = set()
         self._capture_templates = {}
+        self.layerwise_events = None
+        self._capture_ready = None
+        if (
+            envs.SGLANG_DISAGG_LAYERWISE.get()
+            and args.disaggregation_mode == "prefill"
+            and self.prune
+        ):
+            from sglang.srt.hardware_backend.npu.graph_runner.layerwise_graph_events import (
+                LayerwiseGraphEvents,
+                welm_full_writer_entries,
+            )
+            from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                NPUMHATokenToKVPool,
+            )
+
+            pool = self.backend.token_to_kv_pool
+            if isinstance(getattr(pool, "full_kv_pool", None), NPUMHATokenToKVPool):
+                self.layerwise_events = LayerwiseGraphEvents.create(
+                    welm_full_writer_entries(self.model, pool),
+                    envs.SGLANG_DISAGG_LAYERWISE_GROUP_SIZE.get(),
+                )
+            else:
+                logger.warning(
+                    "WELM layerwise graph requires the NPU hybrid MHA KV pool"
+                )
         logger.info(
             "WeLM BF16 breakable prefill: T-only prompt graphs, %s mirror "
             "batches %s, mirror=%s, "
@@ -385,6 +410,8 @@ class WelmPrefillGraphAdapter:
         )
         mirror = batch.welm_prefill_graph_phase == "mirror"
         key = self.mirror_key(batch.batch_size) if mirror else self.key(capacity)
+        if self.layerwise_events is not None and not mirror:
+            self.layerwise_events.prepare_capture(key)
         metadata = copy.copy(self.flash_inputs)
         metadata.welm_flash_schedules = {}
         if mirror:
@@ -475,6 +502,15 @@ class WelmPrefillGraphAdapter:
             if batch.welm_prefill_graph_phase == "mirror"
             else self.key(batch.positions.numel())
         )
+        self._capture_ready = (
+            self.layerwise_events.ready_sets.get(key)
+            if self.layerwise_events is not None
+            else None
+        )
+        if self._capture_ready is not None:
+            self._capture_ready.begin_capture_forward(
+                torch.get_device_module().is_current_stream_capturing()
+            )
         self.current_flash_metadata = self.flash_metadata[key]
         self.current_flash_metadata.welm_flash_schedules.clear()
         batch.model_specific_states = None
@@ -495,6 +531,9 @@ class WelmPrefillGraphAdapter:
         self.current_batch = batch
 
     def after_capture(self, key: ShapeKey, batch: ForwardBatch):
+        if self._capture_ready is not None:
+            self._capture_ready.finish_capture()
+        self._capture_ready = None
         self.capture_keys.add(key)
         if batch.welm_prefill_graph_phase == "prompt":
             self.captured_states[key] = batch.model_specific_states
@@ -539,8 +578,8 @@ class WelmPrefillGraphAdapter:
     def finish_prompt(self, hidden_states, residual, positions, batch):
         """T-only graph tail. Persistent outputs live outside both graph pools."""
         from sglang.srt.models.welmv4 import (
-            KVMirrorManager,
             WELMV4_MTP_MIRROR_STATES_KEY,
+            KVMirrorManager,
         )
 
         capacity = positions.numel()
@@ -564,6 +603,8 @@ class WelmPrefillGraphAdapter:
                 self.full_write_locs[:capacity],
                 self.swa_write_locs[:capacity],
             )
+            if self._capture_ready is not None:
+                self._capture_ready.record_writer(attn.attn.layer_id)
 
         first = self.model.layers[self.first_mirror]
         hidden_states, residual, partial = first.prepare_graph_mirror_input(
@@ -630,16 +671,67 @@ class WelmPrefillGraphAdapter:
             self.mirror_positions[:bs],
         )
 
-    def replay(self, key, batch, **kwargs):
+    def replay(self, key, batch, *, layerwise_plan=None, **kwargs):
         mirror_key = self.select_mirror_key(batch.batch_size) if self.prune else None
         # Both checks precede either replay. Never run a mixed eager/graph body.
         if key not in self.capture_keys or (
             self.prune and mirror_key not in self.capture_keys
         ):
             raise RuntimeError("WeLM graph eligibility changed before replay")
-        result = self.runner.backend.replay(key, batch, **kwargs)
-        if mirror_key is not None:
-            result = self.runner.backend.replay(mirror_key, batch, **kwargs)
+        ready = (
+            self.layerwise_events.ready_sets[key]
+            if self.layerwise_events is not None
+            else None
+        )
+        tickets = None
+        committed = False
+        replay_started = False
+        try:
+            if ready is not None and layerwise_plan is not None:
+                tickets = ready.reserve()
+                if tickets is not None:
+                    # Eligibility is now final. prepare snapshots only this
+                    # batch's immutable page indices on the current compute
+                    # stream, including any previous unsent middle range.
+                    if layerwise_plan.prepare(ready.group_entries):
+                        committed = layerwise_plan.commit()
+                    if not committed:
+                        for ticket in tickets:
+                            ticket.release()
+                        tickets = None
+            if ready is not None:
+                # Fixed flags must be consumed before this bucket writes them
+                # again. This is a device dependency on notification cleanup,
+                # not a wait for the previous request's RDMA transfer.
+                replay_started = True
+                ready.before_replay()
+            result = self.runner.backend.replay(key, batch, **kwargs)
+            if mirror_key is not None:
+                result = self.runner.backend.replay(mirror_key, batch, **kwargs)
+            if ready is not None:
+                # Flush PTA's host submission queue after launching both graphs;
+                # obtaining the native stream does not wait for device completion.
+                # Consume captured flags even without transfer work, otherwise a
+                # later replay could mistake an old flag for its own KV readiness.
+                _ = torch.get_device_module().current_stream().npu_stream
+                ready.bind_after_replay(tickets)
+            if committed:
+                layerwise_plan.arm(tickets)
+        except Exception as exc:
+            if replay_started:
+                # A partially submitted graph or notification sequence cannot
+                # safely reuse its fixed flags on another replay.
+                ready.fail()
+            else:
+                # No notification has been submitted; cancelled reservations
+                # must not consume this bucket's ticket capacity forever.
+                for ticket in tickets or ():
+                    ticket.release()
+            if layerwise_plan is not None:
+                # Keep partially bound tickets/D2H alive through producer
+                # drain. A committed range must never fall back to resend.
+                layerwise_plan.fail(exc, tickets=tickets or ())
+            raise
         self.publish_state(key, batch)
         return result
 
@@ -660,6 +752,10 @@ class WelmPrefillGraphAdapter:
                 self.full_write_locs[: q.shape[0]],
                 self.swa_write_locs[: q.shape[0]],
             )
+        if not mirror and self._capture_ready is not None:
+            # The fused-QKV path already wrote KV before calling flash with
+            # save_kv_cache=False; both paths need this same post-writer node.
+            self._capture_ready.record_writer(layer.layer_id)
         pool = self.backend.token_to_kv_pool
         return self.backend._forward_welm_flash_attention(
             q,

@@ -136,6 +136,7 @@ class EagerRunner(BaseRunner):
             ),
             dp_size=sa.dp_size,
         )
+        self._layerwise_eager_manifest = None
         # Eager has no capture step, so warm up here (run-once via mr._kernel_warmed_up).
         self.warmup()
 
@@ -163,6 +164,32 @@ class EagerRunner(BaseRunner):
         # Eager never runs a cuda graph; callers dispatch on isinstance(...,
         # EagerRunner) and must not route an eager batch into a replay branch.
         return False
+
+    def _layerwise_transfer_scope(self, forward_batch: ForwardBatch):
+        plan = forward_batch.pd_transfer_plan
+        if plan is None:
+            return contextlib.nullcontext()
+        from sglang.srt.hardware_backend.npu.graph_runner.layerwise_graph_events import (
+            eager_layerwise_transfer,
+            full_writer_groups,
+            welm_full_writer_entries,
+        )
+
+        if self._layerwise_eager_manifest is None:
+            mr = self.model_runner
+            model = getattr(mr.model, "model", None)
+            if not hasattr(model, "_compute_oe_hashed_ids"):
+                raise RuntimeError("Eager layerwise transfer requires the WELM target")
+            self._layerwise_eager_manifest = full_writer_groups(
+                welm_full_writer_entries(model, mr.token_to_kv_pool),
+                envs.SGLANG_DISAGG_LAYERWISE_GROUP_SIZE.get(),
+            )
+        return eager_layerwise_transfer(
+            forward_batch,
+            plan,
+            self._layerwise_eager_manifest,
+            self.device_module,
+        )
 
     def load_batch(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None, **kwargs
@@ -328,12 +355,15 @@ class EagerRunner(BaseRunner):
             elif cp_v2_active:
                 ret = self._execute_extend_cp_v2(forward_batch, kwargs)
             else:
-                ret = model_runner.model.forward(
-                    forward_batch.input_ids,
-                    forward_batch.positions,
-                    forward_batch,
-                    **kwargs,
-                )
+                # The dispatch has selected a real eager forward. Graph body
+                # replay and capture never activate these Python writer hooks.
+                with self._layerwise_transfer_scope(forward_batch):
+                    ret = model_runner.model.forward(
+                        forward_batch.input_ids,
+                        forward_batch.positions,
+                        forward_batch,
+                        **kwargs,
+                    )
         return ret
 
     def _execute_extend_cp_v2(

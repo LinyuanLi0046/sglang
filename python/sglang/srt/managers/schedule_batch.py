@@ -1127,6 +1127,9 @@ class Req(ReqDllmMixin):
         self.pd_rebootstrap_forced_output_id: Optional[int] = None
         self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
         self.disagg_kv_sender: Optional[BaseKVSender] = None
+        self.pd_producer_fence = None
+        self.pd_transfer_resources: list = []
+        self.pd_cleanup_pending: Optional[str] = None
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank
@@ -1995,6 +1998,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     prefill_stats: Optional[PrefillStats] = None
     forward_iter: Optional[int] = None
     launch_ts: Optional[float] = None
+    # Live final-chunk reservation; copied with the result, never reconstructed
+    # from Req.extend_range after another overlapped forward has launched.
+    pd_transfer_plan: object = None
 
     # === GPU tensors crossing to ForwardBatch (clone targets for stream isolation) ===
     # Batched arguments to model runner
@@ -3226,6 +3232,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             fpm_start_time=self.fpm_start_time,
             forward_iter=self.forward_iter,
             launch_ts=self.launch_ts,
+            pd_transfer_plan=self.pd_transfer_plan,
             extend_num_tokens=self.extend_num_tokens,
         )
 

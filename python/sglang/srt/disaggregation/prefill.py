@@ -23,6 +23,7 @@ import hashlib
 import logging
 from array import array
 from collections import deque
+from contextlib import contextmanager
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
 
@@ -32,6 +33,10 @@ import torch
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.common.utils import (
+    LayerwiseChunkSpec,
+    LayerwiseReservation,
+)
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -64,6 +69,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.pd_time_stats import timed_send_prepare
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.runtime_context import get_disagg
@@ -79,6 +85,142 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+
+
+def _uses_layerwise_transport(req: Req) -> bool:
+    return bool(
+        getattr(
+            getattr(req.disagg_kv_sender, "kv_mgr", None), "layerwise_enabled", False
+        )
+    )
+
+
+class _LayerwiseReadyFence:
+    """A host predicate, not a device-stream wait around a host RDMA call."""
+
+    def __init__(self, reservation, ticket):
+        self.reservation = reservation
+        self.ticket = ticket
+
+    def query(self):
+        return self.reservation.snapshot_ready.query() and self.ticket.query()
+
+
+class _LayerwiseProducerFence:
+    """An unrecorded or failed event must never appear producer-complete."""
+
+    def __init__(self):
+        self.event = None
+        self.armed = False
+
+    def record(self, device_module):
+        self.event = device_module.Event()
+        self.event.record()
+        self.armed = True
+
+    def query(self):
+        return self.armed and self.event.query()
+
+
+class _LayerwisePrefillPlan:
+    """Own one final unsent range for either eager or captured WELM writers."""
+
+    def __init__(self, scheduler, candidates):
+        self.scheduler = scheduler
+        self.candidates = candidates
+        self.reservations = {}
+        self.groups = ()
+
+    def prepare(self, group_buffer_indices):
+        self.groups = tuple(tuple(group) for group in group_buffer_indices)
+        if not self.candidates or not self.groups:
+            return False
+        page_size = self.scheduler.token_to_kv_pool_allocator.page_size
+        for req, spec in self.candidates:
+            reservation = LayerwiseReservation(spec)
+            self.reservations[req] = reservation
+            # Retain partial snapshots too if an allocation/copy/record fails.
+            # The forward-finally producer fence protects their device lifetime.
+            req.pd_transfer_resources.append(reservation)
+            reservation.device_indices = (
+                self.scheduler.req_to_token_pool.req_to_token[
+                    spec.req_pool_idx, spec.start : spec.end : page_size
+                ]
+                // page_size
+            ).to(dtype=torch.int32)
+            reservation.cpu_indices = torch.empty(
+                reservation.device_indices.shape,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=True,
+            )
+            reservation.cpu_indices.copy_(reservation.device_indices, non_blocking=True)
+            reservation.snapshot_ready = self.scheduler.device_module.Event()
+            reservation.snapshot_ready.record()
+        return True
+
+    def commit(self):
+        # The scheduler is the only cursor owner. The execution path and its
+        # readiness mechanism have been selected before this call.
+        has_group_work = False
+        for req, reservation in self.reservations.items():
+            page_count = reservation.cpu_indices.numel()
+            reservation.index_slice = req.disagg_kv_sender.reserve_final_range(
+                page_count, expected_groups=len(self.groups) if page_count else 0
+            )
+            if reservation.index_slice is None:
+                # Per-room capacity/cancellation can change while preparing.
+                # This request retains its ordinary final send; requests already
+                # committed in this batch still use their layerwise reservations.
+                continue
+            reservation.committed = True
+            req.start_send_idx = reservation.spec.end
+            has_group_work |= page_count > 0
+        # An empty reservation still owns the final SWA/aux tail, but needs no
+        # layer-ready tickets. Captured flags still need consumption and reset
+        # on every Prompt replay, independently of whether it transfers data.
+        return has_group_work
+
+    def arm(self, tickets):
+        if len(tickets) != len(self.groups):
+            raise RuntimeError("Layerwise graph ticket/group count mismatch")
+        for group_id, ticket in enumerate(tickets):
+            self.publish_group(group_id, ticket)
+
+    def publish_group(self, group_id, ticket):
+        """Publish a recorded eager event or a bound graph readiness ticket."""
+        for req, reservation in self.reservations.items():
+            if not reservation.committed or reservation.cpu_indices.numel() == 0:
+                continue
+            # Keep events alive through native drain, including partial eager
+            # forwards and cancellation between two writer groups.
+            reservation.tickets += (ticket,)
+            accepted = req.disagg_kv_sender.register_layerwise_group(
+                group_id=group_id,
+                kv_indices=reservation.cpu_indices.numpy,
+                index_slice=reservation.index_slice,
+                kv_buffer_indices=self.groups[group_id],
+                ready_fence=_LayerwiseReadyFence(reservation, ticket),
+                num_kv_tokens=reservation.spec.end - reservation.spec.start,
+            )
+            if accepted is False:
+                req.disagg_kv_sender.abort()
+
+    def fail(self, exc, *, tickets=()):
+        # After takeover, fallback would duplicate the range and may publish
+        # aux before partial layer jobs finish. Abort and drain instead.
+        for req, _ in self.candidates:
+            reservation = self.reservations.get(req)
+            if reservation is not None:
+                reservation.tickets = tuple(tickets) or reservation.tickets
+            logger.error("WELM layerwise forward failed for %s: %s", req.rid, exc)
+            req.disagg_kv_sender.abort(reason=str(exc))
+
+    def reservation_for(self, req):
+        reservation = self.reservations.get(req)
+        return (
+            reservation if reservation is not None and reservation.committed else None
+        )
 
 
 def should_force_retry(req: Req) -> bool:
@@ -246,6 +388,14 @@ class PrefillBootstrapQueue:
         )
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.ps.gpu_id
+        kv_args.layerwise_welm_pool = (
+            isinstance(self.token_to_kv_pool, SWAKVPool)
+            and self.draft_token_to_kv_pool is None
+            and "WeLMV4MoeForCausalLM"
+            in (self.scheduler.model_config.hf_config.architectures or [])
+            and not self.scheduler.enable_hisparse
+            and not self.scheduler.enable_hierarchical_cache
+        )
 
         req_to_token_pool = getattr(self.scheduler, "req_to_token_pool", None)
         setup_state_kv_args(
@@ -466,6 +616,12 @@ class PrefillBootstrapQueue:
             return bootstrapped_reqs, failed_reqs
 
     def release_memory_occupation(self):
+        if getattr(self.kv_manager, "layerwise_enabled", False) and (
+            self.queue
+            or self.scheduler.disagg_prefill_inflight_queue
+            or self.scheduler.disagg_prefill_deferred_cleanup
+        ):
+            raise RuntimeError("Cannot deregister WELM KV buffers with live transfers")
         self.queue.clear()
         if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
             self.kv_manager.deregister_buffer_to_engine()
@@ -479,6 +635,133 @@ class SchedulerDisaggregationPrefillMixin:
     """
     Mixin for Scheduler to handle disaggregation prefill
     """
+
+    def prepare_layerwise_prefill_plan(self: Scheduler, batch: ScheduleBatch) -> None:
+        batch.pd_transfer_plan = None
+        if not getattr(
+            self.disagg_prefill_bootstrap_queue.kv_manager, "layerwise_enabled", False
+        ):
+            return
+        candidates = []
+        for req in batch.reqs:
+            if (
+                not _uses_layerwise_transport(req)
+                or req.pending_bootstrap
+                or req.pd_cleanup_pending is not None
+                or is_aborted(req)
+                or req.host_hit_length > 0
+                or req.extend_range is None
+                or req.extend_range.end < len(req.origin_input_ids)
+            ):
+                continue
+            candidates.append(
+                (
+                    req,
+                    LayerwiseChunkSpec(
+                        req_pool_idx=int(req.req_pool_idx),
+                        start=req.start_send_idx,
+                        end=len(req.origin_input_ids),
+                    ),
+                )
+            )
+        if candidates:
+            batch.pd_transfer_plan = _LayerwisePrefillPlan(self, candidates)
+
+    @contextmanager
+    def layerwise_producer_scope(self: Scheduler, batch: ScheduleBatch):
+        if self.disaggregation_mode != DisaggregationMode.PREFILL or not getattr(
+            self.disagg_prefill_bootstrap_queue.kv_manager, "layerwise_enabled", False
+        ):
+            yield
+            return
+        protected = [req for req in batch.reqs if _uses_layerwise_transport(req)]
+        try:
+            yield
+        finally:
+            if protected:
+                # This context surrounds the worker on its actual compute stream
+                # in both overlap and normal scheduling. A fresh event covers all
+                # producer writes, including the second (Mirror) graph.
+                fence = _LayerwiseProducerFence()
+                for req in protected:
+                    req.pd_producer_fence = fence
+                try:
+                    fence.record(self.device_module)
+                except Exception:
+                    for req in protected:
+                        req.disagg_kv_sender.abort()
+                    raise
+
+    def _layerwise_release_ready(self: Scheduler, reqs: List[Req]) -> List[bool]:
+        if not reqs or not any(_uses_layerwise_transport(req) for req in reqs):
+            return [True] * len(reqs)
+        ready = []
+        for req in reqs:
+            if not _uses_layerwise_transport(req):
+                ready.append(True)
+                continue
+            producer = req.pd_producer_fence
+            ready.append(
+                (producer is None or producer.query())
+                and req.disagg_kv_sender.can_release_transfer_buffers()
+            )
+        if torch.distributed.get_world_size(self.attn_tp_cpu_group) > 1:
+            flags = torch.tensor(ready, dtype=torch.uint8, device="cpu")
+            torch.distributed.all_reduce(
+                flags,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.attn_tp_cpu_group,
+            )
+            ready = flags.bool().tolist()
+        return ready
+
+    def defer_layerwise_cleanup(self: Scheduler, req: Req, kind: str) -> None:
+        # Always enqueue on all ranks; local event arrival must not determine
+        # which ranks enter the next collective or free a request.
+        if req.pd_cleanup_pending in ("abort", "bootstrap_failure"):
+            return
+        if req.pd_cleanup_pending is None:
+            self.disagg_prefill_deferred_cleanup.append(req)
+        req.pd_cleanup_pending = kind
+
+    def process_layerwise_deferred_cleanup(self: Scheduler) -> None:
+        pending = self.disagg_prefill_deferred_cleanup
+        if not pending:
+            return
+        ready = self._layerwise_release_ready(pending)
+        remaining = []
+        for req, can_release in zip(pending, ready):
+            if not can_release:
+                remaining.append(req)
+                continue
+            kind = req.pd_cleanup_pending
+            req.pd_transfer_resources.clear()
+            req.pd_producer_fence = None
+            if kind == "retry":
+                req.pd_cleanup_pending = None
+                self.optimistic_release_and_requeue(req, drained=True)
+            else:
+                if req.req_pool_idx is not None or req.mamba_pool_idx is not None:
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                maybe_release_metadata_buffer(
+                    req, self.req_to_metadata_buffer_idx_allocator
+                )
+                req.disagg_kv_sender.clear()
+        self.disagg_prefill_deferred_cleanup = remaining
+
+    def cache_unfinished_prefill_req(
+        self: Scheduler, req: Req, *, chunked=False, last_chunk=False
+    ):
+        if last_chunk and _uses_layerwise_transport(req):
+            # Radix insertion can deduplicate/free pages referenced by queued
+            # transfers. Apply the same policy on every TP rank, including local
+            # reservation fallback, so new suffixes become visible together after
+            # the common drain. Middle chunks retain their usual cache insertion.
+            req.prefix_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : req.extend_range.end
+            ]
+        else:
+            maybe_cache_unfinished_req(req, self.tree_cache, chunked=chunked)
 
     def maybe_prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
         """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""
@@ -565,6 +848,7 @@ class SchedulerDisaggregationPrefillMixin:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            self.process_layerwise_deferred_cleanup()
             if self._engine_paused:
                 continue
             self.waiting_queue.extend(
@@ -604,6 +888,7 @@ class SchedulerDisaggregationPrefillMixin:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            self.process_layerwise_deferred_cleanup()
             if self._engine_paused:
                 continue
             self.waiting_queue.extend(
@@ -702,6 +987,11 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
+            if req.pd_cleanup_pending in ("abort", "bootstrap_failure"):
+                if req.inflight_middle_chunks > 0:
+                    req.inflight_middle_chunks -= 1
+                advance_logprob_pt(i, req)
+                continue
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
 
@@ -712,7 +1002,12 @@ class SchedulerDisaggregationPrefillMixin:
                     continue
 
                 req.output_ids.append(next_token_id)
-                maybe_cache_unfinished_req(req, self.tree_cache)
+                reservation = (
+                    batch.pd_transfer_plan.reservation_for(req)
+                    if batch.pd_transfer_plan is not None
+                    else None
+                )
+                self.cache_unfinished_prefill_req(req, last_chunk=True)
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
                     req.output_topk_p = draft_input.topk_p[i]
@@ -748,7 +1043,7 @@ class SchedulerDisaggregationPrefillMixin:
                         i, req, logits_output
                     )
                 if not req.pending_bootstrap:
-                    self.send_kv_chunk(req, last_chunk=True)
+                    self.send_kv_chunk(req, last_chunk=True, reservation=reservation)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
 
                 if req.grammar is not None:
@@ -836,6 +1131,17 @@ class SchedulerDisaggregationPrefillMixin:
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
         )
+        failed_reqs = [
+            req
+            for req, poll in zip(self.disagg_prefill_inflight_queue, polls)
+            if poll == KVPoll.Failed
+        ]
+        for req in failed_reqs:
+            if _uses_layerwise_transport(req):
+                req.disagg_kv_sender.abort(reason=None)
+        failed_ready = dict(
+            zip(failed_reqs, self._layerwise_release_ready(failed_reqs))
+        )
 
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
@@ -869,6 +1175,13 @@ class SchedulerDisaggregationPrefillMixin:
                     undone_reqs.append(req)
                 continue
 
+            # Layerwise Success already includes the final producer-ready fence
+            # and the shared outstanding counter reaching zero (also for a full
+            # send fallback). Only failures need a second TP drain decision.
+            if poll == KVPoll.Failed and not failed_ready[req]:
+                undone_reqs.append(req)
+                continue
+
             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
                 # todo: set Transferring correctly in backend
                 undone_reqs.append(req)
@@ -878,6 +1191,8 @@ class SchedulerDisaggregationPrefillMixin:
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
                 # FIXME: clean up req's data in transfer engine
                 req.disagg_kv_sender.clear()
+                req.pd_transfer_resources.clear()
+                req.pd_producer_fence = None
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
             elif poll == KVPoll.Failed:
@@ -947,6 +1262,10 @@ class SchedulerDisaggregationPrefillMixin:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         release_kv_cache(req, self.tree_cache)  # unlock the tree
+        if _uses_layerwise_transport(req):
+            req.disagg_kv_sender.clear()
+            req.pd_transfer_resources.clear()
+            req.pd_producer_fence = None
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
@@ -974,6 +1293,8 @@ class SchedulerDisaggregationPrefillMixin:
         return transferred_rids
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
+        if req.pd_cleanup_pending in ("abort", "bootstrap_failure"):
+            return
         error_message = (
             f"Prefill bootstrap failed for request rank={self.ps.tp_rank} "
             f"{req.rid=} {req.bootstrap_room=}"
@@ -990,13 +1311,19 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-        if (
-            req.req_pool_idx is not None
-            or req.kv is not None
-            or req.mamba_pool_idx is not None
-        ):
-            release_kv_cache(req, self.tree_cache)
-        maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
+        if _uses_layerwise_transport(req):
+            req.disagg_kv_sender.abort(reason=None)
+            self.defer_layerwise_cleanup(req, "bootstrap_failure")
+        else:
+            if (
+                req.req_pool_idx is not None
+                or req.kv is not None
+                or req.mamba_pool_idx is not None
+            ):
+                release_kv_cache(req, self.tree_cache)
+            maybe_release_metadata_buffer(
+                req, self.req_to_metadata_buffer_idx_allocator
+            )
         req.pending_bootstrap = False
         prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
         self.output_streamer.stream_output([req], req.return_logprob)
@@ -1044,7 +1371,7 @@ class SchedulerDisaggregationPrefillMixin:
         chunked_req_to_exclude = set()
         if (req := self.chunked_req) is not None:
             chunked_req_to_exclude.add(req)
-            maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+            self.cache_unfinished_prefill_req(req, chunked=True)
 
             if not self.check_bootstrap(req):
                 if is_aborted(req):
@@ -1102,6 +1429,13 @@ class SchedulerDisaggregationPrefillMixin:
         # be writing these prefix pages on forward_stream. Record a completion
         # event now so the transfer worker can wait on those writes before the
         # RDMA read, instead of racing them.
+        if _uses_layerwise_transport(req):
+            ev = self.device_module.Event()
+            ev.record(self.forward_stream if self.enable_overlap else None)
+            self.send_kv_chunk(
+                req, last_chunk=False, end_idx=cached_end, ready_fence=ev
+            )
+            return
         if self.enable_overlap:
             ev = torch.cuda.Event()
             ev.record(self.forward_stream)
@@ -1114,6 +1448,9 @@ class SchedulerDisaggregationPrefillMixin:
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
+        *,
+        reservation: Optional[LayerwiseReservation] = None,
+        ready_fence=None,
     ) -> None:
         """
         Send a prefilled chunk to the decode server
@@ -1126,6 +1463,8 @@ class SchedulerDisaggregationPrefillMixin:
             if end_idx is not None
             else min(req.extend_range.end, transfer_input_len)
         )
+        if reservation is not None:
+            start_idx, end_idx = reservation.spec.start, reservation.spec.end
 
         if not last_chunk:
             # if not the last chunk and the last page is partial, delay the last partial page to the next send
@@ -1244,21 +1583,43 @@ class SchedulerDisaggregationPrefillMixin:
                 payloads[st]() if st in payloads else None for st in state_types
             ]
 
+        if reservation is not None:
+            if not reservation.final_published:
+                req.disagg_kv_sender.finish_layerwise_final(
+                    index_slice=reservation.index_slice,
+                    state_indices=state_indices,
+                    ready_fence=req.pd_producer_fence,
+                )
+                reservation.final_published = True
+            return
+
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, start_idx:end_idx
         ]
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             return
+        kwargs = {}
+        if _uses_layerwise_transport(req):
+            kwargs = {
+                "ready_fence": ready_fence or req.pd_producer_fence,
+                "last_chunk": last_chunk,
+            }
         req.disagg_kv_sender.send(
             page_indices,
             state_indices,
             num_kv_tokens=end_idx - start_idx,
+            **kwargs,
         )
         req.start_send_idx = end_idx
 
-    def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
+    def optimistic_release_and_requeue(
+        self: Scheduler, req: Req, *, drained=False
+    ) -> None:
         """Release KV cache and requeue an optimistic prefill request."""
+        if _uses_layerwise_transport(req) and not drained:
+            self.defer_layerwise_cleanup(req, "retry")
+            return
         max_attempts = get_disagg().optimistic_prefill_attempts
         maybe_cache_unfinished_req(req, self.tree_cache)
         release_kv_cache(req, self.tree_cache)

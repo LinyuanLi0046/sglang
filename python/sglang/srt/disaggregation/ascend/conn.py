@@ -38,6 +38,8 @@ _DSV4_KVCACHE_STATE_TYPES = tuple(AscendStateType)
 
 
 class AscendKVManager(MooncakeKVManager):
+    _supports_layerwise_transport = True
+
     def _start_transfer_thread(self, target, *, role, args=(), name=None, daemon=None):
         affinity = get_pd_thread_affinity()
         start = (
@@ -125,7 +127,11 @@ class AscendKVManager(MooncakeKVManager):
         executor: concurrent.futures.ThreadPoolExecutor,
         dst_layer_ids: Optional[List[int]] = None,
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        *,
+        kv_buffer_indices: Optional[Tuple[int, ...]] = None,
     ):
+        if kv_buffer_indices == ():
+            return 0
         if dst_device_kv_indices is not None:
             raise NotImplementedError(
                 "Ascend direct KV transfer does not support separate destination "
@@ -137,7 +143,17 @@ class AscendKVManager(MooncakeKVManager):
             prefill_kv_indices, dst_kv_indices
         )
 
-        if self.pp_size > 1:
+        if kv_buffer_indices is not None:
+            # Buffer order was checked when the peer registered its buffers.
+            layers_params = [
+                (
+                    self.kv_args.kv_data_ptrs[i],
+                    dst_kv_ptrs[i],
+                    self.kv_args.kv_item_lens[i],
+                )
+                for i in kv_buffer_indices
+            ]
+        elif self.pp_size > 1:
             if self.is_mla_backend:
                 src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage = (
                     self.get_mla_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
@@ -238,6 +254,10 @@ class AscendKVManager(MooncakeKVManager):
                 )
                 for (src_ptr, dst_ptr, item_len) in layers_params
             ]
+            if self.layerwise_enabled:
+                # cancel() cannot stop a running native call. Drain every
+                # submitted future before the enclosing job can release pages.
+                return self._await_transfer_futures(futures)
             for future in concurrent.futures.as_completed(futures):
                 status = future.result()
                 if status != 0:

@@ -36,6 +36,31 @@ class TransferKVChunk:
     wait_event: Optional[object] = None
     # Optional CPU-only diagnostic record, never serialized on the wire.
     pd_timing: object = None
+    # None selects all Full buffers; () selects the final state/aux tail only.
+    kv_buffer_indices: Optional[Tuple[int, ...]] = None
+    ready_fence: object = None
+    layerwise_owner: object = None
+
+
+@dataclasses.dataclass(frozen=True)
+class LayerwiseChunkSpec:
+    """Final suffix frozen before overlap can mutate the request's next chunk."""
+
+    req_pool_idx: int
+    start: int
+    end: int
+
+
+@dataclasses.dataclass
+class LayerwiseReservation:
+    spec: LayerwiseChunkSpec
+    device_indices: object = None
+    cpu_indices: object = None
+    snapshot_ready: object = None
+    index_slice: Optional[slice] = None
+    committed: bool = False
+    final_published: bool = False
+    tickets: tuple = ()
 
 
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:

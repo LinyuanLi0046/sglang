@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import dataclasses
 import logging
 import os
@@ -42,6 +43,7 @@ from sglang.srt.disaggregation.common.utils import (
     pack_int_lists,
     unpack_int_lists,
 )
+from sglang.srt.disaggregation.mooncake.layerwise import LayerwisePublisher
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
 )
@@ -201,6 +203,7 @@ class KVArgsRegisterInfo:
 class MooncakeKVManager(CommonKVManager):
     supports_deferred_decode_kv_release = True
     AUX_DATA_HEADER = b"AUX_DATA"
+    _supports_layerwise_transport = False
 
     def __init__(
         self,
@@ -215,6 +218,27 @@ class MooncakeKVManager(CommonKVManager):
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.enable_trace = server_args.enable_trace
+        self.layerwise_enabled = bool(
+            self._supports_layerwise_transport and envs.SGLANG_DISAGG_LAYERWISE.get()
+        )
+        if self.layerwise_enabled and not (
+            getattr(args, "layerwise_welm_pool", False)
+            and os.environ.get("ASCEND_MF_TRANSFER_PROTOCOL", "sdma").lower()
+            == "host_rdma"
+            and self.pp_size == self.attn_cp_size == self.dcp_size == 1
+            and not self.enable_staging
+            and self.enable_deferred_decode_kv_release
+        ):
+            raise ValueError(
+                "WELM layerwise requires HOST_RDMA, PP=CP=DCP=1, no staging, "
+                "and community deferred decode KV release enabled"
+            )
+        self.layerwise_publisher = (
+            LayerwisePublisher(self)
+            if self.layerwise_enabled
+            and self.disaggregation_mode == DisaggregationMode.PREFILL
+            else None
+        )
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
@@ -266,6 +290,12 @@ class MooncakeKVManager(CommonKVManager):
                     ),
                     daemon=True,
                 )
+            if self.layerwise_publisher is not None:
+                self._start_transfer_thread(
+                    target=self.layerwise_publisher.run,
+                    role="layerwise_ready",
+                    daemon=True,
+                )
             self.enable_failed_session_probe = (
                 envs.SGLANG_ENABLE_FAILED_SESSION_PROBE.get()
             )
@@ -287,6 +317,52 @@ class MooncakeKVManager(CommonKVManager):
                 self._staging_handler = None
                 self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(list))
             self.start_decode_thread()
+
+    def _maybe_ack_drained_abort(self, room):
+        publisher = getattr(self, "layerwise_publisher", None)
+        with publisher.lock if publisher is not None else contextlib.nullcontext():
+            super()._maybe_ack_drained_abort(room)
+
+    def conclude_transfer(
+        self, *, bootstrap_room, status, targets=None, failure_reason=None
+    ):
+        publisher = self.layerwise_publisher
+        if publisher is None:
+            return super().conclude_transfer(
+                bootstrap_room=bootstrap_room,
+                status=status,
+                targets=targets,
+                failure_reason=failure_reason,
+            )
+        with publisher.lock:
+            owner = publisher.rooms.get(bootstrap_room)
+            if status == KVPoll.Success and owner is not None:
+                # Like community deferred-allocation completion, publish Success
+                # only after sender cleanup. A true rebootstrap can reuse the room
+                # as soon as decode sees Success, so it must not race old cleanup.
+                result = super().conclude_transfer(
+                    bootstrap_room=bootstrap_room,
+                    status=status,
+                    targets=[],
+                    failure_reason=failure_reason,
+                )
+                if result == KVPoll.Success:
+                    owner.success_targets = (
+                        self._room_notify_targets(bootstrap_room)
+                        if targets is None
+                        else targets
+                    )
+                    return result
+                status = result
+                if status is None:
+                    return None
+            publisher.cancel_room(bootstrap_room)
+            return super().conclude_transfer(
+                bootstrap_room=bootstrap_room,
+                status=status,
+                targets=targets,
+                failure_reason=failure_reason,
+            )
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
@@ -1620,6 +1696,15 @@ class MooncakeKVManager(CommonKVManager):
                 if (
                     kv_chunk.room not in self.request_status
                     or self.check_status(kv_chunk.room) == KVPoll.Failed
+                    or (
+                        kv_chunk.layerwise_owner is not None
+                        and (
+                            not self.layerwise_publisher.current(
+                                kv_chunk.layerwise_owner
+                            )
+                            or kv_chunk.layerwise_owner.cancelled
+                        )
+                    )
                 ):
                     timing_error = "skipped_failed_or_cleared"
                     logger.debug(
@@ -1631,9 +1716,12 @@ class MooncakeKVManager(CommonKVManager):
                             MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
                             thread_finish_flag=True,
                         )
-                    self._staging_outstanding.pop(kv_chunk.room, None)
-                    if self.enable_deferred_decode_kv_release:
-                        self._maybe_ack_drained_abort(kv_chunk.room)
+                    if kv_chunk.layerwise_owner is not None:
+                        self.layerwise_publisher.complete(kv_chunk)
+                    else:
+                        self._staging_outstanding.pop(kv_chunk.room, None)
+                        if self.enable_deferred_decode_kv_release:
+                            self._maybe_ack_drained_abort(kv_chunk.room)
                     continue
 
                 if (
@@ -1757,6 +1845,11 @@ class MooncakeKVManager(CommonKVManager):
                                 executor,
                                 dst_layer_ids=target_rank_registration_info.dst_kv_layer_ids,
                                 dst_device_kv_indices=chunked_dst_device_kv_indice,
+                                **(
+                                    {"kv_buffer_indices": kv_chunk.kv_buffer_indices}
+                                    if kv_chunk.layerwise_owner is not None
+                                    else {}
+                                ),
                             )
                         elif (
                             self.enable_staging
@@ -1889,22 +1982,27 @@ class MooncakeKVManager(CommonKVManager):
                 if staging_deferred:
                     continue
 
-                self._staging_outstanding[kv_chunk.room] -= 1
-                if self.enable_deferred_decode_kv_release:
-                    # In-flight write finished; if aborted and nothing outstanding,
-                    # the pages are idle -> release the held ack.
-                    self._maybe_ack_drained_abort(kv_chunk.room)
+                if kv_chunk.layerwise_owner is not None:
+                    self.layerwise_publisher.complete(kv_chunk)
+                else:
+                    self._staging_outstanding[kv_chunk.room] -= 1
+                    if self.enable_deferred_decode_kv_release:
+                        self._maybe_ack_drained_abort(kv_chunk.room)
                 # Tear down only when no chunk is still outstanding and the room
                 # has concluded: already cleared, Success, or a Failed *last*
                 # chunk. A non-last Failed chunk keeps the room (more chunks may
                 # follow), not on the last chunk alone since an earlier deferred
                 # chunk may still need to transfer.
-                if self._staging_outstanding.get(kv_chunk.room, 0) <= 0 and (
-                    kv_chunk.room not in self.request_status
-                    or self.check_status(kv_chunk.room) == KVPoll.Success
-                    or (
-                        kv_chunk.is_last_chunk
-                        and self.check_status(kv_chunk.room) == KVPoll.Failed
+                if (
+                    kv_chunk.layerwise_owner is None
+                    and self._staging_outstanding.get(kv_chunk.room, 0) <= 0
+                    and (
+                        kv_chunk.room not in self.request_status
+                        or self.check_status(kv_chunk.room) == KVPoll.Success
+                        or (
+                            kv_chunk.is_last_chunk
+                            and self.check_status(kv_chunk.room) == KVPoll.Failed
+                        )
                     )
                 ):
                     if kv_chunk.room in self.transfer_infos:
@@ -1926,6 +2024,10 @@ class MooncakeKVManager(CommonKVManager):
                 timing_error = type(e).__name__
                 if kv_chunk is not None:
                     self.poison_deferred_ack_room(kv_chunk.room)
+                    if kv_chunk.layerwise_owner is not None:
+                        self.conclude_failure(
+                            bootstrap_room=kv_chunk.room, failure_reason=str(e)
+                        )
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
@@ -1953,21 +2055,26 @@ class MooncakeKVManager(CommonKVManager):
     def _handle_deferred_abort_notification(
         self, notification: AbortNotification, room_active: bool
     ) -> None:
-        room = notification.room
-        if room_active:
-            self.update_status(room, KVPoll.Failed)
+        publisher = self.layerwise_publisher
+        with publisher.lock if publisher is not None else contextlib.nullcontext():
+            room = notification.room
+            if room_active:
+                self.update_status(room, KVPoll.Failed)
 
-        ack_target = notification.deferred_ack_target()
-        if ack_target is None:
-            return
-        self.register_deferred_ack_target(room, ack_target)
-        self._maybe_ack_drained_abort(room)
-        if room_active:
-            logger.debug(
-                "Received abort notification for room %s, marked as Failed; "
-                "ACK deferred until transfer drains",
-                room,
-            )
+            if publisher is not None:
+                publisher.cancel_room(room)
+
+            ack_target = notification.deferred_ack_target()
+            if ack_target is None:
+                return
+            self.register_deferred_ack_target(room, ack_target)
+            self._maybe_ack_drained_abort(room)
+            if room_active:
+                logger.debug(
+                    "Received abort notification for room %s, marked as Failed; "
+                    "ACK deferred until transfer drains",
+                    room,
+                )
 
     def _handle_legacy_abort_notification(
         self, notification: AbortNotification, room_active: bool
@@ -2042,6 +2149,15 @@ class MooncakeKVManager(CommonKVManager):
                                 [decode_kv_args.dst_kv_item_len]
                                 * len(self.kv_args.kv_item_lens)
                             )
+                        )
+                    if self.layerwise_enabled and (
+                        decode_kv_args.dst_attn_tp_size != self.attn_tp_size
+                        or len(decode_kv_args.dst_kv_ptrs)
+                        != len(self.kv_args.kv_data_ptrs)
+                        or decode_kv_args.dst_kv_layer_ids != self.kv_args.kv_layer_ids
+                    ):
+                        raise ValueError(
+                            "WELM layerwise P/D Full KV layouts must match"
                         )
                     self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
                     with self.session_lock:
@@ -2166,6 +2282,11 @@ class MooncakeKVManager(CommonKVManager):
         num_kv_tokens: Optional[int] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
         wait_event: Optional[object] = None,
+        *,
+        kv_buffer_indices: Optional[Tuple[int, ...]] = None,
+        ready_fence=None,
+        layerwise_owner=None,
+        group_id: Optional[int] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -2177,13 +2298,13 @@ class MooncakeKVManager(CommonKVManager):
             logger.debug(
                 "Request with bootstrap_room=%s already failed", bootstrap_room
             )
-            return
+            return False if layerwise_owner is not None else None
 
         if bootstrap_room not in self.transfer_infos:
             # This means that the current rank is a dummy rank for this request,
             # and it has already been marked as success, so there is no need to
             # add further chunks into the transfer queue.
-            return
+            return False if layerwise_owner is not None else None
 
         # NOTE(shangming): sharding according to the dst_infos to make sure
         # requests with the same dst_sessions will be added into the same
@@ -2204,7 +2325,11 @@ class MooncakeKVManager(CommonKVManager):
                 peers=list(dst_infos),
                 page_start=index_slice.start,
                 page_end=index_slice.stop,
-                num_pages=len(kv_indices),
+                num_pages=(
+                    index_slice.stop - index_slice.start
+                    if layerwise_owner is not None
+                    else len(kv_indices)
+                ),
                 num_kv_tokens=num_kv_tokens,
                 is_last_chunk=is_last_chunk,
                 state_types=[str(st) for st in (self.kv_args.state_types or [])],
@@ -2212,20 +2337,26 @@ class MooncakeKVManager(CommonKVManager):
             if request_timing is not None
             else None
         )
-        self.transfer_queues[shard_idx].put(
-            TransferKVChunk(
-                room=bootstrap_room,
-                prefill_kv_indices=kv_indices,
-                index_slice=index_slice,
-                is_last_chunk=is_last_chunk,
-                prefill_aux_index=aux_index,
-                state_indices=state_indices,
-                num_kv_tokens=num_kv_tokens,
-                trace_ctx=trace_ctx,
-                pd_timing=chunk_timing,
-                wait_event=wait_event,
-            )
+        job = TransferKVChunk(
+            room=bootstrap_room,
+            prefill_kv_indices=kv_indices,
+            index_slice=index_slice,
+            is_last_chunk=is_last_chunk,
+            prefill_aux_index=aux_index,
+            state_indices=state_indices,
+            num_kv_tokens=num_kv_tokens,
+            trace_ctx=trace_ctx,
+            pd_timing=chunk_timing,
+            wait_event=wait_event,
+            kv_buffer_indices=kv_buffer_indices,
+            ready_fence=ready_fence,
         )
+        if layerwise_owner is not None:
+            return self.layerwise_publisher.add(
+                layerwise_owner, job, shard_idx, group_id
+            )
+        self.transfer_queues[shard_idx].put(job)
+        return True
 
     def get_session_id(self):
         return self.engine.get_session_id()
@@ -2326,12 +2457,108 @@ class MooncakeKVSender(CommonKVSender):
         self.init_time = time.time()
         self._init_trace_ctx()
         self.pd_timing = mgr.new_request_timing(bootstrap_room)
+        self._layerwise_final_reserved = False
+        self._layerwise_owner = (
+            mgr.layerwise_publisher.bind(bootstrap_room)
+            if mgr.layerwise_enabled
+            else None
+        )
+
+    @property
+    def layerwise_enabled(self):
+        return self.kv_mgr.layerwise_enabled
+
+    def reserve_final_range(self, page_count, expected_groups):
+        if self._layerwise_final_reserved:
+            raise RuntimeError("Final KV range was already reserved")
+        end = self.curr_idx + page_count
+        if page_count < 0 or end != self.num_kv_indices:
+            raise ValueError("Final range must cover all remaining pages")
+        if not self.kv_mgr.layerwise_publisher.reserve(
+            self._layerwise_owner, expected_groups
+        ):
+            return None
+        index_slice = slice(self.curr_idx, end)
+        self.curr_idx = end
+        self._transfer_num_kv_indices += page_count
+        self._layerwise_final_reserved = True
+        return index_slice
+
+    def register_layerwise_group(
+        self,
+        *,
+        group_id,
+        kv_indices,
+        index_slice,
+        kv_buffer_indices,
+        ready_fence,
+        num_kv_tokens=None,
+    ):
+        return self.kv_mgr.add_transfer_request(
+            self.bootstrap_room,
+            kv_indices,
+            index_slice,
+            False,
+            num_kv_tokens=num_kv_tokens,
+            trace_ctx=self.trace_ctx.copy_for_thread(),
+            kv_buffer_indices=tuple(kv_buffer_indices),
+            ready_fence=ready_fence,
+            layerwise_owner=self._layerwise_owner,
+            group_id=group_id,
+        )
+
+    def finish_layerwise_final(
+        self, *, index_slice, state_indices=None, ready_fence=None
+    ):
+        indices = np.empty(0, dtype=np.int32)
+        result = self.kv_mgr.add_transfer_request(
+            self.bootstrap_room,
+            indices,
+            index_slice,
+            True,
+            aux_index=self.aux_index,
+            state_indices=state_indices,
+            trace_ctx=self.trace_ctx.copy_for_thread(),
+            kv_buffer_indices=(),
+            ready_fence=ready_fence,
+            layerwise_owner=self._layerwise_owner,
+        )
+        self._record_transfer_indices(indices, state_indices)
+        return result
+
+    def can_release_transfer_buffers(self):
+        return not self.layerwise_enabled or self.kv_mgr.layerwise_publisher.drained(
+            self._layerwise_owner
+        )
 
     def clear(self):
-        self.kv_mgr.finish_request_timing(
-            self.bootstrap_room, getattr(self, "pd_timing", None)
-        )
-        super().clear()
+        if not self.layerwise_enabled:
+            self.kv_mgr.finish_request_timing(
+                self.bootstrap_room, getattr(self, "pd_timing", None)
+            )
+            return super().clear()
+        publisher = self.kv_mgr.layerwise_publisher
+        with publisher.lock:
+            owner = self._layerwise_owner
+            if not publisher.current(owner) or not publisher.drained(owner):
+                return
+            targets = (
+                owner.success_targets
+                if self.kv_mgr.request_status.get(self.bootstrap_room) == KVPoll.Success
+                else None
+            )
+            self.kv_mgr.finish_request_timing(self.bootstrap_room, self.pd_timing)
+            super().clear()
+            self.kv_mgr._staging_outstanding.pop(self.bootstrap_room, None)
+            with self.kv_mgr.failure_lock:
+                self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+            publisher.clear(owner)
+        if targets:
+            self.kv_mgr.send_kv_status_message(
+                targets=targets,
+                bootstrap_room=self.bootstrap_room,
+                status=KVPoll.Success,
+            )
 
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
     def send(
@@ -2339,6 +2566,9 @@ class MooncakeKVSender(CommonKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
+        *,
+        ready_fence=None,
+        last_chunk: Optional[bool] = None,
     ):
         kv_indices, index_slice, is_last_chunk, should_skip = (
             self._prepare_send_indices(kv_indices, state_indices)
@@ -2346,8 +2576,13 @@ class MooncakeKVSender(CommonKVSender):
         if should_skip:
             return
 
+        if self.layerwise_enabled and last_chunk is not None:
+            is_last_chunk = last_chunk
         wait_event = getattr(self, "_early_send_wait_event", None)
         self._early_send_wait_event = None
+        if self.layerwise_enabled:
+            ready_fence = ready_fence if ready_fence is not None else wait_event
+            wait_event = None
         if not is_last_chunk:
             self.kv_mgr.add_transfer_request(
                 self.bootstrap_room,
@@ -2357,6 +2592,8 @@ class MooncakeKVSender(CommonKVSender):
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
                 wait_event=wait_event,
+                ready_fence=ready_fence,
+                layerwise_owner=self._layerwise_owner,
             )
         else:
             self.kv_mgr.add_transfer_request(
@@ -2369,6 +2606,8 @@ class MooncakeKVSender(CommonKVSender):
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
                 wait_event=wait_event,
+                ready_fence=ready_fence,
+                layerwise_owner=self._layerwise_owner,
             )
         self._record_transfer_indices(kv_indices, state_indices)
 
@@ -2400,10 +2639,16 @@ class MooncakeKVSender(CommonKVSender):
         if self.conclude_state is None:
             self.conclude_state = KVPoll.Failed
 
-        self.clear()
-
-        with self.kv_mgr.failure_lock:
-            failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+        if self.layerwise_enabled:
+            self.abort(reason=None)
+            with self.kv_mgr.failure_lock:
+                failure_reason = self.kv_mgr.failure_records.get(self.bootstrap_room)
+        else:
+            self.clear()
+            with self.kv_mgr.failure_lock:
+                failure_reason = self.kv_mgr.failure_records.pop(
+                    self.bootstrap_room, None
+                )
         is_propagated = failure_reason is None
         if is_propagated:
             failure_reason = "Failed due to an unknown reason from another rank"
@@ -2426,13 +2671,29 @@ class MooncakeKVSender(CommonKVSender):
 
         self.trace_ctx.trace_req_start()
 
-    def abort(self):
-        super().abort()
+    def abort(self, *, reason="Aborted by AbortReq."):
+        publisher = self.kv_mgr.layerwise_publisher
+        if publisher is None:
+            super().abort()
+        else:
+            with publisher.lock:
+                publisher.cancel(self._layerwise_owner)
+                if reason is not None:
+                    with self.kv_mgr.failure_lock:
+                        self.kv_mgr.failure_records.setdefault(
+                            self.bootstrap_room, reason
+                        )
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                self.conclude_state = KVPoll.Failed
         self.trace_ctx.abort(abort_info={"reason": "Aborted"})
         self.trace_ctx.trace_req_finish()
 
 
 class MooncakeKVReceiver(CommonKVReceiver):
+    @property
+    def layerwise_enabled(self):
+        return self.kv_mgr.layerwise_enabled
+
     def __init__(
         self,
         mgr: MooncakeKVManager,

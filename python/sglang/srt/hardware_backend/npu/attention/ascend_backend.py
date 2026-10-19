@@ -2494,6 +2494,11 @@ class AscendAttnBackend(AttentionBackend):
                         layer, KVWriteLoc(cache_loc, swa_loc), k, v
                     )
 
+            if forward_batch.pd_eager_transfer is not None:
+                # Fused QKV already wrote both buffers before this call with
+                # save_kv_cache=False. Ordinary and mirror consumers wrote above.
+                forward_batch.pd_eager_transfer.record_writer(layer.layer_id)
+
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
 

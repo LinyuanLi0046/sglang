@@ -488,6 +488,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.ps.gpu_id
+        kv_args.layerwise_welm_pool = (
+            isinstance(self.token_to_kv_pool, SWAKVPool)
+            and self.draft_token_to_kv_pool is None
+            and "WeLMV4MoeForCausalLM"
+            in (self.scheduler.model_config.hf_config.architectures or [])
+            and not self.scheduler.enable_hisparse
+            and not self.scheduler.enable_decode_hicache
+            and not self.enable_staging
+        )
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
             kv_args,
@@ -1285,16 +1294,30 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.transfer_queue.staging_handler.register_decode_req(
                     decode_req.req.bootstrap_room, decode_req
                 )
-            decode_req.kv_receiver.send_metadata(
-                page_indices,
-                decode_req.metadata_buffer_index,
-                state_indices,
-                **metadata_kwargs,
-            )
-            if decode_req.is_rebootstrap:
-                self.kv_manager.submit_prefill_recompute(
-                    decode_req.kv_receiver,
-                    decode_req.req.build_rebootstrap_payload(),
+            try:
+                decode_req.kv_receiver.send_metadata(
+                    page_indices,
+                    decode_req.metadata_buffer_index,
+                    state_indices,
+                    **metadata_kwargs,
+                )
+                if decode_req.is_rebootstrap:
+                    self.kv_manager.submit_prefill_recompute(
+                        decode_req.kv_receiver,
+                        decode_req.req.build_rebootstrap_payload(),
+                    )
+            except Exception as exc:
+                if not getattr(self.kv_manager, "layerwise_enabled", False):
+                    raise
+                # Some peers may already hold destinations. Keep the request
+                # in the transfer queue, whose common failure path force-arms
+                # the upstream drain ACK tracker before notifying cancellation.
+                self.kv_manager.record_failure(
+                    decode_req.req.bootstrap_room,
+                    f"Decode metadata dispatch failed: {exc}",
+                )
+                self.kv_manager.update_status(
+                    decode_req.req.bootstrap_room, KVPoll.Failed
                 )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
@@ -2175,19 +2198,46 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if not self._deferred_releases:
             return
         now = time.monotonic()
+        layerwise_indices = [
+            i
+            for i, (decode_req, _, _, _, _) in enumerate(self._deferred_releases)
+            if getattr(decode_req.kv_receiver.kv_mgr, "layerwise_enabled", False)
+        ]
+        layerwise_ready = {}
+        if layerwise_indices:
+            # ACK delivery and local deadlines are independent across TP ranks.
+            # Keep the upstream device timeout policy, but commit each WELM
+            # destination release only when every rank may release that entry.
+            ready = []
+            for i in layerwise_indices:
+                decode_req, _, deadline, _, required_acks = self._deferred_releases[i]
+                ready.append(
+                    decode_req.kv_receiver.kv_mgr.is_abort_release_safe(
+                        decode_req.req.bootstrap_room, required_acks
+                    )
+                    or now >= deadline
+                )
+            if torch.distributed.get_world_size(self.gloo_group) > 1:
+                flags = torch.tensor(ready, dtype=torch.uint8, device="cpu")
+                torch.distributed.all_reduce(
+                    flags, op=torch.distributed.ReduceOp.MIN, group=self.gloo_group
+                )
+                ready = flags.bool().tolist()
+            layerwise_ready = dict(zip(layerwise_indices, ready))
         still_held = []
         to_release = []
-        for (
+        for i, (
             decode_req,
             start_time,
             deadline,
             idx,
             required_acks,
-        ) in self._deferred_releases:
+        ) in enumerate(self._deferred_releases):
             room = decode_req.req.bootstrap_room
             kv_mgr = decode_req.kv_receiver.kv_mgr
             drained = kv_mgr.is_abort_release_safe(room, required_acks)
-            if not drained and now < deadline:
+            can_release = layerwise_ready.get(i, drained or now >= deadline)
+            if not can_release:
                 still_held.append(
                     (decode_req, start_time, deadline, idx, required_acks)
                 )
@@ -2211,6 +2261,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def release_memory_occupation(self):
         """Clean up in-flight transfers before releasing GPU memory."""
+        if any(
+            getattr(decode_req.kv_receiver.kv_mgr, "layerwise_enabled", False)
+            for decode_req in self.queue
+        ) or any(
+            getattr(decode_req.kv_receiver.kv_mgr, "layerwise_enabled", False)
+            for decode_req, _, _, _, _ in self._deferred_releases
+        ):
+            raise RuntimeError("Cannot deregister WELM KV buffers with live transfers")
         self.queue.clear()
         # Pool is being torn down; drop held entries without per-request release.
         self._deferred_releases.clear()

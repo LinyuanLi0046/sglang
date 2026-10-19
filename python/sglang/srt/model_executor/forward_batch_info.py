@@ -1002,6 +1002,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     welm_prefill_token_mask: Optional[torch.Tensor] = None
     welm_prefill_full_write_locs: Optional[torch.Tensor] = None
     welm_prefill_swa_write_locs: Optional[torch.Tensor] = None
+    pd_transfer_plan: object = None
+    # Activated only around a real eager target forward, not capture/replay.
+    pd_eager_transfer: object = None
 
     # For dumper: int-hashed request / bootstrap-room IDs (derived from rids)
     rids_int: Optional[torch.Tensor] = None
@@ -1184,6 +1187,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Scalar config / flags
             return_logprob=batch.return_logprob,
             is_extend_in_batch=batch.is_extend_in_batch,
+            pd_transfer_plan=(
+                batch.pd_transfer_plan
+                if not model_runner.is_draft_worker
+                and batch.forward_mode == ForwardMode.EXTEND
+                else None
+            ),
             # Preserve group eligibility on an idle participant, but never
             # inherit it into a draft/verify forward reusing the ScheduleBatch.
             welm_dp_all_active_ordinary_prefill=(

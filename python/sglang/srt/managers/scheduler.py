@@ -76,6 +76,7 @@ from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
+    _uses_layerwise_transport,
     maybe_release_metadata_buffer,
 )
 from sglang.srt.disaggregation.utils import (
@@ -1371,6 +1372,7 @@ class Scheduler(
             )
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
+            self.disagg_prefill_deferred_cleanup: List[Req] = []
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
@@ -2907,6 +2909,17 @@ class Scheduler(
         prepare_abort(req, "Aborted")
         req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
         req.to_finish = None
+        if (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            and _uses_layerwise_transport(req)
+        ):
+            req.disagg_kv_sender.abort()
+            req.pending_bootstrap = False
+            self.defer_layerwise_cleanup(req, "abort")
+            self.chunked_req = None
+            self._pending_chunked_abort_req = None
+            self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+            return
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             req.disagg_kv_sender.abort()
             maybe_release_metadata_buffer(
@@ -3630,6 +3643,7 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             for req in batch.reqs:
                 self.maybe_send_cached_prefix_chunk(req)
+            self.prepare_layerwise_prefill_plan(batch)
 
         # Run forward
         if self.is_generation:
@@ -3669,9 +3683,10 @@ class Scheduler(
                                 )
 
                         # FIXME: pp is not compatible with overlap
-                        batch_result = self.model_worker.forward_batch_generation(
-                            batch, **fwd_kwargs
-                        )
+                        with self.layerwise_producer_scope(batch):
+                            batch_result = self.model_worker.forward_batch_generation(
+                                batch, **fwd_kwargs
+                            )
                         if batch.spec_algorithm.is_none():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
@@ -3762,9 +3777,10 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
-                batch_result = self.model_worker.forward_batch_generation(
-                    batch, **kwargs
-                )
+                with self.layerwise_producer_scope(batch):
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch, **kwargs
+                    )
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
                     self._relay_forward_payload(batch.req_pool_indices, batch_result)
@@ -4074,6 +4090,7 @@ class Scheduler(
             idle &= len(self.grammar_manager.grammar_queue) == 0
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
+                idle &= len(self.disagg_prefill_deferred_cleanup) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -4425,6 +4442,12 @@ class Scheduler(
                 release_kv_cache(req, self.tree_cache)
             # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                if _uses_layerwise_transport(req):
+                    prepare_abort(req, "Aborted")
+                    req.disagg_kv_sender.abort()
+                    req.pending_bootstrap = False
+                    self.defer_layerwise_cleanup(req, "abort")
+                    continue
                 bootstrap_pending = req.pending_bootstrap
                 maybe_release_metadata_buffer(
                     req, self.req_to_metadata_buffer_idx_allocator
@@ -4469,6 +4492,15 @@ class Scheduler(
 
         # Delete requests not in the waiting queue when PD disaggregation is enabled
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            for req in self.disagg_prefill_deferred_cleanup:
+                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                    if req.pd_cleanup_pending == "retry":
+                        prepare_abort(req, "Aborted")
+                        req.disagg_kv_sender.abort()
+                        req.pd_cleanup_pending = "abort"
+                        self.ipc_channels.send_to_tokenizer.send_output(
+                            AbortReq(rid=req.rid), req
+                        )
             # Abort requests that have not yet been bootstrapped
             for req in self.disagg_prefill_bootstrap_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
@@ -4533,6 +4565,8 @@ class Scheduler(
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
                 req.to_finish = FINISH_ABORT()
+                if _uses_layerwise_transport(req):
+                    req.disagg_kv_sender.abort()
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()

@@ -1685,7 +1685,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     )[: ie.shape[0]].copy_(ie)
             if self.welm_adapter is not None:
                 hs = self.welm_adapter.replay(
-                    shape_key, static_forward_batch, **kwargs
+                    shape_key,
+                    static_forward_batch,
+                    layerwise_plan=forward_batch.pd_transfer_plan,
+                    **kwargs,
                 )
                 if self.welm_adapter.pad_mirror:
                     # Mirror produces Bcap rows, while the eager LM head and

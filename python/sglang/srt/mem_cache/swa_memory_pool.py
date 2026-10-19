@@ -141,6 +141,19 @@ class SWAKVPool(BaseSWAKVPool):
 
         return swa_kv_data_ptrs, swa_kv_data_lens, swa_kv_item_lens
 
+    def get_full_layer_transfer_entries(
+        self, layer_id: int
+    ) -> Optional[Tuple[int, int]]:
+        """Registered Full K/V entries for a global layer; SWA travels as state.
+
+        The MHA Full pool registers all K buffers followed by all V buffers.
+        This is a layer mapping only: no KV access, stream wait, or layout change.
+        """
+        compact_layer, is_swa = self.layers_mapping[layer_id]
+        if is_swa:
+            return None
+        return compact_layer, self.full_layer_nums + compact_layer
+
     def get_key_buffer(self, layer_id: int):
         self._wait_for_layer(layer_id)
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]

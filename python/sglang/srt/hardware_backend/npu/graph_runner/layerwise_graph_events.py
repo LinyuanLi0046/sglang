@@ -34,7 +34,7 @@ def welm_full_writer_entries(model, pool):
     return tuple(writers)
 
 
-def full_writer_groups(writer_entries, group_size):
+def full_writer_groups(writer_entries, group_size, *, tail_writer_ids=()):
     """Return groups in actual writer order, with both registered K/V entries."""
     if group_size < 1:
         raise ValueError("SGLANG_DISAGG_LAYERWISE_GROUP_SIZE must be positive")
@@ -46,10 +46,19 @@ def full_writer_groups(writer_entries, group_size):
         flattened
     ):
         raise ValueError("Each WELM Full writer must own distinct K and V entries")
+    tail_writer_ids = tuple(tail_writer_ids)
+    main_count = len(writers) - len(tail_writer_ids)
+    if tail_writer_ids and (
+        main_count < 0
+        or tuple(layer for layer, _ in writers[main_count:]) != tail_writer_ids
+    ):
+        raise ValueError("WELM BCG tail writers must be an ordered Full-writer suffix")
     groups = tuple(
-        writers[start : start + group_size]
-        for start in range(0, len(writers), group_size)
+        writers[start : min(start + group_size, main_count)]
+        for start in range(0, main_count, group_size)
     )
+    if tail_writer_ids:
+        groups += (writers[main_count:],)
     entries = tuple(
         tuple(entry for _, pair in group for entry in pair) for group in groups
     )
@@ -359,13 +368,15 @@ class PromptReadySet:
 
 
 class LayerwiseGraphEvents:
-    def __init__(self, runtime, writer_entries, group_size):
+    def __init__(self, runtime, writer_entries, group_size, *, tail_writer_ids=()):
         self._runtime = runtime
-        self._manifest = full_writer_groups(writer_entries, group_size)
+        self._manifest = full_writer_groups(
+            writer_entries, group_size, tail_writer_ids=tail_writer_ids
+        )
         self.ready_sets = {}
 
     @classmethod
-    def create(cls, writer_entries, group_size):
+    def create(cls, writer_entries, group_size, *, tail_writer_ids=()):
         try:
             import acl
             import torch
@@ -374,15 +385,20 @@ class LayerwiseGraphEvents:
                 "Enabled WELM layerwise BCG requires CANN pyACL value_write/value_wait"
             ) from exc
         runtime = _ACLRuntime(acl, torch.npu)
-        bridge = cls(runtime, writer_entries, group_size)
+        bridge = cls(
+            runtime, writer_entries, group_size, tail_writer_ids=tail_writer_ids
+        )
         # Missing/unsupported graph primitives must not silently turn this into
         # whole-prefill transfer. Exercise true mid-graph Host visibility.
         _validate_runtime(runtime)
         logger.info(
             "WELM layerwise pyACL graph signals enabled: %d Full-KV groups, "
-            "group_size=%d; startup mid-graph/replay check passed",
+            "group_size=%d, main_groups=%d, merged_tail_writers=%d; "
+            "startup mid-graph/replay check passed",
             len(bridge._manifest[1]),
             group_size,
+            len(bridge._manifest[1]) - bool(tail_writer_ids),
+            len(tail_writer_ids),
         )
         return bridge
 

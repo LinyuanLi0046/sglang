@@ -289,9 +289,24 @@ class WelmPrefillGraphAdapter:
 
             pool = self.backend.token_to_kv_pool
             if isinstance(getattr(pool, "full_kv_pool", None), NPUMHATokenToKVPool):
+                tail_writer_ids = ()
+                if envs.SGLANG_DISAGG_LAYERWISE_BCG_MERGE_MIRROR_TAIL.get():
+                    # Match finish_prompt's actual order, including sparse Full
+                    # layers. These IDs need not equal ModuleList positions.
+                    tail_writer_ids = tuple(
+                        layer.self_attn.attn.layer_id
+                        for layer in self.model.layers[
+                            self.first_mirror : self.model.end_layer
+                        ]
+                        if pool.get_full_layer_transfer_entries(
+                            layer.self_attn.attn.layer_id
+                        )
+                        is not None
+                    )
                 self.layerwise_events = LayerwiseGraphEvents.create(
                     welm_full_writer_entries(self.model, pool),
                     envs.SGLANG_DISAGG_LAYERWISE_GROUP_SIZE.get(),
+                    tail_writer_ids=tail_writer_ids,
                 )
             else:
                 logger.warning(

@@ -27,6 +27,7 @@ class LayerwiseTransfer:
     cancelled: bool = False
     queue_idx: int | None = None
     timing_peers: tuple | None = None
+    full_page_blocks: dict | None = None
     success_targets: list | None = None
     transport_retired: bool = False
 
@@ -141,6 +142,8 @@ class LayerwisePublisher:
                 return False
             if self.current(owner):
                 self.rooms.pop(owner.room)
+            owner.full_page_blocks = None
+            owner.timing_peers = None
             return True
 
     @staticmethod

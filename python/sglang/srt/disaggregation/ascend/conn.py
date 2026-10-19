@@ -129,6 +129,7 @@ class AscendKVManager(MooncakeKVManager):
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
         *,
         kv_buffer_indices: Optional[Tuple[int, ...]] = None,
+        page_blocks=None,
     ):
         if kv_buffer_indices == ():
             return 0
@@ -139,8 +140,10 @@ class AscendKVManager(MooncakeKVManager):
             )
 
         # Group by indices
-        prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
-            prefill_kv_indices, dst_kv_indices
+        prefill_kv_blocks, dst_kv_blocks = (
+            group_concurrent_contiguous(prefill_kv_indices, dst_kv_indices)
+            if page_blocks is None
+            else page_blocks
         )
 
         if kv_buffer_indices is not None:

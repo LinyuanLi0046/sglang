@@ -1897,6 +1897,35 @@ class MooncakeKVManager(CommonKVManager):
                             or self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
                         ):
+                            kv_kwargs = {}
+                            owner = kv_chunk.layerwise_owner
+                            if owner is not None:
+                                kv_kwargs["kv_buffer_indices"] = kv_chunk.kv_buffer_indices
+                                if kv_chunk.kv_buffer_indices:
+                                    # One immutable final range per owner. The
+                                    # fixed worker is the only cache user; key
+                                    # after the existing short-destination trim.
+                                    if owner.full_page_blocks is None:
+                                        owner.full_page_blocks = {}
+                                    index_slice = kv_chunk.index_slice
+                                    key = (
+                                        id(req),
+                                        index_slice.start,
+                                        index_slice.stop,
+                                        index_slice.step,
+                                        len(kv_chunk.prefill_kv_indices),
+                                        len(chunked_dst_kv_indice),
+                                    )
+                                    cached = owner.full_page_blocks.get(key)
+                                    if cached is None:
+                                        blocks = group_concurrent_contiguous(
+                                            kv_chunk.prefill_kv_indices,
+                                            chunked_dst_kv_indice,
+                                        )
+                                        # Retain the peer object to prevent id reuse.
+                                        cached = (req, blocks)
+                                        owner.full_page_blocks[key] = cached
+                                    kv_kwargs["page_blocks"] = cached[1]
                             ret = self.send_kvcache(
                                 req.mooncake_session_id,
                                 kv_chunk.prefill_kv_indices,
@@ -1905,11 +1934,7 @@ class MooncakeKVManager(CommonKVManager):
                                 executor,
                                 dst_layer_ids=target_rank_registration_info.dst_kv_layer_ids,
                                 dst_device_kv_indices=chunked_dst_device_kv_indice,
-                                **(
-                                    {"kv_buffer_indices": kv_chunk.kv_buffer_indices}
-                                    if kv_chunk.layerwise_owner is not None
-                                    else {}
-                                ),
+                                **kv_kwargs,
                             )
                         elif (
                             self.enable_staging

@@ -732,6 +732,10 @@ class WelmPrefillGraphAdapter:
                 ready.bind_after_replay(tickets)
             if committed:
                 layerwise_plan.arm(tickets)
+            if ready is not None:
+                # Destroy old readiness handles after graph submission and
+                # publication, rather than on the next graph's launch path.
+                ready.after_replay()
         except Exception as exc:
             if replay_started:
                 # A partially submitted graph or notification sequence cannot

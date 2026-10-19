@@ -109,6 +109,7 @@ class _LayerwiseProducerFence:
     def __init__(self):
         self.event = None
         self.armed = False
+        self.complete = False
 
     def record(self, device_module):
         self.event = device_module.Event()
@@ -116,7 +117,9 @@ class _LayerwiseProducerFence:
         self.armed = True
 
     def query(self):
-        return self.armed and self.event.query()
+        if not self.complete and self.armed and self.event.query():
+            self.complete = True
+        return self.complete
 
 
 class _LayerwisePrefillPlan:
@@ -129,12 +132,14 @@ class _LayerwisePrefillPlan:
         self.groups = ()
 
     def prepare(self, group_buffer_indices):
-        self.groups = tuple(tuple(group) for group in group_buffer_indices)
+        self.groups = group_buffer_indices
         if not self.candidates or not self.groups:
             return False
         page_size = self.scheduler.token_to_kv_pool_allocator.page_size
+        snapshot_ready = _LayerwiseProducerFence()
         for req, spec in self.candidates:
             reservation = LayerwiseReservation(spec)
+            reservation.snapshot_ready = snapshot_ready
             self.reservations[req] = reservation
             # Retain partial snapshots too if an allocation/copy/record fails.
             # The forward-finally producer fence protects their device lifetime.
@@ -152,8 +157,9 @@ class _LayerwisePrefillPlan:
                 pin_memory=True,
             )
             reservation.cpu_indices.copy_(reservation.device_indices, non_blocking=True)
-            reservation.snapshot_ready = self.scheduler.device_module.Event()
-            reservation.snapshot_ready.record()
+        # All copies precede Prompt on this stream. One cached fence covers the
+        # batch without adding a wait on the host or moving copies after replay.
+        snapshot_ready.record(self.scheduler.device_module)
         return True
 
     def commit(self):

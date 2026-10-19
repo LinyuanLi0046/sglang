@@ -291,9 +291,12 @@ class PromptReadySet:
 
     def reserve(self):
         self._check_healthy()
-        self._reap()
         if len(self._epochs) + len(self._reservations) >= self._MAX_PENDING:
-            return None
+            # Reclaim before declining a reservation under capacity pressure.
+            # Normally retire only after the next graphs have been submitted.
+            self._reap()
+            if len(self._epochs) + len(self._reservations) >= self._MAX_PENDING:
+                return None
         tickets = []
         try:
             for i in range(len(self.group_entries)):
@@ -309,7 +312,6 @@ class PromptReadySet:
 
     def before_replay(self):
         self._check_healthy()
-        self._reap()
         if self._pending is not None or self._last_gate is None:
             raise RuntimeError(
                 "WELM graph replay is missing capture or notification binding"
@@ -342,6 +344,10 @@ class PromptReadySet:
         self._last_gate = epoch.gate
         self._epochs.append(epoch)
         self._pending = None
+
+    def after_replay(self):
+        self._check_healthy()
+        self._reap()
 
     def fail(self):
         # Partial submission has unknown Device progress. Never destroy its
@@ -464,6 +470,7 @@ def _validate_runtime(runtime):
                     tail_done.record(stream)
                     runtime.current_stream()  # submit graph and tail event
                     ready.bind_after_replay(tickets)
+                    ready.after_replay()
                     executor.submit(await_ready, ready._last_gate).result()
                     if tail_done.query():
                         raise RuntimeError(

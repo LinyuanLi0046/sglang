@@ -599,13 +599,6 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
         self.result_queue = deque()
-        self._deferred_cached_prefixes = None
-        defer_cached_prefix = (
-            envs.SGLANG_DISAGG_PREFILL_DEFER_CACHED_PREFIX.get()
-            and envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get()
-            and self.transfer_backend == TransferBackend.MOONCAKE
-            and not self.enable_staging
-        )
 
         while True:
             # Receive requests
@@ -628,22 +621,6 @@ class SchedulerDisaggregationPrefillMixin:
             )
             self.cur_batch_for_debug = batch
 
-            if defer_cached_prefix and batch and self.last_batch:
-                # Use the queued result's request list: last_batch may have been
-                # filtered while preparing B. Only defer if A will publish final.
-                previous_reqs = self.result_queue[0][0].reqs
-                if any(
-                    req.inflight_middle_chunks <= 0 and not req.pending_bootstrap
-                    for req in previous_reqs
-                ):
-                    previous_rids = {req.rid for req in previous_reqs}
-                    # Shared chunked requests keep their original send order.
-                    self._deferred_cached_prefixes = {
-                        req.rid: None
-                        for req in batch.reqs
-                        if req.rid not in previous_rids
-                    }
-
             # Launch the current batch
             if batch:
                 if self.enable_staging:
@@ -661,21 +638,6 @@ class SchedulerDisaggregationPrefillMixin:
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
-
-            if self._deferred_cached_prefixes is not None:
-                deferred = self._deferred_cached_prefixes
-                self._deferred_cached_prefixes = None
-                # A.final is now published; release B.prefix in this same loop,
-                # before processing inflight completions or sampling B.
-                for entry in deferred.values():
-                    if entry is not None:
-                        req, page_indices, cached_end = entry
-                        req.disagg_kv_sender.send(
-                            page_indices,
-                            None,
-                            num_kv_tokens=cached_end - req.start_send_idx,
-                        )
-                        req.start_send_idx = cached_end
 
             self.process_disagg_prefill_inflight_queue()
 
@@ -1287,12 +1249,6 @@ class SchedulerDisaggregationPrefillMixin:
         ]
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
-            return
-        deferred = getattr(self, "_deferred_cached_prefixes", None)
-        if not last_chunk and deferred is not None and req.rid in deferred:
-            # Keep page-index preparation (including its D2H copy) before B's
-            # forward. Only the host-side sender publication is deferred.
-            deferred[req.rid] = (req, page_indices, end_idx)
             return
         req.disagg_kv_sender.send(
             page_indices,

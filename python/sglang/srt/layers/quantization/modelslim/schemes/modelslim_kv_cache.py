@@ -52,8 +52,6 @@ class ModelSlimKVCacheState:
     v_scale: Optional[torch.Tensor] = None
     k_inv_scale: Optional[torch.Tensor] = None
     v_inv_scale: Optional[torch.Tensor] = None
-    k_antiquant_scale: Optional[torch.Tensor] = None
-    v_antiquant_scale: Optional[torch.Tensor] = None
     v_scale_encoded: Optional[torch.Tensor] = None
     p_scale: Optional[torch.Tensor] = None
     refresh_cache_scales: Optional[Callable[[], None]] = None

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Dynamic per-token/head Q and static per-head K/V in ModelSlim FP8."""
+"""ModelSlim MLA FP8 with static shared latent and dynamic per-token/head Q."""
 
 import logging
 
@@ -11,6 +11,13 @@ logger = logging.getLogger(__name__)
 
 
 class ModelSlimQFP8DynamicKVFP8Scheme(ModelSlimKVCacheScheme):
+    def __init__(self, prefix, binding):
+        super().__init__(prefix, binding)
+        if not binding.shared_latent:
+            raise ValueError(
+                f"{prefix}: Q_FP8_DYNAMIC_KV_FP8 KV cache is only supported for MLA"
+            )
+
     def create_weights(self, layer):
         for component in ("k", "v"):
             self._create_parameter(
@@ -22,11 +29,10 @@ class ModelSlimQFP8DynamicKVFP8Scheme(ModelSlimKVCacheScheme):
 
     def process_weights_after_loading(self, layer):
         state = layer.modelslim_kv_state
-        components = ("k",) if self.binding.shared_latent else ("k", "v")
         for component in ("k", "v"):
             scale = getattr(layer, f"fa_{component}_scale")
             offset = getattr(layer, f"fa_{component}_offset")
-            if component in components and not scale.modelslim_loaded:
+            if component == "k" and not scale.modelslim_loaded:
                 logger.warning(
                     "%s.fa_%s.scale is missing; using scale=1 "
                     "(raw=%s, effective=%s, source=%s)",
@@ -50,38 +56,18 @@ class ModelSlimQFP8DynamicKVFP8Scheme(ModelSlimKVCacheScheme):
 
         # MLA's fa_v is export compatibility data. QK and PV share fa_k's C.
         self._set_runtime_tensor(state, "k_scale", layer.fa_k_scale)
-        self._set_runtime_tensor(
-            state,
-            "v_scale",
-            layer.fa_k_scale if self.binding.shared_latent else layer.fa_v_scale,
-        )
+        self._set_runtime_tensor(state, "v_scale", layer.fa_k_scale)
         self._set_runtime_tensor(state, "k_inv_scale", state.k_scale.reciprocal())
         self._set_runtime_tensor(state, "v_inv_scale", state.v_scale.reciprocal())
-        if not self.binding.shared_latent:
-            dtype = self.binding.compute_dtype
-            self._set_runtime_tensor(
-                state,
-                "k_antiquant_scale",
-                state.k_scale.expand(-1, self.binding.head_dim).to(dtype),
-            )
-            self._set_runtime_tensor(
-                state,
-                "v_antiquant_scale",
-                state.v_scale.expand(-1, self.binding.value_head_dim).to(dtype),
-            )
 
     def get_cache_spec(self):
         binding = self.binding
         return ModelSlimKVCacheSpec(
-            layout="mla_fp8" if binding.shared_latent else "gqa_fp8",
+            layout="mla_fp8",
             key_head_dim=binding.head_dim,
-            value_head_dim=(
-                binding.side_dim if binding.shared_latent else binding.value_head_dim
-            ),
+            value_head_dim=binding.side_dim,
             local_kv_heads=binding.num_local_kv_heads,
-            value_dtype=(
-                torch.bfloat16 if binding.shared_latent else torch.float8_e4m3fn
-            ),
+            value_dtype=torch.bfloat16,
         )
 
     def quantize_query(self, state, q):
@@ -113,11 +99,7 @@ class ModelSlimQFP8DynamicKVFP8Scheme(ModelSlimKVCacheScheme):
 
     def quantize_cache(self, state, k, v):
         k = self._quantize(k, state.k_inv_scale)
-        if self.binding.shared_latent:
-            v = v.to(torch.bfloat16)
-        else:
-            v = self._quantize(v, state.v_inv_scale)
-        return k, v, None, None
+        return k, v.to(torch.bfloat16), None, None
 
     def dequantize_cache(self, state, k, v=None, k_scale=None, v_scale=None):
         import torch_npu
@@ -128,10 +110,4 @@ class ModelSlimQFP8DynamicKVFP8Scheme(ModelSlimKVCacheScheme):
             state.k_scale.view(*([1] * (k.ndim - 2)), -1, 1),
             dst_dtype=self.binding.compute_dtype,
         )
-        if v is not None and not self.binding.shared_latent:
-            v = torch_npu.npu_anti_quant(
-                v,
-                state.v_scale.view(*([1] * (v.ndim - 2)), -1, 1),
-                dst_dtype=self.binding.compute_dtype,
-            )
         return k, v

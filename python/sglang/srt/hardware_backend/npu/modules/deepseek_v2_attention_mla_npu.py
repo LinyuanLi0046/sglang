@@ -212,7 +212,7 @@ def forward_mla_prepare_npu(
                     else {}
                 ),
             )
-        if kv_quant_state is not None:
+        if kv_quant_state is not None or m.mla_preprocess.uses_mlaprolog():
             (
                 q_pe,
                 k_pe,

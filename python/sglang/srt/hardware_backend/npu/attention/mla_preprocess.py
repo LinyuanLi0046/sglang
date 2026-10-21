@@ -643,10 +643,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         return result + (dequant_scale_q_nope,) if return_q_descale else result
 
     def uses_mlaprolog(self) -> bool:
-        _is_arch35_dsa = (
-            self.is_npu_arch35 and get_token_to_kv_pool().index_head_dim is not None
-        )
-        return _is_arch35_dsa or (
+        return self.is_npu_arch35 or (
             hasattr(self.quant_config, "ignore")
             and any(re.fullmatch(r".*kv_b_proj", l) for l in self.quant_config.ignore)
         )
@@ -659,12 +656,10 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             and self.qkv_a_proj.quant_method.quantization_config.get_name()
             == "modelslim"
         )
-        _is_arch35_dsa = (
-            self.is_npu_arch35 and get_token_to_kv_pool().index_head_dim is not None
-        )
         # with the mlaprolog enabled, the kv_b_proj layers are unquantized
         _is_mlaprolog = self.uses_mlaprolog()
-        if _is_w8a8 and not _is_arch35_dsa:
+        # The legacy MLAPO kernel is only available on A2/A3.
+        if _is_w8a8 and not self.is_npu_arch35:
             return self.forward_mlapo(
                 positions, hidden_states, forward_batch, zero_allocator
             )

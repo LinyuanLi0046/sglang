@@ -24,30 +24,91 @@ if is_npu():
     import torch_npu
 
 
+def get_modelslim_kv_cache_config(model, page_size):
+    """Collect the loaded layers' shared NPU allocation contract once."""
+    quant_config = getattr(model, "quant_config", None)
+    if (
+        quant_config is None
+        or quant_config.get_name() != "modelslim"
+        or quant_config.requested_kv_cache_dtype != "fp8_e4m3"
+    ):
+        return None, {}
+
+    cache_spec = None
+    states = {}
+    for module in model.modules():
+        state = getattr(module, "modelslim_kv_state", None)
+        if state is None:
+            if getattr(module, "kv_quant_binding", None) is not None:
+                raise ValueError(
+                    "Explicit ModelSlim FP8 KV cache cannot share a pool "
+                    f"with unquantized attention layer {module.layer_id}. "
+                    "Remove that layer's ignore/FLOAT declaration or use "
+                    "--kv-cache-dtype auto for a BF16 cache."
+                )
+            continue
+        spec = state.cache_spec
+        if cache_spec not in (None, spec):
+            raise ValueError(
+                "ModelSlim attention layers in one NPU pool must share "
+                "the same KV cache layout and local head geometry."
+            )
+        if spec.layout == "mla_fp8" and module.tp_q_head_num > 128:
+            raise ValueError(
+                "CANN 9.1.0 ModelSlim MLA FP8 FIA supports at most "
+                "128 local query heads; increase attention TP size."
+            )
+        cache_spec = spec
+        states[module.layer_id] = state
+
+    if cache_spec is not None and cache_spec.layout == "gqa_mxfp8":
+        if (
+            page_size not in (512, 1024)
+            or cache_spec.key_head_dim not in (64, 128)
+            or cache_spec.value_head_dim != cache_spec.key_head_dim
+        ):
+            raise ValueError(
+                "CANN 9.1.0 ModelSlim MXFP8 FIA requires --page-size 512 "
+                "or --page-size 1024 and equal K/V head dimensions of 64 or 128."
+            )
+    elif cache_spec is not None and cache_spec.layout == "mla_fp8":
+        if (
+            page_size != 128
+            or cache_spec.local_kv_heads != 1
+            or cache_spec.key_head_dim != 512
+            or cache_spec.value_head_dim != 64
+        ):
+            raise ValueError(
+                "CANN 9.1.0 ModelSlim MLA FP8 FIA requires --page-size 128, "
+                "one shared KV head, latent dimension 512 and side dimension 64."
+            )
+    return cache_spec, states
+
+
 def _mla_fia_nz_scatter_indices(
-    loc: torch.Tensor, head_dim: int, page_size: int
+    loc: torch.Tensor, head_dim: int, page_size: int, tile_size: int = 16
 ) -> torch.Tensor:
     """Return physical rows for token-wise writes into an MLA NZ cache.
 
     The storage allocation remains page-major ``[page, slot, 1, D]`` for
     transfer and bookkeeping compatibility. FIA reads that storage as
-    ``[page, 1, D / 16, page_size, 16]``. A token-major scatter would therefore
+    ``[page, 1, D / tile_size, page_size, tile_size]``. A token-major scatter would therefore
     write the wrong physical rows, so every logical token expands to its
-    ``D / 16`` NZ tiles.
+    ``D / tile_size`` NZ tiles.
     """
-    if head_dim % 16:
+    if head_dim % tile_size:
         raise ValueError(
-            "FIA NZ MLA cache requires a head dimension divisible by 16, "
+            f"FIA NZ MLA cache requires a head dimension divisible by {tile_size}, "
             f"got {head_dim}."
         )
     if page_size <= 0:
         raise ValueError(f"page_size must be positive, got {page_size}.")
 
-    num_tiles = head_dim // 16
+    num_tiles = head_dim // tile_size
     page = torch.div(loc, page_size, rounding_mode="floor")
     slot = torch.remainder(loc, page_size)
     tiles = torch.arange(num_tiles, dtype=loc.dtype, device=loc.device)
-    # Flatten [token, tile] in the same order as source.view(T, tiles, 16).
+    # Flatten [token, tile] in the same order as source.view(T, tiles, tile_size).
     rows = ((page[:, None] * num_tiles + tiles) * page_size) + slot[:, None]
     return rows.reshape(-1, 1)
 
@@ -103,9 +164,22 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
+        modelslim_cache_spec=None,
+        modelslim_states=None,
         **kwargs,
     ):
+        self.modelslim_cache_spec = modelslim_cache_spec
+        self.modelslim_states = modelslim_states or {}
+        self.is_modelslim_mxfp8 = (
+            modelslim_cache_spec is not None
+            and modelslim_cache_spec.layout == "gqa_mxfp8"
+        )
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        if modelslim_cache_spec is not None:
+            self.use_fia = True
+            head_num = modelslim_cache_spec.local_kv_heads
+            head_dim = modelslim_cache_spec.key_head_dim
+            v_head_dim = modelslim_cache_spec.value_head_dim
         self.use_scatter_pa_kv_cache = envs.SGLANG_NPU_USE_SCATTER_PA_KV_CACHE.get()
         self.use_triton_prefix_kv_cache_store = (
             envs.SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE.get()
@@ -132,6 +206,54 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            if self.is_modelslim_mxfp8:
+                pages = self.size // self.page_size + 1
+                shape = (self.layer_num, pages, self.head_num, self.page_size)
+                self._hicache_k_buffer = torch.zeros(
+                    (*shape, self.head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                self._hicache_v_buffer = torch.zeros(
+                    (*shape, self.v_head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                self.k_buffer_tensor = self._hicache_k_buffer
+                self.v_buffer_tensor = self._hicache_v_buffer
+                self.k_buffer = list(self.k_buffer_tensor.unbind(0))
+                self.v_buffer = list(self.v_buffer_tensor.unbind(0))
+                self.k_scale_buffer = torch.full(
+                    (*shape, self.head_dim // 64, 2),
+                    127,
+                    dtype=torch.uint8,
+                    device=self.device,
+                )
+                self.v_scale_buffer = torch.empty(
+                    (
+                        self.layer_num,
+                        pages,
+                        self.head_num,
+                        self.page_size // 64,
+                        self.v_head_dim,
+                        2,
+                    ),
+                    dtype=torch.uint8,
+                    device=self.device,
+                )
+                for layer_id, state in self.modelslim_states.items():
+                    scale_buffer = self.v_scale_buffer[layer_id - self.start_layer]
+
+                    def refresh_cache_scales(state=state, buffer=scale_buffer):
+                        buffer.copy_(
+                            state.v_scale_encoded.view(
+                                1, buffer.shape[1], 1, buffer.shape[-2], 1
+                            )
+                        )
+
+                    state.refresh_cache_scales = refresh_cache_scales
+                    refresh_cache_scales()
+                return
             # [size, head_num, head_dim] for each layer
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
             # Continuous memory improves the efficiency of Ascend`s transmission backend,
@@ -223,6 +345,40 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         # NPU paged buffer layout never builds.
         self._kv_copy_config = None
 
+    def get_kv_scale_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        local_layer = layer_id - self.start_layer
+        return self.k_scale_buffer[local_layer], self.v_scale_buffer[local_layer]
+
+    def _set_modelslim_mxfp8_buffer(self, layer_id, loc, cache_k, cache_v, k_scale):
+        # FIA uses BnNBsD; each write addresses [page, head, token].
+        loc = loc.reshape(-1)
+        heads = torch.arange(self.head_num, device=loc.device, dtype=loc.dtype)
+        pages = torch.div(loc, self.page_size, rounding_mode="floor")
+        slots = loc.remainder(self.page_size)
+        indices = torch.stack(
+            (
+                pages[:, None].expand(-1, self.head_num),
+                heads[None, :].expand(loc.numel(), -1),
+                slots[:, None].expand(-1, self.head_num),
+            ),
+            dim=-1,
+        ).reshape(-1, 3)
+        offset = layer_id - self.start_layer
+        for dst, src, width in (
+            (self.k_buffer[offset], cache_k, self.head_dim),
+            (self.v_buffer[offset], cache_v, self.v_head_dim),
+            (
+                self.k_scale_buffer[offset].flatten(-2),
+                k_scale,
+                self.head_dim // 32,
+            ),
+        ):
+            torch_npu.npu_scatter_nd_update_(
+                dst, indices, src.contiguous().view(-1, width)
+            )
+
     # for disagg
     def get_contiguous_buf_infos(self):
         # layer_num x [seq_len, head_num, head_dim]
@@ -275,7 +431,12 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
-        if cache_k.dtype != self.dtype:
+        state = getattr(layer, "modelslim_kv_state", None)
+        if state is not None:
+            cache_k, cache_v, k_scale, _ = state.scheme.quantize_cache(
+                state, cache_k, cache_v
+            )
+        elif cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
             if v_scale is not None:
@@ -286,6 +447,10 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
+
+        if self.is_modelslim_mxfp8:
+            self._set_modelslim_mxfp8_buffer(layer_id, loc, cache_k, cache_v, k_scale)
+            return
 
         # Both FIA and paged-attention buffers share the same physical layout.
         # Opt in at pool initialization, keeping environment reads outside graph
@@ -368,6 +533,21 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
+        if getattr(layer, "modelslim_kv_state", None) is not None:
+            # Slot zero is the allocator's reserved sink for uncommitted rows.
+            loc_2d = loc_2d.to(cache_k.device, non_blocking=True)
+            commit_lens = commit_lens.to(cache_k.device, non_blocking=True)
+            columns = torch.arange(loc_2d.shape[1], device=loc_2d.device)
+            loc = torch.where(
+                columns[None, :] < commit_lens[:, None], loc_2d, 0
+            ).flatten()
+            return self.set_kv_buffer(
+                layer,
+                loc,
+                cache_k,
+                cache_v,
+                layer_id_override=layer_id_override,
+            )
         if not self.use_triton_prefix_kv_cache_store:
             return super().set_kv_buffer_prefix_valid(
                 layer,
@@ -644,11 +824,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         indexer_layer_ids: Optional[Sequence[int]] = None,
         kv_cache_dim: Optional[int] = None,
         is_draft_worker: bool = False,
+        modelslim_cache_spec=None,
     ):
         # MLAPO historically owned NZ writes. Keep the allocation unchanged and
         # write into the NZ-addressed view below so ordinary MLA (including
         # Kimi-K3 MTP) can use FIA NZ without MLAPO.
         self.use_fia_nz = get_bool_env_var("SGLANG_USE_FIA_NZ")
+        self.modelslim_cache_spec = modelslim_cache_spec
         super(MLATokenToKVPool, self).__init__(
             size=size,
             page_size=page_size,
@@ -704,6 +886,14 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             requested_kv_cache_dim if self.dsa_kv_cache_store_fp8 else kv_lora_rank
         )
         self.kr_cache_dim = 0 if self.dsa_kv_cache_store_fp8 else qk_rope_head_dim
+        self.side_dtype = (
+            modelslim_cache_spec.value_dtype
+            if modelslim_cache_spec is not None
+            else dtype
+        )
+        self.side_store_dtype = (
+            self.side_dtype if modelslim_cache_spec is not None else self.store_dtype
+        )
         self.index_k_scale_buffer = None
         self.indexer_hadamard_128 = None
         self.index_page_size = page_size if index_page_size is None else index_page_size
@@ -750,7 +940,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     dtype=(
                         torch.bfloat16
                         if self.dsa_kv_cache_store_fp8
-                        else self.store_dtype
+                        else self.side_store_dtype
                     ),
                     device=self.device,
                 )
@@ -865,10 +1055,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         self._raise_if_native_kv_cache_disabled()
-        return (
-            self.k_buffer[layer_id - self.start_layer],
-            self.v_buffer[layer_id - self.start_layer],
-        )
+        key = self.k_buffer[layer_id - self.start_layer]
+        value = self.v_buffer[layer_id - self.start_layer]
+        if self.modelslim_cache_spec is not None:
+            key = key.view(self.dtype)
+            value = value.view(self.side_dtype)
+        return key, value
 
     def get_state_buf_infos(self):
         if self.index_head_dim is None:
@@ -895,8 +1087,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         self._raise_if_native_kv_cache_disabled()
 
-        if self.store_dtype != self.dtype:
-            return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
+        if self.side_store_dtype != self.side_dtype:
+            return self.v_buffer[layer_id - self.start_layer].view(self.side_dtype)
         return self.v_buffer[layer_id - self.start_layer]
 
     def get_index_k_buffer(self, layer_id: int):
@@ -1022,13 +1214,19 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )
 
-        if cache_k.dtype != self.dtype:
+        state = getattr(layer, "modelslim_kv_state", None)
+        if state is not None:
+            cache_k, cache_v, _, _ = state.scheme.quantize_cache(
+                state, cache_k, cache_v
+            )
+        elif cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
-            cache_v = cache_v.to(self.dtype)
+            cache_v = cache_v.to(self.side_dtype)
 
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
-            cache_v = cache_v.view(self.store_dtype)
+        if self.side_store_dtype != self.side_dtype:
+            cache_v = cache_v.view(self.side_store_dtype)
 
         if self.use_fia_nz:
             self._set_fia_nz_kv_buffer(layer_id, loc, cache_k, cache_v)
@@ -1057,12 +1255,17 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         """Store MLA latent and RoPE KV tensors in FIA's NZ tile order."""
 
         def scatter(cache: torch.Tensor, values: torch.Tensor, head_dim: int):
-            num_tiles = head_dim // 16
-            indices = _mla_fia_nz_scatter_indices(loc, head_dim, self.page_size)
+            tile_size = 32 // cache.element_size()
+            num_tiles = head_dim // tile_size
+            indices = _mla_fia_nz_scatter_indices(
+                loc, head_dim, self.page_size, tile_size
+            )
             # Destination rows are ordered [page, tile, slot]. Source rows use
             # the matching [token, tile] order after this reshape.
-            dst = cache.view(-1, 1, num_tiles, self.page_size, 16).view(-1, 16)
-            src = values.contiguous().view(-1, num_tiles, 16).view(-1, 16)
+            dst = cache.view(-1, 1, num_tiles, self.page_size, tile_size).view(
+                -1, tile_size
+            )
+            src = values.contiguous().view(-1, num_tiles, tile_size).view(-1, tile_size)
             torch_npu.npu_scatter_nd_update_(dst, indices, src)
 
         offset = layer_id - self.start_layer

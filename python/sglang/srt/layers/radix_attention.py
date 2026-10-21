@@ -74,6 +74,7 @@ class RadixAttention(nn.Module):
         use_irope: bool = False,
         prefix: str = "",
         use_prefill_attention_wrapper: bool = True,
+        kv_quant_binding=None,
     ):
         super().__init__()
         self.tp_q_head_num = num_heads
@@ -98,6 +99,8 @@ class RadixAttention(nn.Module):
         self.idx_k_scale_float = None
         self.idx_v_scale_float = None
         self.quant_method = None
+        self.kv_quant_binding = kv_quant_binding
+        self.modelslim_kv_state = None
 
         if quant_config is not None:
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)

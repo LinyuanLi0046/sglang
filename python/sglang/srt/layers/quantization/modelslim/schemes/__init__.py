@@ -5,11 +5,19 @@
 # so the base class must be imported first.
 # isort: off
 from .modelslim_scheme import ModelSlimLinearScheme, ModelSlimMoEScheme
+from .modelslim_kv_cache import (
+    ModelSlimKVCacheBinding,
+    ModelSlimKVCacheSpec,
+    ModelSlimKVCacheState,
+    ModelSlimKVCacheScheme,
+)
 from .modelslim_mxfp8 import ModelSlimMXFP8Scheme
 from .modelslim_mxfp4_w4a8 import ModelSlimMXFP4W4A8Scheme
 from .modelslim_mxfp4 import ModelSlimMXFP4Scheme
 
 # isort: on
+from .modelslim_kv_fp8 import ModelSlimQFP8DynamicKVFP8Scheme
+from .modelslim_kv_mxfp8 import ModelSlimQKMXFP8DynamicVMXFP8PerChannelScheme
 from .modelslim_mxfp8_moe import ModelSlimMXFP8MoEScheme
 from .modelslim_w4a4_int4 import ModelSlimW4A4Int4
 from .modelslim_w4a4_int4_moe import ModelSlimW4A4Int4MoE
@@ -22,6 +30,12 @@ from .modelslim_w8a8_int8_moe import ModelSlimW8A8Int8MoE
 __all__ = [
     "ModelSlimLinearScheme",
     "ModelSlimMoEScheme",
+    "ModelSlimKVCacheBinding",
+    "ModelSlimKVCacheSpec",
+    "ModelSlimKVCacheState",
+    "ModelSlimKVCacheScheme",
+    "ModelSlimQFP8DynamicKVFP8Scheme",
+    "ModelSlimQKMXFP8DynamicVMXFP8PerChannelScheme",
     "ModelSlimMXFP8Scheme",
     "ModelSlimMXFP4W4A8Scheme",
     "ModelSlimMXFP4Scheme",

@@ -23,6 +23,9 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.hardware_backend.npu.attention.modelslim_attention import (
+    forward_modelslim_attention,
+)
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
@@ -1498,8 +1501,13 @@ class AscendAttnBackend(AttentionBackend):
         topk_indices: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
         slopes: Optional[torch.Tensor] = None,
+        q_descale: Optional[torch.Tensor] = None,
     ):
-        if is_mla_preprocess_enabled() and self.use_mla:
+        if (
+            is_mla_preprocess_enabled()
+            and self.use_mla
+            and layer.modelslim_kv_state is None
+        ):
             # DSA callers set save_kv_cache based on whether preprocessing was used.
             # Only override it for the existing non-sparse MLA path.
             if topk_indices is None:
@@ -1558,6 +1566,7 @@ class AscendAttnBackend(AttentionBackend):
                 q_rope=q_rope,
                 k_rope=k_rope,
                 sinks=sinks,
+                q_descale=q_descale,
             )
 
         if not self.use_mla:
@@ -1596,6 +1605,9 @@ class AscendAttnBackend(AttentionBackend):
                     self.token_to_kv_pool.set_kv_buffer(
                         layer, KVWriteLoc(cache_loc, swa_loc), k, v
                     )
+
+            if layer.modelslim_kv_state is not None:
+                return forward_modelslim_attention(self, q, layer, forward_batch)
 
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
@@ -1988,6 +2000,9 @@ class AscendAttnBackend(AttentionBackend):
                     self.forward_metadata.flatten_prefix_block_tables,
                     is_nz=is_fia_nz(),
                 )
+                if layer.modelslim_kv_state is not None:
+                    state = layer.modelslim_kv_state
+                    kv_cached = state.scheme.dequantize_cache(state, kv_cached)[0]
                 k_rope_cached = gather_mla_cache_pages(
                     v_buffer,
                     self.forward_metadata.flatten_prefix_block_tables,
@@ -2089,6 +2104,9 @@ class AscendAttnBackend(AttentionBackend):
                     self.forward_metadata.flatten_prefix_block_tables,
                     is_nz=is_fia_nz(),
                 )
+                if layer.modelslim_kv_state is not None:
+                    state = layer.modelslim_kv_state
+                    kv_cached = state.scheme.dequantize_cache(state, kv_cached)[0]
                 k_rope_cached = gather_mla_cache_pages(
                     v_buffer,
                     self.forward_metadata.flatten_prefix_block_tables,
@@ -2335,6 +2353,7 @@ class AscendAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        q_descale: Optional[torch.Tensor] = None,
     ):
         if save_kv_cache:
             if self.use_mla:
@@ -2353,6 +2372,11 @@ class AscendAttnBackend(AttentionBackend):
                     k,
                     v,
                 )
+
+        if layer.modelslim_kv_state is not None:
+            return forward_modelslim_attention(
+                self, q, layer, forward_batch, q_rope=q_rope, q_descale=q_descale
+            )
 
         if not self.use_mla:
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
@@ -2967,7 +2991,11 @@ class AscendAttnBackend(AttentionBackend):
         slopes: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        if is_mla_preprocess_enabled() and self.use_mla:
+        if (
+            is_mla_preprocess_enabled()
+            and self.use_mla
+            and layer.modelslim_kv_state is None
+        ):
             # DSA callers set save_kv_cache based on whether preprocessing was used.
             # Only override it for the existing non-sparse MLA path.
             if topk_indices is None:
@@ -3000,6 +3028,31 @@ class AscendAttnBackend(AttentionBackend):
                 q_rope,
                 k_rope,
                 topk_indices,
+            )
+
+        if layer.modelslim_kv_state is not None:
+            if save_kv_cache:
+                if self.use_mla:
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer, forward_batch.out_cache_loc, k, k_rope
+                    )
+                else:
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        KVWriteLoc(
+                            forward_batch.out_cache_loc,
+                            self.forward_metadata.swa_out_cache_loc,
+                        ),
+                        k,
+                        v,
+                    )
+            return forward_modelslim_attention(
+                self,
+                q,
+                layer,
+                forward_batch,
+                q_rope=q_rope,
+                q_descale=kwargs.get("q_descale"),
             )
 
         if self.graph_mode and (not self.enable_torch_compile):

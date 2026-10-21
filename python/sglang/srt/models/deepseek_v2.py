@@ -253,6 +253,9 @@ else:
 if _is_cuda:
     from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
 elif _is_npu:
+    from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
+        modelslim_mlaprolog_eligible,
+    )
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
         forward_dsa_core_npu,
         forward_dsa_prepare_npu,
@@ -260,6 +263,9 @@ elif _is_npu:
         forward_mha_prepare_npu,
         forward_mla_core_npu,
         forward_mla_prepare_npu,
+    )
+    from sglang.srt.layers.quantization.modelslim.schemes.modelslim_kv_cache import (
+        ModelSlimKVCacheBinding,
     )
 else:
     pass
@@ -2207,6 +2213,23 @@ class DeepseekV2AttentionMLA(
             self.rotary_emb = None
         self.use_deepseek_yarn_rope = rope_scaling is not None
 
+        kv_quant_binding = None
+        if (
+            _is_npu
+            and quant_config is not None
+            and quant_config.get_name() == "modelslim"
+            and not self.use_dsa
+        ):
+            kv_quant_binding = ModelSlimKVCacheBinding(
+                num_kv_heads=1,
+                num_local_kv_heads=1,
+                head_dim=self.kv_lora_rank,
+                value_head_dim=self.kv_lora_rank,
+                shared_latent=True,
+                side_dim=self.qk_rope_head_dim,
+                canonical_prefix=prefix,
+                compute_dtype=torch.get_default_dtype(),
+            )
         self.attn_mqa = RadixAttention(
             self.num_local_heads,
             self.kv_lora_rank + self.qk_rope_head_dim,
@@ -2216,7 +2239,9 @@ class DeepseekV2AttentionMLA(
             v_head_dim=self.kv_lora_rank,
             quant_config=quant_config,
             prefix=add_prefix("attn_mqa", prefix),
+            kv_quant_binding=kv_quant_binding,
         )
+        modelslim_kv_state = getattr(self.attn_mqa, "modelslim_kv_state", None)
         # use num_local_heads * dcp_world_size because q_nope, q_rope is all gathered from dcp ranks
         if self.dcp_size > 1:
             self.attn_mqa_for_dcp_decode = RadixAttention(
@@ -2226,9 +2251,11 @@ class DeepseekV2AttentionMLA(
                 num_kv_heads=1,
                 layer_id=layer_id,
                 v_head_dim=self.kv_lora_rank,
-                quant_config=quant_config,
+                quant_config=quant_config if modelslim_kv_state is None else None,
                 prefix=add_prefix("attn_mqa", prefix),
             )
+            if modelslim_kv_state is not None:
+                self.attn_mqa_for_dcp_decode.modelslim_kv_state = modelslim_kv_state
 
         self.attn_mha = RadixAttention(
             self.num_local_heads,
@@ -2237,9 +2264,14 @@ class DeepseekV2AttentionMLA(
             num_kv_heads=self.num_local_heads,
             layer_id=layer_id,
             v_head_dim=self.v_head_dim,
-            quant_config=quant_config,
+            quant_config=quant_config if modelslim_kv_state is None else None,
             prefix=add_prefix("attn_mha", prefix),
         )
+        if modelslim_kv_state is not None:
+            # Both execution views read the canonical owner's mutable state.
+            # Only attn_mqa registers checkpoint parameters.
+            self.attn_mha.modelslim_kv_state = modelslim_kv_state
+            self._modelslim_mlaprolog_enabled = modelslim_mlaprolog_eligible(self)
 
         self.alt_stream = alt_stream
         self.attn_mha.kv_b_proj = None

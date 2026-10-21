@@ -70,7 +70,14 @@ if _use_aiter:
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 
+    from sglang.srt.distributed.utils import get_group_rank_size
     from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
+    from sglang.srt.layers.quantization.modelslim.modelslim import (
+        maybe_remap_modelslim_kv_scale_name,
+    )
+    from sglang.srt.layers.quantization.modelslim.schemes.modelslim_kv_cache import (
+        ModelSlimKVCacheBinding,
+    )
 
 
 def aiter_fused_qk_norm_rope_set_kv(
@@ -220,6 +227,23 @@ class Qwen3Attention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
+        kv_quant_binding = None
+        if (
+            _is_npu
+            and quant_config is not None
+            and quant_config.get_name() == "modelslim"
+        ):
+            kv_rank, _ = get_group_rank_size(self.qkv_proj.kv_tp_group)
+            kv_quant_binding = ModelSlimKVCacheBinding(
+                num_kv_heads=self.total_num_kv_heads,
+                num_local_kv_heads=self.qkv_proj.num_kv_heads,
+                head_dim=self.head_dim,
+                value_head_dim=self.head_dim,
+                kv_tp_rank=kv_rank,
+                num_kv_head_replicas=self.qkv_proj.num_kv_head_replicas,
+                canonical_prefix=prefix,
+                compute_dtype=torch.get_default_dtype(),
+            )
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -227,6 +251,8 @@ class Qwen3Attention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             prefix=add_prefix("attn", prefix),
+            quant_config=quant_config if kv_quant_binding is not None else None,
+            kv_quant_binding=kv_quant_binding,
         )
         self.alt_stream = alt_stream
 
@@ -730,6 +756,14 @@ class Qwen3ForCausalLM(nn.Module):
                 continue
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
+            if (
+                _is_npu
+                and self.quant_config is not None
+                and self.quant_config.get_name() == "modelslim"
+            ):
+                name = maybe_remap_modelslim_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
             if "scale" in name:
                 name = maybe_remap_kv_scale_name(name, params_dict)
                 if name is None:

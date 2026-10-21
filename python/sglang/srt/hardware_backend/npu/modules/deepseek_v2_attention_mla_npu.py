@@ -50,6 +50,7 @@ def forward_mha_prepare_npu(
     zero_allocator: "BumpAllocator",
     input_on_attn_tp_slices: bool,
 ):
+    kv_quant_state = getattr(m.attn_mqa, "modelslim_kv_state", None)
     if m.q_lora_rank is not None:
         q, latent_cache = (
             get_attn_tp_context()
@@ -111,7 +112,11 @@ def forward_mha_prepare_npu(
             k_rope_cache,
             ckv_cache,
             k_rope_scale=None,
-            c_kv_scale=None,
+            c_kv_scale=(
+                kv_quant_state.k_inv_scale.view(1)
+                if kv_quant_state is not None
+                else None
+            ),
             k_rope_offset=None,
             c_kv_offset=None,
             epsilon=m.kv_a_layernorm.variance_epsilon,
@@ -124,10 +129,18 @@ def forward_mha_prepare_npu(
         kv_a = m.kv_a_layernorm(kv_a)
         k_pe = latent_cache[:, :, m.kv_lora_rank :]
         if m.rotary_emb is not None:
-            q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+            if kv_quant_state is not None and not m.rotary_emb.is_neox_style:
+                q_pe, k_pe = _apply_interleaved_rope_with_half_output(
+                    m.rotary_emb, positions, q_pe, k_pe
+                )
+            else:
+                q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
         # this is for model kimi-vl-a3B-instruct
         get_token_to_kv_pool().set_kv_buffer(
-            m, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+            m.attn_mqa if kv_quant_state is not None else m,
+            forward_batch.out_cache_loc,
+            kv_a.unsqueeze(1),
+            k_pe,
         )
 
     q[..., m.qk_nope_head_dim :] = q_pe
@@ -172,8 +185,15 @@ def forward_mla_prepare_npu(
     zero_allocator: "BumpAllocator",
     input_on_attn_tp_slices: bool,
 ):
-    if is_mla_preprocess_enabled():
+    kv_quant_state = getattr(m.attn_mqa, "modelslim_kv_state", None)
+    q_descale = None
+    if kv_quant_state is not None:
+        cache_written = m._modelslim_mlaprolog_enabled
+    else:
+        cache_written = is_mla_preprocess_enabled()
+    if cache_written:
         if not hasattr(m, "mla_preprocess"):
+            # Supply the prolog config only for C8; preserve legacy MLA dispatch.
             m.mla_preprocess = NPUFusedMLAPreprocess(
                 m.fused_qkv_a_proj_with_mqa,
                 m.q_a_layernorm,
@@ -185,19 +205,39 @@ def forward_mla_prepare_npu(
                 m.num_local_heads,
                 m.qk_nope_head_dim,
                 m.qk_rope_head_dim,
-                m.quant_config,
+                m.v_head_dim,
+                **(
+                    dict(quant_config=m.quant_config, kv_quant_state=kv_quant_state)
+                    if kv_quant_state is not None
+                    else {}
+                ),
             )
-        (
-            q_pe,
-            k_pe,
-            q_nope_out,
-            k_nope,
-            forward_batch,
-            zero_allocator,
-            positions,
-        ) = m.mla_preprocess.forward(
-            positions, hidden_states, forward_batch, zero_allocator
-        )
+        if kv_quant_state is not None:
+            (
+                q_pe,
+                k_pe,
+                q_nope_out,
+                k_nope,
+                _,
+                forward_batch,
+                positions,
+                _,
+                q_descale,
+            ) = m.mla_preprocess.forward_mlaprolog(
+                positions, hidden_states, forward_batch, return_q_descale=True
+            )
+        else:
+            (
+                q_pe,
+                k_pe,
+                q_nope_out,
+                k_nope,
+                forward_batch,
+                zero_allocator,
+                positions,
+            ) = m.mla_preprocess.forward(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
         topk_indices = None
     else:
         q_lora = None
@@ -264,7 +304,12 @@ def forward_mla_prepare_npu(
         q_nope_out = q_nope_out.transpose(0, 1)
 
         if m.rotary_emb is not None:
-            q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+            if kv_quant_state is not None and not m.rotary_emb.is_neox_style:
+                q_pe, k_pe = _apply_interleaved_rope_with_half_output(
+                    m.rotary_emb, positions, q_pe, k_pe
+                )
+            else:
+                q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
         if dsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
@@ -281,6 +326,14 @@ def forward_mla_prepare_npu(
                 layer_id=m.layer_id,
             )
 
+        if kv_quant_state is not None:
+            q_nope_out, q_descale = kv_quant_state.scheme.quantize_query(
+                kv_quant_state, q_nope_out
+            )
+            q_pe = (q_pe.float() / (q_descale * kv_quant_state.k_scale)).to(
+                torch.bfloat16
+            )
+
     return (
         q_pe,
         k_pe,
@@ -290,6 +343,8 @@ def forward_mla_prepare_npu(
         zero_allocator,
         positions,
         topk_indices,
+        q_descale,
+        cache_written,
     )
 
 
@@ -303,11 +358,16 @@ def forward_mla_core_npu(
     zero_allocator: "BumpAllocator",
     positions: torch.Tensor,
     topk_indices: torch.Tensor,
+    q_descale: Optional[torch.Tensor],
+    cache_written: bool,
     # Gated attention (Ling-V3 / BailingMoeV3): the subclass appends its gate
     # to inner_state, so every *_core dispatched from forward_core takes it as
     # a trailing arg. None everywhere else.
     gate: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    attn_kwargs = dict(topk_indices=topk_indices) if topk_indices is not None else {}
+    if getattr(m.attn_mqa, "modelslim_kv_state", None) is not None:
+        attn_kwargs.update(q_descale=q_descale, save_kv_cache=not cache_written)
     attn_output = m.attn_mqa(
         q_nope_out,
         k_nope,
@@ -315,7 +375,7 @@ def forward_mla_core_npu(
         forward_batch,
         q_rope=q_pe,
         k_rope=k_pe,
-        **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+        **attn_kwargs,
     )
 
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)

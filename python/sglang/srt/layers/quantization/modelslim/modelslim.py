@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+from collections import Counter
+from fnmatch import fnmatchcase
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Union, cast
 
@@ -14,12 +16,16 @@ from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
+    QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.modelslim.schemes import (
+    ModelSlimKVCacheState,
     ModelSlimMXFP4Scheme,
     ModelSlimMXFP4W4A8Scheme,
     ModelSlimMXFP8MoEScheme,
     ModelSlimMXFP8Scheme,
+    ModelSlimQFP8DynamicKVFP8Scheme,
+    ModelSlimQKMXFP8DynamicVMXFP8PerChannelScheme,
     ModelSlimW4A4Int4,
     ModelSlimW4A4Int4MoE,
     ModelSlimW4A4MXFP4MoE,
@@ -37,12 +43,31 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
-    from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
     from sglang.srt.layers.quantization.modelslim.schemes import (
         ModelSlimLinearScheme,
     )
 
 logger = logging.getLogger(__name__)
+
+
+def maybe_remap_modelslim_kv_scale_name(name, params_dict, owner="attn"):
+    """Map only ModelSlim FA parameters; skip known unused FA compatibility data."""
+    stem, _, parameter = name.rpartition(".")
+    prefix, _, component = stem.rpartition(".")
+    if parameter not in ("scale", "offset") or component not in (
+        "fa_q",
+        "fa_k",
+        "fa_v",
+    ):
+        return name
+    target_suffix = f"{component}_{parameter}"
+    candidates = [f"{prefix}.{owner}.{target_suffix}"]
+    # Qwen3.5 maps self_attn to its full-attention module before loading.
+    if prefix.endswith(".self_attn"):
+        candidates.append(
+            f"{prefix.removesuffix('.self_attn')}.{owner}.{target_suffix}"
+        )
+    return next((key for key in candidates if key in params_dict), None)
 
 
 # func refers to RMSNorm.__init__
@@ -97,6 +122,10 @@ class ModelSlimConfig(QuantizationConfig):
 
     def __init__(self, quant_config: Dict[str, Any] = {}):
         super().__init__()
+        self.requested_kv_cache_dtype = "auto"
+        self.kv_quant_type_override = None
+        self.kv_model_identity = None
+        self._kv_raw_types = Counter()
         keys = [k for k in quant_config if isinstance(k, str)]
         is_dsv4 = any(k.startswith("hc_head_") for k in keys)
         if is_dsv4:
@@ -201,6 +230,119 @@ class ModelSlimConfig(QuantizationConfig):
 
         self.quant_description = quant_config
 
+    def bind_kv_cache_request(self, dtype, *, override=None, model_identity=None):
+        """Bind this worker's request before constructing its attention layers."""
+        self.requested_kv_cache_dtype = dtype
+        self.kv_model_identity = model_identity
+        self.kv_quant_type_override = (
+            (override.strip() or None)
+            if dtype == "fp8_e4m3" and override is not None
+            else None
+        )
+        if self.kv_quant_type_override is not None:
+            self._kv_scheme_class(self.kv_quant_type_override)
+
+    @staticmethod
+    def _kv_scheme_class(quant_type):
+        # The sole supported-format map, also used to validate an override.
+        kv_quant_schemes = {
+            "Q_FP8_DYNAMIC_KV_FP8": ModelSlimQFP8DynamicKVFP8Scheme,
+            "QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL": (
+                ModelSlimQKMXFP8DynamicVMXFP8PerChannelScheme
+            ),
+        }
+        scheme_class = kv_quant_schemes.get(quant_type)
+        if scheme_class is None:
+            raise ValueError(f"Unsupported ModelSlim KV quant_type: {quant_type!r}")
+        return scheme_class
+
+    def log_kv_quantization_summary(self):
+        if self.kv_quant_type_override is not None:
+            logger.info(
+                "SGLANG_NPU_MODELSLIM_KV_QUANT_TYPE_OVERRIDE=%s for %s: "
+                "%d attention layers, raw quant_type counts=%s",
+                self.kv_quant_type_override,
+                self.kv_model_identity,
+                sum(self._kv_raw_types.values()),
+                dict(self._kv_raw_types),
+            )
+            if not self._kv_raw_types:
+                logger.warning(
+                    "ModelSlim KV quant_type override matched no attention layers"
+                )
+
+    def get_kv_scheme(self, layer, prefix):
+        if self.requested_kv_cache_dtype != "fp8_e4m3":
+            return None
+        binding = layer.kv_quant_binding
+        if binding is None:
+            return None
+        prefix = binding.canonical_prefix or prefix.rsplit(".", 1)[0]
+        resolved_prefix = prefix
+        candidates = self._quant_prefix_candidates(prefix)
+        # Qwen3.5's loader removes the checkpoint's model.language_model wrapper.
+        for candidate in list(candidates):
+            if candidate.startswith("model.language_model."):
+                candidates.append(
+                    candidate.replace("model.language_model.", "model.", 1)
+                )
+            elif candidate.startswith("model."):
+                candidates.append(
+                    candidate.replace("model.", "model.language_model.", 1)
+                )
+        kv_suffixes = (
+            "quant_type",
+            "fa_k.scale",
+            "fa_k.offset",
+            "fa_v.scale",
+            "fa_v.offset",
+        )
+        has_layer_metadata = False
+        for candidate in candidates:
+            if any(
+                f"{candidate}.{suffix}" in self.quant_description
+                for suffix in kv_suffixes
+            ):
+                resolved_prefix = candidate
+                has_layer_metadata = True
+                break
+        raw = self.quant_description.get(f"{resolved_prefix}.quant_type")
+        if raw == "FLOAT" or any(
+            fnmatchcase(resolved_prefix, ignored)
+            or resolved_prefix.startswith(ignored + ".")
+            for ignored in self.ignore
+        ):
+            return None
+        if not has_layer_metadata:
+            raise ValueError(
+                f"{resolved_prefix}: explicit ModelSlim FP8 KV cache requires "
+                "a per-layer FA quantization declaration; an override does not "
+                "create quantized layers"
+            )
+        effective = self.kv_quant_type_override or raw
+        try:
+            scheme_class = self._kv_scheme_class(effective)
+        except ValueError as error:
+            raise ValueError(
+                f"{resolved_prefix}: unsupported ModelSlim KV format "
+                f"(raw={raw!r}, effective={effective!r})"
+            ) from error
+        scheme = scheme_class(resolved_prefix, binding)
+        layer.modelslim_kv_state = ModelSlimKVCacheState(
+            scheme=scheme,
+            binding=binding,
+            cache_spec=scheme.get_cache_spec(),
+            raw_quant_type=raw,
+            effective_quant_type=effective,
+            quant_type_source=(
+                "environment_override"
+                if self.kv_quant_type_override is not None
+                else "checkpoint"
+            ),
+        )
+        self._kv_raw_types[raw] += 1
+        return scheme
+
     def update_packed_modules_mapping(self, mapping: Dict[str, List[str]]) -> None:
         self.packed_modules_mapping.update(mapping)
 
@@ -262,6 +404,11 @@ class ModelSlimConfig(QuantizationConfig):
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.layers.radix_attention import RadixAttention
+
+        if isinstance(layer, RadixAttention):
+            layer.scheme = self.get_kv_scheme(layer, prefix)
+            return ModelSlimKVCacheMethod() if layer.scheme is not None else None
 
         if isinstance(layer, LinearBase):
             # TODO: we should remove this code and switch to the packed_modules_mapping declared inside the modeling files
@@ -470,6 +617,26 @@ class ModelSlimConfig(QuantizationConfig):
 
     def get_scaled_act_names(self) -> List[str]:
         return []
+
+
+class ModelSlimKVCacheMethod(QuantizeMethodBase):
+    """Use the attention layer's scheme without GPU per-tensor KV fallbacks."""
+
+    def create_weights(self, layer):
+        layer.scheme.create_weights(layer)
+
+    def process_weights_after_loading(self, layer):
+        layer.scheme.process_weights_after_loading(layer)
+        refresh = layer.modelslim_kv_state.refresh_cache_scales
+        if refresh is not None:
+            refresh()
+
+    def restore_weights_before_loading(self, layer):
+        for parameter in layer.parameters(recurse=False):
+            parameter.modelslim_loaded = False
+
+    def apply(self, layer, k, v):
+        return layer.scheme.quantize_cache(layer.modelslim_kv_state, k, v)
 
 
 class ModelSlimLinearMethod(_NPULinearMethodBase):

@@ -214,6 +214,24 @@ def _get_quantization_config(
         # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
         if quant_config is None:
             return None
+        if _is_npu and model_config.quantization == "modelslim":
+            server_args = get_server_args()
+            requested_dtype = (
+                server_args.speculative_draft_kv_cache_dtype
+                if model_config.is_draft_model
+                and server_args.speculative_draft_kv_cache_dtype is not None
+                else server_args.kv_cache_dtype
+            )
+            override = (
+                envs.SGLANG_NPU_MODELSLIM_KV_QUANT_TYPE_OVERRIDE.get()
+                if requested_dtype == "fp8_e4m3" and not model_config.is_draft_model
+                else None
+            )
+            quant_config.bind_kv_cache_request(
+                requested_dtype,
+                override=override,
+                model_identity=model_config.model_path,
+            )
         from sglang.srt.layers.quantization.fp8 import Fp8Config
 
         if isinstance(quant_config, Fp8Config):
@@ -304,6 +322,8 @@ def _initialize_model(
     with get_model().override(shared_experts=shared_experts):
         model = model_class(**kwargs)
         check_stage_producers(model)
+    if _is_npu and model_config.quantization == "modelslim":
+        quant_config.log_kv_quantization_summary()
     model.shared_experts_config = shared_experts
     return model
 

@@ -161,6 +161,11 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 
+if _is_npu:
+    from sglang.srt.layers.quantization.modelslim.modelslim import (
+        maybe_remap_modelslim_kv_scale_name,
+    )
+
 
 def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
@@ -3195,6 +3200,17 @@ class KimiK3LinearForCausalLM(nn.Module):
             # (NPU keeps weight_packed for NPUCompressedTensorsW4A8mxfp4MoE).
             if "weight_packed" in name and not _is_npu:
                 name = name.replace("weight_packed", "weight")
+
+            if (
+                _is_npu
+                and self.quant_config is not None
+                and self.quant_config.get_name() == "modelslim"
+            ):
+                name = maybe_remap_modelslim_kv_scale_name(
+                    name, params_dict, owner="attn_mqa"
+                )
+                if name is None:
+                    continue
 
             # MLA: fuse q_a_proj + kv_a_proj_with_mqa → fused_qkv_a_proj_with_mqa
             if ".q_a_proj." in name or ".kv_a_proj_with_mqa." in name:

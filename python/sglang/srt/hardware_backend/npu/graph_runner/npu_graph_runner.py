@@ -110,6 +110,8 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         from sglang.srt.compilation import torch_compile_decoration
 
         torch_compile_decoration.patch_model = patch_model_npu
+        cache_spec = model_runner.kv_cache_configurator.modelslim_cache_spec
+        self.modelslim_kv = cache_spec is not None
         super().__init__(
             model_runner,
             attn_backend=attn_backend,
@@ -164,6 +166,8 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         # IDLE DP ranks replay the same target-verify graph as active ranks.
         # Select the handler from the captured graph, not the runtime mode;
         # a V1 update key is ignored by V2 and leaves stale KV lengths behind.
+        if self.modelslim_kv:
+            return True
         return self.if_use_v2 or (
             self.use_fias_v2_bsnd and self.capture_forward_mode.is_target_verify()
         )

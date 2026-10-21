@@ -66,6 +66,11 @@ from sglang.srt.utils import bind_or_assign, log_info_on_rank0
 if _use_aiter_gfx95:
     from sglang.srt.layers.quantization.quark.utils import quark_post_load_weights
 
+if _is_npu:
+    from sglang.srt.layers.quantization.modelslim.modelslim import (
+        maybe_remap_modelslim_kv_scale_name,
+    )
+
 logger = logging.getLogger(__name__)
 
 # Optional quantization for DeepSeek nvfp4 checkpoint
@@ -318,6 +323,17 @@ class DeepseekV2WeightLoaderMixin:
                                     >= self.config.num_hidden_layers
                                 ):
                                     continue
+
+                if (
+                    _is_npu
+                    and self.quant_config is not None
+                    and self.quant_config.get_name() == "modelslim"
+                ):
+                    name = maybe_remap_modelslim_kv_scale_name(
+                        name, params_dict, owner="attn_mqa"
+                    )
+                    if name is None:
+                        continue
 
                 if _load_fused_expert_tensor(name, loaded_weight, params_dict):
                     continue

@@ -40,10 +40,15 @@ class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
             seq_lens = forward_batch.seq_lens_cpu.tolist() + [0] * (
                 self.bs - self.raw_bs
             )
+            cache_spec = self.model_runner.kv_cache_configurator.modelslim_cache_spec
             return self.backend.replay_with_input_update(
                 shape_key,
                 seq_lens=seq_lens,
-                attr_name="actual_seq_lengths_kv",
+                attr_name=(
+                    "actual_seq_kvlen"
+                    if cache_spec is not None
+                    else "actual_seq_lengths_kv"
+                ),
                 attr_type=[],
             )
         else:

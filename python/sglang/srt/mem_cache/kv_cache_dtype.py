@@ -39,6 +39,15 @@ def configure_kv_cache_dtype(
         quant_config = getattr(model, "quant_config", None)
         kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
         if (
+            current_platform.is_npu()
+            and quant_config is not None
+            and quant_config.get_name() == "modelslim"
+        ):
+            # ModelSlim KV quantization is opt-in, including FP8 metadata in
+            # otherwise weight-only quantized checkpoints.
+            kv_cache_dtype = torch.bfloat16
+            resolved_kv_cache_dtype = "auto"
+        elif (
             isinstance(kv_cache_quant_algo, str)
             and kv_cache_quant_algo.upper() == "FP8"
         ):

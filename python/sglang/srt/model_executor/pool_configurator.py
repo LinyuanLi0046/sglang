@@ -251,6 +251,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # Logical-page KV sharding reserves a fixed double-buffered assembly
         # scratch next to the pool; charge it before token sizing.
         self._fixed_overhead_bytes = compute_page_shard_scratch_bytes(kvc)
+        if kvc.modelslim_cache_spec is not None:
+            # NPU pools reserve one physical page for the allocator's sink slots.
+            self._fixed_overhead_bytes += self._cell_size * kvc.pool_page_size
 
         # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
         # which holds for EAGLE/MTP drafts that reuse the target's attention config.
@@ -347,6 +350,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             if kvc.server_args.enable_hisparse
             else get_glm_dsa_layer_split_effective_num_layers(kvc, num_layers)
         )
+
+        if kvc.modelslim_cache_spec is not None:
+            return kvc.modelslim_kv_bytes_per_token * effective_num_layers
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size

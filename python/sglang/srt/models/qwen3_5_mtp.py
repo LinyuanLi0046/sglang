@@ -46,6 +46,11 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
+if is_npu():
+    from sglang.srt.layers.quantization.modelslim.modelslim import (
+        maybe_remap_modelslim_kv_scale_name,
+    )
+
 
 def _mtp_quant_config(quant_config):
     """The quantization the MTP module itself is built with.
@@ -371,6 +376,15 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+
+            if (
+                is_npu()
+                and self.quant_config is not None
+                and self.quant_config.get_name() == "modelslim"
+            ):
+                name = maybe_remap_modelslim_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
 
             if (
                 _use_aiter

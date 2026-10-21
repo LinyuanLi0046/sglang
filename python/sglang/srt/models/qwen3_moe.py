@@ -112,6 +112,14 @@ _is_npu = is_npu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 
+    from sglang.srt.distributed.utils import get_group_rank_size
+    from sglang.srt.layers.quantization.modelslim.modelslim import (
+        maybe_remap_modelslim_kv_scale_name,
+    )
+    from sglang.srt.layers.quantization.modelslim.schemes.modelslim_kv_cache import (
+        ModelSlimKVCacheBinding,
+    )
+
 
 def compute_yarn_parameters(
     config: PretrainedConfig,
@@ -595,6 +603,23 @@ class Qwen3MoeAttention(nn.Module):
         )
         self._used_fused_qk_norm_rope_last_call = False
 
+        kv_quant_binding = None
+        if (
+            _is_npu
+            and quant_config is not None
+            and quant_config.get_name() == "modelslim"
+        ):
+            kv_rank, _ = get_group_rank_size(self.qkv_proj.kv_tp_group)
+            kv_quant_binding = ModelSlimKVCacheBinding(
+                num_kv_heads=self.total_num_kv_heads,
+                num_local_kv_heads=self.qkv_proj.num_kv_heads,
+                head_dim=self.head_dim,
+                value_head_dim=self.head_dim,
+                kv_tp_rank=kv_rank,
+                num_kv_head_replicas=self.qkv_proj.num_kv_head_replicas,
+                canonical_prefix=prefix,
+                compute_dtype=torch.get_default_dtype(),
+            )
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -602,6 +627,8 @@ class Qwen3MoeAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             prefix=add_prefix("attn", prefix),
+            quant_config=quant_config if kv_quant_binding is not None else None,
+            kv_quant_binding=kv_quant_binding,
         )
 
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -1218,6 +1245,14 @@ class Qwen3MoeForCausalLM(nn.Module):
 
             if "rotary_emb.inv_freq" in name:
                 continue
+            if (
+                _is_npu
+                and self.quant_config is not None
+                and self.quant_config.get_name() == "modelslim"
+            ):
+                name = maybe_remap_modelslim_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:

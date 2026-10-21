@@ -306,6 +306,13 @@ if _is_npu:
     # original Triton kernel.
     from sgl_kernel_npu.fla.utils import fused_qkvzba_split_reshape_cat_contiguous
 
+    from sglang.srt.layers.quantization.modelslim.modelslim import (
+        maybe_remap_modelslim_kv_scale_name,
+    )
+    from sglang.srt.layers.quantization.modelslim.schemes.modelslim_kv_cache import (
+        ModelSlimKVCacheBinding,
+    )
+
 
 def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
     quant_method = getattr(linear, "quant_method", None)
@@ -1348,6 +1355,22 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
+        kv_quant_binding = None
+        if (
+            _is_npu
+            and quant_config is not None
+            and quant_config.get_name() == "modelslim"
+        ):
+            kv_quant_binding = ModelSlimKVCacheBinding(
+                num_kv_heads=self.total_num_kv_heads,
+                num_local_kv_heads=self.qkv_proj.num_kv_heads,
+                head_dim=self.head_dim,
+                value_head_dim=self.head_dim,
+                kv_tp_rank=self.kv_tp_rank,
+                num_kv_head_replicas=self.qkv_proj.num_kv_head_replicas,
+                canonical_prefix=prefix,
+                compute_dtype=torch.get_default_dtype(),
+            )
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -1362,6 +1385,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             ),
             prefix=f"{prefix}.attn",
             quant_config=quant_config,
+            kv_quant_binding=kv_quant_binding,
         )
 
         # Dense MLP for non-MoE variant
@@ -1756,6 +1780,7 @@ class Qwen3_5ForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.quant_config = quant_config
         self.hidden_size = config.hidden_size
         self.pp_group = get_parallel().pp_group
 
@@ -1985,6 +2010,14 @@ class Qwen3_5ForCausalLM(nn.Module):
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+            if (
+                _is_npu
+                and self.quant_config is not None
+                and self.quant_config.get_name() == "modelslim"
+            ):
+                name = maybe_remap_modelslim_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
             layer_id = get_layer_id(name)
             if (
                 layer_id is not None
@@ -2182,6 +2215,14 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+            if (
+                _is_npu
+                and self.quant_config is not None
+                and self.quant_config.get_name() == "modelslim"
+            ):
+                name = maybe_remap_modelslim_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
 
             layer_id = get_layer_id(name)
             if (
@@ -2451,6 +2492,14 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+            if (
+                _is_npu
+                and self.quant_config is not None
+                and self.quant_config.get_name() == "modelslim"
+            ):
+                name = maybe_remap_modelslim_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
             if (
                 self.config.tie_word_embeddings
                 and self.pp_group.is_last_rank
@@ -2749,6 +2798,14 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+            if (
+                _is_npu
+                and self.quant_config is not None
+                and self.quant_config.get_name() == "modelslim"
+            ):
+                name = maybe_remap_modelslim_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
             if (
                 self.config.tie_word_embeddings
                 and self.pp_group.is_last_rank

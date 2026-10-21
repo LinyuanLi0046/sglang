@@ -34,6 +34,38 @@ def is_fia_nz() -> bool:
     return get_bool_env_var("SGLANG_USE_FIA_NZ")
 
 
+def modelslim_mlaprolog_eligible(attention) -> bool:
+    """CANN 9.1 MXFP8-projection/FP8-cache combination, selected once per layer."""
+    from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+        NPUMXFP8LinearMethod,
+    )
+
+    if (
+        not is_mla_preprocess_enabled()
+        or not is_npu_arch35()
+        or attention.rotary_emb is None
+        or attention.rotary_emb.is_neox_style
+        or attention.use_dsa
+        or attention.q_lora_rank not in (1536, 2048)
+        or attention.kv_lora_rank != 512
+        or attention.qk_nope_head_dim not in (128, 192)
+        or attention.qk_rope_head_dim != 64
+        or attention.num_local_heads not in (1, 2, 4, 8, 16, 32, 64, 128)
+        or attention.hidden_size
+        not in (1024, 2048, 3072, 4096, 5120, 6144, 7168, 7680, 8192)
+    ):
+        return False
+    # BF16 weight mode 0 cannot be combined with static FP8 cache mode 1.
+    # Reuse the existing offline/online MXFP8 kernel's projection contract.
+    return all(
+        isinstance(
+            getattr(getattr(layer, "scheme", None), "kernel", layer.quant_method),
+            NPUMXFP8LinearMethod,
+        )
+        for layer in (attention.fused_qkv_a_proj_with_mqa, attention.q_b_proj)
+    )
+
+
 def round_up(val: int, align: int) -> int:
     if align == 0:
         return 0
@@ -82,6 +114,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         qk_rope_head_dim,
         v_head_dim,
         quant_config: Optional["QuantizationConfig"] = None,
+        kv_quant_state=None,
     ):
         super().__init__()
         self.qkv_a_proj = fused_qkv_a_proj_with_mqa
@@ -92,6 +125,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         self.rotary_emb = rotary_emb
         self.layer_id = layer_id
         self.quant_config = quant_config
+        self.kv_quant_state = kv_quant_state
         self.has_preprocess_weights = False
         self.dtype = None
 
@@ -513,7 +547,9 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             positions,
         )
 
-    def forward_mlaprolog(self, positions, hidden_states, forward_batch):
+    def forward_mlaprolog(
+        self, positions, hidden_states, forward_batch, *, return_q_descale=False
+    ):
         if not self.has_preprocess_weights:
             self.mlaprolog_preprocess_weight()
             self.has_preprocess_weights = True
@@ -576,6 +612,13 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             mla_prolog_input_args.update(
                 ckvkr_repo_mode=1, quant_scale_repo_mode=1, tile_size=128
             )
+        if self.kv_quant_state is not None:
+            mla_prolog_input_args.update(
+                kv_cache_quant_mode=1,
+                query_quant_mode=1,
+                quant_scale_ckv=self.kv_quant_state.k_inv_scale.view(1),
+                query_norm_flag=False,
+            )
         import torch_npu
 
         q_nope, q_pe, dequant_scale_q_nope, qr, dequant_q_norm = (
@@ -585,7 +628,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             dequant_q_norm = None
         elif self.weight_quant_mode == 1:
             dequant_q_norm = dequant_q_norm.view(hidden_states.shape[0])
-        return (
+        result = (
             q_pe,
             v_cache,
             q_nope,
@@ -595,6 +638,9 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             positions,
             dequant_q_norm,
         )
+        # The prolog already compensates Q's BF16 side by 1/(sq * sc).
+        # Keep its per-token/head descale separate from Q-norm's weight scale.
+        return result + (dequant_scale_q_nope,) if return_q_descale else result
 
     def uses_mlaprolog(self) -> bool:
         _is_arch35_dsa = (

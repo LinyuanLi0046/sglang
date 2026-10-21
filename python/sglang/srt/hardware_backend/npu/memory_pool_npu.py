@@ -261,6 +261,8 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                     dtype=torch.uint8,
                     device=self.device,
                 )
+                self.k_scale_buffer = list(self.k_scale_buffer.unbind(0))
+                self.v_scale_buffer = list(self.v_scale_buffer.unbind(0))
                 for layer_id, state in self.modelslim_states.items():
                     scale_buffer = self.v_scale_buffer[layer_id - self.start_layer]
 
@@ -337,31 +339,23 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         return self.k_scale_buffer[local_layer], self.v_scale_buffer[local_layer]
 
     def _set_modelslim_mxfp8_buffer(self, layer_id, loc, cache_k, cache_v, k_scale):
-        # FIA uses BnNBsD; each write addresses [page, head, token].
+        # FIA uses BnNBsD; scatter complete D rows through a flat view.
         loc = loc.reshape(-1)
         heads = torch.arange(self.head_num, device=loc.device, dtype=loc.dtype)
         pages = torch.div(loc, self.page_size, rounding_mode="floor")
         slots = loc.remainder(self.page_size)
-        indices = torch.stack(
-            (
-                pages[:, None].expand(-1, self.head_num),
-                heads[None, :].expand(loc.numel(), -1),
-                slots[:, None].expand(-1, self.head_num),
-            ),
-            dim=-1,
-        ).reshape(-1, 3)
+        indices = (
+            (pages[:, None] * self.head_num + heads[None, :]) * self.page_size
+            + slots[:, None]
+        ).reshape(-1, 1)
         offset = layer_id - self.start_layer
         for dst, src, width in (
             (self.k_buffer[offset], cache_k, self.head_dim),
             (self.v_buffer[offset], cache_v, self.v_head_dim),
-            (
-                self.k_scale_buffer[offset].flatten(-2),
-                k_scale,
-                self.head_dim // 32,
-            ),
+            (self.k_scale_buffer[offset], k_scale, self.head_dim // 32),
         ):
             torch_npu.npu_scatter_nd_update_(
-                dst, indices, src.contiguous().view(-1, width)
+                dst.view(-1, width), indices, src.contiguous().view(-1, width)
             )
 
     # for disagg
@@ -518,21 +512,6 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
-        if getattr(layer, "modelslim_kv_state", None) is not None:
-            # Slot zero is the allocator's reserved sink for uncommitted rows.
-            loc_2d = loc_2d.to(cache_k.device, non_blocking=True)
-            commit_lens = commit_lens.to(cache_k.device, non_blocking=True)
-            columns = torch.arange(loc_2d.shape[1], device=loc_2d.device)
-            loc = torch.where(
-                columns[None, :] < commit_lens[:, None], loc_2d, 0
-            ).flatten()
-            return self.set_kv_buffer(
-                layer,
-                loc,
-                cache_k,
-                cache_v,
-                layer_id_override=layer_id_override,
-            )
         if not self.use_triton_prefix_kv_cache_store:
             return super().set_kv_buffer_prefix_valid(
                 layer,

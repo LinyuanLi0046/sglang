@@ -1361,16 +1361,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             and quant_config is not None
             and quant_config.get_name() == "modelslim"
         ):
-            kv_quant_binding = ModelSlimKVCacheBinding(
-                num_kv_heads=self.total_num_kv_heads,
-                num_local_kv_heads=self.qkv_proj.num_kv_heads,
-                head_dim=self.head_dim,
-                value_head_dim=self.head_dim,
-                kv_tp_rank=self.kv_tp_rank,
-                num_kv_head_replicas=self.qkv_proj.num_kv_head_replicas,
-                canonical_prefix=prefix,
-                compute_dtype=torch.get_default_dtype(),
-            )
+            kv_quant_binding = ModelSlimKVCacheBinding.from_qkv(self.qkv_proj, prefix)
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,

@@ -230,7 +230,6 @@ def _get_quantization_config(
             quant_config.bind_kv_cache_request(
                 requested_dtype,
                 override=override,
-                model_identity=model_config.model_path,
             )
         from sglang.srt.layers.quantization.fp8 import Fp8Config
 
@@ -322,8 +321,6 @@ def _initialize_model(
     with get_model().override(shared_experts=shared_experts):
         model = model_class(**kwargs)
         check_stage_producers(model)
-    if _is_npu and model_config.quantization == "modelslim":
-        quant_config.log_kv_quantization_summary()
     model.shared_experts_config = shared_experts
     return model
 

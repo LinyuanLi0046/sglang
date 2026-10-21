@@ -47,7 +47,6 @@ from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils import (
     get_bool_env_var,
     get_current_device_stream_fast,
-    next_power_of_2,
 )
 
 if TYPE_CHECKING:
@@ -80,14 +79,8 @@ def _reshape_kv_for_fia_nz(
     tensor: torch.Tensor, num_heads: int, head_dim: int, page_size: int
 ) -> torch.Tensor:
     """Reshapes a tensor for FIA NZ format."""
-    return tensor.view(-1, 1, num_heads * head_dim // 16, page_size, 16)
-
-
-def _mla_cache_view(cache, page_size, head_dim):
-    if is_fia_nz():
-        d0 = 32 // cache.element_size()
-        return cache.view(-1, 1, head_dim // d0, page_size, d0)
-    return cache.view(-1, page_size, head_dim)
+    tile_size = 32 // tensor.element_size()
+    return tensor.view(-1, 1, num_heads * head_dim // tile_size, page_size, tile_size)
 
 
 @dataclass
@@ -106,6 +99,7 @@ class ForwardMetadata:
     seq_lens_cpu_int: Optional[torch.Tensor] = None
     seq_lens_cpu_list: Optional[List[int]] = None
     seq_lens_list_cumsum: Optional[List[int]] = None
+    max_query_len: int = 1
     seq_lens: Optional[torch.Tensor] = None
     actual_seq_lengths_q: Optional[torch.Tensor] = None
     actual_seq_lengths_q_pa: Optional[torch.Tensor] = None
@@ -334,6 +328,9 @@ class AscendAttnBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         self.model_dtype = model_runner.model_config.dtype
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+        self.use_modelslim_kv_cache = (
+            model_runner.kv_cache_configurator.modelslim_cache_spec is not None
+        )
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         if self.use_mla:
             self.kv_lora_rank = model_runner.model_config.kv_lora_rank
@@ -612,6 +609,34 @@ class AscendAttnBackend(AttentionBackend):
         ):
             self.forward_metadata.seq_lens_cpu_int += self.speculative_step_id + 1
 
+        if self.use_modelslim_kv_cache:
+            # Reuse the CPU lengths after speculative offsets, without D2H.
+            self.forward_metadata.seq_lens_cpu_list = (
+                self.forward_metadata.seq_lens_cpu_int[
+                    : forward_batch._original_batch_size
+                ].tolist()
+            )
+            if forward_batch.forward_mode.is_target_verify():
+                query_lens = [int(forward_batch.spec_info.draft_token_num)] * len(
+                    self.forward_metadata.seq_lens_cpu_list
+                )
+            elif forward_batch.forward_mode.is_decode_or_idle():
+                query_lens = [1] * len(self.forward_metadata.seq_lens_cpu_list)
+            else:
+                query_lens = forward_batch.extend_seq_lens_cpu[
+                    : forward_batch._original_batch_size
+                ]
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+                or forward_batch.forward_mode.is_decode_or_idle()
+            ):
+                self.forward_metadata.seq_lens_list_cumsum = np.cumsum(query_lens)
+            self.forward_metadata.seq_lens_list_cumsum = (
+                self.forward_metadata.seq_lens_list_cumsum[: len(query_lens)].tolist()
+            )
+            self.forward_metadata.max_query_len = max(query_lens, default=0)
+
         # Set actual_seq_lengths_q from the pre-pad batch size so that the DSA
         # indexer reads a value consistent with actual_seq_lengths_kv /
         # block_tables (which are also built from the pre-pad batch here).
@@ -858,6 +883,18 @@ class AscendAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=seq_lens.device,
             )
+        if self.use_modelslim_kv_cache:
+            # Graph query slots have a fixed width, including draft_extend;
+            # replay updates KV lengths through the existing graph runner.
+            query_len = (
+                self.speculative_num_draft_tokens
+                if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
+                else 1
+            )
+            metadata.seq_lens_list_cumsum = list(
+                range(query_len, (bs + 1) * query_len, query_len)
+            )
+            metadata.max_query_len = query_len
         if forward_mode.is_dllm_extend():
             extend_seq_lens_cpu_int = torch.tensor(
                 [self.dllm_block_size for i in range(bs)],
@@ -1491,6 +1528,70 @@ class AscendAttnBackend(AttentionBackend):
 
         return attn_out
 
+    def _prepare_mxfp8_query(self, query, layer):
+        state = layer.modelslim_kv_state
+        query, q_scale = state.scheme.quantize_query(state, query)
+        kv_heads = state.binding.num_local_kv_heads
+        groups = layer.tp_q_head_num // kv_heads
+        q_scale = q_scale.reshape(query.shape[0], layer.tp_q_head_num, -1, 2)
+        # Both layouts are legal; FIA prefers N2TGD for decode-sized queries.
+        if groups * self.forward_metadata.max_query_len <= 80:
+            q_scale = (
+                q_scale.view(query.shape[0], kv_heads, groups, -1, 2)
+                .permute(1, 0, 2, 3, 4)
+                .contiguous()
+            )
+        k_scale, v_scale = self.token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
+        return query, dict(
+            dequant_scale_query=q_scale,
+            dequant_scale_key=k_scale,
+            dequant_scale_value=v_scale,
+            dequant_scale_query_dtype=torch_npu.float8_e8m0fnu,
+            dequant_scale_key_dtype=torch_npu.float8_e8m0fnu,
+            dequant_scale_value_dtype=torch_npu.float8_e8m0fnu,
+            query_dtype=torch.float8_e4m3fn,
+            key_dtype=torch.float8_e4m3fn,
+            value_dtype=torch.float8_e4m3fn,
+            query_quant_mode=6,
+            key_quant_mode=6,
+            value_quant_mode=8,
+            quant_scale_p=state.p_scale,
+        )
+
+    def _pad_mla_query(
+        self,
+        q,
+        q_rope,
+        q_descale=None,
+        nope_padding=None,
+        rope_padding=None,
+        *,
+        zero_padding=True,
+    ):
+        if self.q_head_num_padding is None or self.q_head_num_padding == q.shape[-2]:
+            return q, q_rope, q_descale
+        padding_heads = self.q_head_num_padding - q.shape[-2]
+        # Byte views avoid unsupported FP8 cat kernels. Graph decode reuses
+        # the existing padding buffers; other stages allocate on the device.
+        query = q.view(torch.uint8) if q_descale is not None else q
+        if nope_padding is None:
+            nope_padding = (query.new_zeros if zero_padding else query.new_empty)(
+                (*query.shape[:-2], padding_heads, query.shape[-1])
+            )
+            rope_padding = (q_rope.new_zeros if zero_padding else q_rope.new_empty)(
+                (*q_rope.shape[:-2], padding_heads, q_rope.shape[-1])
+            )
+        elif q_descale is not None:
+            nope_padding = nope_padding.view(torch.uint8)[..., : q.shape[-1]]
+        q = torch.cat((query, nope_padding), dim=-2).view(q.dtype).contiguous()
+        q_rope = torch.cat((q_rope, rope_padding), dim=-2).contiguous()
+        if q_descale is not None:
+            q_descale = torch.cat(
+                (q_descale, q_descale.new_ones((*q_descale.shape[:-1], padding_heads))),
+                dim=-1,
+            )
+        return q, q_rope, q_descale
+
     def forward_extend(
         self,
         q,
@@ -1617,51 +1718,14 @@ class AscendAttnBackend(AttentionBackend):
             if state is not None:
                 q = q.reshape(-1, layer.tp_q_head_num, state.binding.head_dim)
                 num_token_padding = q.shape[0]
-                if not self.graph_mode:
-                    valid_tokens = forward_batch.global_num_token_non_padded_cpu
-                    if valid_tokens is not None:
-                        q = q[:valid_tokens]
+                q = q[: forward_batch.global_num_token_non_padded_cpu]
                 if q.shape[0] == 0:
                     return q.new_zeros(
                         (num_token_padding, layer.tp_q_head_num * layer.v_head_dim),
                         dtype=state.binding.compute_dtype,
                     )
-                q_lens = forward_batch.extend_seq_lens_cpu
-                if not self.graph_mode:
-                    q_lens = q_lens[: forward_batch._original_batch_size]
-                batch_size = len(q_lens)
-                # Graph.update rebinds the Host IntArray used by FIA v2.
-                kv_lens = self.forward_metadata.seq_lens_cpu_list
-                if self.forward_metadata.seq_lens_cpu_int is not None:
-                    kv_lens = self.forward_metadata.seq_lens_cpu_int.tolist()
-                q, q_scale = state.scheme.quantize_query(state, q)
-                kv_heads = state.binding.num_local_kv_heads
-                groups = layer.tp_q_head_num // kv_heads
-                q_scale = q_scale.reshape(q.shape[0], layer.tp_q_head_num, -1, 2)
-                if groups * max(q_lens, default=0) <= 80:
-                    q_scale = (
-                        q_scale.view(q.shape[0], kv_heads, groups, -1, 2)
-                        .permute(1, 0, 2, 3, 4)
-                        .contiguous()
-                    )
-                k_scale, v_scale = self.token_to_kv_pool.get_kv_scale_buffer(
-                    layer.layer_id
-                )
-                quant_kwargs = dict(
-                    dequant_scale_query=q_scale,
-                    dequant_scale_key=k_scale,
-                    dequant_scale_value=v_scale,
-                    dequant_scale_query_dtype=torch_npu.float8_e8m0fnu,
-                    dequant_scale_key_dtype=torch_npu.float8_e8m0fnu,
-                    dequant_scale_value_dtype=torch_npu.float8_e8m0fnu,
-                    query_dtype=torch.float8_e4m3fn,
-                    key_dtype=torch.float8_e4m3fn,
-                    value_dtype=torch.float8_e4m3fn,
-                    query_quant_mode=6,
-                    key_quant_mode=6,
-                    value_quant_mode=8,
-                    quant_scale_p=state.p_scale,
-                )
+                batch_size = len(self.forward_metadata.seq_lens_list_cumsum)
+                q, quant_kwargs = self._prepare_mxfp8_query(q, layer)
                 attn_output = torch_npu.npu_fused_infer_attention_score_v2(
                     q,
                     k_cache,
@@ -1671,8 +1735,8 @@ class AscendAttnBackend(AttentionBackend):
                     num_query_heads=layer.tp_q_head_num,
                     num_key_value_heads=state.binding.num_local_kv_heads,
                     input_layout="TND",
-                    actual_seq_qlen=np.cumsum(q_lens).tolist(),
-                    actual_seq_kvlen=kv_lens[:batch_size],
+                    actual_seq_qlen=self.forward_metadata.seq_lens_list_cumsum,
+                    actual_seq_kvlen=self.forward_metadata.seq_lens_cpu_list,
                     atten_mask=self.fia_mask,
                     sparse_mode=3,
                     softmax_scale=layer.scaling,
@@ -2457,13 +2521,6 @@ class AscendAttnBackend(AttentionBackend):
         if not self.use_mla:
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-            if state is None:
-                k_cache = k_cache.view(
-                    -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
-                )
-                v_cache = v_cache.view(
-                    -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
-                )
             query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
             num_token_padding = query.shape[0]
 
@@ -2481,39 +2538,43 @@ class AscendAttnBackend(AttentionBackend):
                     dtype=state.binding.compute_dtype,
                 )
 
-            if self.forward_metadata.seq_lens_cpu_int is None:
-                # Graph mode: bind the Python list, which graph.update can
-                # rebind (a captured CPU tensor would be baked as constant).
+            if state is not None:
+                actual_seq_lengths = self.forward_metadata.seq_lens_list_cumsum
                 actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
             else:
-                actual_seq_lengths_kv = (
-                    self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
-                )
-            if (
-                not self.graph_mode
-                and forward_batch.forward_mode.is_target_verify()
-                and len(actual_seq_lengths_kv) > real_bs
-            ):
-                actual_seq_lengths_kv = actual_seq_lengths_kv[:real_bs]
+                if self.forward_metadata.seq_lens_cpu_int is None:
+                    # Graph mode: bind the Python list, which graph.update can
+                    # rebind (a captured CPU tensor would be baked as constant).
+                    actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
+                else:
+                    actual_seq_lengths_kv = (
+                        self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
+                    )
+                if (
+                    not self.graph_mode
+                    and forward_batch.forward_mode.is_target_verify()
+                    and len(actual_seq_lengths_kv) > real_bs
+                ):
+                    actual_seq_lengths_kv = actual_seq_lengths_kv[:real_bs]
 
-            if forward_batch.forward_mode.is_draft_extend_v2():
-                extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+                if forward_batch.forward_mode.is_draft_extend_v2():
+                    extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+                    if not self.graph_mode:
+                        extend_seq_lens_cpu = extend_seq_lens_cpu[
+                            : forward_batch._original_batch_size
+                        ]
+                    actual_seq_lengths = np.array(extend_seq_lens_cpu).cumsum().tolist()
+                else:
+                    # Static across replays ([spec_draft, 2*spec_draft, ...]).
+                    actual_seq_lengths = np.arange(
+                        self.speculative_num_draft_tokens,
+                        self.speculative_num_draft_tokens + query.shape[0],
+                        self.speculative_num_draft_tokens,
+                    )
+
                 if not self.graph_mode:
-                    extend_seq_lens_cpu = extend_seq_lens_cpu[
-                        : forward_batch._original_batch_size
-                    ]
-                actual_seq_lengths = np.array(extend_seq_lens_cpu).cumsum().tolist()
-            else:
-                # Static across replays ([spec_draft, 2*spec_draft, ...]).
-                actual_seq_lengths = np.arange(
-                    self.speculative_num_draft_tokens,
-                    self.speculative_num_draft_tokens + query.shape[0],
-                    self.speculative_num_draft_tokens,
-                )
-
-            if not self.graph_mode:
-                actual_bs = len(actual_seq_lengths)
-                actual_seq_lengths_kv = actual_seq_lengths_kv[:actual_bs]
+                    actual_bs = len(actual_seq_lengths)
+                    actual_seq_lengths_kv = actual_seq_lengths_kv[:actual_bs]
 
             is_swa_layer = layer.sliding_window_size != -1
             if (
@@ -2539,44 +2600,19 @@ class AscendAttnBackend(AttentionBackend):
                 mask = self.mtp_mask
                 sparse_mode = 4 if is_swa_layer else 3
 
+            if state is None:
+                k_cache = k_cache.view(
+                    -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
+                )
+                v_cache = v_cache.view(
+                    -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
+                )
+
             if state is not None:
-                if forward_batch.forward_mode.is_target_verify():
-                    actual_seq_lengths = actual_seq_lengths.tolist()
-                    max_query_len = self.speculative_num_draft_tokens
-                else:
-                    max_query_len = max(extend_seq_lens_cpu, default=0)
-                actual_bs = len(actual_seq_lengths)
-                actual_seq_lengths_kv = actual_seq_lengths_kv[:actual_bs]
-                block_table = self.forward_metadata.block_tables[:actual_bs]
-                query, q_scale = state.scheme.quantize_query(state, query)
-                kv_heads = state.binding.num_local_kv_heads
-                groups = layer.tp_q_head_num // kv_heads
-                q_scale = q_scale.reshape(query.shape[0], layer.tp_q_head_num, -1, 2)
-                # FIA's decode-sized MX query uses N2TGD; larger Q uses TND.
-                if groups * max_query_len <= 80:
-                    q_scale = (
-                        q_scale.view(query.shape[0], kv_heads, groups, -1, 2)
-                        .permute(1, 0, 2, 3, 4)
-                        .contiguous()
-                    )
-                k_scale, v_scale = self.token_to_kv_pool.get_kv_scale_buffer(
-                    layer.layer_id
-                )
-                quant_kwargs = dict(
-                    dequant_scale_query=q_scale,
-                    dequant_scale_key=k_scale,
-                    dequant_scale_value=v_scale,
-                    dequant_scale_query_dtype=torch_npu.float8_e8m0fnu,
-                    dequant_scale_key_dtype=torch_npu.float8_e8m0fnu,
-                    dequant_scale_value_dtype=torch_npu.float8_e8m0fnu,
-                    query_dtype=torch.float8_e4m3fn,
-                    key_dtype=torch.float8_e4m3fn,
-                    value_dtype=torch.float8_e4m3fn,
-                    query_quant_mode=6,
-                    key_quant_mode=6,
-                    value_quant_mode=8,
-                    quant_scale_p=state.p_scale,
-                )
+                block_table = self.forward_metadata.block_tables[
+                    : len(actual_seq_lengths)
+                ]
+                query, quant_kwargs = self._prepare_mxfp8_query(query, layer)
                 attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
                     query,
                     k_cache,
@@ -2653,20 +2689,16 @@ class AscendAttnBackend(AttentionBackend):
             return attn_output
         else:
             c_kv, k_rope = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-            if state is not None:
-                c_kv_cache = _mla_cache_view(
-                    c_kv, self.page_size, state.binding.head_dim
-                )
-                k_rope_cache = _mla_cache_view(
-                    k_rope, self.page_size, state.binding.side_dim
-                )
-            elif is_fia_nz():
+            if is_fia_nz():
                 k_rope_cache = _reshape_kv_for_fia_nz(
                     k_rope, layer.tp_k_head_num, self.qk_rope_head_dim, self.page_size
                 )
                 c_kv_cache = _reshape_kv_for_fia_nz(
                     c_kv, layer.tp_v_head_num, self.kv_lora_rank, self.page_size
                 )
+            elif state is not None:
+                k_rope_cache = k_rope.view(-1, self.page_size, self.qk_rope_head_dim)
+                c_kv_cache = c_kv.view(-1, self.page_size, self.kv_lora_rank)
             else:
                 k_rope_cache = k_rope.view(
                     -1, layer.tp_k_head_num, self.page_size, self.qk_rope_head_dim
@@ -2692,27 +2724,20 @@ class AscendAttnBackend(AttentionBackend):
                     (num_token_padding, layer.tp_q_head_num * layer.v_head_dim),
                     dtype=state.binding.compute_dtype,
                 )
-            if self.forward_metadata.seq_lens_cpu_int is None:
+            if state is not None:
+                actual_seq_lengths = self.forward_metadata.seq_lens_list_cumsum
                 actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
             else:
                 actual_seq_lengths_kv = (
-                    self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
+                    self.forward_metadata.seq_lens_cpu_list
+                    if self.forward_metadata.seq_lens_cpu_int is None
+                    else self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
-            if state is not None and forward_batch.forward_mode.is_draft_extend_v2():
-                extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
-                if not self.graph_mode:
-                    extend_seq_lens_cpu = extend_seq_lens_cpu[
-                        : forward_batch._original_batch_size
-                    ]
-                actual_seq_lengths = np.array(extend_seq_lens_cpu).cumsum().tolist()
-            else:
                 actual_seq_lengths = np.arange(
                     self.speculative_num_draft_tokens,
                     self.speculative_num_draft_tokens + q_nope.shape[0],
                     self.speculative_num_draft_tokens,
                 )
-                if state is not None:
-                    actual_seq_lengths = actual_seq_lengths.tolist()
 
             # When not in graph_mode, query is sliced to num_token_non_padded
             # which may drop finished requests. The FIA TND kernel requires
@@ -2720,79 +2745,14 @@ class AscendAttnBackend(AttentionBackend):
             if not self.graph_mode or state is not None:
                 actual_bs = len(actual_seq_lengths)
                 block_table = self.forward_metadata.block_tables[:actual_bs]
-                actual_seq_lengths_kv = actual_seq_lengths_kv[:actual_bs]
+                if state is None:
+                    actual_seq_lengths_kv = actual_seq_lengths_kv[:actual_bs]
             else:
                 block_table = self.forward_metadata.block_tables
 
-            if state is not None:
-                query_heads = layer.tp_q_head_num
-                padded_heads = 1 << (query_heads - 1).bit_length()
-                if padded_heads != query_heads:
-                    # Byte padding avoids unsupported FP8 cat kernels.
-                    q_bytes = q_nope.view(torch.uint8)
-                    q_nope = torch.cat(
-                        (
-                            q_bytes,
-                            q_bytes.new_zeros(
-                                q_nope.shape[0],
-                                padded_heads - query_heads,
-                                q_nope.shape[-1],
-                            ),
-                        ),
-                        dim=1,
-                    ).view(torch.float8_e4m3fn)
-                    q_rope = torch.cat(
-                        (
-                            q_rope,
-                            q_rope.new_zeros(
-                                q_rope.shape[0],
-                                padded_heads - query_heads,
-                                q_rope.shape[-1],
-                            ),
-                        ),
-                        dim=1,
-                    )
-                    q_descale = torch.cat(
-                        (
-                            q_descale,
-                            q_descale.new_ones(
-                                q_nope.shape[0], padded_heads - query_heads
-                            ),
-                        ),
-                        dim=1,
-                    )
-            elif (
-                self.q_head_num_padding is not None
-                and self.q_head_num_padding > self.tp_q_head_num
-            ):
-                nope_padding = torch.empty(
-                    [
-                        q_nope.shape[0],
-                        self.q_head_num_padding - self.tp_q_head_num,
-                        self.kv_lora_rank,
-                    ],
-                    dtype=(
-                        self.model_dtype
-                        if self.model_dtype is not None
-                        else torch.bfloat16
-                    ),
-                    device=q_nope.device,
-                )
-                rope_padding = torch.empty(
-                    [
-                        q_rope.shape[0],
-                        self.q_head_num_padding - self.tp_q_head_num,
-                        self.qk_rope_head_dim,
-                    ],
-                    dtype=(
-                        self.model_dtype
-                        if self.model_dtype is not None
-                        else torch.bfloat16
-                    ),
-                    device=q_rope.device,
-                )
-                q_nope = torch.cat([q_nope, nope_padding], dim=1).contiguous()
-                q_rope = torch.cat([q_rope, rope_padding], dim=1).contiguous()
+            q_nope, q_rope, q_descale = self._pad_mla_query(
+                q_nope, q_rope, q_descale, zero_padding=state is not None
+            )
 
             num_query_heads = q_nope.shape[1]
             if state is not None:
@@ -2953,171 +2913,6 @@ class AscendAttnBackend(AttentionBackend):
         q_descale: Optional[torch.Tensor] = None,
     ):
         state = layer.modelslim_kv_state
-        if state is not None:
-            if not self.use_mla:
-                if save_kv_cache and k is not None and v is not None:
-                    # support cross attention
-                    cache_loc = (
-                        forward_batch.out_cache_loc
-                        if not layer.is_cross_attention
-                        else forward_batch.encoder_out_cache_loc
-                    )
-                    # swa_out_cache_loc is the full->SWA write target, derived from
-                    # out_cache_loc; it must not be applied to cross-attention writes
-                    # (which target encoder_out_cache_loc) and is None for non-SWA pools.
-                    swa_loc = (
-                        self.forward_metadata.swa_out_cache_loc
-                        if not layer.is_cross_attention
-                        else None
-                    )
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer, KVWriteLoc(cache_loc, swa_loc), k, v
-                    )
-                k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-                v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-
-                q = q.reshape(-1, layer.tp_q_head_num, state.binding.head_dim)
-                num_token_padding = q.shape[0]
-                if q.shape[0] == 0:
-                    return q.new_zeros(
-                        (num_token_padding, layer.tp_q_head_num * layer.v_head_dim),
-                        dtype=state.binding.compute_dtype,
-                    )
-                batch_size = q.shape[0]
-                # Graph.update rebinds the Host IntArray used by FIA v2.
-                kv_lens = self.forward_metadata.seq_lens_cpu_list
-                if self.forward_metadata.seq_lens_cpu_int is not None:
-                    kv_lens = self.forward_metadata.seq_lens_cpu_int.tolist()
-                q, q_scale = state.scheme.quantize_query(state, q)
-                kv_heads = state.binding.num_local_kv_heads
-                groups = layer.tp_q_head_num // kv_heads
-                q_scale = q_scale.reshape(q.shape[0], layer.tp_q_head_num, -1, 2)
-                if groups <= 80:
-                    q_scale = (
-                        q_scale.view(q.shape[0], kv_heads, groups, -1, 2)
-                        .permute(1, 0, 2, 3, 4)
-                        .contiguous()
-                    )
-                k_scale, v_scale = self.token_to_kv_pool.get_kv_scale_buffer(
-                    layer.layer_id
-                )
-                quant_kwargs = dict(
-                    dequant_scale_query=q_scale,
-                    dequant_scale_key=k_scale,
-                    dequant_scale_value=v_scale,
-                    dequant_scale_query_dtype=torch_npu.float8_e8m0fnu,
-                    dequant_scale_key_dtype=torch_npu.float8_e8m0fnu,
-                    dequant_scale_value_dtype=torch_npu.float8_e8m0fnu,
-                    query_dtype=torch.float8_e4m3fn,
-                    key_dtype=torch.float8_e4m3fn,
-                    value_dtype=torch.float8_e4m3fn,
-                    query_quant_mode=6,
-                    key_quant_mode=6,
-                    value_quant_mode=8,
-                    quant_scale_p=state.p_scale,
-                )
-                attn_output = torch_npu.npu_fused_infer_attention_score_v2(
-                    q,
-                    k_cache,
-                    v_cache,
-                    block_table=self.forward_metadata.block_tables[:batch_size],
-                    block_size=self.page_size,
-                    num_query_heads=layer.tp_q_head_num,
-                    num_key_value_heads=state.binding.num_local_kv_heads,
-                    input_layout="TND",
-                    actual_seq_qlen=list(range(1, batch_size + 1)),
-                    actual_seq_kvlen=kv_lens[:batch_size],
-                    atten_mask=None,
-                    sparse_mode=0,
-                    softmax_scale=layer.scaling,
-                    out_dtype=state.binding.compute_dtype,
-                    **quant_kwargs,
-                )[0].reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
-                return attn_output
-            else:
-                if save_kv_cache:
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer, forward_batch.out_cache_loc, k, k_rope
-                    )
-                kv_c = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-                k_pe = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-
-                q = q.reshape(-1, layer.tp_q_head_num, state.binding.head_dim)
-                num_token_padding = q.shape[0]
-                if q.shape[0] == 0:
-                    return q.new_zeros(
-                        (num_token_padding, layer.tp_q_head_num * layer.v_head_dim),
-                        dtype=state.binding.compute_dtype,
-                    )
-                batch_size = q.shape[0]
-                # Graph.update rebinds the Host IntArray used by FIA v2.
-                kv_lens = self.forward_metadata.seq_lens_cpu_list
-                if self.forward_metadata.seq_lens_cpu_int is not None:
-                    kv_lens = self.forward_metadata.seq_lens_cpu_int.tolist()
-                query_heads = layer.tp_q_head_num
-                padded_heads = 1 << (query_heads - 1).bit_length()
-                q_rope = q_rope.reshape(-1, query_heads, state.binding.side_dim)
-                q_descale = q_descale.reshape(-1, query_heads)
-                if padded_heads != query_heads:
-                    # Byte padding avoids unsupported FP8 cat kernels.
-                    q_bytes = q.view(torch.uint8)
-                    q = torch.cat(
-                        (
-                            q_bytes,
-                            q_bytes.new_zeros(
-                                q.shape[0], padded_heads - query_heads, q.shape[-1]
-                            ),
-                        ),
-                        dim=1,
-                    ).view(torch.float8_e4m3fn)
-                    q_rope = torch.cat(
-                        (
-                            q_rope,
-                            q_rope.new_zeros(
-                                q.shape[0], padded_heads - query_heads, q_rope.shape[-1]
-                            ),
-                        ),
-                        dim=1,
-                    )
-                    q_descale = torch.cat(
-                        (
-                            q_descale,
-                            q_descale.new_ones(q.shape[0], padded_heads - query_heads),
-                        ),
-                        dim=1,
-                    )
-                kv_c = _mla_cache_view(kv_c, self.page_size, state.binding.head_dim)
-                k_pe = _mla_cache_view(k_pe, self.page_size, state.binding.side_dim)
-                # The model compensates the BF16 side by sq*sc before FIA
-                # applies sq*sc to QK and sc to PV.
-                attn_output = torch_npu.npu_fused_infer_attention_score_v2(
-                    q,
-                    kv_c,
-                    kv_c,
-                    query_rope=q_rope,
-                    key_rope=k_pe,
-                    dequant_scale_query=q_descale.contiguous(),
-                    dequant_scale_key=state.k_scale.reshape(1),
-                    dequant_scale_value=state.k_scale.reshape(1),
-                    query_quant_mode=3,
-                    key_quant_mode=0,
-                    value_quant_mode=0,
-                    block_table=self.forward_metadata.block_tables[:batch_size],
-                    block_size=self.page_size,
-                    num_query_heads=padded_heads,
-                    num_key_value_heads=state.binding.num_local_kv_heads,
-                    input_layout="TND",
-                    actual_seq_qlen=list(range(1, batch_size + 1)),
-                    actual_seq_kvlen=kv_lens[:batch_size],
-                    atten_mask=None,
-                    sparse_mode=0,
-                    softmax_scale=layer.scaling,
-                    out_dtype=state.binding.compute_dtype,
-                )[0]
-                attn_output = attn_output[:, :query_heads].reshape(
-                    -1, layer.tp_q_head_num * layer.v_head_dim
-                )
-                return attn_output
 
         if save_kv_cache:
             if self.use_mla:
@@ -3137,7 +2932,7 @@ class AscendAttnBackend(AttentionBackend):
                     v,
                 )
 
-        if sinks is not None or self.is_hybrid_swa:
+        if state is None and (sinks is not None or self.is_hybrid_swa):
             # Use SWA block tables if hybrid SWA is enabled for this layer
             if self._is_swa_layer(layer):
                 block_tables = self.forward_metadata.block_tables_swa
@@ -3236,10 +3031,32 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 block_tables = self.forward_metadata.block_tables
                 attn_mask = None
-            k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
+            k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            if state is not None:
+                query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                query, quant_kwargs = self._prepare_mxfp8_query(query, layer)
+                output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                    query,
+                    k_cache,
+                    v_cache,
+                    block_table=block_tables,
+                    block_size=self.page_size,
+                    num_query_heads=layer.tp_q_head_num,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    input_layout="TND",
+                    actual_seq_qlen=self.forward_metadata.seq_lens_list_cumsum,
+                    actual_seq_kvlen=seq_lens_cpu_list,
+                    sparse_mode=0,
+                    softmax_scale=layer.scaling,
+                    out_dtype=state.binding.compute_dtype,
+                    **quant_kwargs,
+                )
+                return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+            k_cache = k_cache.view(
                 -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
             )
-            v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
+            v_cache = v_cache.view(
                 -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
             )
             query = q.reshape(-1, 1, layer.tp_q_head_num * layer.qk_head_dim)
@@ -3306,6 +3123,9 @@ class AscendAttnBackend(AttentionBackend):
             q_nope = q.view(-1, 1, layer.tp_q_head_num, self.kv_lora_rank).contiguous()
             q_rope = q_rope.view(-1, 1, layer.tp_q_head_num, self.qk_rope_head_dim)
 
+            if state is not None:
+                q_descale = q_descale.reshape(-1, 1, layer.tp_q_head_num)
+
             assert (
                 self.q_head_num_padding is None
                 or self.q_head_num_padding >= layer.tp_q_head_num
@@ -3315,20 +3135,48 @@ class AscendAttnBackend(AttentionBackend):
                 self.q_head_num_padding is not None
                 and self.q_head_num_padding > layer.tp_q_head_num
             ):
-                # The FIA kernel only supports head counts that are powers of 2.
-                # Therefore, we pad the head dimension when it is not a power of 2.
-                q_nope = torch.cat(
-                    [q_nope, self.forward_metadata.nope_padding], dim=2
-                ).contiguous()
-                q_rope = torch.cat(
-                    [q_rope, self.forward_metadata.rope_padding], dim=2
-                ).contiguous()
+                q_nope, q_rope, q_descale = self._pad_mla_query(
+                    q_nope,
+                    q_rope,
+                    q_descale,
+                    self.forward_metadata.nope_padding,
+                    self.forward_metadata.rope_padding,
+                )
 
             if self.forward_metadata.seq_lens_cpu_int is None:
                 actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
             else:
                 actual_seq_len_kv = (
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
+                )
+
+            if state is not None:
+                num_heads = q_nope.shape[-2]
+                output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                    q_nope.reshape(-1, num_heads, self.kv_lora_rank),
+                    c_kv_cache,
+                    c_kv_cache,
+                    query_rope=q_rope.reshape(-1, num_heads, self.qk_rope_head_dim),
+                    key_rope=k_rope_cache,
+                    dequant_scale_query=q_descale.reshape(-1, num_heads).contiguous(),
+                    dequant_scale_key=state.k_scale.reshape(1),
+                    dequant_scale_value=state.k_scale.reshape(1),
+                    query_quant_mode=3,
+                    key_quant_mode=0,
+                    value_quant_mode=0,
+                    block_table=self.forward_metadata.block_tables,
+                    block_size=self.page_size,
+                    num_query_heads=num_heads,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    input_layout="TND",
+                    actual_seq_qlen=self.forward_metadata.seq_lens_list_cumsum,
+                    actual_seq_kvlen=actual_seq_len_kv,
+                    sparse_mode=0,
+                    softmax_scale=layer.scaling,
+                    out_dtype=state.binding.compute_dtype,
+                )
+                return output[:, : layer.tp_q_head_num].reshape(
+                    -1, layer.tp_q_head_num * layer.v_head_dim
                 )
 
             workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
@@ -3468,81 +3316,9 @@ class AscendAttnBackend(AttentionBackend):
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
             state = layer.modelslim_kv_state
-            if state is not None:
-                q = q.reshape(-1, layer.tp_q_head_num, state.binding.head_dim)
-                num_token_padding = q.shape[0]
-                if not self.graph_mode:
-                    valid_tokens = forward_batch.global_num_token_non_padded_cpu
-                    if valid_tokens is not None:
-                        q = q[:valid_tokens]
-                if q.shape[0] == 0:
-                    return q.new_zeros(
-                        (num_token_padding, layer.tp_q_head_num * layer.v_head_dim),
-                        dtype=state.binding.compute_dtype,
-                    )
-                batch_size = q.shape[0]
-                # Graph.update rebinds the Host IntArray used by FIA v2.
-                kv_lens = self.forward_metadata.seq_lens_cpu_list
-                if self.forward_metadata.seq_lens_cpu_int is not None:
-                    kv_lens = self.forward_metadata.seq_lens_cpu_int.tolist()
-                q, q_scale = state.scheme.quantize_query(state, q)
-                kv_heads = state.binding.num_local_kv_heads
-                groups = layer.tp_q_head_num // kv_heads
-                q_scale = q_scale.reshape(q.shape[0], layer.tp_q_head_num, -1, 2)
-                if groups <= 80:
-                    q_scale = (
-                        q_scale.view(q.shape[0], kv_heads, groups, -1, 2)
-                        .permute(1, 0, 2, 3, 4)
-                        .contiguous()
-                    )
-                k_scale, v_scale = self.token_to_kv_pool.get_kv_scale_buffer(
-                    layer.layer_id
-                )
-                quant_kwargs = dict(
-                    dequant_scale_query=q_scale,
-                    dequant_scale_key=k_scale,
-                    dequant_scale_value=v_scale,
-                    dequant_scale_query_dtype=torch_npu.float8_e8m0fnu,
-                    dequant_scale_key_dtype=torch_npu.float8_e8m0fnu,
-                    dequant_scale_value_dtype=torch_npu.float8_e8m0fnu,
-                    query_dtype=torch.float8_e4m3fn,
-                    key_dtype=torch.float8_e4m3fn,
-                    value_dtype=torch.float8_e4m3fn,
-                    query_quant_mode=6,
-                    key_quant_mode=6,
-                    value_quant_mode=8,
-                    quant_scale_p=state.p_scale,
-                )
-                attn_output = torch_npu.npu_fused_infer_attention_score_v2(
-                    q,
-                    k_cache,
-                    v_cache,
-                    block_table=self.forward_metadata.block_tables[:batch_size],
-                    block_size=self.page_size,
-                    num_query_heads=layer.tp_q_head_num,
-                    num_key_value_heads=state.binding.num_local_kv_heads,
-                    input_layout="TND",
-                    actual_seq_qlen=list(range(1, batch_size + 1)),
-                    actual_seq_kvlen=kv_lens[:batch_size],
-                    atten_mask=None,
-                    sparse_mode=0,
-                    softmax_scale=layer.scaling,
-                    out_dtype=state.binding.compute_dtype,
-                    **quant_kwargs,
-                )[0].reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
-                if attn_output.shape[0] < num_token_padding:
-                    attn_output = torch.cat(
-                        (
-                            attn_output,
-                            attn_output.new_zeros(
-                                num_token_padding - attn_output.shape[0],
-                                attn_output.shape[1],
-                            ),
-                        )
-                    )
-                return attn_output
-
-            if sinks is not None or (self._is_swa_layer(layer) and self.use_fia):
+            if state is None and (
+                sinks is not None or (self._is_swa_layer(layer) and self.use_fia)
+            ):
                 # Use SWA block tables if hybrid SWA is enabled for this layer
                 if self._is_swa_layer(layer):
                     block_tables = self.forward_metadata.block_tables_swa
@@ -3610,38 +3386,67 @@ class AscendAttnBackend(AttentionBackend):
                     )
                 return attn_out
 
-            if self.use_fia:
-                if self.forward_metadata.seq_lens_cpu_int is None:
-                    actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
+            if state is not None or self.use_fia:
+                num_token_padding = q.shape[0]
+                actual_bs = (
+                    len(self.forward_metadata.seq_lens_cpu_list)
+                    if state is not None
+                    else self.forward_metadata.block_tables.shape[0]
+                )
+                q = q[:actual_bs]
+                if state is not None:
+                    q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                    if q.shape[0] == 0:
+                        return q.new_zeros(
+                            (num_token_padding, layer.tp_q_head_num * layer.v_head_dim),
+                            dtype=state.binding.compute_dtype,
+                        )
+                    q, quant_kwargs = self._prepare_mxfp8_query(q, layer)
+                    attn_output = torch_npu.npu_fused_infer_attention_score_v2(
+                        q,
+                        k_cache,
+                        v_cache,
+                        block_table=self.forward_metadata.block_tables[:actual_bs],
+                        block_size=self.page_size,
+                        num_query_heads=layer.tp_q_head_num,
+                        num_key_value_heads=state.binding.num_local_kv_heads,
+                        input_layout="TND",
+                        actual_seq_qlen=self.forward_metadata.seq_lens_list_cumsum,
+                        actual_seq_kvlen=self.forward_metadata.seq_lens_cpu_list,
+                        atten_mask=None,
+                        sparse_mode=0,
+                        softmax_scale=layer.scaling,
+                        out_dtype=state.binding.compute_dtype,
+                        **quant_kwargs,
+                    )[0]
                 else:
                     actual_seq_len_kv = (
-                        self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
+                        self.forward_metadata.seq_lens_cpu_list
+                        if self.forward_metadata.seq_lens_cpu_int is None
+                        else self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                     )
-                num_token_padding = q.shape[0]
-                actual_bs = self.forward_metadata.block_tables.shape[0]
-                q = q[:actual_bs]
-                attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
-                    q.view(
-                        -1,
-                        1,
-                        layer.tp_q_head_num,
-                        layer.qk_head_dim,
-                    ),
-                    k_cache.view(
-                        -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
-                    ),
-                    v_cache.view(
-                        -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
-                    ),
-                    num_heads=layer.tp_q_head_num,
-                    num_key_value_heads=layer.tp_k_head_num,
-                    input_layout="BSND",
-                    atten_mask=None,
-                    block_size=self.page_size,
-                    block_table=self.forward_metadata.block_tables,
-                    actual_seq_lengths_kv=actual_seq_len_kv,
-                    scale=layer.scaling,
-                )
+                    attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+                        q.view(
+                            -1,
+                            1,
+                            layer.tp_q_head_num,
+                            layer.qk_head_dim,
+                        ),
+                        k_cache.view(
+                            -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
+                        ),
+                        v_cache.view(
+                            -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
+                        ),
+                        num_heads=layer.tp_q_head_num,
+                        num_key_value_heads=layer.tp_k_head_num,
+                        input_layout="BSND",
+                        atten_mask=None,
+                        block_size=self.page_size,
+                        block_table=self.forward_metadata.block_tables,
+                        actual_seq_lengths_kv=actual_seq_len_kv,
+                        scale=layer.scaling,
+                    )
                 if actual_bs != num_token_padding:
                     attn_output = torch.cat(
                         [
@@ -3757,103 +3562,9 @@ class AscendAttnBackend(AttentionBackend):
             k_pe = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
             state = layer.modelslim_kv_state
-            if state is not None:
-                q = q.reshape(-1, layer.tp_q_head_num, state.binding.head_dim)
-                num_token_padding = q.shape[0]
-                q_descale = kwargs.get("q_descale")
-                if not self.graph_mode:
-                    valid_tokens = forward_batch.global_num_token_non_padded_cpu
-                    if valid_tokens is not None:
-                        q = q[:valid_tokens]
-                        if q_rope is not None:
-                            q_rope = q_rope[:valid_tokens]
-                            q_descale = q_descale[:valid_tokens]
-                if q.shape[0] == 0:
-                    return q.new_zeros(
-                        (num_token_padding, layer.tp_q_head_num * layer.v_head_dim),
-                        dtype=state.binding.compute_dtype,
-                    )
-                batch_size = q.shape[0]
-                # Graph.update rebinds the Host IntArray used by FIA v2.
-                kv_lens = self.forward_metadata.seq_lens_cpu_list
-                if self.forward_metadata.seq_lens_cpu_int is not None:
-                    kv_lens = self.forward_metadata.seq_lens_cpu_int.tolist()
-                query_heads = layer.tp_q_head_num
-                padded_heads = 1 << (query_heads - 1).bit_length()
-                q_rope = q_rope.reshape(-1, query_heads, state.binding.side_dim)
-                q_descale = q_descale.reshape(-1, query_heads)
-                if padded_heads != query_heads:
-                    # Byte padding avoids unsupported FP8 cat kernels.
-                    q_bytes = q.view(torch.uint8)
-                    q = torch.cat(
-                        (
-                            q_bytes,
-                            q_bytes.new_zeros(
-                                q.shape[0], padded_heads - query_heads, q.shape[-1]
-                            ),
-                        ),
-                        dim=1,
-                    ).view(torch.float8_e4m3fn)
-                    q_rope = torch.cat(
-                        (
-                            q_rope,
-                            q_rope.new_zeros(
-                                q.shape[0], padded_heads - query_heads, q_rope.shape[-1]
-                            ),
-                        ),
-                        dim=1,
-                    )
-                    q_descale = torch.cat(
-                        (
-                            q_descale,
-                            q_descale.new_ones(q.shape[0], padded_heads - query_heads),
-                        ),
-                        dim=1,
-                    )
-                kv_c = _mla_cache_view(kv_c, self.page_size, state.binding.head_dim)
-                k_pe = _mla_cache_view(k_pe, self.page_size, state.binding.side_dim)
-                # The model compensates the BF16 side by sq*sc before FIA
-                # applies sq*sc to QK and sc to PV.
-                attn_output = torch_npu.npu_fused_infer_attention_score_v2(
-                    q,
-                    kv_c,
-                    kv_c,
-                    query_rope=q_rope,
-                    key_rope=k_pe,
-                    dequant_scale_query=q_descale.contiguous(),
-                    dequant_scale_key=state.k_scale.reshape(1),
-                    dequant_scale_value=state.k_scale.reshape(1),
-                    query_quant_mode=3,
-                    key_quant_mode=0,
-                    value_quant_mode=0,
-                    block_table=self.forward_metadata.block_tables[:batch_size],
-                    block_size=self.page_size,
-                    num_query_heads=padded_heads,
-                    num_key_value_heads=state.binding.num_local_kv_heads,
-                    input_layout="TND",
-                    actual_seq_qlen=list(range(1, batch_size + 1)),
-                    actual_seq_kvlen=kv_lens[:batch_size],
-                    atten_mask=None,
-                    sparse_mode=0,
-                    softmax_scale=layer.scaling,
-                    out_dtype=state.binding.compute_dtype,
-                )[0]
-                attn_output = attn_output[:, :query_heads].reshape(
-                    -1, layer.tp_q_head_num * layer.v_head_dim
-                )
-                if attn_output.shape[0] < num_token_padding:
-                    attn_output = torch.cat(
-                        (
-                            attn_output,
-                            attn_output.new_zeros(
-                                num_token_padding - attn_output.shape[0],
-                                attn_output.shape[1],
-                            ),
-                        )
-                    )
-                return attn_output
-
-            if self.use_fia and (layer.tp_q_head_num // layer.tp_k_head_num) >= 8:
+            if state is not None or (
+                self.use_fia and (layer.tp_q_head_num // layer.tp_k_head_num) >= 8
+            ):
                 """layer.tp_q_head_num // layer.tp_k_head_num < 8 will support in the later version of CANN"""
                 if is_fia_nz():
                     kv_c = _reshape_kv_for_fia_nz(
@@ -3869,52 +3580,89 @@ class AscendAttnBackend(AttentionBackend):
                     k_pe = k_pe.view(
                         -1, self.page_size, layer.tp_k_head_num * self.qk_rope_head_dim
                     )
-                q = q.view(
-                    forward_batch.batch_size, -1, layer.tp_q_head_num, self.kv_lora_rank
-                )
-                q_rope = q_rope.view(
-                    forward_batch.batch_size,
-                    -1,
-                    layer.tp_q_head_num,
-                    self.qk_rope_head_dim,
-                )
-                if (layer.tp_q_head_num & (layer.tp_q_head_num - 1)) != 0:
-                    power_of_2_head = next_power_of_2(layer.tp_q_head_num)
-                    padding_head = power_of_2_head - layer.tp_q_head_num
-                    q_padding_tensor = torch.zeros(
-                        [num_tokens, q.shape[1], padding_head, q.shape[-1]],
-                        dtype=q.dtype,
-                        device=q.device,
+                if state is not None:
+                    actual_bs = len(self.forward_metadata.seq_lens_cpu_list)
+                    q = q[:actual_bs].reshape(
+                        -1, 1, layer.tp_q_head_num, self.kv_lora_rank
                     )
-                    q = torch.cat((q, q_padding_tensor), dim=-2)
-                    q_rope_padding_tensor = torch.zeros(
-                        [num_tokens, q_rope.shape[1], padding_head, q_rope.shape[-1]],
-                        dtype=q_rope.dtype,
-                        device=q_rope.device,
+                    q_rope = q_rope[:actual_bs].reshape(
+                        -1, 1, layer.tp_q_head_num, self.qk_rope_head_dim
                     )
-                    q_rope = torch.cat((q_rope, q_rope_padding_tensor), dim=-2)
-                    tp_q_head_num = power_of_2_head
+                    q_descale = kwargs["q_descale"][:actual_bs].reshape(
+                        -1, 1, layer.tp_q_head_num
+                    )
+                    if q.shape[0] == 0:
+                        return q.new_zeros(
+                            (num_tokens, layer.tp_q_head_num * layer.v_head_dim),
+                            dtype=state.binding.compute_dtype,
+                        )
                 else:
-                    tp_q_head_num = layer.tp_q_head_num
+                    q = q.view(
+                        forward_batch.batch_size,
+                        -1,
+                        layer.tp_q_head_num,
+                        self.kv_lora_rank,
+                    )
+                    q_rope = q_rope.view(
+                        forward_batch.batch_size,
+                        -1,
+                        layer.tp_q_head_num,
+                        self.qk_rope_head_dim,
+                    )
+                    q_descale = None
+                q, q_rope, q_descale = self._pad_mla_query(q, q_rope, q_descale)
+                tp_q_head_num = q.shape[-2]
 
-                attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
-                    q,
-                    kv_c,
-                    kv_c,
-                    query_rope=q_rope,
-                    key_rope=k_pe,
-                    num_heads=tp_q_head_num,
-                    num_key_value_heads=layer.tp_k_head_num,
-                    input_layout="BSND",
-                    atten_mask=None,
-                    sparse_mode=0,
-                    scale=layer.scaling,
-                    antiquant_mode=0,
-                    antiquant_scale=None,
-                    block_table=self.forward_metadata.block_tables,
-                    block_size=self.page_size,
-                    actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int,
-                )
+                if state is not None:
+                    # The model compensates the BF16 side by sq*sc before FIA
+                    # applies sq*sc to QK and sc to PV.
+                    attn_output = torch_npu.npu_fused_infer_attention_score_v2(
+                        q.reshape(-1, tp_q_head_num, self.kv_lora_rank),
+                        kv_c,
+                        kv_c,
+                        query_rope=q_rope.reshape(
+                            -1, tp_q_head_num, self.qk_rope_head_dim
+                        ),
+                        key_rope=k_pe,
+                        dequant_scale_query=q_descale.reshape(
+                            -1, tp_q_head_num
+                        ).contiguous(),
+                        dequant_scale_key=state.k_scale.reshape(1),
+                        dequant_scale_value=state.k_scale.reshape(1),
+                        query_quant_mode=3,
+                        key_quant_mode=0,
+                        value_quant_mode=0,
+                        block_table=self.forward_metadata.block_tables[:actual_bs],
+                        block_size=self.page_size,
+                        num_query_heads=tp_q_head_num,
+                        num_key_value_heads=state.binding.num_local_kv_heads,
+                        input_layout="TND",
+                        actual_seq_qlen=self.forward_metadata.seq_lens_list_cumsum,
+                        actual_seq_kvlen=self.forward_metadata.seq_lens_cpu_list,
+                        atten_mask=None,
+                        sparse_mode=0,
+                        softmax_scale=layer.scaling,
+                        out_dtype=state.binding.compute_dtype,
+                    )[0].reshape(-1, 1, tp_q_head_num, self.kv_lora_rank)
+                else:
+                    attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+                        q,
+                        kv_c,
+                        kv_c,
+                        query_rope=q_rope,
+                        key_rope=k_pe,
+                        num_heads=tp_q_head_num,
+                        num_key_value_heads=layer.tp_k_head_num,
+                        input_layout="BSND",
+                        atten_mask=None,
+                        sparse_mode=0,
+                        scale=layer.scaling,
+                        antiquant_mode=0,
+                        antiquant_scale=None,
+                        block_table=self.forward_metadata.block_tables,
+                        block_size=self.page_size,
+                        actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int,
+                    )
                 attn_output = attn_output[:, :, : layer.tp_q_head_num, :]
             else:
                 assert (
@@ -3945,6 +3693,16 @@ class AscendAttnBackend(AttentionBackend):
                     context_lens=self.forward_metadata.seq_lens_cpu_int,
                     mla_vheadsize=self.kv_lora_rank,
                     out=attn_output,
+                )
+            if state is not None and attn_output.shape[0] < num_tokens:
+                attn_output = torch.cat(
+                    (
+                        attn_output,
+                        attn_output.new_zeros(
+                            num_tokens - attn_output.shape[0], *attn_output.shape[1:]
+                        ),
+                    ),
+                    dim=0,
                 )
             return attn_output.view(num_tokens, layer.tp_q_head_num * self.kv_lora_rank)
 

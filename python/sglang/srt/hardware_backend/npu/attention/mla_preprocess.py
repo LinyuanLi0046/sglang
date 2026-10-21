@@ -34,38 +34,6 @@ def is_fia_nz() -> bool:
     return get_bool_env_var("SGLANG_USE_FIA_NZ")
 
 
-def modelslim_mlaprolog_eligible(attention) -> bool:
-    """CANN 9.1 MXFP8-projection/FP8-cache combination, selected once per layer."""
-    from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
-        NPUMXFP8LinearMethod,
-    )
-
-    if (
-        not is_mla_preprocess_enabled()
-        or not is_npu_arch35()
-        or attention.rotary_emb is None
-        or attention.rotary_emb.is_neox_style
-        or attention.use_dsa
-        or attention.q_lora_rank not in (1536, 2048)
-        or attention.kv_lora_rank != 512
-        or attention.qk_nope_head_dim not in (128, 192)
-        or attention.qk_rope_head_dim != 64
-        or attention.num_local_heads not in (1, 2, 4, 8, 16, 32, 64, 128)
-        or attention.hidden_size
-        not in (1024, 2048, 3072, 4096, 5120, 6144, 7168, 7680, 8192)
-    ):
-        return False
-    # BF16 weight mode 0 cannot be combined with static FP8 cache mode 1.
-    # Reuse the existing offline/online MXFP8 kernel's projection contract.
-    return all(
-        isinstance(
-            getattr(getattr(layer, "scheme", None), "kernel", layer.quant_method),
-            NPUMXFP8LinearMethod,
-        )
-        for layer in (attention.fused_qkv_a_proj_with_mqa, attention.q_b_proj)
-    )
-
-
 def round_up(val: int, align: int) -> int:
     if align == 0:
         return 0
@@ -279,6 +247,15 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             self.num_local_heads * (self.qk_nope_head_dim + self.qk_rope_head_dim)
         )
 
+    @staticmethod
+    def is_mxfp8_projection(layer):
+        from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+            NPUMXFP8LinearMethod,
+        )
+
+        kernel = getattr(getattr(layer, "scheme", None), "kernel", layer.quant_method)
+        return isinstance(kernel, NPUMXFP8LinearMethod)
+
     def mlaprolog_preprocess_weight(self):
         # MLAPrologV3 weight quantization modes (self.weight_quant_mode) used here:
         #   0: No weight quantization. QKV-A and Q-B weights are FP16/BF16.
@@ -288,16 +265,8 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         #   3: MXFP8 quantization. token_x, weight_dq, weight_uq_qr, and
         #      weight_dkv_kr use MXFP8 with their corresponding dequant scales.
         #      weight_uk remains unquantized.
-        from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
-            NPUMXFP8LinearMethod,
-        )
-
         projections = (self.qkv_a_proj, self.q_b_proj)
-        kernels = [
-            getattr(getattr(layer, "scheme", None), "kernel", layer.quant_method)
-            for layer in projections
-        ]
-        is_mxfp8 = [isinstance(kernel, NPUMXFP8LinearMethod) for kernel in kernels]
+        is_mxfp8 = [self.is_mxfp8_projection(layer) for layer in projections]
         if any(is_mxfp8):
             if not all(is_mxfp8):
                 raise RuntimeError(

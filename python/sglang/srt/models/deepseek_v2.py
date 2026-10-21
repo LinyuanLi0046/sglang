@@ -253,9 +253,6 @@ else:
 if _is_cuda:
     from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
 elif _is_npu:
-    from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
-        modelslim_mlaprolog_eligible,
-    )
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
         forward_dsa_core_npu,
         forward_dsa_prepare_npu,
@@ -2271,7 +2268,6 @@ class DeepseekV2AttentionMLA(
             # Both execution views read the canonical owner's mutable state.
             # Only attn_mqa registers checkpoint parameters.
             self.attn_mha.modelslim_kv_state = modelslim_kv_state
-            self._modelslim_mlaprolog_enabled = modelslim_mlaprolog_eligible(self)
 
         self.alt_stream = alt_stream
         self.attn_mha.kv_b_proj = None

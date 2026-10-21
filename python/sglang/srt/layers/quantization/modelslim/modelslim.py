@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from collections import Counter
 from fnmatch import fnmatchcase
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Union, cast
@@ -124,8 +123,6 @@ class ModelSlimConfig(QuantizationConfig):
         super().__init__()
         self.requested_kv_cache_dtype = "auto"
         self.kv_quant_type_override = None
-        self.kv_model_identity = None
-        self._kv_raw_types = Counter()
         keys = [k for k in quant_config if isinstance(k, str)]
         is_dsv4 = any(k.startswith("hc_head_") for k in keys)
         if is_dsv4:
@@ -230,10 +227,9 @@ class ModelSlimConfig(QuantizationConfig):
 
         self.quant_description = quant_config
 
-    def bind_kv_cache_request(self, dtype, *, override=None, model_identity=None):
+    def bind_kv_cache_request(self, dtype, *, override=None):
         """Bind this worker's request before constructing its attention layers."""
         self.requested_kv_cache_dtype = dtype
-        self.kv_model_identity = model_identity
         self.kv_quant_type_override = (
             (override.strip() or None)
             if dtype == "fp8_e4m3" and override is not None
@@ -241,6 +237,10 @@ class ModelSlimConfig(QuantizationConfig):
         )
         if self.kv_quant_type_override is not None:
             self._kv_scheme_class(self.kv_quant_type_override)
+            logger.info(
+                "ModelSlim KV quant_type override: %s",
+                self.kv_quant_type_override,
+            )
 
     @staticmethod
     def _kv_scheme_class(quant_type):
@@ -255,21 +255,6 @@ class ModelSlimConfig(QuantizationConfig):
         if scheme_class is None:
             raise ValueError(f"Unsupported ModelSlim KV quant_type: {quant_type!r}")
         return scheme_class
-
-    def log_kv_quantization_summary(self):
-        if self.kv_quant_type_override is not None:
-            logger.info(
-                "SGLANG_NPU_MODELSLIM_KV_QUANT_TYPE_OVERRIDE=%s for %s: "
-                "%d attention layers, raw quant_type counts=%s",
-                self.kv_quant_type_override,
-                self.kv_model_identity,
-                sum(self._kv_raw_types.values()),
-                dict(self._kv_raw_types),
-            )
-            if not self._kv_raw_types:
-                logger.warning(
-                    "ModelSlim KV quant_type override matched no attention layers"
-                )
 
     def get_kv_scheme(self, layer, prefix):
         if self.requested_kv_cache_dtype != "fp8_e4m3":
@@ -340,7 +325,6 @@ class ModelSlimConfig(QuantizationConfig):
                 else "checkpoint"
             ),
         )
-        self._kv_raw_types[raw] += 1
         return scheme
 
     def update_packed_modules_mapping(self, mapping: Dict[str, List[str]]) -> None:

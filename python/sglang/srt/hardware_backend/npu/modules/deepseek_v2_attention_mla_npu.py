@@ -187,10 +187,22 @@ def forward_mla_prepare_npu(
 ):
     kv_quant_state = getattr(m.attn_mqa, "modelslim_kv_state", None)
     q_descale = None
-    if kv_quant_state is not None:
-        cache_written = m._modelslim_mlaprolog_enabled
-    else:
-        cache_written = is_mla_preprocess_enabled()
+    cache_written = is_mla_preprocess_enabled()
+    if cache_written and kv_quant_state is not None:
+        if not hasattr(m, "_use_fp8_mlaprolog"):
+            # Static C8 requires MXFP8 projections and interleaved RoPE.
+            # Kimi's no-RoPE path keeps the ordinary MLA preprocessing.
+            m._use_fp8_mlaprolog = (
+                _is_npu_arch35
+                and m.rotary_emb is not None
+                and not m.rotary_emb.is_neox_style
+                and m.q_lora_rank is not None
+                and all(
+                    NPUFusedMLAPreprocess.is_mxfp8_projection(layer)
+                    for layer in (m.fused_qkv_a_proj_with_mqa, m.q_b_proj)
+                )
+            )
+        cache_written = m._use_fp8_mlaprolog
     if cache_written:
         if not hasattr(m, "mla_preprocess"):
             # Supply the prolog config only for C8; preserve legacy MLA dispatch.
@@ -206,11 +218,8 @@ def forward_mla_prepare_npu(
                 m.qk_nope_head_dim,
                 m.qk_rope_head_dim,
                 m.v_head_dim,
-                **(
-                    dict(quant_config=m.quant_config, kv_quant_state=kv_quant_state)
-                    if kv_quant_state is not None
-                    else {}
-                ),
+                quant_config=m.quant_config if kv_quant_state is not None else None,
+                kv_quant_state=kv_quant_state,
             )
         if kv_quant_state is not None or m.mla_preprocess.uses_mlaprolog():
             (

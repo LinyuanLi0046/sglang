@@ -23,6 +23,22 @@ class ModelSlimKVCacheBinding:
     canonical_prefix: Optional[str] = None
     compute_dtype: torch.dtype = torch.bfloat16
 
+    @classmethod
+    def from_qkv(cls, qkv_proj, prefix):
+        from sglang.srt.distributed.utils import get_group_rank_size
+
+        kv_tp_rank, _ = get_group_rank_size(qkv_proj.kv_tp_group)
+        return cls(
+            num_kv_heads=qkv_proj.total_num_kv_heads,
+            num_local_kv_heads=qkv_proj.num_kv_heads,
+            head_dim=qkv_proj.head_size,
+            value_head_dim=qkv_proj.v_head_size,
+            kv_tp_rank=kv_tp_rank,
+            num_kv_head_replicas=qkv_proj.num_kv_head_replicas,
+            canonical_prefix=prefix,
+            compute_dtype=torch.get_default_dtype(),
+        )
+
 
 @dataclass(frozen=True)
 class ModelSlimKVCacheSpec:
@@ -49,7 +65,6 @@ class ModelSlimKVCacheState:
     effective_quant_type: Optional[str] = None
     quant_type_source: str = "checkpoint"
     k_scale: Optional[torch.Tensor] = None
-    v_scale: Optional[torch.Tensor] = None
     k_inv_scale: Optional[torch.Tensor] = None
     v_inv_scale: Optional[torch.Tensor] = None
     v_scale_encoded: Optional[torch.Tensor] = None
@@ -83,12 +98,7 @@ class ModelSlimKVCacheScheme(ABC):
 
     @abstractmethod
     def quantize_cache(self, state: ModelSlimKVCacheState, k, v):
-        """Return K, V, dynamic K scale, and encoded static V scale."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def dequantize_cache(self, state, k, v=None, k_scale=None, v_scale=None):
-        """Decode already gathered tokens, leaving an MLA side tensor unchanged."""
+        """Return encoded K, V and optional dynamic K scale."""
         raise NotImplementedError
 
     def _create_parameter(self, layer, name, channels, dtype, default):
@@ -115,8 +125,6 @@ class ModelSlimKVCacheScheme(ABC):
                 local_weight = loaded_weight.reshape(
                     binding.num_kv_heads, channels
                 ).narrow(0, first_head, binding.num_local_kv_heads)
-            elif loaded_weight.numel() == 1 and channels == 1:
-                local_weight = loaded_weight.reshape(1, 1).expand_as(param)
             else:
                 raise ValueError(
                     f"{self.prefix}.{name}: cannot map shape "

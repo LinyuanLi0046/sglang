@@ -36,6 +36,7 @@ def get_modelslim_kv_cache_config(model, page_size):
 
     cache_spec = None
     states = {}
+    max_query_heads = 0
     for module in model.modules():
         state = getattr(module, "modelslim_kv_state", None)
         if state is None:
@@ -53,11 +54,7 @@ def get_modelslim_kv_cache_config(model, page_size):
                 "ModelSlim attention layers in one NPU pool must share "
                 "the same KV cache layout and local head geometry."
             )
-        if spec.layout == "mla_fp8" and module.tp_q_head_num > 128:
-            raise ValueError(
-                "CANN 9.1.0 ModelSlim MLA FP8 FIA supports at most "
-                "128 local query heads; increase attention TP size."
-            )
+        max_query_heads = max(max_query_heads, module.tp_q_head_num)
         cache_spec = spec
         states[module.layer_id] = state
 
@@ -72,6 +69,11 @@ def get_modelslim_kv_cache_config(model, page_size):
                 "or --page-size 1024 and equal K/V head dimensions of 64 or 128."
             )
     elif cache_spec is not None and cache_spec.layout == "mla_fp8":
+        if max_query_heads > 128:
+            raise ValueError(
+                "CANN 9.1.0 ModelSlim MLA FP8 FIA supports at most "
+                "128 local query heads; increase attention TP size."
+            )
         if (
             page_size != 128
             or cache_spec.local_kv_heads != 1
@@ -206,21 +208,39 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            # [size, head_num, head_dim] for each layer
+            # The padded slot 0 is used for writing dummy outputs from padded tokens.
+            # Continuous memory improves the efficiency of Ascend`s transmission backend,
+            # while other backends remain unchanged.
+            # FIA exposes the KV cache as per-layer Python views so graph
+            # capture does not retain the full multi-layer tensor. HiCache's
+            # NPU exchange operator still requires the original contiguous
+            # [layer, page, token, head, dim] allocation.
+            pages = self.size // self.page_size + 1
+            # MXFP8 FIA consumes BnNBsD; existing caches retain BnBsND.
+            head_token_shape = (
+                (self.head_num, self.page_size)
+                if self.is_modelslim_mxfp8
+                else (self.page_size, self.head_num)
+            )
+            shape = (self.layer_num, pages, *head_token_shape)
+            self._hicache_k_buffer = torch.zeros(
+                (*shape, self.head_dim),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+            self._hicache_v_buffer = torch.zeros(
+                (*shape, self.v_head_dim),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+            # Keep a reference to the contiguous tensor for HiCache
+            # D2H/H2D transfers (transfer_kv_dim_exchange expects a
+            # tensor, not the per-layer list used in FIA mode below).
+            self.k_buffer_tensor = self._hicache_k_buffer
+            self.v_buffer_tensor = self._hicache_v_buffer
+
             if self.is_modelslim_mxfp8:
-                pages = self.size // self.page_size + 1
-                shape = (self.layer_num, pages, self.head_num, self.page_size)
-                self._hicache_k_buffer = torch.zeros(
-                    (*shape, self.head_dim),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
-                self._hicache_v_buffer = torch.zeros(
-                    (*shape, self.v_head_dim),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
-                self.k_buffer_tensor = self._hicache_k_buffer
-                self.v_buffer_tensor = self._hicache_v_buffer
                 self.k_buffer = list(self.k_buffer_tensor.unbind(0))
                 self.v_buffer = list(self.v_buffer_tensor.unbind(0))
                 self.k_scale_buffer = torch.full(
@@ -254,41 +274,6 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                     state.refresh_cache_scales = refresh_cache_scales
                     refresh_cache_scales()
                 return
-            # [size, head_num, head_dim] for each layer
-            # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            # Continuous memory improves the efficiency of Ascend`s transmission backend,
-            # while other backends remain unchanged.
-            # FIA exposes the KV cache as per-layer Python views so graph
-            # capture does not retain the full multi-layer tensor. HiCache's
-            # NPU exchange operator still requires the original contiguous
-            # [layer, page, token, head, dim] allocation.
-            self._hicache_k_buffer = torch.zeros(
-                (
-                    self.layer_num,
-                    self.size // self.page_size + 1,
-                    self.page_size,
-                    self.head_num,
-                    self.head_dim,
-                ),
-                dtype=self.store_dtype,
-                device=self.device,
-            )
-            self._hicache_v_buffer = torch.zeros(
-                (
-                    self.layer_num,
-                    self.size // self.page_size + 1,
-                    self.page_size,
-                    self.head_num,
-                    self.v_head_dim,
-                ),
-                dtype=self.store_dtype,
-                device=self.device,
-            )
-            # Keep a reference to the contiguous tensor for HiCache
-            # D2H/H2D transfers (transfer_kv_dim_exchange expects a
-            # tensor, not the per-layer list used in FIA mode below).
-            self.k_buffer_tensor = self._hicache_k_buffer
-            self.v_buffer_tensor = self._hicache_v_buffer
 
             self.k_buffer = self._hicache_k_buffer
             self.v_buffer = self._hicache_v_buffer
@@ -433,7 +418,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             layer_id = layer.layer_id
         state = getattr(layer, "modelslim_kv_state", None)
         if state is not None:
-            cache_k, cache_v, k_scale, _ = state.scheme.quantize_cache(
+            cache_k, cache_v, k_scale = state.scheme.quantize_cache(
                 state, cache_k, cache_v
             )
         elif cache_k.dtype != self.dtype:
@@ -1216,9 +1201,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
         state = getattr(layer, "modelslim_kv_state", None)
         if state is not None:
-            cache_k, cache_v, _, _ = state.scheme.quantize_cache(
-                state, cache_k, cache_v
-            )
+            cache_k, cache_v, _ = state.scheme.quantize_cache(state, cache_k, cache_v)
         elif cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.side_dtype)

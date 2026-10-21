@@ -19,46 +19,32 @@ class ModelSlimQFP8DynamicKVFP8Scheme(ModelSlimKVCacheScheme):
             )
 
     def create_weights(self, layer):
-        for component in ("k", "v"):
-            self._create_parameter(
-                layer, f"fa_{component}_scale", 1, torch.float32, 1.0
-            )
-            self._create_parameter(
-                layer, f"fa_{component}_offset", 1, torch.float32, 0.0
-            )
+        # MLA's exported fa_v is compatibility data: QK and PV share fa_k's C.
+        self._create_parameter(layer, "fa_k_scale", 1, torch.float32, 1.0)
+        self._create_parameter(layer, "fa_k_offset", 1, torch.float32, 0.0)
 
     def process_weights_after_loading(self, layer):
         state = layer.modelslim_kv_state
-        for component in ("k", "v"):
-            scale = getattr(layer, f"fa_{component}_scale")
-            offset = getattr(layer, f"fa_{component}_offset")
-            if component == "k" and not scale.modelslim_loaded:
-                logger.warning(
-                    "%s.fa_%s.scale is missing; using scale=1 "
-                    "(raw=%s, effective=%s, source=%s)",
-                    self.prefix,
-                    component,
-                    state.raw_quant_type,
-                    state.effective_quant_type,
-                    state.quant_type_source,
-                )
-                scale.data.fill_(1)
-            if scale.modelslim_loaded and (
-                not torch.isfinite(scale).all() or not (scale > 0).all()
-            ):
-                raise ValueError(
-                    f"{self.prefix}.fa_{component}.scale must be finite and positive"
-                )
-            if offset.modelslim_loaded and torch.count_nonzero(offset):
-                raise ValueError(
-                    f"{self.prefix}.fa_{component}.offset must be zero for FP8"
-                )
+        scale, offset = layer.fa_k_scale, layer.fa_k_offset
+        if not scale.modelslim_loaded:
+            logger.warning(
+                "%s.fa_k.scale is missing; using scale=1 "
+                "(raw=%s, effective=%s, source=%s)",
+                self.prefix,
+                state.raw_quant_type,
+                state.effective_quant_type,
+                state.quant_type_source,
+            )
+            scale.data.fill_(1)
+        if scale.modelslim_loaded and (
+            not torch.isfinite(scale).all() or not (scale > 0).all()
+        ):
+            raise ValueError(f"{self.prefix}.fa_k.scale must be finite and positive")
+        if offset.modelslim_loaded and torch.count_nonzero(offset):
+            raise ValueError(f"{self.prefix}.fa_k.offset must be zero for FP8")
 
-        # MLA's fa_v is export compatibility data. QK and PV share fa_k's C.
         self._set_runtime_tensor(state, "k_scale", layer.fa_k_scale)
-        self._set_runtime_tensor(state, "v_scale", layer.fa_k_scale)
         self._set_runtime_tensor(state, "k_inv_scale", state.k_scale.reciprocal())
-        self._set_runtime_tensor(state, "v_inv_scale", state.v_scale.reciprocal())
 
     def get_cache_spec(self):
         binding = self.binding
@@ -99,7 +85,7 @@ class ModelSlimQFP8DynamicKVFP8Scheme(ModelSlimKVCacheScheme):
 
     def quantize_cache(self, state, k, v):
         k = self._quantize(k, state.k_inv_scale)
-        return k, v.to(torch.bfloat16), None, None
+        return k, v.to(torch.bfloat16), None
 
     def dequantize_cache(self, state, k, v=None, k_scale=None, v_scale=None):
         import torch_npu

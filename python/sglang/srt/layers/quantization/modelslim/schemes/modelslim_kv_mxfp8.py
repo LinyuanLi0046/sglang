@@ -48,9 +48,10 @@ class ModelSlimQKMXFP8DynamicVMXFP8PerChannelScheme(ModelSlimKVCacheScheme):
             torch.where(scale == 0, 127, scale).to(torch.uint8),
         )
         self._set_runtime_tensor(
-            state, "v_scale", torch.exp2(state.v_scale_encoded.float() - 127)
+            state,
+            "v_inv_scale",
+            torch.exp2(state.v_scale_encoded.float() - 127).reciprocal(),
         )
-        self._set_runtime_tensor(state, "v_inv_scale", state.v_scale.reciprocal())
         self._set_runtime_tensor(
             state, "p_scale", torch.ones(1, dtype=torch.float32, device=scale.device)
         )
@@ -89,21 +90,4 @@ class ModelSlimQKMXFP8DynamicVMXFP8PerChannelScheme(ModelSlimKVCacheScheme):
             axis=-1,
             div_mode=False,
         ).view(v.shape)
-        return k, v, k_scale, state.v_scale_encoded
-
-    def dequantize_cache(self, state, k, v=None, k_scale=None, v_scale=None):
-        import torch_npu
-
-        # Restore DynamicMxQuant's paired E8M0 scale layout.
-        k = torch_npu.npu_anti_mx_quant(
-            k,
-            k_scale.reshape(*k.shape[:-1], k.shape[-1] // 64, 2),
-            dst_type=self.binding.compute_dtype,
-        )
-        if v is not None:
-            v = torch_npu.npu_anti_quant(
-                v.flatten(-2),
-                state.v_scale.reshape(-1),
-                dst_dtype=self.binding.compute_dtype,
-            ).view(v.shape)
-        return k, v
+        return k, v, k_scale

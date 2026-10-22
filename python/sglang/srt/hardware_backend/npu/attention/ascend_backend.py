@@ -10,6 +10,9 @@ from sgl_kernel_npu.attention.sinks_attention import (
     attention_sinks_triton,
 )
 
+from sglang.kernels.ops.attention.trtllm_mha_page_table import (
+    build_trtllm_mha_page_table,
+)
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
@@ -338,6 +341,7 @@ class AscendAttnBackend(AttentionBackend):
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         cache_spec = model_runner.kv_cache_configurator.modelslim_cache_spec
         self.use_qfa = cache_spec is not None and cache_spec.layout == "gqa_mxfp8"
+        self.needs_cpu_seq_lens = not self.use_qfa
         if self.use_qfa:
             from cann_ops_transformer.ops import (
                 quant_flash_attn,
@@ -527,6 +531,11 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.seq_lens,
                 forward_batch.out_cache_loc,
             )
+        if self.use_qfa:
+            # QFA rebuilds both lengths and page tables inside the captured graph.
+            self.forward_metadata = self.graph_metadata[bs]
+            self.graph_mode = True
+            return
         self._apply_cuda_graph_metadata(
             bs=bs,
             req_pool_indices=forward_batch.req_pool_indices,
@@ -545,9 +554,29 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
-        if self.use_qfa and forward_batch.seq_lens.numel() == 0:
-            seq_lens_max = 0
-        elif forward_batch.forward_mode.is_target_verify():
+        if self.use_qfa:
+            metadata = self.forward_metadata
+            # Eager MTP trims DP padding from Q; use the same request extent here.
+            bs = forward_batch.seq_lens[: forward_batch._original_batch_size].numel()
+            max_pages = (
+                self.req_to_token.shape[1] + self.page_size - 1
+            ) // self.page_size
+            metadata.block_tables = torch.empty(
+                (bs, max_pages), dtype=torch.int32, device=self.device
+            )
+            metadata.seq_lens = forward_batch.seq_lens
+            if forward_batch.forward_mode.is_decode_or_idle():
+                query_len = 1
+            elif forward_batch.forward_mode.is_target_verify():
+                query_len = int(forward_batch.spec_info.draft_token_num)
+            else:
+                query_len = None
+            self._init_qfa_metadata(metadata, forward_batch.forward_mode, query_len)
+            self.graph_mode = False
+            self.init_forward_metadata_in_graph(forward_batch)
+            return
+
+        if forward_batch.forward_mode.is_target_verify():
             if (
                 forward_batch.spec_algorithm is not None
                 and forward_batch.spec_algorithm.is_dflash()
@@ -592,24 +621,6 @@ class AscendAttnBackend(AttentionBackend):
                 .to(torch.int32)
                 .contiguous()
             )
-        if self.use_qfa:
-            metadata = self.forward_metadata
-            # Eager MTP trims DP padding from Q; use the same request extent here.
-            metadata.block_tables = metadata.block_tables[
-                : forward_batch._original_batch_size
-            ]
-            metadata.seq_lens = forward_batch.seq_lens
-            if forward_batch.forward_mode.is_decode_or_idle():
-                query_len = 1
-            elif forward_batch.forward_mode.is_target_verify():
-                query_len = int(forward_batch.spec_info.draft_token_num)
-            else:
-                query_len = None
-            self._init_qfa_metadata(metadata, forward_batch.forward_mode, query_len)
-            self.graph_mode = False
-            self.init_forward_metadata_in_graph(forward_batch)
-            return
-
         if forward_batch.extend_seq_lens is not None:
             self.forward_metadata.extend_seq_lens = forward_batch.extend_seq_lens
             self.forward_metadata.extend_seq_lens_cpu_int = (
@@ -792,6 +803,15 @@ class AscendAttnBackend(AttentionBackend):
         if self.graph_mode and offset:
             # Zero is the existing graph-padding sentinel, not a real KV prefix.
             metadata.actual_seq_lengths_kv.masked_fill_(seq_lens == 0, 0)
+        # Read only valid page boundaries, using the same lengths as QFA. The
+        # static table capacity avoids host max() and keeps graph addresses fixed.
+        build_trtllm_mha_page_table(
+            req_to_token=self.req_to_token,
+            req_pool_indices=forward_batch.req_pool_indices[:bs],
+            cache_seqlens=metadata.actual_seq_lengths_kv,
+            page_table=metadata.block_tables,
+            page_size=self.page_size,
+        )
         if metadata.qfa_query_len is None:
             torch.cumsum(
                 forward_batch.extend_seq_lens[:bs],
@@ -3922,6 +3942,9 @@ class AscendAttnMultiStepDraftBackend:
             self.attn_backends.append(
                 AscendAttnBackend(model_runner, speculative_step_id=step_id)
             )
+        self.needs_cpu_seq_lens = any(
+            backend.needs_cpu_seq_lens for backend in self.attn_backends
+        )
 
     def common_template(self, forward_batch: ForwardBatch, call_fn: int):
         assert forward_batch.spec_info is not None

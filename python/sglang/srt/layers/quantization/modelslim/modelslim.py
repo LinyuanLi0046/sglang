@@ -274,12 +274,11 @@ class ModelSlimConfig(QuantizationConfig):
         if cache_spec is not None and cache_spec.layout == "gqa_mxfp8":
             if (
                 page_size not in (512, 1024)
-                or cache_spec.key_head_dim not in (64, 128)
                 or cache_spec.value_head_dim != cache_spec.key_head_dim
             ):
                 raise ValueError(
-                    "CANN 9.1.0 ModelSlim MXFP8 FIA requires --page-size 512 "
-                    "or --page-size 1024 and equal K/V head dimensions of 64 or 128."
+                    "ModelSlim MXFP8 cache currently requires --page-size 512 "
+                    "or --page-size 1024 and equal K/V head dimensions."
                 )
         elif cache_spec is not None and cache_spec.layout == "mla_fp8":
             if max_query_heads > 128:

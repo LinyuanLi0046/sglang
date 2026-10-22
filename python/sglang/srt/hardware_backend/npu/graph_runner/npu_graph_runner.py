@@ -112,6 +112,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         torch_compile_decoration.patch_model = patch_model_npu
         cache_spec = model_runner.kv_cache_configurator.modelslim_cache_spec
         self.modelslim_kv = cache_spec is not None
+        self.use_qfa = cache_spec is not None and cache_spec.layout == "gqa_mxfp8"
         super().__init__(
             model_runner,
             attn_backend=attn_backend,
@@ -374,7 +375,8 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         graph_key = self._make_graph_key(self.bs)
 
         if not (
-            is_deepseek_dsa(self.model_runner.model_config.hf_config)
+            self.use_qfa
+            or is_deepseek_dsa(self.model_runner.model_config.hf_config)
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
             if forward_batch.forward_mode.is_target_verify():

@@ -33,6 +33,9 @@ class MultiLayerEagleDraftExtendNpuGraphRunner(
     MultiLayerEagleDraftExtendCudaGraphRunner
 ):
     def _replay_graph(self, shape_key, forward_batch):
+        cache_spec = self.model_runner.kv_cache_configurator.modelslim_cache_spec
+        if cache_spec is not None and cache_spec.layout == "gqa_mxfp8":
+            return self.backend.replay(shape_key, forward_batch)
         seq_lens = self.buffers.seq_lens_cpu[: self.raw_bs].tolist() + [0] * (
             self.bs - self.raw_bs
         )

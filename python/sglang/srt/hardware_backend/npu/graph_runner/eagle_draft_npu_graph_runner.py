@@ -91,6 +91,9 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         return bool(decision.item())
 
     def _replay_graph(self, shape_key, forward_batch):
+        cache_spec = self.model_runner.kv_cache_configurator.modelslim_cache_spec
+        if cache_spec is not None and cache_spec.layout == "gqa_mxfp8":
+            return self.backend.replay(shape_key, forward_batch)
         hf_config = self.model_runner.model_config.hf_config
         if not (is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)):
             seq_lens_for_each_draft_step = []

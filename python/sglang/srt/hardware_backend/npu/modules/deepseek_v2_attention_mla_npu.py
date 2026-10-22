@@ -43,14 +43,11 @@ def _use_dsa_dcp_partial_attention(forward_batch: "ForwardBatch") -> bool:
 
 def _use_fp8_mlaprolog(m: "DeepseekV2AttentionMLA") -> bool:
     if not hasattr(m, "_use_fp8_mlaprolog"):
-        # Decide before prefill writes cache so decode uses the same RoPE layout.
-        # Static C8 requires MXFP8 projections and interleaved RoPE.
+        # Static C8 uses MXFP8 projections; no-RoPE Kimi stays unfused.
         m._use_fp8_mlaprolog = (
             is_mla_preprocess_enabled()
             and _is_npu_arch35
             and m.rotary_emb is not None
-            and not m.rotary_emb.is_neox_style
-            and m.q_lora_rank is not None
             and all(
                 NPUFusedMLAPreprocess.is_mxfp8_projection(layer)
                 for layer in (m.fused_qkv_a_proj_with_mqa, m.q_b_proj)
@@ -69,7 +66,6 @@ def forward_mha_prepare_npu(
     input_on_attn_tp_slices: bool,
 ):
     kv_quant_state = getattr(m.attn_mqa, "modelslim_kv_state", None)
-    use_fp8_mlaprolog = kv_quant_state is not None and _use_fp8_mlaprolog(m)
     if m.q_lora_rank is not None:
         q, latent_cache = (
             get_attn_tp_context()
@@ -148,12 +144,7 @@ def forward_mha_prepare_npu(
         kv_a = m.kv_a_layernorm(kv_a)
         k_pe = latent_cache[:, :, m.kv_lora_rank :]
         if m.rotary_emb is not None:
-            if use_fp8_mlaprolog:
-                q_pe, k_pe = _apply_interleaved_rope_with_half_output(
-                    m.rotary_emb, positions, q_pe, k_pe
-                )
-            else:
-                q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+            q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
         # this is for model kimi-vl-a3B-instruct
         get_token_to_kv_pool().set_kv_buffer(
             m.attn_mqa if kv_quant_state is not None else m,

@@ -3419,13 +3419,13 @@ class AscendAttnBackend(AttentionBackend):
                 return attn_out
 
             if state is not None or self.use_fia:
-                num_token_padding = q.shape[0]
                 if self.forward_metadata.seq_lens_cpu_int is None:
                     actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
                 else:
                     actual_seq_len_kv = (
                         self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                     )
+                num_token_padding = q.shape[0]
                 actual_bs = self.forward_metadata.block_tables.shape[0]
                 q = q[:actual_bs]
                 if state is not None:
@@ -3601,9 +3601,7 @@ class AscendAttnBackend(AttentionBackend):
             k_pe = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
             state = layer.modelslim_kv_state
-            if state is not None or (
-                self.use_fia and (layer.tp_q_head_num // layer.tp_k_head_num) >= 8
-            ):
+            if self.use_fia and (layer.tp_q_head_num // layer.tp_k_head_num) >= 8:
                 """layer.tp_q_head_num // layer.tp_k_head_num < 8 will support in the later version of CANN"""
                 if is_fia_nz():
                     kv_c = _reshape_kv_for_fia_nz(
@@ -3619,41 +3617,27 @@ class AscendAttnBackend(AttentionBackend):
                     k_pe = k_pe.view(
                         -1, self.page_size, layer.tp_k_head_num * self.qk_rope_head_dim
                     )
-                if state is not None:
-                    actual_bs = self.forward_metadata.block_tables.shape[0]
-                    q = q[:actual_bs].reshape(
-                        -1, 1, layer.tp_q_head_num, self.kv_lora_rank
+                q = q.view(
+                    forward_batch.batch_size, -1, layer.tp_q_head_num, self.kv_lora_rank
+                )
+                q_rope = q_rope.view(
+                    forward_batch.batch_size,
+                    -1,
+                    layer.tp_q_head_num,
+                    self.qk_rope_head_dim,
+                )
+                q_descale = (
+                    kwargs["q_descale"].reshape(
+                        forward_batch.batch_size, -1, layer.tp_q_head_num
                     )
-                    q_rope = q_rope[:actual_bs].reshape(
-                        -1, 1, layer.tp_q_head_num, self.qk_rope_head_dim
-                    )
-                    q_descale = kwargs["q_descale"][:actual_bs].reshape(
-                        -1, 1, layer.tp_q_head_num
-                    )
-                    if q.shape[0] == 0:
-                        return q.new_zeros(
-                            (num_tokens, layer.tp_q_head_num * layer.v_head_dim),
-                            dtype=state.binding.compute_dtype,
-                        )
-                else:
-                    q = q.view(
-                        forward_batch.batch_size,
-                        -1,
-                        layer.tp_q_head_num,
-                        self.kv_lora_rank,
-                    )
-                    q_rope = q_rope.view(
-                        forward_batch.batch_size,
-                        -1,
-                        layer.tp_q_head_num,
-                        self.qk_rope_head_dim,
-                    )
-                    q_descale = None
+                    if state is not None
+                    else None
+                )
                 if (layer.tp_q_head_num & (layer.tp_q_head_num - 1)) != 0:
                     power_of_2_head = next_power_of_2(layer.tp_q_head_num)
                     padding_head = power_of_2_head - layer.tp_q_head_num
                     q_padding_tensor = torch.zeros(
-                        [q.shape[0], q.shape[1], padding_head, q.shape[-1]],
+                        [num_tokens, q.shape[1], padding_head, q.shape[-1]],
                         dtype=torch.uint8 if state is not None else q.dtype,
                         device=q.device,
                     )
@@ -3673,12 +3657,7 @@ class AscendAttnBackend(AttentionBackend):
                     else:
                         q = torch.cat((q, q_padding_tensor), dim=-2)
                     q_rope_padding_tensor = torch.zeros(
-                        [
-                            q_rope.shape[0],
-                            q_rope.shape[1],
-                            padding_head,
-                            q_rope.shape[-1],
-                        ],
+                        [num_tokens, q_rope.shape[1], padding_head, q_rope.shape[-1]],
                         dtype=q_rope.dtype,
                         device=q_rope.device,
                     )
@@ -3762,16 +3741,6 @@ class AscendAttnBackend(AttentionBackend):
                     context_lens=self.forward_metadata.seq_lens_cpu_int,
                     mla_vheadsize=self.kv_lora_rank,
                     out=attn_output,
-                )
-            if state is not None and attn_output.shape[0] < num_tokens:
-                attn_output = torch.cat(
-                    (
-                        attn_output,
-                        attn_output.new_zeros(
-                            num_tokens - attn_output.shape[0], *attn_output.shape[1:]
-                        ),
-                    ),
-                    dim=0,
                 )
             return attn_output.view(num_tokens, layer.tp_q_head_num * self.kv_lora_rank)
 

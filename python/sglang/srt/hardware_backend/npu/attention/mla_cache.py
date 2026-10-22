@@ -19,7 +19,7 @@ def gather_mla_cache_pages(
     if not is_nz:
         return pages.view(cache.dtype)
     page_size, head_dim = cache.shape[1], cache.shape[-1]
-    tile_size = 32 // cache.element_size()
+    tile_size = 32 if cache.dtype == torch.float8_e4m3fn else 16
     return (
         pages.view(block_ids.numel(), head_dim // tile_size, page_size, tile_size)
         .permute(0, 2, 1, 3)

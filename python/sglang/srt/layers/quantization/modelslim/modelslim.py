@@ -242,6 +242,63 @@ class ModelSlimConfig(QuantizationConfig):
                 self.kv_quant_type_override,
             )
 
+    def get_kv_cache_config(self, model, page_size):
+        """Collect this worker's NPU allocation contract only for explicit FP8 KV."""
+        if self.requested_kv_cache_dtype != "fp8_e4m3":
+            return None, {}
+
+        cache_spec = None
+        states = {}
+        max_query_heads = 0
+        for module in model.modules():
+            state = getattr(module, "modelslim_kv_state", None)
+            if state is None:
+                if getattr(module, "kv_quant_binding", None) is not None:
+                    raise ValueError(
+                        "Explicit ModelSlim FP8 KV cache cannot share a pool "
+                        f"with unquantized attention layer {module.layer_id}. "
+                        "Remove that layer's ignore/FLOAT declaration or use "
+                        "--kv-cache-dtype auto for a BF16 cache."
+                    )
+                continue
+            spec = state.cache_spec
+            if cache_spec not in (None, spec):
+                raise ValueError(
+                    "ModelSlim attention layers in one NPU pool must share "
+                    "the same KV cache layout and local head geometry."
+                )
+            max_query_heads = max(max_query_heads, module.tp_q_head_num)
+            cache_spec = spec
+            states[module.layer_id] = state
+
+        if cache_spec is not None and cache_spec.layout == "gqa_mxfp8":
+            if (
+                page_size not in (512, 1024)
+                or cache_spec.key_head_dim not in (64, 128)
+                or cache_spec.value_head_dim != cache_spec.key_head_dim
+            ):
+                raise ValueError(
+                    "CANN 9.1.0 ModelSlim MXFP8 FIA requires --page-size 512 "
+                    "or --page-size 1024 and equal K/V head dimensions of 64 or 128."
+                )
+        elif cache_spec is not None and cache_spec.layout == "mla_fp8":
+            if max_query_heads > 128:
+                raise ValueError(
+                    "CANN 9.1.0 ModelSlim MLA FP8 FIA supports at most "
+                    "128 local query heads; increase attention TP size."
+                )
+            if (
+                page_size != 128
+                or cache_spec.local_kv_heads != 1
+                or cache_spec.key_head_dim != 512
+                or cache_spec.value_head_dim != 64
+            ):
+                raise ValueError(
+                    "CANN 9.1.0 ModelSlim MLA FP8 FIA requires --page-size 128, "
+                    "one shared KV head, latent dimension 512 and side dimension 64."
+                )
+        return cache_spec, states
+
     @staticmethod
     def _kv_scheme_class(quant_type):
         # The sole supported-format map, also used to validate an override.

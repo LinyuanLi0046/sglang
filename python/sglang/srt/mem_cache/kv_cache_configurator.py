@@ -4,6 +4,7 @@ import gc
 import logging
 import math
 from dataclasses import dataclass, field
+from functools import partial
 from typing import TYPE_CHECKING, Any, Optional
 
 import msgspec
@@ -362,32 +363,15 @@ class KVCacheConfigurator:
         self.draft_swa_full_capacity = self.is_hybrid_swa_mtp_draft and bool(
             self.layer_info.swa_attention_layer_ids
         )
-        if _is_npu:
-            from sglang.srt.hardware_backend.npu.memory_pool_npu import (
-                get_modelslim_kv_cache_config,
-            )
-
+        quant_config = getattr(self.model, "quant_config", None)
+        if (
+            _is_npu
+            and quant_config is not None
+            and quant_config.get_name() == "modelslim"
+        ):
             self.modelslim_cache_spec, self.modelslim_kv_states = (
-                get_modelslim_kv_cache_config(self.model, self.pool_page_size)
+                quant_config.get_kv_cache_config(self.model, self.pool_page_size)
             )
-
-    @property
-    def modelslim_kv_bytes_per_token(self) -> int:
-        spec = self.modelslim_cache_spec
-        if spec is None:
-            return 0
-        size = spec.local_kv_heads * (
-            spec.key_head_dim * torch._utils._element_size(spec.key_dtype)
-            + spec.value_head_dim * torch._utils._element_size(spec.value_dtype)
-        )
-        if spec.scale_dtype is not None:
-            size += (
-                spec.local_kv_heads
-                * (spec.key_head_dim + spec.value_head_dim)
-                // spec.group_size
-                * torch._utils._element_size(spec.scale_dtype)
-            )
-        return size
 
     def hybrid_swa_token_capacity(
         self,
@@ -2515,34 +2499,15 @@ class KVCacheConfigurator:
                 qsa_indexer_dtype=resolve_qsa_indexer_dtype(qsa_indexer_dtype),
             )
         if self.modelslim_cache_spec is not None:
-            spec = self.modelslim_cache_spec
-            pool_kwargs = dict(
-                size=max_total_num_tokens,
-                page_size=self.pool_page_size,
-                dtype=self.kv_cache_dtype,
-                layer_num=len(full_attention_layer_ids),
-                device=self.device,
-                enable_memory_saver=get_exec().features.enable_memory_saver,
-                modelslim_cache_spec=spec,
-            )
+            pool_kwargs = dict(modelslim_cache_spec=self.modelslim_cache_spec)
             if self.use_mla_backend:
-                pool_kwargs.update(
-                    kv_lora_rank=spec.key_head_dim,
-                    qk_rope_head_dim=spec.value_head_dim,
-                    is_draft_worker=self.is_draft_worker,
-                )
+                pool_kwargs["is_draft_worker"] = self.is_draft_worker
             else:
-                pool_kwargs.update(
-                    head_num=spec.local_kv_heads,
-                    head_dim=spec.key_head_dim,
-                    v_head_dim=spec.value_head_dim,
-                    modelslim_states={
-                        i: self.modelslim_kv_states[layer_id]
-                        for i, layer_id in enumerate(full_attention_layer_ids)
-                    },
-                )
-            # Reuse the wrapper's existing injection point and dense layer mapping.
-            extra_args["full_kv_pool"] = full_pool_class(**pool_kwargs)
+                pool_kwargs["modelslim_states"] = {
+                    i: self.modelslim_kv_states[layer_id]
+                    for i, layer_id in enumerate(full_attention_layer_ids)
+                }
+            full_pool_class = partial(full_pool_class, **pool_kwargs)
         token_to_kv_pool = pool_class(
             page_size=self.pool_page_size,
             size=max_total_num_tokens,

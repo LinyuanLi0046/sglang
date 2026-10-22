@@ -53,6 +53,21 @@ class ModelSlimKVCacheSpec:
     scale_dtype: Optional[torch.dtype] = None
     group_size: int = 0
 
+    @property
+    def bytes_per_token(self) -> int:
+        size = self.local_kv_heads * (
+            self.key_head_dim * torch._utils._element_size(self.key_dtype)
+            + self.value_head_dim * torch._utils._element_size(self.value_dtype)
+        )
+        if self.scale_dtype is not None:
+            size += (
+                self.local_kv_heads
+                * (self.key_head_dim + self.value_head_dim)
+                // self.group_size
+                * torch._utils._element_size(self.scale_dtype)
+            )
+        return size
+
 
 @dataclass
 class ModelSlimKVCacheState:

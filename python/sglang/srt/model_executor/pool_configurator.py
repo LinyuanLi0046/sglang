@@ -352,7 +352,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         )
 
         if kvc.modelslim_cache_spec is not None:
-            return kvc.modelslim_kv_bytes_per_token * effective_num_layers
+            return kvc.modelslim_cache_spec.bytes_per_token * effective_num_layers
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size

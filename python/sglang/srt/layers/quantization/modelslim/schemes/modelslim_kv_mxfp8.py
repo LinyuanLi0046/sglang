@@ -70,6 +70,11 @@ class ModelSlimQKMXFP8DynamicVMXFP8PerChannelScheme(ModelSlimKVCacheScheme):
     def quantize_query(self, state, q):
         import torch_npu
 
+        if q.numel() == 0:
+            return (
+                q.new_empty(q.shape, dtype=torch.float8_e4m3fn),
+                q.new_empty((*q.shape[:-1], q.shape[-1] // 32), dtype=torch.uint8),
+            )
         quantized, scale = torch_npu.npu_dynamic_mx_quant(
             q, dst_type=torch.float8_e4m3fn
         )

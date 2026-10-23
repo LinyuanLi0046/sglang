@@ -467,6 +467,10 @@ class ModelSlimConfig(QuantizationConfig):
                 prefix_in_quant_config = prefix.replace(
                     proj_name, packed_modules_mapping_subset[proj_name][0]
                 )
+            elif proj_name in self.packed_modules_mapping:
+                prefix_in_quant_config = prefix.replace(
+                    proj_name, self.packed_modules_mapping[proj_name][0]
+                )
             prefix_in_quant_config = self._resolve_quant_prefix(prefix_in_quant_config)
             if self.is_layer_skipped(
                 prefix, packed_modules_mapping_subset

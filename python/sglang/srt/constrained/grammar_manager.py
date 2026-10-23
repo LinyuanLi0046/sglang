@@ -14,6 +14,7 @@ from sglang.srt.constrained.base_grammar_backend import (
 from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
+from sglang.srt.observability.pd_time_stats import emit, identity, interval_ms
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq
@@ -21,6 +22,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
+_time_stats_logger = logging.getLogger("sglang.srt.managers.schedule_batch")
 
 
 class GrammarManager:
@@ -113,6 +115,59 @@ class GrammarManager:
                 if isinstance(req.grammar, futures.Future) and req.grammar:
                     req.grammar.cancel()
                 req.set_finish_with_abort("Aborted by AbortReq.")
+                if self._grammar_timing_enabled():
+                    self._finish_grammar_timing(req, "aborted")
+
+    def _grammar_timing_enabled(self) -> bool:
+        try:
+            return (
+                self.server_args.enable_request_time_stats_logging
+                and _time_stats_logger.isEnabledFor(logging.INFO)
+            )
+        except Exception:
+            return False
+
+    def _finish_grammar_timing(self, req: Req, status: str) -> None:
+        # Only called under the logging gate. Pop before emitting so aborts and
+        # the subsequent queue drain cannot produce duplicate records.
+        try:
+            timing = req.__dict__.pop("_pd_grammar_timing", None)
+            if timing is None:
+                return
+            end_ns = time.perf_counter_ns()
+            grammar_stats = getattr(req.grammar, "grammar_stats", None)
+            compilation_time = (
+                getattr(grammar_stats, "compilation_time", None)
+                if not timing["cache_hit"] and status == "ready"
+                else None
+            )
+            emit(
+                "PDGrammarStats ",
+                identity(
+                    self.server_args.disaggregation_mode,
+                    getattr(req, "bootstrap_room", None),
+                    stage="grammar_ready",
+                    rid=req.rid,
+                    tp_rank=self.scheduler.ps.tp_rank,
+                    dp_rank=self.scheduler.ps.dp_rank,
+                    pp_rank=self.pp_rank,
+                    status=status,
+                    **timing,
+                    end_ns=end_ns,
+                    lookup_ms=interval_ms(timing["begin_ns"], timing["lookup_end_ns"]),
+                    # Includes scheduler polling and TP/PP readiness synchronization;
+                    # it is request-visible queue residence, not pure compile time.
+                    wait_ms=interval_ms(timing["queued_ns"], end_ns),
+                    total_ms=interval_ms(timing["begin_ns"], end_ns),
+                    compilation_ms=(
+                        compilation_time * 1000 if compilation_time is not None else None
+                    ),
+                    poll_count=req.grammar_wait_ct,
+                ),
+            )
+        except Exception:
+            # Diagnostics must not alter grammar readiness or scheduler behavior.
+            pass
 
     def _get_request_thinking_budget(self, req: Req) -> int | None:
         custom_params = req.sampling_params.custom_params
@@ -150,10 +205,27 @@ class GrammarManager:
                 elif req.sampling_params.structural_tag is not None:
                     key = ("structural_tag", req.sampling_params.structural_tag)
 
+                log_grammar_timing = self._grammar_timing_enabled()
+                if log_grammar_timing:
+                    try:
+                        begin_ns = time.perf_counter_ns()
+                    except Exception:
+                        log_grammar_timing = False
                 value, cache_hit = self.grammar_backend.get_cached_or_future_value(
                     key, req.require_reasoning
                 )
                 req.grammar = value
+                if log_grammar_timing:
+                    try:
+                        req._pd_grammar_timing = {
+                            "constraint_type": key[0],
+                            "cache_hit": cache_hit,
+                            "begin_ns": begin_ns,
+                            "lookup_end_ns": time.perf_counter_ns(),
+                            "queued_ns": None,
+                        }
+                    except Exception:
+                        log_grammar_timing = False
 
                 if not cache_hit:
                     req.grammar_key = key
@@ -168,6 +240,11 @@ class GrammarManager:
                         req.set_finish_with_abort(error_msg)
                     else:
                         self._apply_request_reasoning_budget(req)
+                    if log_grammar_timing:
+                        self._finish_grammar_timing(
+                            req,
+                            "invalid" if isinstance(value, InvalidGrammarObject) else "ready",
+                        )
         elif self._enable_strict_thinking:
             grammar_obj = self.grammar_backend.init_strict_reasoning_grammar(
                 req.require_reasoning
@@ -177,6 +254,11 @@ class GrammarManager:
                 self._apply_request_reasoning_budget(req)
 
         if add_to_grammar_queue:
+            if log_grammar_timing:
+                try:
+                    req._pd_grammar_timing["queued_ns"] = time.perf_counter_ns()
+                except Exception:
+                    pass
             self.grammar_queue.append(req)
 
         return add_to_grammar_queue
@@ -272,6 +354,8 @@ class GrammarManager:
             req = self.grammar_queue[i]
             return_reqs.append(req)
             if req.finished() or req.grammar is None:  # It is aborted by AbortReq
+                if self._grammar_timing_enabled():
+                    self._finish_grammar_timing(req, "aborted")
                 continue
 
             assert isinstance(req.grammar, futures.Future) and req.grammar_key
@@ -288,6 +372,11 @@ class GrammarManager:
             if isinstance(req.grammar, InvalidGrammarObject):
                 error_msg = f"Failed to compile {req.grammar_key[0]} grammar: {req.grammar.error_message}"
                 req.set_finish_with_abort(error_msg)
+            if self._grammar_timing_enabled():
+                self._finish_grammar_timing(
+                    req,
+                    "invalid" if isinstance(req.grammar, InvalidGrammarObject) else "ready",
+                )
 
         # Return failed requests
         for i in synced_failed_req_idxs:
@@ -301,6 +390,8 @@ class GrammarManager:
             )
             error_msg = f"Grammar preprocessing timed out: {req.grammar_key=}"
             req.set_finish_with_abort(error_msg)
+            if self._grammar_timing_enabled():
+                self._finish_grammar_timing(req, "timeout")
 
         # Remove finished requests from grammar_queue
         self.grammar_queue = [

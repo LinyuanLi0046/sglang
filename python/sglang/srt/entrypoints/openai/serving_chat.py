@@ -70,6 +70,12 @@ from sglang.srt.function_call.utils import (
     normalize_json_schema_types,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.observability.pd_serving_time_stats import (
+    ParserTimingState,
+    ResponseTimingState,
+    ServingTiming,
+    is_enabled as pd_serving_logging_enabled,
+)
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -204,6 +210,11 @@ class OpenAIServingChat(OpenAIServingBase):
         self.template_manager = template_manager
         self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
         self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
+        self._log_pd_serving = (
+            self.tokenizer_manager.server_args.enable_request_time_stats_logging
+            and self.tokenizer_manager.server_args.disaggregation_mode
+            in ("prefill", "decode")
+        )
         self.default_chat_template_kwargs = (
             self.tokenizer_manager.server_args.default_chat_template_kwargs or {}
         )
@@ -350,6 +361,43 @@ class OpenAIServingChat(OpenAIServingBase):
 
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
+
+    def _new_pd_serving_timing(self, request, adapted_request):
+        # Called only behind the request-stats flag AND the existing INFO logger.
+        # Retain scalar metadata, never messages, schemas or generated arguments.
+        try:
+            tools = self._effective_tools(request)
+            params = adapted_request.sampling_params
+            return ServingTiming(
+                self.tokenizer_manager.server_args.disaggregation_mode,
+                adapted_request.bootstrap_room,
+                stream=request.stream,
+                reasoning_parser=self.reasoning_parser,
+                tool_call_parser=self.tool_call_parser,
+                tool_count=len(tools),
+                strict_tool_count=sum(bool(tool.function.strict) for tool in tools),
+                tool_choice=(
+                    request.tool_choice
+                    if isinstance(request.tool_choice, str)
+                    else "named"
+                ),
+                tool_strict_level=envs.SGLANG_TOOL_STRICT_LEVEL.get(),
+                require_reasoning=adapted_request.require_reasoning,
+                template_force_reasoning=self.template_manager.force_reasoning,
+                separate_reasoning=request.separate_reasoning,
+                stream_reasoning=request.stream_reasoning,
+                constraint_kind=next(
+                    (
+                        key
+                        for key in ("json_schema", "regex", "ebnf", "structural_tag")
+                        if isinstance(params, dict) and params.get(key) is not None
+                    ),
+                    None,
+                ),
+            )
+        except Exception:
+            # Optional diagnostics must not prevent generation.
+            return None
 
     def _effective_tools(self, request: ChatCompletionRequest) -> List[Tool]:
         tools = list(request.tools or [])
@@ -667,6 +715,11 @@ class OpenAIServingChat(OpenAIServingBase):
         completion_tokens: Dict[int, int],
     ) -> AsyncGenerator[str, None]:
         """Generate SSE chunks for streaming content."""
+        timing = (
+            parser_dict.timing
+            if self._log_pd_serving and isinstance(parser_dict, ParserTimingState)
+            else None
+        )
         offset = stream_offsets.get(index, 0)
         if self.tokenizer_manager.server_args.incremental_streaming_output:
             delta = content["text"]
@@ -681,6 +734,9 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Handle reasoning content
         if self.reasoning_parser and request.separate_reasoning:
+            if timing is not None:
+                reasoning_chars = len(delta)
+                reasoning_start = timing.start()
             reasoning_text, delta = self._process_reasoning_stream(
                 index,
                 delta,
@@ -689,6 +745,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 request,
                 finish_reason_type,
             )
+            if timing is not None:
+                timing.observe(
+                    "reasoning",
+                    reasoning_start,
+                    input_chars=reasoning_chars,
+                    empty=not reasoning_text and not delta,
+                )
             if reasoning_text:
                 usage = None
                 if continuous_usage_stats:
@@ -699,7 +762,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         cached_tokens=self._continuous_usage_cached_details(content),
                     ).model_dump()
 
-                yield build_sse_content(
+                chunk = build_sse_content(
                     chunk_id=content["meta_info"]["id"],
                     created=int(time.time()),
                     model=request.model,
@@ -708,6 +771,14 @@ class OpenAIServingChat(OpenAIServingBase):
                     logprobs=remaining_logprobs,
                     usage=usage,
                 )
+                if timing is not None:
+                    timing.first(
+                        "reasoning",
+                        rid=content["meta_info"]["id"],
+                        index=index,
+                        completion_tokens=content["meta_info"].get("completion_tokens"),
+                    )
+                yield chunk
                 remaining_logprobs = None
 
         # Handle tool calls
@@ -731,10 +802,21 @@ class OpenAIServingChat(OpenAIServingBase):
             # Send any remaining tool call arguments when generation finishes
             if finish_reason_type is not None and index in parser_dict:
                 parser = parser_dict[index]
+                if timing is not None:
+                    flush_start = timing.start()
                 remaining_chunk = self._check_for_unstreamed_tool_args(
                     parser, content, request, index
                 )
+                if timing is not None:
+                    timing.observe("tool_flush", flush_start, empty=not remaining_chunk)
                 if remaining_chunk:
+                    if timing is not None:
+                        timing.first(
+                            "tool_calls",
+                            rid=content["meta_info"]["id"],
+                            index=index,
+                            completion_tokens=content["meta_info"].get("completion_tokens"),
+                        )
                     yield remaining_chunk
 
         else:
@@ -749,7 +831,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         cached_tokens=self._continuous_usage_cached_details(content),
                     ).model_dump()
 
-                yield build_sse_content(
+                chunk = build_sse_content(
                     chunk_id=content["meta_info"]["id"],
                     created=int(time.time()),
                     model=request.model,
@@ -758,6 +840,14 @@ class OpenAIServingChat(OpenAIServingBase):
                     logprobs=remaining_logprobs,
                     usage=usage,
                 )
+                if timing is not None:
+                    timing.first(
+                        "content",
+                        rid=content["meta_info"]["id"],
+                        index=index,
+                        completion_tokens=content["meta_info"].get("completion_tokens"),
+                    )
+                yield chunk
                 remaining_logprobs = None
 
         # Flush logprobs still unattached this step — only when a parser is
@@ -1461,6 +1551,11 @@ class OpenAIServingChat(OpenAIServingBase):
         # Parsers for tool calls and reasoning
         parser_dict = {}
         reasoning_parser_dict = {}
+        timing = None
+        if self._log_pd_serving and pd_serving_logging_enabled():
+            timing = self._new_pd_serving_timing(request, adapted_request)
+            if timing is not None:
+                parser_dict = ParserTimingState(timing)
 
         # State tracking for streaming
         is_firsts = {}
@@ -1482,6 +1577,7 @@ class OpenAIServingChat(OpenAIServingBase):
         video_tokens = {}
 
         stream_started = False
+        timing_status = "interrupted"
         try:
             include_usage, continuous_usage_stats = should_include_usage(
                 request.stream_options,
@@ -1550,7 +1646,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 # First chunk with role
                 if is_firsts.get(index, True):
                     is_firsts[index] = False
-                    yield build_sse_content(
+                    chunk = build_sse_content(
                         chunk_id=content["meta_info"]["id"],
                         created=int(time.time()),
                         model=request.model,
@@ -1558,6 +1654,14 @@ class OpenAIServingChat(OpenAIServingBase):
                         role="assistant",
                         content="",
                     )
+                    if timing is not None:
+                        timing.first(
+                            "role",
+                            rid=content["meta_info"]["id"],
+                            index=index,
+                            completion_tokens=content["meta_info"].get("completion_tokens"),
+                        )
+                    yield chunk
                     stream_started = True
 
                 # Generate streaming content (override in subclass for custom behavior)
@@ -1680,11 +1784,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 yield f"data: {usage_chunk.model_dump_json()}\n\n"
 
+            timing_status = "complete"
         except ValueError as e:
+            timing_status = "error"
             if not stream_started:
                 raise
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
+        finally:
+            if timing is not None:
+                timing.finish(timing_status)
 
         yield "data: [DONE]\n\n"
 
@@ -1705,6 +1814,23 @@ class OpenAIServingChat(OpenAIServingBase):
         if not isinstance(ret, list):
             ret = [ret]
 
+        timing = None
+        if self._log_pd_serving and pd_serving_logging_enabled():
+            timing = self._new_pd_serving_timing(request, adapted_request)
+        if timing is not None:
+            ret = ResponseTimingState(ret, timing)
+            build_start = timing.start()
+            status = "error"
+            try:
+                response = self._build_chat_response(request, ret, int(time.time()))
+                timing.observe("response_build", build_start)
+                # FastAPI serialization / ASGI send happen AFTER this boundary.
+                timing.mark("response_object_ready")
+                status = "response_ready"
+                return response
+            finally:
+                timing.finish(status)
+
         response = self._build_chat_response(
             request,
             ret,
@@ -1720,6 +1846,11 @@ class OpenAIServingChat(OpenAIServingBase):
         created: int,
     ) -> Union[ChatCompletionResponse, ORJSONResponse]:
         """Build chat completion response from generation results"""
+        timing = (
+            ret.timing
+            if self._log_pd_serving and isinstance(ret, ResponseTimingState)
+            else None
+        )
         choices = []
 
         # Build sglext at response level (from first ret_item, as these are per-request)
@@ -1757,6 +1888,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     self.template_manager.force_reasoning
                     or self._get_reasoning_from_request(request)
                 )
+                if timing is not None:
+                    reasoning_chars = len(text)
+                    reasoning_start = timing.start()
                 try:
                     parser = ReasoningParser(
                         model_type=self.reasoning_parser,
@@ -1766,6 +1900,13 @@ class OpenAIServingChat(OpenAIServingBase):
                         tokenizer=self.tokenizer_manager.tokenizer,
                     )
                     reasoning_text, text = parser.parse_non_stream(text)
+                    if timing is not None:
+                        timing.observe(
+                            "reasoning",
+                            reasoning_start,
+                            input_chars=reasoning_chars,
+                            empty=not reasoning_text and not text,
+                        )
                 except Exception as e:
                     logger.error(f"Reasoning parsing error: {e}")
                     return self.create_error_response(
@@ -1782,6 +1923,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 and effective_tools
                 and self.tool_call_parser
             ):
+                if timing is not None:
+                    tool_chars = len(text)
+                    tool_start = timing.start()
                 history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
                 tool_calls, text, finish_reason = self._process_tool_calls(
                     text,
@@ -1790,6 +1934,13 @@ class OpenAIServingChat(OpenAIServingBase):
                     request.tool_choice,
                     history_tool_calls_cnt,
                 )
+                if timing is not None:
+                    timing.observe(
+                        "tool",
+                        tool_start,
+                        input_chars=tool_chars,
+                        empty=not tool_calls and not text,
+                    )
 
             # Extract prompt_token_ids if requested
             choice_prompt_token_ids = (
@@ -2320,6 +2471,13 @@ class OpenAIServingChat(OpenAIServingBase):
         continuous_usage_stats: bool = False,
     ):
         """Process tool calls in streaming response"""
+        timing = (
+            parser_dict.timing
+            if self._log_pd_serving and isinstance(parser_dict, ParserTimingState)
+            else None
+        )
+        if timing is not None:
+            tool_start = timing.start()
         effective_tools = self._effective_tools(request)
         if index not in parser_dict:
             is_required = request.tool_choice == "required" or isinstance(
@@ -2361,6 +2519,13 @@ class OpenAIServingChat(OpenAIServingBase):
             normal_text, calls = result.normal_text, result.calls
         else:
             normal_text, calls = parser.parse_stream_chunk(delta)
+        if timing is not None:
+            timing.observe(
+                "tool",
+                tool_start,
+                input_chars=len(delta),
+                empty=not normal_text and not calls,
+            )
 
         # Yield normal text
         if normal_text:
@@ -2388,7 +2553,15 @@ class OpenAIServingChat(OpenAIServingBase):
                     cached_tokens=self._continuous_usage_cached_details(content),
                 )
 
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            serialized_chunk = f"data: {chunk.model_dump_json()}\n\n"
+            if timing is not None:
+                timing.first(
+                    "content",
+                    rid=content["meta_info"]["id"],
+                    index=index,
+                    completion_tokens=content["meta_info"].get("completion_tokens"),
+                )
+            yield serialized_chunk
 
         # Yield tool calls
         history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
@@ -2441,7 +2614,15 @@ class OpenAIServingChat(OpenAIServingBase):
                     cached_tokens=self._continuous_usage_cached_details(content),
                 )
 
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            serialized_chunk = f"data: {chunk.model_dump_json()}\n\n"
+            if timing is not None:
+                timing.first(
+                    "tool_calls",
+                    rid=content["meta_info"]["id"],
+                    index=index,
+                    completion_tokens=content["meta_info"].get("completion_tokens"),
+                )
+            yield serialized_chunk
 
     def _check_for_unstreamed_tool_args(
         self,

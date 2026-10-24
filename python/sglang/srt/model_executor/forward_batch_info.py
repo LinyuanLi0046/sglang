@@ -184,6 +184,7 @@ def _welm_build_row_view(
     padding_mode: DpPaddingMode,
     real_rows_gpu: Optional[torch.Tensor] = None,
     slot_rows_cpu: Optional[List[int]] = None,
+    pin_memory: bool = False,
 ) -> WelmDpRowView:
     rows = [int(x) for x in real_rows_cpu]
     if not rows:
@@ -212,14 +213,27 @@ def _welm_build_row_view(
         offsets.append(cursor)
         cursor += slot
 
-    if real_rows_gpu is None:
+    if real_rows_gpu is not None and real_rows_gpu.numel() != len(rows):
+        raise ValueError(
+            "WeLM DP fixed real-row buffer has the wrong capacity: "
+            f"{real_rows_gpu.numel()} != {len(rows)}"
+        )
+    if pin_memory:
+        # Fresh staging lets the NPU pinned allocator protect in-flight H2D
+        # reads; a shared host buffer could be overwritten by the next batch.
+        rows_host = torch.tensor(
+            rows,
+            dtype=torch.int32 if real_rows_gpu is None else real_rows_gpu.dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+        if real_rows_gpu is None:
+            real_rows_gpu = rows_host.to(device=device, non_blocking=True)
+        else:
+            real_rows_gpu.copy_(rows_host, non_blocking=True)
+    elif real_rows_gpu is None:
         real_rows_gpu = torch.tensor(rows, dtype=torch.int32, device=device)
     else:
-        if real_rows_gpu.numel() != len(rows):
-            raise ValueError(
-                "WeLM DP fixed real-row buffer has the wrong capacity: "
-                f"{real_rows_gpu.numel()} != {len(rows)}"
-            )
         real_rows_gpu.copy_(
             torch.tensor(rows, dtype=real_rows_gpu.dtype, device=real_rows_gpu.device)
         )
@@ -250,6 +264,7 @@ def build_welm_dp_moe_row_layout(
     current_slot_rows_cpu: Optional[List[int]] = None,
     current_slot_alignment: int = 1,
     request_slot_alignment: int = 1,
+    pin_memory: bool = False,
 ) -> WelmDpMoeRowLayout:
     """Build WeLM row metadata without touching generic DP token counts.
 
@@ -289,6 +304,7 @@ def build_welm_dp_moe_row_layout(
         padding_mode=padding_mode,
         real_rows_gpu=current_real_rows_gpu,
         slot_rows_cpu=current_slots,
+        pin_memory=pin_memory,
     )
 
     request = None
@@ -307,6 +323,7 @@ def build_welm_dp_moe_row_layout(
                 ceil_align(x, request_slot_alignment)
                 for x in request_slot_basis
             ],
+            pin_memory=pin_memory,
         )
     return WelmDpMoeRowLayout(current=current, request=request)
 
@@ -1226,6 +1243,26 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ret._maybe_init_non_generation_fields(batch)
 
         device = model_runner.device
+        decode_attn_backend = (
+            model_runner.decode_attn_backend or model_runner.attn_backend
+        )
+        decode_attn_backend = getattr(
+            decode_attn_backend, "decode_backend", decode_attn_backend
+        )
+        # Adapt upstream #35944's pinned count staging to this branch, whose
+        # default platform does not advertise NPU pinned-memory support.
+        # Keep the opt-in local to ordinary overlapped WeLM native-Flash decode.
+        pin_welm_npu_decode_metadata = (
+            _is_npu
+            and batch.enable_overlap
+            and not model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_none()
+            and batch.spec_algorithm.is_none()
+            and batch.spec_info is None
+            and batch.forward_mode.is_decode_or_idle()
+            and not batch.is_extend_in_batch
+            and getattr(decode_attn_backend, "use_welm_flash_attn", False)
+        )
 
         if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
             hashed = _hash_rids_to_tensor(
@@ -1253,9 +1290,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
         if enable_num_token_non_padded():
-            ret.num_token_non_padded = torch.tensor(num_tokens, dtype=torch.int32).to(
-                device, non_blocking=True
-            )
+            ret.num_token_non_padded = torch.tensor(
+                num_tokens,
+                dtype=torch.int32,
+                pin_memory=pin_welm_npu_decode_metadata,
+            ).to(device, non_blocking=True)
         ret.num_token_non_padded_cpu = num_tokens
 
         # For MLP sync
@@ -1282,12 +1321,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.original_global_num_tokens_cpu = batch.global_num_tokens
             ret.global_num_tokens_cpu = global_num_tokens
             ret.global_num_tokens_gpu = torch.tensor(
-                global_num_tokens, dtype=torch.int64
+                global_num_tokens,
+                dtype=torch.int64,
+                pin_memory=pin_welm_npu_decode_metadata,
             ).to(device, non_blocking=True)
 
             ret.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
             ret.global_num_tokens_for_logprob_gpu = torch.tensor(
-                global_num_tokens_for_logprob, dtype=torch.int64
+                global_num_tokens_for_logprob,
+                dtype=torch.int64,
+                pin_memory=pin_welm_npu_decode_metadata,
             ).to(device, non_blocking=True)
 
         # Build WeLM's independent row metadata before the idle return. Raw
@@ -1341,6 +1384,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     model_runner,
                     current_width=1,
                 ),
+                pin_memory=pin_welm_npu_decode_metadata,
             )
 
         if ret.forward_mode.is_idle():

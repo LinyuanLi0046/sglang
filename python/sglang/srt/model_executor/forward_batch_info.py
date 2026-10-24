@@ -1243,26 +1243,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ret._maybe_init_non_generation_fields(batch)
 
         device = model_runner.device
-        decode_attn_backend = (
-            model_runner.decode_attn_backend or model_runner.attn_backend
-        )
-        decode_attn_backend = getattr(
-            decode_attn_backend, "decode_backend", decode_attn_backend
-        )
-        # Adapt upstream #35944's pinned count staging to this branch, whose
-        # default platform does not advertise NPU pinned-memory support.
-        # Keep the opt-in local to ordinary overlapped WeLM native-Flash decode.
-        pin_welm_npu_decode_metadata = (
-            _is_npu
-            and batch.enable_overlap
-            and not model_runner.is_draft_worker
-            and model_runner.spec_algorithm.is_none()
-            and batch.spec_algorithm.is_none()
-            and batch.spec_info is None
-            and batch.forward_mode.is_decode_or_idle()
-            and not batch.is_extend_in_batch
-            and getattr(decode_attn_backend, "use_welm_flash_attn", False)
-        )
+        pin_memory = is_pin_memory_available(device)
 
         if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
             hashed = _hash_rids_to_tensor(
@@ -1293,7 +1274,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.num_token_non_padded = torch.tensor(
                 num_tokens,
                 dtype=torch.int32,
-                pin_memory=pin_welm_npu_decode_metadata,
+                pin_memory=pin_memory,
             ).to(device, non_blocking=True)
         ret.num_token_non_padded_cpu = num_tokens
 
@@ -1323,14 +1304,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.global_num_tokens_gpu = torch.tensor(
                 global_num_tokens,
                 dtype=torch.int64,
-                pin_memory=pin_welm_npu_decode_metadata,
+                pin_memory=pin_memory,
             ).to(device, non_blocking=True)
 
             ret.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
             ret.global_num_tokens_for_logprob_gpu = torch.tensor(
                 global_num_tokens_for_logprob,
                 dtype=torch.int64,
-                pin_memory=pin_welm_npu_decode_metadata,
+                pin_memory=pin_memory,
             ).to(device, non_blocking=True)
 
         # Build WeLM's independent row metadata before the idle return. Raw
@@ -1384,7 +1365,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     model_runner,
                     current_width=1,
                 ),
-                pin_memory=pin_welm_npu_decode_metadata,
+                pin_memory=pin_memory,
             )
 
         if ret.forward_mode.is_idle():
@@ -1421,10 +1402,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 # Main path: H2D from host lists; populate *_cpu mirrors.
                 assert isinstance(extend_prefix_lens, list)
                 ret.extend_seq_lens = torch.tensor(
-                    extend_seq_lens, dtype=torch.int32
+                    extend_seq_lens,
+                    dtype=torch.int32,
+                    pin_memory=pin_memory,
                 ).to(device, non_blocking=True)
                 ret.extend_prefix_lens = torch.tensor(
-                    extend_prefix_lens, dtype=torch.int32
+                    extend_prefix_lens,
+                    dtype=torch.int32,
+                    pin_memory=pin_memory,
                 ).to(device, non_blocking=True)
                 ret.extend_prefix_lens_cpu = extend_prefix_lens
                 ret.extend_seq_lens_cpu = extend_seq_lens

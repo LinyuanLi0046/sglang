@@ -43,11 +43,10 @@ def _use_dsa_dcp_partial_attention(forward_batch: "ForwardBatch") -> bool:
 
 def _use_fp8_mlaprolog(m: "DeepseekV2AttentionMLA") -> bool:
     if not hasattr(m, "_use_fp8_mlaprolog"):
-        # Static C8 uses MXFP8 projections; no-RoPE Kimi stays unfused.
+        # Static C8 uses MXFP8 projections, including no-RoPE Kimi.
         m._use_fp8_mlaprolog = (
             is_mla_preprocess_enabled()
             and _is_npu_arch35
-            and m.rotary_emb is not None
             and all(
                 NPUFusedMLAPreprocess.is_mxfp8_projection(layer)
                 for layer in (m.fused_qkv_a_proj_with_mqa, m.q_b_proj)

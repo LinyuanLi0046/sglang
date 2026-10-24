@@ -94,6 +94,12 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         self.layer_id = layer_id
         self.quant_config = quant_config
         self.kv_quant_state = kv_quant_state
+        self.no_rope_mlaprolog = None
+        if kv_quant_state is not None and rotary_emb is None:
+            # The official V4 wrapper supports no-RoPE with static FP8 KV.
+            from cann_ops_transformer import mla_prolog
+
+            self.no_rope_mlaprolog = mla_prolog
         self.has_preprocess_weights = False
         self.dtype = None
 
@@ -522,7 +528,10 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         if not self.has_preprocess_weights:
             self.mlaprolog_preprocess_weight()
             self.has_preprocess_weights = True
-        self.cos, self.sin = self.get_sin_cos(positions)
+        if self.no_rope_mlaprolog is not None:
+            self.cos = self.sin = None
+        else:
+            self.cos, self.sin = self.get_sin_cos(positions)
         k_cache, v_cache, slot_mapping = self.get_kv_cache_and_cache_idx(forward_batch)
         pool = get_token_to_kv_pool()
         packed = pool.dsa_kv_cache_store_fp8
@@ -590,8 +599,9 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             )
         import torch_npu
 
-        q_nope, q_pe, dequant_scale_q_nope, qr, dequant_q_norm = (
-            torch_npu.npu_mla_prolog_v3(**mla_prolog_input_args)
+        mlaprolog = self.no_rope_mlaprolog or torch_npu.npu_mla_prolog_v3
+        q_nope, q_pe, dequant_scale_q_nope, qr, dequant_q_norm = mlaprolog(
+            **mla_prolog_input_args
         )
         if self.weight_quant_mode == 0:
             dequant_q_norm = None

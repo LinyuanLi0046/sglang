@@ -1946,6 +1946,8 @@ class Envs:
     # ===================================================================
     # Kimi K3
     # ===================================================================
+    # NPU KDA: fuse Q/K/V separately from G for mixed-precision checkpoints.
+    SGLANG_NPU_KIMIK3_SPLIT_QKVG = EnvBool(False)
     # MNNVL fused all-reduce (bf16, TP8): zero-copy 1shot multicast-push for
     # small messages and in-place NVLS 2shot on symmetric-memory tensors for
     # large ones, with an optional fused residual add. Covers the KDA o_proj

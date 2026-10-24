@@ -621,6 +621,64 @@ class AscendAttnBackend(AttentionBackend):
                 self.full_to_swa_index_mapping[page_tokens] // self.page_size
             )
 
+    def prepare_welm_prefill_graph_metadata_device(
+        self,
+        metadata: ForwardMetadata,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        page_starts: torch.Tensor,
+        page_in_bounds: torch.Tensor,
+    ) -> None:
+        """Capture prefill metadata from the adapter's fixed Bmax inputs.
+
+        Replay clears only unused E rows; every consumer masks req/seq tails
+        with E>0. Capture dummy requests retain legal Q/KV lengths but use
+        reserved request 0, whose page tables must remain zero.
+        """
+        has_q = extend_seq_lens > 0
+        metadata.welm_flash_seqused_q.copy_(extend_seq_lens)
+        metadata.welm_flash_seqused_kv.copy_(torch.where(has_q, seq_lens, 0))
+        self._prepare_welm_graph_page_tables_device(
+            metadata,
+            req_pool_indices,
+            seq_lens,
+            has_q & (req_pool_indices > 0),
+            page_starts,
+            page_in_bounds,
+        )
+
+    def _prepare_welm_graph_page_tables_device(
+        self,
+        metadata: ForwardMetadata,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        valid_rows: torch.Tensor,
+        page_starts: torch.Tensor,
+        page_in_bounds: torch.Tensor,
+    ) -> None:
+        """Gather Full/SWA page heads into fixed graph-owned output tables."""
+        valid_pages = valid_rows[:, None] & (page_starts < seq_lens[:, None])
+        valid_pages = valid_pages & page_in_bounds
+
+        # Mask BEFORE gathering: padding and unused pages must not read stale
+        # entries of a real request (or use them to index the SWA mapping).
+        # ReqToTokenPool reserves row 0 for padding; token offset 0 is in bounds.
+        req_indices = torch.where(valid_pages, req_pool_indices[:, None], 0)
+        token_indices = torch.where(valid_pages, page_starts, 0)
+        full_page_locs = torch.where(
+            valid_pages, self.req_to_token[req_indices, token_indices], 0
+        )
+        metadata.block_tables.copy_(full_page_locs // self.page_size)
+        if self.is_hybrid_swa:
+            # Reuse upstream's page-head gather -> SWA mapping order. Full and
+            # SWA share the gather; never materialize a B x context token map.
+            # Floor division preserves the existing negative sentinel semantics.
+            swa_page_locs = self.full_to_swa_index_mapping[full_page_locs]
+            metadata.block_tables_swa.copy_(
+                torch.where(valid_pages, swa_page_locs, 0) // self.page_size
+            )
+
     def write_welm_prefill_graph_kv(self, layer, k, v, full_locs, swa_locs) -> None:
         """Fixed-row BF16 cache write for this graph path only.
 
@@ -1417,29 +1475,14 @@ class AscendAttnBackend(AttentionBackend):
         metadata = self.forward_metadata
         seq_lens = forward_batch.seq_lens
         valid_rows = seq_lens > 0
-        page_starts = self.graph_metadata["welm_decode_page_starts"]
-        valid_pages = valid_rows[:, None] & (page_starts < seq_lens[:, None])
-        valid_pages = valid_pages & self.graph_metadata["welm_decode_page_in_bounds"]
-
-        # Mask BEFORE gathering: padding and unused pages must not read stale
-        # entries of a real request (or use them to index the SWA mapping).
-        # ReqToTokenPool reserves row 0 for padding; token offset 0 is in bounds.
-        req_indices = torch.where(
-            valid_pages, forward_batch.req_pool_indices[:, None], 0
+        self._prepare_welm_graph_page_tables_device(
+            metadata,
+            forward_batch.req_pool_indices,
+            seq_lens,
+            valid_rows,
+            self.graph_metadata["welm_decode_page_starts"],
+            self.graph_metadata["welm_decode_page_in_bounds"],
         )
-        token_indices = torch.where(valid_pages, page_starts, 0)
-        full_page_locs = torch.where(
-            valid_pages, self.req_to_token[req_indices, token_indices], 0
-        )
-        metadata.block_tables.copy_(full_page_locs // self.page_size)
-        if self.is_hybrid_swa:
-            # Reuse upstream's page-head gather -> SWA mapping order. Full and
-            # SWA share the gather; never materialize a B x context token map.
-            # Floor division preserves the existing negative sentinel semantics.
-            swa_page_locs = self.full_to_swa_index_mapping[full_page_locs]
-            metadata.block_tables_swa.copy_(
-                torch.where(valid_pages, swa_page_locs, 0) // self.page_size
-            )
 
         if metadata.swa_out_cache_loc is not None:
             full_write_locs = torch.where(valid_rows, forward_batch.out_cache_loc, 0)

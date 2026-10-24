@@ -905,6 +905,8 @@ def build_prefill_registry(
                 lambda _bs2, _mt: (1,),
                 torch.int32,
                 axis="none",
+                # Skip the FB copy only when post_fill recomputes the scalar.
+                copy_from_fb=not (require_gathered_buffer and not enable_prefill_cp),
                 post_fill=_prefill_num_token_non_padded_post_fill,
             )
         )

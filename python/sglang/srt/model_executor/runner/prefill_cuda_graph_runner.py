@@ -1647,7 +1647,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         if self.welm_adapter is not None:
             self.welm_adapter.prepare_replay(
-                forward_batch, static_forward_batch, static_num_tokens
+                forward_batch,
+                static_forward_batch,
+                static_num_tokens,
+                raw_num_tokens=num_tokens,
             )
 
         return static_forward_batch

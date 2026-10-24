@@ -499,7 +499,14 @@ class WelmPrefillGraphAdapter:
         if batch.welm_prefill_graph_phase == "prompt":
             self.captured_states[key] = batch.model_specific_states
 
-    def prepare_replay(self, live: ForwardBatch, static: ForwardBatch, capacity: int):
+    def prepare_replay(
+        self,
+        live: ForwardBatch,
+        static: ForwardBatch,
+        capacity: int,
+        *,
+        raw_num_tokens: int,
+    ):
         self._bind(static, capacity)
         self._prepare_mirror_requests(live.batch_size)
         static.welm_prefill_graph_phase = "prompt"
@@ -533,7 +540,11 @@ class WelmPrefillGraphAdapter:
         self._prepare_flash_offsets(self.current_flash_metadata, live, capacity)
         self._prepare_tiles(static, capacity)
         # Arbitrary-position fused QKV may load padded positions as well.
-        static.positions[real_rows:capacity].zero_()
+        # The registry already clears [raw_num_tokens:capacity] on every load.
+        # Only clear MLP-sync padding copied with the live input head; real
+        # request rows can be fewer than the input length passed to load_batch.
+        if real_rows < raw_num_tokens:
+            static.positions[real_rows:raw_num_tokens].zero_()
         self.current_batch = static
 
     def finish_prompt(self, hidden_states, residual, positions, batch):

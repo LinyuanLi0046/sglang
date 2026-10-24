@@ -1710,7 +1710,22 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             dim=1,
         ).to(dtype=torch.int64, device=model_runner.device, non_blocking=True)
 
-    def _pad_tensor_to_size(self, tensor: torch.Tensor, size: int, *, value: int = 0):
+    def _pad_tensor_to_size(
+        self,
+        tensor: torch.Tensor,
+        size: int,
+        *,
+        value: int = 0,
+        allow_unpadded_alias: bool = False,
+    ):
+        # Opt in only for read-only inputs with an already-protected lifetime.
+        # Keep cat's materialization for non-contiguous inputs and real padding.
+        if (
+            allow_unpadded_alias
+            and size == tensor.shape[0]
+            and tensor.is_contiguous()
+        ):
+            return tensor
         if value == 0:
             return torch.cat(
                 [tensor, tensor.new_zeros(size - tensor.shape[0], *tensor.shape[1:])],
@@ -1734,6 +1749,31 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None
+
+        # Decide before decode/idle can be converted into a synthetic EXTEND.
+        # Ordinary WeLM Flash prefill reads these device inputs; graph input
+        # staging and the default eager runner's buffer copies remain intact.
+        # Overlap keeps scheduler input references alive, and subsequent batch
+        # updates rebind tensors rather than overwriting these inputs.
+        args = model_runner.server_args
+        allow_unpadded_alias = (
+            _is_npu
+            and self.forward_mode == ForwardMode.EXTEND
+            and self.spec_algorithm is not None
+            and self.spec_algorithm.is_none()
+            and self.spec_info is None
+            and not model_runner.is_draft_worker
+            and getattr(model_runner.attn_backend, "use_welm_flash_attn", False)
+            and not args.enable_two_batch_overlap
+            and self.tbo_split_seq_index is None
+            and not self.tbo_children
+            and not args.enable_pdmux
+            and not args.enable_prefill_cp
+            and get_parallel().attn_cp_size == 1
+            and model_runner.dcp_size == 1
+            and not enable_cp_v2()
+            and not envs.SGLANG_EAGER_INPUT_NO_COPY.get()
+        )
 
         self._original_batch_size = self.batch_size
         global_num_tokens = list(self.global_num_tokens_cpu)
@@ -1941,7 +1981,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.extend_num_tokens = num_tokens
 
         # padding
-        self._pad_inputs_to_size(model_runner, num_tokens, bs)
+        self._pad_inputs_to_size(
+            model_runner, num_tokens, bs, allow_unpadded_alias=allow_unpadded_alias
+        )
         self.global_num_tokens_cpu = global_num_tokens
         global_num_tokens_pinned = torch.tensor(global_num_tokens, pin_memory=True)
         self.global_num_tokens_gpu.copy_(global_num_tokens_pinned, non_blocking=True)
@@ -1958,11 +2000,22 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     model_runner, child.tbo_padded_len, child.batch_size
                 )
 
-    def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
+    def _pad_inputs_to_size(
+        self,
+        model_runner: ModelRunner,
+        num_tokens,
+        bs,
+        *,
+        allow_unpadded_alias: bool = False,
+    ):
         # padding
         self._original_num_tokens = self.positions.shape[0]
-        self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
-        self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
+        self.input_ids = self._pad_tensor_to_size(
+            self.input_ids, num_tokens, allow_unpadded_alias=allow_unpadded_alias
+        )
+        self.req_pool_indices = self._pad_tensor_to_size(
+            self.req_pool_indices, bs, allow_unpadded_alias=allow_unpadded_alias
+        )
         if self.lora_ids is not None:
             self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
 
@@ -1976,17 +2029,24 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 bs - self.seq_lens.shape[0]
             )
         self.seq_lens = self._pad_tensor_to_size(
-            self.seq_lens, bs, value=seq_len_fill_value
+            self.seq_lens,
+            bs,
+            value=seq_len_fill_value,
+            allow_unpadded_alias=allow_unpadded_alias,
         )
         if self.seq_lens_cpu is not None:
             self.seq_lens_cpu = self._pad_tensor_to_size(
                 self.seq_lens_cpu, bs, value=seq_len_fill_value
             )
 
-        self.out_cache_loc = self._pad_tensor_to_size(self.out_cache_loc, num_tokens)
+        self.out_cache_loc = self._pad_tensor_to_size(
+            self.out_cache_loc, num_tokens, allow_unpadded_alias=allow_unpadded_alias
+        )
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
-        self.positions = self._pad_tensor_to_size(self.positions, num_tokens)
+        self.positions = self._pad_tensor_to_size(
+            self.positions, num_tokens, allow_unpadded_alias=allow_unpadded_alias
+        )
         if self.mamba_track_indices is not None:
             self.mamba_track_indices = self._pad_tensor_to_size(
                 self.mamba_track_indices, bs
@@ -2011,7 +2071,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # TODO: check if we need to pad other tensors
         if self.extend_seq_lens is not None:
-            self.extend_seq_lens = self._pad_tensor_to_size(self.extend_seq_lens, bs)
+            self.extend_seq_lens = self._pad_tensor_to_size(
+                self.extend_seq_lens, bs, allow_unpadded_alias=allow_unpadded_alias
+            )
 
         if self.rids_int is not None:
             self.rids_int = self._pad_tensor_to_size(self.rids_int, bs)

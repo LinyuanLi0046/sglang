@@ -293,7 +293,13 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         graph_key = self._make_graph_key(self.bs)
 
         if self.welmv4_device_attention_metadata:
-            output = self.backend.replay(graph_key, forward_batch)
+            if self.model_runner.welm_graph_read_done_enabled:
+                owner = self.welm_read_done_by_key[graph_key]
+                with owner.replay(torch.npu.current_stream()) as ticket:
+                    output = self.backend.replay(graph_key, forward_batch)
+                self.model_runner.war_fastpath_read_done_event = ticket
+            else:
+                output = self.backend.replay(graph_key, forward_batch)
         elif not (
             is_deepseek_dsa(self.model_runner.model_config.hf_config)
             or is_deepseek_v4(self.model_runner.model_config.hf_config)

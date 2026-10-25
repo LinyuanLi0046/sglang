@@ -5006,6 +5006,11 @@ class Qwen2MoeModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        # All embedding/history reads and attention address preparation precede
+        # this point. Leave OE computation and history updates unchanged.
+        if forward_batch.welm_graph_read_done is not None:
+            forward_batch.welm_graph_read_done.signal_once()
+
         if self.start_layer < self.end_layer:
             first_local_layer = self.layers[self.start_layer]
             dp_executor = getattr(first_local_layer, "_welm_dp_executor", None)

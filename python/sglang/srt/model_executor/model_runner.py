@@ -20,7 +20,7 @@ import inspect
 import logging
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -370,10 +370,11 @@ class ModelRunner:
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
 
-        # WAR fast-path: a decode-graph forward publishes a fresh event here after
-        # load_batch; the scheduler's WAR barrier waits on it (then clears it)
-        # instead of the whole-forward wait_stream. None -> whole-forward fallback.
-        self.war_fastpath_read_done_event: Optional[torch.cuda.Event] = None
+        # Fence after this batch's last shared-buffer read. NPU graphs publish a
+        # ticket implementing wait(stream); None uses the whole-forward fallback.
+        self.war_fastpath_read_done_event: Optional[Any] = None
+        self.war_required_for_welm = False
+        self.welm_graph_read_done_enabled = False
 
         # CPU offload
         set_offloader(
@@ -885,6 +886,27 @@ class ModelRunner:
         self.decode_attn_backend_group = backends.decode_attn_backend_group
         self.prefill_attention_backend_str = backends.prefill_attention_backend_str
         self.decode_attention_backend_str = backends.decode_attention_backend_str
+
+        # Set before graph capture and scheduler initialization. Ordinary WeLM
+        # must protect shared reads even when the opt-in WAR env var is unset.
+        self.war_required_for_welm = (
+            self.device == "npu"
+            and not self.server_args.disable_overlap_schedule
+            and self.spec_algorithm.is_none()
+            and not self.is_draft_worker
+            and self.ps.pp_size == 1
+            and getattr(self.attn_backend, "use_welm_flash_attn", False)
+        )
+        # The ticket lifetime proof uses one scheduler/forward stream pair.
+        # Other execution modes retain the existing coarse WAR fallback.
+        self.welm_graph_read_done_enabled = (
+            self.war_required_for_welm
+            and not self.server_args.enable_pdmux
+            and not self.server_args.enable_two_batch_overlap
+            and not self.server_args.enable_torch_compile
+            and not self.server_args.enable_unified_memory
+            and not envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get()
+        )
 
         if self.server_args.dcp_size > 1 and get_parallel().dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()

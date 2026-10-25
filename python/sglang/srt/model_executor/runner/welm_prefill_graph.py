@@ -29,7 +29,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -242,6 +242,7 @@ class WelmPrefillGraphAdapter:
         self.flash_metadata = {}
         self.current_flash_metadata = None
         self.capture_phase = "prompt"
+        self.read_done_by_key = {}
         self.first_mirror = (
             self.model.layers[0].first_target_kv_mirror_layer if self.prune else None
         )
@@ -414,6 +415,14 @@ class WelmPrefillGraphAdapter:
         )
         mirror = batch.welm_prefill_graph_phase == "mirror"
         key = self.mirror_key(batch.batch_size) if mirror else self.key(capacity)
+        if not mirror and self.runner.model_runner.welm_graph_read_done_enabled:
+            from sglang.srt.hardware_backend.npu.graph_runner.graph_read_done import (
+                NpuGraphReadDone,
+            )
+
+            if key in self.read_done_by_key:
+                raise RuntimeError("Cannot replace a live WeLM read-done graph owner")
+            self.read_done_by_key[key] = NpuGraphReadDone(device=self.device)
         metadata = copy.copy(self.flash_inputs)
         metadata.welm_flash_schedules = {}
         if mirror:
@@ -564,13 +573,21 @@ class WelmPrefillGraphAdapter:
         # Mirror consumes the metadata produced by Prompt; never overwrite it
         # with Mirror's one-Q-per-request capture template.
         if batch.welm_prefill_graph_phase == "prompt":
+            read_done = self.read_done_by_key.get(key)
+            if read_done is not None:
+                read_done.begin_capture_forward()
             self._prepare_prompt_metadata_device(batch)
+            if read_done is not None:
+                read_done.signal_once()
         self.current_batch = batch
 
     def after_capture(self, key: ShapeKey, batch: ForwardBatch):
         self.capture_keys.add(key)
         if batch.welm_prefill_graph_phase == "prompt":
             self.captured_states[key] = batch.model_specific_states
+            read_done = self.read_done_by_key.get(key)
+            if read_done is not None:
+                read_done.after_capture()
 
     def prepare_replay(
         self,
@@ -710,9 +727,29 @@ class WelmPrefillGraphAdapter:
             self.prune and mirror_key not in self.capture_keys
         ):
             raise RuntimeError("WeLM graph eligibility changed before replay")
-        result = self.runner.backend.replay(key, batch, **kwargs)
-        if mirror_key is not None:
-            result = self.runner.backend.replay(mirror_key, batch, **kwargs)
+        owner = self.read_done_by_key.get(key)
+        if self.runner.model_runner.welm_graph_read_done_enabled and owner is None:
+            raise RuntimeError("Missing WeLM Prompt read-done owner")
+        if owner is None:
+            result = self.runner.backend.replay(key, batch, **kwargs)
+            if mirror_key is not None:
+                result = self.runner.backend.replay(mirror_key, batch, **kwargs)
+        else:
+            with owner.replay(torch.npu.current_stream()) as ticket:
+                result = self.runner.backend.replay(key, batch, **kwargs)
+                if mirror_key is not None:
+                    result = self.runner.backend.replay(mirror_key, batch, **kwargs)
+            # MIXED still drains its captured signal, but keeps the conservative
+            # scheduler fence until its request-lifetime paths are audited.
+            # Offload copies ordered behind the scheduler also need KV writes
+            # to finish, so preserve upstream's whole-forward protection.
+            memory = get_memory()
+            if batch.forward_mode == ForwardMode.EXTEND and not (
+                memory.enable_hierarchical_cache
+                or memory.hicache_storage_backend is not None
+                or memory.enable_lmcache
+            ):
+                self.runner.model_runner.war_fastpath_read_done_event = ticket
         self.publish_state(key, batch)
         return result
 

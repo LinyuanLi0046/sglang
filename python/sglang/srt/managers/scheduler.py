@@ -1637,7 +1637,13 @@ class Scheduler(
                 _redraws += 1
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
-        self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+        self._war_barrier_enabled = (
+            is_cuda()
+            or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+            or getattr(
+                self.model_worker.war_fastpath_runner, "war_required_for_welm", False
+            )
+        )
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
 
@@ -1648,11 +1654,11 @@ class Scheduler(
         # forward published after its snapshot (non-spec: decode graph; spec:
         # draft_extend), then clear it. Else whole-forward wait_stream
         # (forceable via SGLANG_FORCE_COARSE_WAR_BARRIER).
-        if not self._war_barrier_enabled:
-            return
         runner = self.model_worker.war_fastpath_runner
         ev = runner.war_fastpath_read_done_event
         runner.war_fastpath_read_done_event = None
+        if not self._war_barrier_enabled:
+            return
         if ev is not None and not envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get():
             self.schedule_stream.wait_event(ev)
         else:
@@ -3635,6 +3641,10 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             if self.enable_overlap:
+                # One mailbox per outer scheduler launch. Spec workers may
+                # publish later within the same launch; do not clear it there.
+                war_runner = self.model_worker.war_fastpath_runner
+                war_runner.war_fastpath_read_done_event = None
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
                 self.future_map.resolve_seq_lens_cpu(batch)

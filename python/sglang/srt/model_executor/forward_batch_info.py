@@ -1009,6 +1009,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # the default full-query path is mathematically equivalent.
     enable_kv_mirror: bool = False
 
+    # Capture-only owner; never copied to the device or reused by eager batches.
+    welm_graph_read_done: Optional[Any] = None
+
     # Target BF16 breakable prefill only. Tensor storage, including native
     # Flash metadata, is runner-owned; request history is prepared before replay.
     welm_prefill_graph: Optional[Any] = None

@@ -25,7 +25,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -2119,6 +2119,37 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
 
 class SchedulerDisaggregationDecodeMixin:
+    def _get_pd_pending_release_reqs(self: Scheduler) -> Iterable[Req]:
+        guard = self.pd_deferred_release_guard
+        return guard.iter_pending_reqs() if guard is not None else ()
+
+    def _on_pd_decode_result_ready(
+        self: Scheduler, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> None:
+        # The result processor invokes this only after its copy_done wait.
+        # A freshly created/unrecorded event is not a completion certificate.
+        assert self.pd_deferred_release_guard is not None
+        assert result.pd_resource_step is not None
+        assert result.copy_done is not None and result.delay_sample_func is None
+        self.pd_deferred_release_guard.on_completed(result.pd_resource_step)
+
+    def _pop_and_process_pd_result(self: Scheduler) -> None:
+        tmp_batch, tmp_result = self.result_queue.popleft()
+        self.process_batch_result(tmp_batch, tmp_result)
+        if self.pd_deferred_release_guard is not None and not self.result_queue:
+            # An OOM/pause drain must not leave the outer loop pointing at a
+            # result it already consumed (or accidentally pop the next launch).
+            self.last_batch = None
+
+    def _drain_pd_inflight_results_for_reclaim(self: Scheduler) -> None:
+        # Only call before the next launch, never from a result-ready callback.
+        guard = self.pd_deferred_release_guard
+        assert guard is not None
+        while self.result_queue:
+            self._pop_and_process_pd_result()
+        self.last_batch = None
+        assert guard.completed == guard.latest_submitted and not guard.has_pending
+
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
@@ -2158,11 +2189,10 @@ class SchedulerDisaggregationDecodeMixin:
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
 
-        def pop_and_process():
-            tmp_batch, tmp_result = self.result_queue.popleft()
-            self.process_batch_result(tmp_batch, tmp_result)
-
         while True:
+            if self.gracefully_exit and self.pd_deferred_release_guard is not None:
+                self._drain_pd_inflight_results_for_reclaim()
+                break
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -2186,11 +2216,15 @@ class SchedulerDisaggregationDecodeMixin:
             )
 
             if disable_overlap_for_batch and self.last_batch:
-                pop_and_process()
+                self._pop_and_process_pd_result()
 
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
+                if self.pd_deferred_release_guard is not None:
+                    self.pd_deferred_release_guard.on_submitted(
+                        batch_result.pd_resource_step
+                    )
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
             else:
@@ -2199,8 +2233,10 @@ class SchedulerDisaggregationDecodeMixin:
             # Process the last batch
             if self.last_batch:
                 if not disable_overlap_for_batch:
-                    pop_and_process()
+                    self._pop_and_process_pd_result()
             elif batch is None:
+                if self.pd_deferred_release_guard is not None:
+                    assert not self.pd_deferred_release_guard.has_pending
                 self.on_idle()
 
             # Run sample of the current batch

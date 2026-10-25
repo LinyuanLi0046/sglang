@@ -72,6 +72,7 @@ from sglang.srt.disaggregation.decode import (
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
+from sglang.srt.disaggregation.deferred_release import DecodeDeferredReleaseGuard
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
@@ -1392,6 +1393,28 @@ class Scheduler(
 
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
+        self.pd_deferred_release_guard: Optional[DecodeDeferredReleaseGuard] = None
+        if (
+            _is_npu
+            and getattr(
+                self.model_worker.war_fastpath_runner, "war_required_for_welm", False
+            )
+            and self.enable_overlap
+            and self.spec_algorithm.is_none()
+            and self.ps.pp_size == 1
+            and not self.enable_pdmux
+            and not self.server_args.enable_two_batch_overlap
+            and self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.transfer_backend == TransferBackend.ASCEND
+            and not get_disagg().disaggregation_decode_enable_radix_cache
+            and self.decode_offload_manager is None
+            and not self.enable_hisparse
+            and not self.enable_unified_memory
+            and not self.enable_hierarchical_cache
+            and not self.enable_session_radix_cache
+            and not self.server_args.enable_streaming_session
+        ):
+            self.pd_deferred_release_guard = DecodeDeferredReleaseGuard(self.tree_cache)
 
         # FutureMap is always-on: input_ids relay used in both modes.
         # Workers without the spec_v2_attn_backends override fall back to
@@ -2076,6 +2099,7 @@ class Scheduler(
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
+            get_pending_release_reqs=self._get_pd_pending_release_reqs,
         )
 
     def init_kv_events_publisher(self) -> None:
@@ -2158,6 +2182,16 @@ class Scheduler(
             ),
             output_streamer=self.output_streamer,
             abort_request=self.abort_request,
+            on_decode_result_ready=(
+                self._on_pd_decode_result_ready
+                if self.pd_deferred_release_guard is not None
+                else None
+            ),
+            maybe_defer_finished_release=(
+                self.pd_deferred_release_guard.defer_if_inflight
+                if self.pd_deferred_release_guard is not None
+                else None
+            ),
         )
 
     def init_req_max_new_tokens(self, req):
@@ -3471,9 +3505,22 @@ class Scheduler(
             return batch
 
         # Check if decode out of memory
-        if (kv_full_retract_flag := not batch.check_decode_mem()) or (
-            TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
+        kv_full_retract_flag = not batch.check_decode_mem()
+        test_retract = TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
+        if (
+            (kv_full_retract_flag or test_retract)
+            and self.pd_deferred_release_guard is not None
+            and self.result_queue
         ):
+            # Retraction needs immediately reclaimable storage. First finish the
+            # existing result(s); do not reset a Req still used by a submitted step.
+            self._drain_pd_inflight_results_for_reclaim()
+            batch.filter_batch()
+            if batch.is_empty():
+                batch.batch_is_full = False
+                return batch
+            kv_full_retract_flag = not batch.check_decode_mem()
+        if kv_full_retract_flag or test_retract:
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio_tracker.current
             mamba_allocator = getattr(
@@ -3800,6 +3847,8 @@ class Scheduler(
             else:
                 batch_result.extend_logprob_start_len_per_req = None
 
+            if self.pd_deferred_release_guard is not None:
+                batch_result.pd_resource_step = batch.forward_iter
             ret = batch_result
         else:  # embedding or reward model
             if self.enable_overlap:
@@ -3917,7 +3966,7 @@ class Scheduler(
             else:
                 self.batch_result_processor.process_batch_result_prefill(batch, result)
         elif batch.forward_mode.is_prebuilt():
-            self.batch_result_processor.process_batch_result_prebuilt(batch)
+            self.batch_result_processor.process_batch_result_prebuilt(batch, result)
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
 
@@ -4066,6 +4115,10 @@ class Scheduler(
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
+            and (
+                self.pd_deferred_release_guard is None
+                or not self.pd_deferred_release_guard.has_pending
+            )
             and self._pp_microbatches_drained()
         )
 
@@ -4552,7 +4605,9 @@ class Scheduler(
             # manipulation logic and the accounting bugs that come with it.
             return
 
-        if self.enable_overlap and self.last_batch:
+        if self.pd_deferred_release_guard is not None:
+            self._drain_pd_inflight_results_for_reclaim()
+        elif self.enable_overlap and self.last_batch:
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)

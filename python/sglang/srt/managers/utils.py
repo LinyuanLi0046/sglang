@@ -67,6 +67,8 @@ class GenerationBatchResult:
 
     # For overlap scheduling
     copy_done: Optional[torch.cuda.Event] = None
+    # Actual PD execution's forward_iter (PREBUILT wrappers keep the inner IDLE id).
+    pd_resource_step: Optional[int] = None
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None

@@ -7,6 +7,8 @@ from typing import (
     TYPE_CHECKING,
     Callable,
     Deque,
+    Iterable,
+    Iterator,
     List,
     Optional,
     Tuple,
@@ -31,6 +33,7 @@ from sglang.srt.utils.common import (
 from sglang.srt.utils.watchdog import WatchdogRaw
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
 
 
@@ -56,6 +59,7 @@ class SchedulerInvariantChecker:
     pool_stats_observer: SchedulerPoolStatsObserver
     get_last_batch: Callable
     get_running_batch: Callable
+    get_pending_release_reqs: Optional[Callable[[], Iterable[Req]]] = None
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
@@ -221,47 +225,41 @@ class SchedulerInvariantChecker:
         )
         return active_leak or int8_leak, active_msg + "\n" + int8_msg
 
-    def _get_total_uncached_sizes(
-        self,
-    ) -> Tuple[int, int]:
-        """Sum uncached tokens for full and SWA pools across all active batches.
+    def _iter_resource_owners(self) -> Iterator[Req]:
+        # A finished PD Req can outlive batch filtering while its last forward
+        # is in flight. Count each owner once even if also present in a batch.
+        seen = set()
+        for batch in (self.get_last_batch(), self.get_running_batch()):
+            if batch is not None:
+                for req in batch.reqs:
+                    if id(req) not in seen:
+                        seen.add(id(req))
+                        yield req
+        if self.get_pending_release_reqs is not None:
+            for req in self.get_pending_release_reqs():
+                if id(req) not in seen:
+                    seen.add(id(req))
+                    yield req
 
-        Returns (full_uncached, swa_uncached). For non-SWA models, swa_uncached is 0.
-
-        For full pool: uncached = allocated - cache_protected_len
-        For SWA pool:  uncached = allocated - max(cache_protected_len, swa_evicted_seqlen)
-        """
-        # After decode: running_batch IS last_batch (same object), count once.
-        # After prefill: they differ, both hold uncached tokens.
-        # Use identity (is / is not), not membership or ==: ScheduleBatch's
-        # dataclass __eq__ compares tensor fields and raises on ambiguous bools.
-        last_batch = self.get_last_batch()
-        running_batch = self.get_running_batch()
-        batches = [last_batch]
-        if (
-            running_batch is not None
-            and running_batch is not last_batch
-            and not running_batch.is_empty()
-        ):
-            batches.append(running_batch)
+    def _get_total_uncached_sizes(self) -> Tuple[int, int]:
+        """Sum uncached Full/SWA tokens across batches and pending PD releases."""
 
         full_uncached = 0
         swa_uncached = 0
-        for batch in batches:
-            for req in batch.reqs:
-                if req.kv is None:
-                    continue
+        for req in self._iter_resource_owners():
+            if req.kv is None:
+                continue
 
-                allocated_len = req.kv.kv_allocated_len
-                if self.page_size > 1:
-                    allocated_len = ceil_align(allocated_len, self.page_size)
-                    assert req.cache_protected_len % self.page_size == 0
+            allocated_len = req.kv.kv_allocated_len
+            if self.page_size > 1:
+                allocated_len = ceil_align(allocated_len, self.page_size)
+                assert req.cache_protected_len % self.page_size == 0
 
-                full_uncached += allocated_len - req.cache_protected_len
-                if self.is_hybrid_swa:
-                    swa_uncached += allocated_len - max(
-                        req.cache_protected_len, req.kv.swa_evicted_seqlen
-                    )
+            full_uncached += allocated_len - req.cache_protected_len
+            if self.is_hybrid_swa:
+                swa_uncached += allocated_len - max(
+                    req.cache_protected_len, req.kv.swa_evicted_seqlen
+                )
 
         return full_uncached, swa_uncached
 
@@ -315,18 +313,16 @@ class SchedulerInvariantChecker:
             owners.append((label, rpi, allocated))
 
         owners: list[tuple[str, Optional[int], int]] = []
-        batch = self.get_last_batch()
-        if batch is not None:
-            for req in batch.reqs:
-                if req.kv is None:
-                    continue
-                _add_owner(
-                    req,
-                    f"req {req.rid}",
-                    req.req_pool_idx,
-                    req.kv_committed_len,
-                    req.kv.kv_allocated_len,
-                )
+        for req in self._iter_resource_owners():
+            if req.kv is None:
+                continue
+            _add_owner(
+                req,
+                f"req {req.rid}",
+                req.req_pool_idx,
+                req.kv_committed_len,
+                req.kv.kv_allocated_len,
+            )
         sess = getattr(self.tree_cache, "slots", None)
         if sess:
             for sid, slot in sess.items():

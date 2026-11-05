@@ -26,7 +26,7 @@ from transformers import (
 )
 
 from sglang.srt.connector import create_remote_connector
-from sglang.srt.utils import is_remote_url, logger
+from sglang.srt.utils import assert_pkg_version, is_remote_url, logger
 from sglang.srt.utils.patch_tokenizer import patch_tokenizer
 
 from ..hf_transformers_patches import _ensure_gguf_version
@@ -260,6 +260,42 @@ def _resolve_tokenizers_backend(tokenizer_name, *args, **common_kwargs):
 # ---------------------------------------------------------------------------
 
 
+def _is_fastokens_backend(backend):
+    return type(backend).__module__.split(".")[0] == "fastokens"
+
+
+def _restore_fastokens_backend_components(tokenizer, raw, model_name_or_path):
+    """Rebuild the shim with raw components; its component setters are no-ops."""
+    backend = tokenizer._tokenizer
+    # Keep HF's live added tokens and truncation/padding settings, replacing
+    # only the components that Qwen2/WeLM loading may have overwritten.
+    config = json.loads(backend.to_str())
+    raw_config = json.loads(raw.to_str())
+    restored = []
+    for attr in ("model", "normalizer", "pre_tokenizer", "post_processor", "decoder"):
+        if config.get(attr) != raw_config.get(attr):
+            config[attr] = raw_config.get(attr)
+            restored.append(attr)
+    if not restored:
+        return
+
+    # Use the existing shim class so the fastokens backend stays active. A
+    # fresh backend also picks up FASTOKENS_SEGMENT_CACHE at construction.
+    # Propagate errors rather than serving with partially restored BPE rules.
+    rebuilt = type(backend).from_str(
+        json.dumps(config, ensure_ascii=False),
+        **getattr(backend, "_pcre2_options", {}),
+    )
+    rebuilt.encode_special_tokens = backend.encode_special_tokens
+    tokenizer._tokenizer = rebuilt
+    logger.info(
+        "Restored fastokens tokenizer backend components for %s "
+        "from tokenizer.json: %s",
+        model_name_or_path,
+        ", ".join(restored),
+    )
+
+
 def _fix_v5_tokenizer_components(tokenizer, model_name_or_path, revision=None):
     """Fix backend components when a v5 tokenizer class overwrites them.
 
@@ -312,6 +348,10 @@ def _fix_v5_tokenizer_components(tokenizer, model_name_or_path, revision=None):
         return repr(loaded) != repr(expected)
 
     if tokenizer_class in _RESTORE_RAW_BACKEND_COMPONENT_TOKENIZER_CLASSES:
+        if _is_fastokens_backend(backend):
+            _restore_fastokens_backend_components(tokenizer, raw, model_name_or_path)
+            return
+
         restored = []
         for attr in (
             "model",
@@ -485,6 +525,19 @@ def _apply_post_load_fixes(tokenizer, tokenizer_name, revision):
     patch_mistral_common_tokenizer(tokenizer)
     _fix_special_tokens_pattern(tokenizer)
     attach_additional_stop_token_ids(tokenizer)
+
+    backend = getattr(tokenizer, "_tokenizer", None)
+    if _is_fastokens_backend(backend):
+        cache_stats = backend.segment_cache_stats()
+        if cache_stats is None:
+            logger.info("fastokens segment cache disabled for %s", tokenizer_name)
+        else:
+            logger.info(
+                "fastokens segment cache enabled for %s: budget=%d MiB per tokenizer",
+                tokenizer_name,
+                cache_stats["max_bytes"] // (1 << 20),
+            )
+
     return patch_tokenizer(tokenizer)
 
 
@@ -509,6 +562,11 @@ def _ensure_fastokens_patched():
             "Install it with: pip install 'sglang[fastokens]'"
         ) from None
 
+    assert_pkg_version(
+        "fastokens",
+        "0.3.5",
+        "Upgrade with: python -m pip install --upgrade --no-deps 'fastokens==0.3.5'",
+    )
     fastokens.patch_transformers()
     _fastokens_patched = True
     logger.info("fastokens backend enabled - transformers patched successfully")

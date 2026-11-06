@@ -5884,7 +5884,7 @@ class ServerArgs:
         view = resolved_view(self)
         if (
             envs.SGLANG_WELMV4_DECODE_RS_AG.get()
-            and view.disaggregation_mode == "decode"
+            and view.disaggregation_mode in ("null", "decode")
         ):
             if view.ep_size <= 1 or view.moe_a2a_backend != "deepep":
                 raise ValueError(

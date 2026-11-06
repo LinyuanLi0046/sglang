@@ -39,7 +39,7 @@ def _welm_draft_graph_uses_local_ep_only(model_runner: ModelRunner) -> bool:
         not envs.SGLANG_WELMV4_DECODE_RS_AG.get()
         or model_runner.device != "npu"
         or not model_runner.is_draft_worker
-        or model_runner.server_args.disaggregation_mode != "decode"
+        or model_runner.server_args.disaggregation_mode not in ("null", "decode")
         or not get_moe_a2a_backend().is_deepep()
         or not get_deepep_mode().is_auto()
     ):

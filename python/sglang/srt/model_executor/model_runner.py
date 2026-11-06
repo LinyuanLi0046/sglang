@@ -368,7 +368,7 @@ class ModelRunner:
             envs.SGLANG_WELMV4_DECODE_RS_AG.get()
             and not self.is_draft_worker
             and self.device == "npu"
-            and self.server_args.disaggregation_mode == "decode"
+            and self.server_args.disaggregation_mode in ("null", "decode")
             and "WeLMV4MoeForCausalLM"
             in (self.model_config.hf_config.architectures or [])
         )

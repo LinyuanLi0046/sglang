@@ -248,11 +248,11 @@ class DeepEPBuffer:
             )
 
         deep_use_mode = os.getenv("DEEP_USE_MODE", "default").lower()
-        if deep_use_mode != "default":
+        if deep_use_mode not in ("default", "ops"):
             raise RuntimeError(
                 f"The standalone DeepEP normal {normal_strategy_name} selector "
-                "requires DEEP_USE_MODE=default; the strategy will be bound "
-                "to its dedicated communication group after Buffer construction"
+                "requires DEEP_USE_MODE=default or ops; the normal strategy will "
+                "be bound to its dedicated communication group after Buffer construction"
             )
 
         if normal_comm_group is None:
@@ -283,10 +283,10 @@ class DeepEPBuffer:
                 f"{normal_strategy_name} strategy"
             )
 
-        # Buffer construction binds deep_ep_cpp and the low-latency strategy to
-        # original_group. Temporarily expose the duplicate group only while the
-        # normal strategy is constructed; the Buffer is not published through
-        # process-wide state until this method returns.
+        # Buffer construction binds deep_ep_cpp and the selected low-latency
+        # strategy (default or ops) to original_group. Rebind only NORMAL to the
+        # duplicate group, preserving the LL object and its original group.
+        # The Buffer is not published until this method returns.
         original_low_latency_strategy = buffer.low_latency_strategy
         try:
             buffer.group = normal_comm_group

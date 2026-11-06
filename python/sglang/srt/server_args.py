@@ -5882,6 +5882,33 @@ class ServerArgs:
             return
 
         view = resolved_view(self)
+        if (
+            envs.SGLANG_WELMV4_DECODE_RS_AG.get()
+            and view.disaggregation_mode == "decode"
+        ):
+            if view.ep_size <= 1 or view.moe_a2a_backend != "deepep":
+                raise ValueError(
+                    "WeLMv4 decode RS/AG requires DeepEP with EP > 1."
+                )
+            if self.deepep_mode not in ("auto", "low_latency"):
+                raise ValueError(
+                    "WeLMv4 decode RS/AG requires DeepEP LOW_LATENCY; "
+                    "use --deepep-mode auto or low_latency."
+                )
+            if self.disable_attn_tp_gather:
+                raise ValueError(
+                    "WeLMv4 decode RS/AG requires attention-TP gather padding; "
+                    "disable --disable-attn-tp-gather."
+                )
+            if (
+                self.pp_size != 1
+                or self.attn_cp_size != 1
+                or self.dcp_size != 1
+                or self.enable_two_batch_overlap
+            ):
+                raise ValueError(
+                    "WeLMv4 decode RS/AG requires PP=CP=DCP=1 and TBO disabled."
+                )
         if not view.enable_dp_attention:
             return
 

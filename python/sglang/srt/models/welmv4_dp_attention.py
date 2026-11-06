@@ -58,7 +58,37 @@ class WelmDpLayout(Enum):
 class WelmMoeTransport(Enum):
     DP_GATHER_TP_MOE = auto()
     DEEPEP_NORMAL_AG_SCATTERED = auto()
+    DEEPEP_LOW_LATENCY_SCATTERED = auto()
     EXPLICIT_AG_LOCAL_SORT_EP_AR = auto()
+
+    @property
+    def uses_scattered_rows(self) -> bool:
+        return self in (
+            WelmMoeTransport.DEEPEP_NORMAL_AG_SCATTERED,
+            WelmMoeTransport.DEEPEP_LOW_LATENCY_SCATTERED,
+        )
+
+
+def use_welm_decode_rs_ag(enabled: bool, forward_batch: "ForwardBatch") -> bool:
+    """Select only pure decode rounds, including their idle participants.
+
+    Keep the group-wide prefill predicate intact: a locally decoding/idle
+    shard in an ordinary-prefill round must use the original transport.
+    The same predicate is shared by the DP executor and the pure-TP path.
+    """
+    if not enabled or forward_batch.is_extend_in_batch:
+        return False
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    original_mode = (
+        getattr(forward_batch, "_original_forward_mode", None)
+        or forward_batch.forward_mode
+    )
+    return original_mode in (
+        ForwardMode.DECODE,
+        ForwardMode.TARGET_VERIFY,
+        ForwardMode.IDLE,
+    )
 
 
 class AttentionFinishKind(Enum):
@@ -84,6 +114,8 @@ class WelmRunnerParallelPlan:
     outer_target_dp_rank: int
     outer_target_dp_size: int
     normal_allgather_enabled: bool = False
+    decode_rs_ag_enabled: bool = False
+    decode_ll_dispatch_capacity: Optional[int] = None
     local_ep_kernel_available: bool = False
     shared_expert_ep_replicated: bool = False
     o_proj_returns_partial: bool = True
@@ -142,6 +174,8 @@ def build_welm_target_runner_plan(
     moe_ep_group: Optional["GroupCoordinator"] = None,
     moe_ep_normal_group: Optional["GroupCoordinator"] = None,
     normal_allgather_enabled: bool = False,
+    decode_rs_ag_enabled: bool = False,
+    decode_ll_dispatch_capacity: Optional[int] = None,
     local_ep_kernel_available: bool = False,
     shared_expert_ep_replicated: bool = False,
     o_proj_returns_partial: bool = True,
@@ -167,6 +201,8 @@ def build_welm_target_runner_plan(
         outer_target_dp_rank=int(parallel_state.attn_dp_rank),
         outer_target_dp_size=int(parallel_state.attn_dp_size),
         normal_allgather_enabled=normal_allgather_enabled,
+        decode_rs_ag_enabled=decode_rs_ag_enabled,
+        decode_ll_dispatch_capacity=decode_ll_dispatch_capacity,
         local_ep_kernel_available=local_ep_kernel_available,
         shared_expert_ep_replicated=shared_expert_ep_replicated,
         o_proj_returns_partial=o_proj_returns_partial,
@@ -260,6 +296,16 @@ def validate_welm_runner_plan(
         )
     if require_finalized and not plan.finalized:
         raise RuntimeError("WeLMv4 runner plan has not been finalized")
+    if plan.decode_rs_ag_enabled:
+        if plan.role is not WelmRunnerRole.TARGET_DP or not plan.has_moe_ep:
+            raise RuntimeError("WeLMv4 DP decode RS/AG requires a target EP plan")
+        capacity = plan.decode_ll_dispatch_capacity
+        if (
+            not isinstance(capacity, int)
+            or isinstance(capacity, bool)
+            or capacity <= 0
+        ):
+            raise RuntimeError("WeLMv4 decode RS/AG requires a positive LL capacity")
     uses_dp_row_executor = (
         plan.role is WelmRunnerRole.TARGET_DP
         or (plan.role is WelmRunnerRole.DRAFT and plan.has_moe_ep)
@@ -598,6 +644,7 @@ class WelmDpExecutionPlanner:
         has_ordinary_prefill: bool,
         layer_id: int,
         enable_kv_mirror: bool,
+        use_decode_ll_rs_ag: bool = False,
     ) -> WelmBatchExecutionPlan:
         plan = self.runner_plan
         if plan.role is WelmRunnerRole.DRAFT:
@@ -619,6 +666,18 @@ class WelmDpExecutionPlanner:
                 else AttentionFinishKind.IDENTITY
             )
             return WelmBatchExecutionPlan(finish, transport)
+
+        if use_decode_ll_rs_ag:
+            if not plan.decode_rs_ag_enabled or has_ordinary_prefill:
+                raise RuntimeError("WeLMv4 LL RS/AG selected outside a decode round")
+            finish = (
+                AttentionFinishKind.ATTN_TP_REDUCE_SCATTER
+                if plan.o_proj_returns_partial and plan.attn_tp_size > 1
+                else AttentionFinishKind.IDENTITY
+            )
+            return WelmBatchExecutionPlan(
+                finish, WelmMoeTransport.DEEPEP_LOW_LATENCY_SCATTERED
+            )
 
         in_scattered_prefill_prefix = (
             has_ordinary_prefill
@@ -685,6 +744,27 @@ class WelmDpAttentionExecutor:
         if hidden_states.dim() < 2:
             raise RuntimeError("WeLMv4 DP scratch requires row-major hidden states")
 
+        use_decode_ll_rs_ag = use_welm_decode_rs_ag(
+            plan.decode_rs_ag_enabled, forward_batch
+        )
+        if use_decode_ll_rs_ag:
+            # Check synchronized CPU slot metadata before any layer collective.
+            # All EP ranks must reject an oversized eager batch/capture bucket
+            # together; no device readback or extra synchronization is needed.
+            slots = row_layout.current.slot_rows_cpu
+            if any(int(rows) % plan.attn_tp_size for rows in slots):
+                raise RuntimeError("WeLMv4 decode slots must align to attention-TP")
+            max_local_rows = max(int(rows) for rows in slots) // plan.attn_tp_size
+            capacity = plan.decode_ll_dispatch_capacity
+            assert capacity is not None
+            if max_local_rows > capacity:
+                raise RuntimeError(
+                    "WeLMv4 decode RS/AG exceeds the DeepEP LL call capacity: "
+                    f"{max_local_rows} > {capacity}; increase "
+                    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK or reduce "
+                    "the decode/capture request limit (including MTP width)."
+                )
+
         has_ordinary_prefill = bool(
             forward_batch.is_extend_in_batch
             and not forward_batch.forward_mode.is_target_verify()
@@ -726,6 +806,10 @@ class WelmDpAttentionExecutor:
                         WelmMoeTransport.EXPLICIT_AG_LOCAL_SORT_EP_AR,
                     )
                 )
+        elif use_decode_ll_rs_ag:
+            requirements.append(
+                (row_layout.current, WelmMoeTransport.DEEPEP_LOW_LATENCY_SCATTERED)
+            )
         else:
             requirements.append(
                 (
@@ -744,7 +828,7 @@ class WelmDpAttentionExecutor:
             if key in prepared:
                 continue
             prepared.add(key)
-            if transport is WelmMoeTransport.DEEPEP_NORMAL_AG_SCATTERED:
+            if transport.uses_scattered_rows:
                 welm_dp_prepare_attn_scattered_transport_scratch(
                     row_view,
                     hidden_states,
@@ -775,6 +859,9 @@ class WelmDpAttentionExecutor:
                 "WeLMv4 DP execution requires ForwardBatch.welm_dp_moe_row_layout"
             )
 
+        use_decode_ll_rs_ag = use_welm_decode_rs_ag(
+            plan.decode_rs_ag_enabled, forward_batch
+        )
         has_ordinary_prefill = bool(
             forward_batch.is_extend_in_batch
             and not forward_batch.forward_mode.is_target_verify()
@@ -787,6 +874,7 @@ class WelmDpAttentionExecutor:
             has_ordinary_prefill=has_ordinary_prefill,
             layer_id=layer.layer_id,
             enable_kv_mirror=enable_kv_mirror,
+            use_decode_ll_rs_ag=use_decode_ll_rs_ag,
         )
         active_view = self._active_row_view(
             layer=layer,
@@ -799,6 +887,7 @@ class WelmDpAttentionExecutor:
             layer_id=layer.layer_id,
             has_ordinary_prefill=has_ordinary_prefill,
             enable_kv_mirror=enable_kv_mirror,
+            use_decode_ll_rs_ag=use_decode_ll_rs_ag,
         )
 
         mirror_transition = self._is_first_target_mirror_transition(
@@ -952,8 +1041,7 @@ class WelmDpAttentionExecutor:
             idle_hidden, idle_residual = welm_dp_idle_buffers(active_view)
             idle_layout = (
                 WelmDpLayout.EP_SCATTERED
-                if batch_plan.moe_transport
-                is WelmMoeTransport.DEEPEP_NORMAL_AG_SCATTERED
+                if batch_plan.moe_transport.uses_scattered_rows
                 else WelmDpLayout.DP_LOCAL_TP_ATTN_FULL
             )
             state = WelmDpLayerState(
@@ -1019,8 +1107,11 @@ class WelmDpAttentionExecutor:
         layer_id: int,
         has_ordinary_prefill: bool,
         enable_kv_mirror: bool,
+        use_decode_ll_rs_ag: bool = False,
     ) -> bool:
         plan = self.runner_plan
+        if use_decode_ll_rs_ag:
+            return layer_id > 0
         if (
             plan.role is not WelmRunnerRole.TARGET_DP
             or not plan.has_moe_ep
@@ -1047,6 +1138,22 @@ class WelmDpAttentionExecutor:
             and enable_kv_mirror
             and layer_id == self.runner_plan.first_mirror_consumer
         )
+
+    def gather_decode_aux_hidden(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: "ForwardBatch",
+        *,
+        layer_id: int,
+    ) -> torch.Tensor:
+        """Publish intermediate decode hidden rows without changing layer state."""
+        if layer_id > 0 and use_welm_decode_rs_ag(
+            self.runner_plan.decode_rs_ag_enabled, forward_batch
+        ):
+            return welm_attn_all_gather_rows(
+                hidden_states, attn_tp_group=self.runner_plan.attn_tp_group
+            )
+        return hidden_states
 
     @staticmethod
     def _assert_fp32_residual(residual: Optional[torch.Tensor]) -> None:
@@ -1230,10 +1337,7 @@ class WelmDpAttentionExecutor:
         input_is_reduce_scattered: bool = False,
     ) -> WelmDpLayerState:
         plan = self.runner_plan
-        if (
-            batch_plan.moe_transport
-            is WelmMoeTransport.DEEPEP_NORMAL_AG_SCATTERED
-        ):
+        if batch_plan.moe_transport.uses_scattered_rows:
             if (
                 batch_plan.attention_finish
                 is AttentionFinishKind.ATTN_TP_REDUCE_SCATTER
@@ -1265,7 +1369,7 @@ class WelmDpAttentionExecutor:
                 residual = state.residual
             else:
                 raise RuntimeError(
-                    "WeLMv4 NORMAL transport requires ReduceScatter when "
+                    "WeLMv4 scattered transport requires ReduceScatter when "
                     "attention-TP is greater than one"
                 )
             state.hidden_layout = WelmDpLayout.EP_SCATTERED
@@ -1353,6 +1457,14 @@ class WelmDpAttentionExecutor:
         transport = batch_plan.moe_transport
         layer.final_mlp_experts_output = None
         layer.final_mlp_shared_output = None
+
+        if transport is WelmMoeTransport.DEEPEP_LOW_LATENCY_SCATTERED:
+            return self._run_decode_low_latency_moe(
+                layer=layer,
+                state=state,
+                forward_batch=forward_batch,
+                active_view=active_view,
+            )
 
         if transport is WelmMoeTransport.DEEPEP_NORMAL_AG_SCATTERED:
             if state.hidden_layout is not WelmDpLayout.EP_SCATTERED:
@@ -1520,4 +1632,61 @@ class WelmDpAttentionExecutor:
         )
         state.hidden_layout = WelmDpLayout.DP_LOCAL_TP_ATTN_FULL
         state.residual_layout = WelmDpLayout.DP_LOCAL_TP_ATTN_FULL
+        return state
+
+    def _run_decode_low_latency_moe(
+        self,
+        *,
+        layer: Any,
+        state: WelmDpLayerState,
+        forward_batch: "ForwardBatch",
+        active_view: "WelmDpRowView",
+    ) -> WelmDpLayerState:
+        """Dispatch unique rows through existing LL, preserving prefill policy."""
+        plan = self.runner_plan
+        if state.hidden_layout is not WelmDpLayout.EP_SCATTERED:
+            raise RuntimeError("WeLMv4 DeepEP LL requires scattered hidden rows")
+        valid_mask = welm_dp_attn_scattered_valid_mask(
+            active_view,
+            dp_rank=plan.outer_target_dp_rank,
+            attn_tp_rank=plan.attn_tp_rank,
+            attn_tp_size=plan.attn_tp_size,
+            local_rows=state.hidden_states.shape[0],
+            device=state.hidden_states.device,
+        )
+        invalid_mask = welm_dp_attn_scattered_invalid_mask(active_view)
+        assert state.residual is not None
+        state.hidden_states.masked_fill_(invalid_mask[:, None], 0)
+        state.residual.masked_fill_(invalid_mask[:, None], 0)
+
+        # AUTO already resolves this group-wide non-extend round to LL.
+        # Retain legal, distinct TopK IDs for dummy rows and zero only their
+        # weights; NORMAL's -1 sentinel is not part of the LL contract.
+        mlp_output = layer.mlp(
+            state.hidden_states,
+            None,
+            forward_batch,
+            False,
+            return_components=False,
+            use_welm_local_ep_moe=False,
+            use_welm_decode_like_stream_policy=True,
+            valid_row_mask=valid_mask,
+            invalid_row_mask=invalid_mask,
+            invalid_topk_id=None,
+            allow_inplace_expert_shared_merge=True,
+        )
+        state.hidden_states = self._store_final_components(layer, mlp_output)
+        state.hidden_states.masked_fill_(invalid_mask[:, None], 0)
+
+        if layer.is_final_layer:
+            # Restore this DP shard for logits and physical NextN MTP. Keep
+            # the FP32 residual separate until the model's existing final norm.
+            state.hidden_states = welm_attn_all_gather_rows(
+                state.hidden_states, attn_tp_group=plan.attn_tp_group
+            )
+            state.residual = welm_attn_all_gather_rows(
+                state.residual, attn_tp_group=plan.attn_tp_group
+            )
+            state.hidden_layout = WelmDpLayout.DP_LOCAL_TP_ATTN_FULL
+            state.residual_layout = WelmDpLayout.DP_LOCAL_TP_ATTN_FULL
         return state

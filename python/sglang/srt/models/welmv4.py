@@ -95,6 +95,7 @@ from sglang.srt.models.welmv4_dp_attention import (
     WelmRunnerParallelPlan,
     WelmRunnerRole,
     get_welm_runner_build_plan_for_init,
+    use_welm_decode_rs_ag,
 )
 from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.server_args import get_global_server_args
@@ -3621,6 +3622,70 @@ class Qwen2MoeDecoderLayer(nn.Module):
         get_tp_group().all_gather_into_tensor(gathered, local_tensor.contiguous())
         return gathered
 
+    def _use_npu_decode_deepep_scattered(self, forward_batch: ForwardBatch) -> bool:
+        # The runner validates the topology once, before capture. Keep this
+        # independent of the prefill selector: mirror/prefill optimizations
+        # must not become eligible just because decode also uses LOCAL rows.
+        return (
+            use_welm_decode_rs_ag(
+                getattr(self, "welm_decode_rs_ag_enabled", False), forward_batch
+            )
+            and self._welm_dp_executor is None
+            and not self.is_nextn
+        )
+
+    def _prepare_npu_decode_rs_ag_scratch(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ) -> None:
+        """Refresh batch-owned pure-TP masks from the existing local scalar."""
+        tp_size = get_tensor_model_parallel_world_size()
+        full_rows = hidden_states.shape[0]
+        if full_rows % tp_size:
+            raise RuntimeError(
+                f"WeLM decode rows {full_rows} are not divisible by TP{tp_size}"
+            )
+        local_rows = full_rows // tp_size
+        capacity = self.welm_decode_ll_dispatch_capacity
+        if capacity is None or local_rows > capacity:
+            raise RuntimeError(
+                "WeLM decode LL capacity does not cover the padded TP shard: "
+                f"rows={local_rows}, capacity={capacity}"
+            )
+        if get_deepep_mode().resolve(False) is not DeepEPMode.LOW_LATENCY:
+            raise RuntimeError("WeLM decode RS/AG requires DeepEP LOW_LATENCY")
+        if forward_batch.can_run_tbo:
+            raise RuntimeError("WeLM decode RS/AG does not support TBO")
+        count = forward_batch.num_token_non_padded
+        if count is None or count.device != hidden_states.device:
+            raise RuntimeError(
+                "WeLM pure-TP decode requires its localized non-padded row scalar"
+            )
+        positions = forward_batch.welm_decode_tp_positions
+        if positions is None:
+            positions = torch.arange(
+                local_rows, device=hidden_states.device, dtype=torch.int32
+            )
+            forward_batch.welm_decode_tp_positions = positions
+            forward_batch.welm_decode_tp_valid_mask = torch.empty(
+                local_rows, device=hidden_states.device, dtype=torch.bool
+            )
+            forward_batch.welm_decode_tp_invalid_mask = torch.empty_like(
+                forward_batch.welm_decode_tp_valid_mask
+            )
+        elif (
+            positions.shape != (local_rows,)
+            or positions.device != hidden_states.device
+        ):
+            raise RuntimeError("WeLM decode scratch shape changed after allocation")
+        torch.lt(positions, count, out=forward_batch.welm_decode_tp_valid_mask)
+        torch.logical_not(
+            forward_batch.welm_decode_tp_valid_mask,
+            out=forward_batch.welm_decode_tp_invalid_mask,
+        )
+        # The non-DP MLP and model publication already understand this layout.
+        # DP execution owns separate row metadata and never sets this flag.
+        forward_batch.welmv4_npu_deepep_scattered = True
+
     def _npu_prefill_deepep_prepare_attention(
         self,
         hidden_states: torch.Tensor,
@@ -3922,6 +3987,9 @@ class Qwen2MoeDecoderLayer(nn.Module):
         use_npu_prefill_deepep_scattered = (
             self._use_npu_prefill_deepep_scattered(hidden_states, forward_batch)
         )
+        use_npu_decode_deepep_scattered = self._use_npu_decode_deepep_scattered(
+            forward_batch
+        )
         is_kv_mirror_prefill = (
             forward_batch.enable_kv_mirror
             and forward_batch.forward_mode.is_extend_without_speculative()
@@ -3944,12 +4012,12 @@ class Qwen2MoeDecoderLayer(nn.Module):
         # attention, and changes the persistent layout to FULL.  Every later
         # mirror layer consumes and produces the same exact [B, D] FULL rows.
         input_hidden_is_scattered = (
-            use_npu_prefill_deepep_scattered
+            (use_npu_prefill_deepep_scattered or use_npu_decode_deepep_scattered)
             and self.layer_id > 0
             and not already_full_mirror
         )
         output_hidden_is_scattered = (
-            use_npu_prefill_deepep_scattered
+            (use_npu_prefill_deepep_scattered or use_npu_decode_deepep_scattered)
             and not is_first_kv_mirror_consumer
             and not already_full_mirror
         )
@@ -4119,6 +4187,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         use_fused_oproj_rs = (
             envs.SGLANG_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER.get()
             and can_oproj_reduce_scatter
+            and not use_npu_decode_deepep_scattered
         )
         max_chunks = envs.SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MAX_CHUNKS.get()
         oproj_rs_pipeline_chunks = 0
@@ -4259,6 +4328,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         use_welm_local_ep_moe = (
             self.mlp.supports_welm_local_ep_moe
             and has_full_replicated_moe_input
+            and not use_npu_decode_deepep_scattered
         )
         if use_welm_local_ep_moe and output_hidden_is_scattered:
             raise RuntimeError(
@@ -4300,6 +4370,21 @@ class Qwen2MoeDecoderLayer(nn.Module):
             # MoE input is already scattered; recover OProj's padded MM rows.
             and megamoe.meets_prefill_threshold(hidden_states.shape[0] * tp_size)
         )
+        valid_mask = invalid_mask = None
+        if use_npu_decode_deepep_scattered:
+            valid_mask = forward_batch.welm_decode_tp_valid_mask
+            invalid_mask = forward_batch.welm_decode_tp_invalid_mask
+            if (
+                valid_mask is None
+                or invalid_mask is None
+                or valid_mask.shape != (hidden_states.shape[0],)
+                or invalid_mask.shape != valid_mask.shape
+            ):
+                raise RuntimeError("WeLM decode scattered scratch was not prepared")
+            hidden_states.masked_fill_(invalid_mask[:, None], 0)
+            residual.masked_fill_(invalid_mask[:, None], 0)
+            if hidden_states_fp32 is not None:
+                hidden_states_fp32.masked_fill_(invalid_mask[:, None], 0)
         with get_forward().scoped(
             deepep_mode_override=(
                 DeepEPMode.LOW_LATENCY
@@ -4316,11 +4401,17 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 forward_batch,
                 use_reduce_scatter,
                 use_welm_local_ep_moe=use_welm_local_ep_moe,
+                use_welm_decode_like_stream_policy=use_npu_decode_deepep_scattered,
+                valid_row_mask=valid_mask,
+                invalid_row_mask=invalid_mask,
+                allow_inplace_expert_shared_merge=use_npu_decode_deepep_scattered,
                 use_welm_prefill_megamoe=(
                     use_megamoe_prefill and megamoe.can_run(hidden_states.shape[0])
                 ),
                 force_serial_shared_expert=use_megamoe_prefill,
-                return_components=self.is_final_layer,
+                return_components=(
+                    self.is_final_layer and not use_npu_decode_deepep_scattered
+                ),
                 skip_component_output=(
                     self.is_final_layer
                     and residual is not None
@@ -4333,6 +4424,9 @@ class Qwen2MoeDecoderLayer(nn.Module):
             hidden_states, experts_output, shared_output = mlp_output
         else:
             hidden_states = mlp_output
+
+        if use_npu_decode_deepep_scattered:
+            hidden_states.masked_fill_(invalid_mask[:, None], 0)
 
         if self.is_final_layer:
             self.final_mlp_experts_output = experts_output
@@ -4878,7 +4972,13 @@ class Qwen2MoeModel(nn.Module):
         aux_hidden_states: List[torch.Tensor],
         forward_batch: ForwardBatch,
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        if forward_batch.welmv4_npu_deepep_full_mirror:
+        decode_scattered = (
+            use_welm_decode_rs_ag(
+                getattr(self, "welm_decode_rs_ag_enabled", False), forward_batch
+            )
+            and forward_batch.welm_decode_tp_valid_mask is not None
+        )
+        if forward_batch.welmv4_npu_deepep_full_mirror and not decode_scattered:
             mirror_num_real_rows = forward_batch.kv_mirror_num_real_rows
             if mirror_num_real_rows is None:
                 raise RuntimeError("KV Mirror FULL output metadata is incomplete")
@@ -4892,11 +4992,19 @@ class Qwen2MoeModel(nn.Module):
             return hidden_states, aux_hidden_states
 
         tp_size = get_tensor_model_parallel_world_size()
-        mirror_num_padded_rows = forward_batch.kv_mirror_num_padded_rows
-        mirror_num_real_rows = forward_batch.kv_mirror_num_real_rows
+        mirror_num_padded_rows = (
+            None if decode_scattered else forward_batch.kv_mirror_num_padded_rows
+        )
+        mirror_num_real_rows = (
+            None if decode_scattered else forward_batch.kv_mirror_num_real_rows
+        )
         if mirror_num_padded_rows is not None and mirror_num_real_rows is None:
             raise RuntimeError("KV Mirror output metadata is incomplete")
-        global_num_rows = mirror_num_padded_rows
+        global_num_rows = (
+            forward_batch.positions.shape[0]
+            if decode_scattered
+            else mirror_num_padded_rows
+        )
         if global_num_rows is None:
             global_num_rows = forward_batch.global_dp_buffer_len
         if global_num_rows is None:
@@ -5022,6 +5130,10 @@ class Qwen2MoeModel(nn.Module):
                     forward_batch=forward_batch,
                     hidden_states=hidden_states,
                 )
+            elif first_local_layer._use_npu_decode_deepep_scattered(forward_batch):
+                first_local_layer._prepare_npu_decode_rs_ag_scratch(
+                    hidden_states, forward_batch
+                )
 
         aux_hidden_states = []
         if forward_batch.can_run_tbo:
@@ -5047,11 +5159,16 @@ class Qwen2MoeModel(nn.Module):
                         hidden_states, residual, positions, forward_batch
                     )
                 if i in self.layers_to_capture:
-                    aux_hidden_states.append(
+                    aux_hidden = (
                         hidden_states + residual
                         if residual is not None
                         else hidden_states
                     )
+                    if dp_executor is not None:
+                        aux_hidden = dp_executor.gather_decode_aux_hidden(
+                            aux_hidden, forward_batch, layer_id=i
+                        )
+                    aux_hidden_states.append(aux_hidden)
                 with get_global_expert_distribution_recorder().with_current_layer(i):
                     layer = self.layers[i]
                     hidden_states, residual = layer(

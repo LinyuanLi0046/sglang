@@ -150,7 +150,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self.record_nolora_graph = False
         self.is_dllm = False
 
-        self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
+        self.deepep_adapter = DeepEPCudaGraphRunnerAdapter.for_draft_runner(
+            model_runner
+        )
 
         # Capture-time globals required by parent's capture_one_shape signature.
         self.capture_forward_mode = ForwardMode.DECODE

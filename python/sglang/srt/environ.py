@@ -774,6 +774,9 @@ class Envs:
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)  # This argument is deprecated
     SGLANG_DEEPEP_NORMAL_USE_ALLTOALL = EnvBool(False)
     SGLANG_DEEPEP_NORMAL_USE_ALLGATHER = EnvBool(False)
+    # PD decode target only: attention RS/AG with DeepEP LOW_LATENCY,
+    # including fixed-width MTP verify. Prefill and NextN keep their paths.
+    SGLANG_WELMV4_DECODE_RS_AG = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_WELMV4_MIRROR_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = (
         EnvInt(None)

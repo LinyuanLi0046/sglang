@@ -396,6 +396,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.buffers.share_buffers()
         self.welm_dp_real_rows_gpu = None
         self.welm_dp_capture_row_layouts = {}
+        self.welm_decode_tp_capture_batches = {}
         target_plan = _welm_target_plan(model_runner)
         if target_plan is not None:
             # This buffer is deliberately runner-private: the registry-owned
@@ -1083,6 +1084,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # wires no buffer here. (SWA write loc rides the `swa_out_cache_loc` rail.)
 
             with canary_ctx:
+                if (
+                    getattr(self.model_runner, "welm_decode_rs_ag_enabled", False)
+                    and _welm_target_plan(self.model_runner) is None
+                ):
+                    # Warmup below allocates the pure-TP mask scratch on this
+                    # batch. Retain its tensors across every graph replay.
+                    self.welm_decode_tp_capture_batches[shape_key] = forward_batch
                 if forward_batch.welm_dp_moe_row_layout is not None:
                     # Keep every captured shape's batch-owned transport
                     # scratch alive for the graph lifetime.  Different target,

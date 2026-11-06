@@ -948,6 +948,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     welm_dp_raw_rows_cpu: Optional[List[int]] = None
     global_num_requests_cpu: Optional[List[int]] = None
     welm_dp_moe_row_layout: Optional[WelmDpMoeRowLayout] = None
+    # Pure attention-TP decode RS/AG: batch-owned masks refreshed at model
+    # entry, shared by layers and retained by each captured decode graph.
+    welm_decode_tp_positions: Optional[torch.Tensor] = None
+    welm_decode_tp_valid_mask: Optional[torch.Tensor] = None
+    welm_decode_tp_invalid_mask: Optional[torch.Tensor] = None
 
     # For padding
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
@@ -1795,10 +1800,22 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if self.welm_dp_moe_row_layout is not None
             else None
         )
+        slot_alignment = attn_tp_size
+        if (
+            welm_current_view is None
+            and getattr(model_runner, "welm_decode_rs_ag_enabled", False)
+        ):
+            from sglang.srt.models.welmv4_dp_attention import use_welm_decode_rs_ag
+
+            if use_welm_decode_rs_ag(True, self):
+                width = max(1, int(getattr(self.spec_info, "num_tokens_per_req", 1)))
+                slot_alignment = _welm_current_slot_alignment(
+                    model_runner, current_width=width
+                )
         for i in range(sync_group_size):
             # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
-            global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
+            global_num_tokens[i] = ceil_align(global_num_tokens[i], slot_alignment)
 
         # make sure that each rank has the same number of tokens to do collective communication.
         # Zigzag (in-seq-split) CP pads to 2 * attn_cp_size for load balance; other CP modes

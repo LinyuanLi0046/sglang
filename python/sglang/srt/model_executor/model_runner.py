@@ -364,6 +364,23 @@ class ModelRunner:
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().
         self.init_torch_distributed()
+        self.welm_decode_rs_ag_enabled = bool(
+            envs.SGLANG_WELMV4_DECODE_RS_AG.get()
+            and not self.is_draft_worker
+            and self.device == "npu"
+            and self.server_args.disaggregation_mode == "decode"
+            and "WeLMV4MoeForCausalLM"
+            in (self.model_config.hf_config.architectures or [])
+        )
+        self.welm_decode_ll_dispatch_capacity = None
+        if self.welm_decode_rs_ag_enabled:
+            from sglang.srt.layers.moe.token_dispatcher.deepep import (
+                _get_deepep_ll_token_capacities,
+            )
+
+            self.welm_decode_ll_dispatch_capacity = (
+                _get_deepep_ll_token_capacities()[0]
+            )
         if self.runner_parallel_plan is None:
             self.runner_parallel_plan = self._maybe_build_welm_target_runner_plan()
 
@@ -399,6 +416,7 @@ class ModelRunner:
         # Load model weights and configure
         self.initialize()
         self.finalize_welm_runner_plan()
+        self._bind_welm_decode_rs_ag()
         self.check_quantized_moe_compatibility()
         self.maybe_init_welm_prefill_megamoe()
 
@@ -1042,6 +1060,8 @@ class ModelRunner:
                 envs.SGLANG_DEEPEP_NORMAL_USE_ALLGATHER.get()
                 and not envs.SGLANG_DEEPEP_NORMAL_USE_ALLTOALL.get()
             ),
+            decode_rs_ag_enabled=self.welm_decode_rs_ag_enabled,
+            decode_ll_dispatch_capacity=self.welm_decode_ll_dispatch_capacity,
             # Module-backed facts are finalized exactly once after load.
             local_ep_kernel_available=False,
             shared_expert_ep_replicated=False,
@@ -1121,6 +1141,60 @@ class ModelRunner:
             )
         bind(final_plan)
         self.runner_parallel_plan = final_plan
+
+    def _bind_welm_decode_rs_ag(self) -> None:
+        """Bind target-only decode capabilities without changing module sharding."""
+        if not self.welm_decode_rs_ag_enabled:
+            return
+        from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
+
+        parallel = get_parallel()
+        if (
+            not get_moe_a2a_backend().is_deepep()
+            or not get_deepep_mode().enable_low_latency()
+            or parallel.moe_tp_size != 1
+            or parallel.moe_ep_size <= 1
+        ):
+            raise RuntimeError(
+                "WeLMv4 decode RS/AG requires initialized DeepEP LL and MoE-TP=1"
+            )
+        inner_model = self.model.model
+        if self.runner_parallel_plan is None and (
+            parallel.attn_tp_size != self.ps.tp_size
+            or parallel.moe_ep_size != self.ps.tp_size
+        ):
+            raise RuntimeError(
+                "WeLMv4 pure-TP decode RS/AG requires attention-TP=EP=TP"
+            )
+        for layer in inner_model.layers:
+            if int(layer.self_attn.o_proj.tp_size) != parallel.attn_tp_size:
+                raise RuntimeError(
+                    "WeLMv4 decode RS/AG OProj does not match attention-TP"
+                )
+            dispatcher = layer.mlp.experts.dispatcher
+            inner_dispatchers = getattr(dispatcher, "_inners", (dispatcher,))
+            if not inner_dispatchers or any(
+                getattr(inner, "_low_latency_dispatcher", None) is None
+                for inner in inner_dispatchers
+            ):
+                raise RuntimeError(
+                    "WeLMv4 decode RS/AG requires an initialized LL dispatcher"
+                )
+            shared = layer.mlp.shared_expert
+            if shared is not None and (
+                shared.gate_up_proj.tp_size != 1 or shared.down_proj.tp_size != 1
+            ):
+                raise RuntimeError(
+                    "WeLMv4 decode RS/AG requires replicated shared experts"
+                )
+            layer.welm_decode_rs_ag_enabled = True
+            layer.welm_decode_ll_dispatch_capacity = (
+                self.welm_decode_ll_dispatch_capacity
+            )
+        inner_model.welm_decode_rs_ag_enabled = True
+        inner_model.welm_decode_ll_dispatch_capacity = (
+            self.welm_decode_ll_dispatch_capacity
+        )
 
     def maybe_init_welm_prefill_megamoe(self) -> None:
         self.welm_prefill_megamoe = None

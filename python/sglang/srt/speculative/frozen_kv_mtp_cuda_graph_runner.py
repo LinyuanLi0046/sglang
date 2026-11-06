@@ -110,7 +110,9 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         self.record_nolora_graph = False
         self.is_dllm = False
 
-        self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
+        self.deepep_adapter = DeepEPCudaGraphRunnerAdapter.for_draft_runner(
+            model_runner
+        )
 
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.LAST

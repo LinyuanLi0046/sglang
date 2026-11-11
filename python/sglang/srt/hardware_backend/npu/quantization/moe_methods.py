@@ -736,11 +736,9 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         self._validate_weight_prefix(layer, weight_prefix)
 
         weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight")
-        # Only opted-in WeLM MegaMoE BF16 experts retain the loader's ND format.
-        # Do not return early: w13 must still configure the dispatcher dtype.
-        keep_nd = (
-            getattr(layer, "welm_megamoe_keep_nd", False)
-            and weight.dtype == torch.bfloat16
+        keep_nd = weight.dtype == torch.bfloat16 and (
+            getattr(layer, "welm_moe_use_nd", False)
+            or getattr(layer, "welm_megamoe_keep_nd", False)
         )
         if not keep_nd:
             weight.data = npu_format_cast(weight)
@@ -884,7 +882,8 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         # llm/probe_mxfp8_moe_nz.py): +1.4% decode, +3.8% prefill against a 0.2-
         # 0.3% noise floor, bit-identical outputs. Set
         # SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT to fall back to plain ND.
-        weight = npu_format_cast(weight)
+        if not getattr(layer, "welm_moe_use_nd", False):
+            weight = npu_format_cast(weight)
 
         # Both paths hand the grouped matmul weight [E, K, N] and scale
         # [E, K//64, N, 2] as strided transpose views — DO NOT call

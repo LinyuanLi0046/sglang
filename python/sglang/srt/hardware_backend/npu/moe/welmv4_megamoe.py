@@ -192,12 +192,8 @@ def init_welm_prefill_megamoe(model_runner):
     for layer in model_runner.model.model.layers:
         mlp = getattr(layer, "mlp", None)
         experts = getattr(mlp, "experts", None)
-        if (
-            experts is None
-            or mlp.is_nextn
-            or mlp.is_kv_mirror_consumer
-            or not mlp.welm_local_ep_kernel_available
-        ):
+        # Bind only layers whose weights were prepared for MegaMoE at load time.
+        if not getattr(experts, "welm_megamoe_keep_nd", False):
             continue
         if _weight_mode(experts) is None:
             continue

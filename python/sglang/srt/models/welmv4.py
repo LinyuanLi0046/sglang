@@ -97,7 +97,7 @@ from sglang.srt.models.welmv4_dp_attention import (
     get_welm_runner_build_plan_for_init,
     use_welm_decode_rs_ag,
 )
-from sglang.srt.runtime_context import get_forward, get_parallel
+from sglang.srt.runtime_context import get_disagg, get_forward, get_parallel
 from sglang.srt.server_args import get_global_server_args
 
 # from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
@@ -1012,12 +1012,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.is_kv_mirror_consumer = self.layer_id in set(
             getattr(config, "kv_mirror_layers", []) or []
         )
-        # Set before weight postprocessing: MegaMoE reuses these weights in ND.
-        # Decode/verify and DeepEP fallback share the same storage as prefill.
-        # MXFP8 GMMs use matching weight/scale transpose views of canonical ND.
+        self.experts.welm_moe_use_nd = envs.WELM_NPU_MOE_USE_ND.get()
+        # MegaMoE also needs the canonical logical layout for MXFP8.
         self.experts.welm_megamoe_keep_nd = (
             envs.WELM_NPU_USE_MEGAMOE.get()
             and self.welm_local_ep_kernel_available
+            and get_disagg().disaggregation_mode in ("null", "prefill")
             and not self.is_nextn
             and not self.is_kv_mirror_consumer
             and moe_clamp_limit is None

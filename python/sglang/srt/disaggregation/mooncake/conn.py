@@ -151,6 +151,9 @@ class KVArgsRegisterInfo:
     dst_dcp_rank: int = 0
     requires_dcp_relayout: bool = False
     dcp_token_item_lens: Optional[List[int]] = None
+    # None uses normal TP dispatch. False rejects real writes for this session.
+    replica_writer: Optional[bool] = dataclasses.field(default=None, kw_only=True)
+    writer_layout: bytes = dataclasses.field(default=b"", kw_only=True)
     # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
     staging: Optional[StagingRegisterInfo] = None
 
@@ -192,11 +195,17 @@ class KVArgsRegisterInfo:
             ),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14),
+            writer_layout=msg[18] if len(msg) > 18 else b"",
         )
 
 
 class MooncakeKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
+    # Optional final frame sent by decode and checked by its prefill writer.
+    kv_writer_registration: tuple[bytes, ...] = ()
+
+    def _is_replica_writer(self, peer: KVArgsRegisterInfo) -> bool:
+        return False
 
     def __init__(
         self,
@@ -1217,12 +1226,15 @@ class MooncakeKVManager(CommonKVManager):
         target_rank_registration_info: Optional[KVArgsRegisterInfo] = None,
     ):
         rc = 0
+        writer = getattr(target_rank_registration_info, "replica_writer", None)
         state_types = getattr(self.kv_args, "state_types", [])
         for i, st in enumerate(state_types):
             indices = (
                 prefill_state_indices[i] if i < len(prefill_state_indices) else None
             )
             if indices is None:
+                if writer:
+                    return -1
                 continue
             src_data_ptrs = self.kv_args.state_data_ptrs[i]
             src_item_lens = self.kv_args.state_item_lens[i]
@@ -1319,6 +1331,7 @@ class MooncakeKVManager(CommonKVManager):
                     and not self.is_mla_backend
                     and self.attn_tp_size
                     != target_rank_registration_info.dst_attn_tp_size
+                    and not (st == StateType.SWA and writer)
                 ):
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
@@ -1344,6 +1357,8 @@ class MooncakeKVManager(CommonKVManager):
                     logger.warning(
                         f"len(prefill_state_indices) = {len(src_indices)}, len(dst_state_indices) = {len(dst_indices_local)}"
                     )
+                    if writer:
+                        return -1
                     if len(src_indices) > len(dst_indices_local):
                         src_indices = src_indices[: len(dst_indices_local)]
                     else:
@@ -1621,12 +1636,28 @@ class MooncakeKVManager(CommonKVManager):
                 for req in reqs_to_be_processed:
                     start_ts = time.perf_counter()
                     if not req.is_dummy:
+                        target_rank_registration_info = self.decode_kv_args_table.get(
+                            req.mooncake_session_id
+                        )
+                        writer = getattr(
+                            target_rank_registration_info, "replica_writer", None
+                        )
+                        rejected = writer is False or (
+                            writer
+                            and kv_chunk.index_slice.stop > len(req.dst_kv_indices)
+                        )
                         # Early exit if the request has failed
                         with self.session_lock:
-                            if req.mooncake_session_id in self.failed_sessions:
+                            if (
+                                rejected
+                                or req.mooncake_session_id in self.failed_sessions
+                            ):
                                 self.record_failure(
                                     kv_chunk.room,
-                                    f"Decode instance could be dead, remote mooncake session {req.mooncake_session_id} is not alive",
+                                    f"Ascend KV writer/layout or page count mismatch on P{self.attn_tp_rank}: "
+                                    f"expected={self.kv_writer_registration}, peer={target_rank_registration_info.writer_layout!r}"
+                                    if rejected
+                                    else f"Decode instance could be dead, remote mooncake session {req.mooncake_session_id} is not alive",
                                 )
                                 self.update_status(kv_chunk.room, KVPoll.Failed)
                                 self.sync_status_to_decode_endpoint(
@@ -1638,9 +1669,6 @@ class MooncakeKVManager(CommonKVManager):
                                 )
                                 break
 
-                        target_rank_registration_info: KVArgsRegisterInfo = (
-                            self.decode_kv_args_table[req.mooncake_session_id]
-                        )
                         is_dcp_transfer = (
                             target_rank_registration_info.requires_dcp_relayout
                         )
@@ -1716,6 +1744,7 @@ class MooncakeKVManager(CommonKVManager):
                             or self.is_hybrid_mla_backend
                             or self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
+                            or writer
                         ):
                             ret = self.send_kvcache(
                                 req.mooncake_session_id,
@@ -1781,16 +1810,19 @@ class MooncakeKVManager(CommonKVManager):
                             break
 
                         if kv_chunk.is_last_chunk:
-                            if kv_chunk.state_indices and not skip_state:
-                                self.maybe_send_extra(
+                            if (kv_chunk.state_indices or writer) and not skip_state:
+                                state_ret = self.maybe_send_extra(
                                     req,
-                                    kv_chunk.state_indices,
+                                    kv_chunk.state_indices or [],
                                     executor,
                                     target_rank_registration_info,
                                 )
+                                if state_ret and writer:
+                                    self.record_failure(req.room, "SWA transfer failed")
+                                    ret = state_ret
 
                             # Only the last chunk we need to send the aux data
-                            ret = self.send_aux(
+                            ret = ret or self.send_aux(
                                 req,
                                 kv_chunk.prefill_aux_index,
                                 target_rank_registration_info.dst_aux_ptrs,
@@ -1923,9 +1955,15 @@ class MooncakeKVManager(CommonKVManager):
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
                     decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                    decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
-                        decode_kv_args.dst_dcp_size,
-                        decode_kv_args.dst_dcp_rank,
+                    if self.kv_writer_registration or len(waiting_req_bytes) > 18:
+                        decode_kv_args.replica_writer = self._is_replica_writer(
+                            decode_kv_args
+                        )
+                    decode_kv_args.requires_dcp_relayout = (
+                        decode_kv_args.replica_writer is None
+                        and self.requires_dcp_relayout(
+                            decode_kv_args.dst_dcp_size, decode_kv_args.dst_dcp_rank
+                        )
                     )
                     if decode_kv_args.requires_dcp_relayout:
                         decode_kv_args.dcp_token_item_lens = (
@@ -2402,6 +2440,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             staging_total_size_str,
                             dst_dcp_size,
                             dst_dcp_rank,
+                            *self.kv_mgr.kv_writer_registration,
                         ]
                     )
             except zmq.ZMQError:

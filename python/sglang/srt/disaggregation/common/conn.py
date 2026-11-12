@@ -1319,14 +1319,15 @@ class CommonKVReceiver(BaseKVReceiver):
                             target_pp_rank,
                         )
                         if bootstrap_info is not None:
-                            if self.kv_mgr.is_mla_backend:
-                                # For MLA: target_tp_rank is the selected real rank, others are dummy ranks
+                            if self.kv_mgr.is_mla_backend or getattr(
+                                self.kv_mgr, "kv_writer_registration", ()
+                            ):
+                                # Only the selected replica writes KV for this rank.
                                 bootstrap_info["is_dummy"] = not bool(
                                     target_tp_rank == self.target_tp_rank
                                     or self.target_tp_rank is None
                                 )
                             else:
-                                # For non-MLA: all target_tp_ranks are selected real ranks
                                 bootstrap_info["is_dummy"] = False
                             logger.debug(
                                 f"Fetched bootstrap info: {bootstrap_info} for DP {self.prefill_dp_rank} CP {target_cp_rank} TP {target_tp_rank} PP {target_pp_rank}"

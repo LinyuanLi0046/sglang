@@ -5,7 +5,8 @@ the disabled path must not allocate timing state or read clocks. Synchronous
 parser calls alone belong between start/observe, never an await or yield.
 ``before_sse_yield`` is application readiness, not ASGI/TCP delivery. Nonstream
 response_build includes parser work, so those durations must not be added.
-All records use the existing bounded asynchronous PD writer.
+Unified streams capture only the first effective delta per choice. All records
+use the existing bounded asynchronous PD writer.
 """
 
 from __future__ import annotations
@@ -32,6 +33,56 @@ class ParserTimingState(dict):
     def __init__(self, timing):
         super().__init__()
         self.timing = timing
+
+
+class UnifiedStreamTiming(dict):
+    """Carry tool parsers and remember the first effective SSE for each choice."""
+
+    def __init__(self, num_choices):
+        super().__init__()
+        self.pending_choices = num_choices
+        self.first_outputs = {}
+
+    @property
+    def timing(self):
+        # After all choices have emitted content, skip the per-delta probes.
+        return self if self.pending_choices else None
+
+    def register_choice(self, rid, index):
+        record = self.first_outputs.get(index)
+        if record is None:
+            record = self.first_outputs[index] = dict(
+                rid=rid,
+                index=index,
+                first_effective_sse_ns=None,
+                first_effective_kind=None,
+                completion_tokens_at_first_effective=None,
+            )
+        return record
+
+    def first(self, kind, *, rid, index, completion_tokens=None):
+        record = self.register_choice(rid, index)
+        if kind != "role" and record["first_effective_sse_ns"] is None:
+            record.update(
+                first_effective_sse_ns=time.perf_counter_ns(),
+                first_effective_kind=kind,
+                completion_tokens_at_first_effective=completion_tokens,
+            )
+            self.pending_choices -= 1
+
+    def finish(self, status):
+        for record in self.first_outputs.values():
+            emit(
+                "UnifiedRequestStats ",
+                identity(
+                    "unified",
+                    None,
+                    event="stream_finished",
+                    status=status,
+                    boundary="before_sse_yield",
+                    **record,
+                ),
+            )
 
 
 class ResponseTimingState(list):

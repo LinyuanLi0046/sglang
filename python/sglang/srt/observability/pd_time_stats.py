@@ -1,4 +1,4 @@
-"""Opt-in, CPU-only PD timing. Uses the existing ReqTimeStats logging channel.
+"""Opt-in CPU-only request and PD transfer timing on the ReqTimeStats log channel.
 
 No device reads, synchronization, or transport protocol changes belong here.
 Monotonic timestamps can only be compared on the same host. MF call durations
@@ -170,6 +170,24 @@ def identity(role, room, **fields):
 
 def interval_ms(start, end):
     return (end - start) / 1e6 if start is not None and end is not None else None
+
+
+def tokenizer_record(stats, role, room, *, event, rid, **fields):
+    # These stamps belong to the API process, including when metrics are off.
+    return identity(
+        role,
+        room,
+        event=event,
+        rid=rid,
+        api_received_ns=int(stats.created_time * 1e9) or None,
+        tokenize_finish_ns=int(stats.tokenize_finish_time * 1e9) or None,
+        api_server_dispatch_ns=int(stats.api_server_dispatch_time * 1e9) or None,
+        api_server_dispatch_finish_ns=(
+            int(stats.api_server_dispatch_finish_time * 1e9) or None
+        ),
+        first_output_ns=int(stats.first_token_time * 1e9) or None,
+        **fields,
+    )
 
 
 def emit_output_timing(payload, stage, begin_ns, send_begin_ns, end_ns):
@@ -501,9 +519,21 @@ def timed_send_prepare(fn):
 
 def request_record(req, event, **fields):
     stats = req.time_stats
-    timestamps = {
-        name: int(getattr(stats, name) * 1e9) or None
-        for name in (
+    role = stats.disagg_mode_str()
+    output_tokens = len(req.output_ids)
+    if role == "unified":
+        names = (
+            "scheduler_recv_time",
+            "wait_queue_entry_time",
+            "forward_entry_time",
+            "prefill_finished_time",
+            "completion_time",
+        )
+        # Match output_ids_through_stop without copying the output token array.
+        if req.finished_len is not None:
+            output_tokens = min(output_tokens, req.finished_len)
+    else:
+        names = (
             "scheduler_recv_time",
             "prefill_bootstrap_queue_entry_time",
             "bootstrap_done_time",
@@ -517,16 +547,16 @@ def request_record(req, event, **fields):
             "decode_prebuilt_finish_time",
             "completion_time",
         )
-    }
+    timestamps = {name: int(getattr(stats, name) * 1e9) or None for name in names}
     return identity(
-        stats.disagg_mode_str(),
+        role,
         req.bootstrap_room,
         event=event,
         rid=req.rid,
         attempt=req.prefill_attempt_count,
         input_tokens=len(req.origin_input_ids),
         cached_tokens=req.cached_tokens,
-        output_tokens=len(req.output_ids),
+        output_tokens=output_tokens,
         timestamps_ns=timestamps,
         **fields,
     )

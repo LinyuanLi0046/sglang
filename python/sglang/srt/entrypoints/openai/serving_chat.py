@@ -74,6 +74,7 @@ from sglang.srt.observability.pd_serving_time_stats import (
     ParserTimingState,
     ResponseTimingState,
     ServingTiming,
+    UnifiedStreamTiming,
     is_enabled as pd_serving_logging_enabled,
 )
 from sglang.srt.parser.conversation import generate_chat_conv
@@ -210,10 +211,10 @@ class OpenAIServingChat(OpenAIServingBase):
         self.template_manager = template_manager
         self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
         self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
-        self._log_pd_serving = (
-            self.tokenizer_manager.server_args.enable_request_time_stats_logging
-            and self.tokenizer_manager.server_args.disaggregation_mode
-            in ("prefill", "decode")
+        server_args = tokenizer_manager.server_args
+        self._log_stream_timing = server_args.enable_request_time_stats_logging
+        self._log_pd_serving = self._log_stream_timing and (
+            server_args.disaggregation_mode in ("prefill", "decode")
         )
         self.default_chat_template_kwargs = (
             self.tokenizer_manager.server_args.default_chat_template_kwargs or {}
@@ -715,11 +716,10 @@ class OpenAIServingChat(OpenAIServingBase):
         completion_tokens: Dict[int, int],
     ) -> AsyncGenerator[str, None]:
         """Generate SSE chunks for streaming content."""
-        timing = (
-            parser_dict.timing
-            if self._log_pd_serving and isinstance(parser_dict, ParserTimingState)
-            else None
+        first_output = (
+            getattr(parser_dict, "timing", None) if self._log_stream_timing else None
         )
+        timing = first_output if self._log_pd_serving else None
         offset = stream_offsets.get(index, 0)
         if self.tokenizer_manager.server_args.incremental_streaming_output:
             delta = content["text"]
@@ -771,8 +771,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     logprobs=remaining_logprobs,
                     usage=usage,
                 )
-                if timing is not None:
-                    timing.first(
+                if first_output is not None:
+                    first_output.first(
                         "reasoning",
                         rid=content["meta_info"]["id"],
                         index=index,
@@ -810,8 +810,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 if timing is not None:
                     timing.observe("tool_flush", flush_start, empty=not remaining_chunk)
                 if remaining_chunk:
-                    if timing is not None:
-                        timing.first(
+                    if first_output is not None:
+                        first_output.first(
                             "tool_calls",
                             rid=content["meta_info"]["id"],
                             index=index,
@@ -840,8 +840,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     logprobs=remaining_logprobs,
                     usage=usage,
                 )
-                if timing is not None:
-                    timing.first(
+                if first_output is not None:
+                    first_output.first(
                         "content",
                         rid=content["meta_info"]["id"],
                         index=index,
@@ -1552,10 +1552,14 @@ class OpenAIServingChat(OpenAIServingBase):
         parser_dict = {}
         reasoning_parser_dict = {}
         timing = None
-        if self._log_pd_serving and pd_serving_logging_enabled():
-            timing = self._new_pd_serving_timing(request, adapted_request)
-            if timing is not None:
-                parser_dict = ParserTimingState(timing)
+        if self._log_stream_timing and pd_serving_logging_enabled():
+            if self._log_pd_serving:
+                timing = self._new_pd_serving_timing(request, adapted_request)
+                if timing is not None:
+                    parser_dict = ParserTimingState(timing)
+            else:
+                timing = UnifiedStreamTiming(request.n)
+                parser_dict = timing
 
         # State tracking for streaming
         is_firsts = {}
@@ -1633,6 +1637,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     if finish_reason_type == "abort" and isinstance(
                         finish_reason.get("status_code"), HTTPStatus
                     ):
+                        if isinstance(timing, UnifiedStreamTiming):
+                            timing.register_choice(content["meta_info"]["id"], index)
+                            timing_status = "error"
                         code = finish_reason["status_code"]
                         error = self.create_streaming_error_response(
                             finish_reason.get("message", "Generation aborted."),
@@ -1784,7 +1791,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 yield f"data: {usage_chunk.model_dump_json()}\n\n"
 
-            timing_status = "complete"
+            if timing_status != "error":
+                timing_status = "complete"
         except ValueError as e:
             timing_status = "error"
             if not stream_started:
@@ -2471,11 +2479,10 @@ class OpenAIServingChat(OpenAIServingBase):
         continuous_usage_stats: bool = False,
     ):
         """Process tool calls in streaming response"""
-        timing = (
-            parser_dict.timing
-            if self._log_pd_serving and isinstance(parser_dict, ParserTimingState)
-            else None
+        first_output = (
+            getattr(parser_dict, "timing", None) if self._log_stream_timing else None
         )
+        timing = first_output if self._log_pd_serving else None
         if timing is not None:
             tool_start = timing.start()
         effective_tools = self._effective_tools(request)
@@ -2554,8 +2561,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
 
             serialized_chunk = f"data: {chunk.model_dump_json()}\n\n"
-            if timing is not None:
-                timing.first(
+            if first_output is not None:
+                first_output.first(
                     "content",
                     rid=content["meta_info"]["id"],
                     index=index,
@@ -2615,8 +2622,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
 
             serialized_chunk = f"data: {chunk.model_dump_json()}\n\n"
-            if timing is not None:
-                timing.first(
+            if first_output is not None:
+                first_output.first(
                     "tool_calls",
                     rid=content["meta_info"]["id"],
                     index=index,

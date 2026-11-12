@@ -1743,7 +1743,17 @@ class Req(ReqDllmMixin):
             f"type={self.time_stats.disagg_mode_str()})"
         )
         message = f"{prefix}: {self.time_stats.convert_to_duration()}"
-        if self.bootstrap_room is not None:
+        if self.time_stats.disagg_mode == DisaggregationMode.NULL:
+            # Keep the existing summary for log consumers. Queue both records on
+            # completion so the scheduler does not serialize JSON or write files.
+            emit("", message)
+            emit(
+                "UnifiedRequestStats ",
+                request_record(
+                    self, "request_finished", num_retractions=self.retraction_count
+                ),
+            )
+        elif self.bootstrap_room is not None:
             emit("", message)
             emit("PDRequestStats ", request_record(self, "request_finished"))
         else:

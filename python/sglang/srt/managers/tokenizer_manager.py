@@ -111,7 +111,12 @@ from sglang.srt.observability.metrics_collector import (
     TokenizerMetricsCollector,
     resolve_collector_class,
 )
-from sglang.srt.observability.pd_time_stats import emit, emit_output_timing, identity
+from sglang.srt.observability.pd_time_stats import (
+    emit,
+    emit_output_timing,
+    identity,
+    tokenizer_record,
+)
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
     convert_time_to_realtime,
@@ -377,6 +382,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
 
     log_d_output: bool = False
+    log_unified_time_stats: bool = False
 
     @property
     def serving_chat_class(self):
@@ -400,6 +406,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.log_d_output = (
             server_args.enable_request_time_stats_logging
             and server_args.disaggregation_mode == "decode"
+        )
+        self.log_unified_time_stats = (
+            server_args.enable_request_time_stats_logging
+            and server_args.disaggregation_mode == "null"
         )
         self._config_updates: List[Tuple[str, Dict[str, Any]]] = []
         self.elastic_worker_count = server_args.dp_size
@@ -2363,29 +2373,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 ):
                     emit(
                         "PDRequestStats ",
-                        identity(
+                        tokenizer_record(
+                            state.time_stats,
                             self.server_args.disaggregation_mode,
                             getattr(state.obj, "bootstrap_room", None),
                             event="tokenizer_first_output",
                             rid=rid,
                             received_ns=received_ns,
                             row_begin_ns=row_begin_ns,
-                            api_received_ns=(
-                                int(state.time_stats.created_time * 1e9) or None
-                            ),
-                            # Reuse tokenizer-local stamps; no extra clocks or IPC.
-                            tokenize_finish_ns=(
-                                int(state.time_stats.tokenize_finish_time * 1e9) or None
-                            ),
-                            api_server_dispatch_ns=(
-                                int(state.time_stats.api_server_dispatch_time * 1e9)
-                                or None
-                            ),
-                            api_server_dispatch_finish_ns=(
-                                int(state.time_stats.api_server_dispatch_finish_time * 1e9)
-                                or None
-                            ),
-                            first_output_ns=int(state.time_stats.first_token_time * 1e9),
                             api_first_output_ms=(
                                 state.time_stats.get_first_token_latency() * 1000
                             ),
@@ -2400,6 +2395,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
                 state.time_stats.set_finished_time()
                 meta_info["e2e_latency"] = state.time_stats.get_e2e_latency()
+                if self.log_unified_time_stats and isinstance(
+                    state.obj, GenerateReqInput
+                ):
+                    self._log_unified_request_finished(state, meta_info)
 
                 if self.server_args.speculative_algorithm:
                     self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
@@ -2450,6 +2449,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if self.log_d_output and not s.pd_first_notify_ns:
                 s.pd_first_notify_ns = time.perf_counter_ns()
             s.event.set()
+
+    @staticmethod
+    def _log_unified_request_finished(state: ReqState, meta_info: dict):
+        finish_reason = meta_info.get("finish_reason")
+        emit(
+            "UnifiedRequestStats ",
+            tokenizer_record(
+                state.time_stats,
+                "unified",
+                None,
+                event="tokenizer_finished",
+                rid=state.obj.rid,
+                stream=state.obj.stream,
+                finished_ns=int(state.time_stats.finished_time * 1e9) or None,
+                output_tokens=meta_info.get("completion_tokens"),
+                finish_type=(
+                    finish_reason.get("type")
+                    if isinstance(finish_reason, dict)
+                    else None
+                ),
+            ),
+        )
 
     def _log_first_output_yield(self, state: ReqState, out: dict, wake_ns: int):
         # The async generator yield is not the HTTP/socket/client receive time.
@@ -3171,6 +3192,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         output_ids = state.output_ids
         meta_info["completion_tokens"] = len(output_ids)
+        if self.log_unified_time_stats and isinstance(state.obj, GenerateReqInput):
+            self._log_unified_request_finished(state, meta_info)
         if is_stream:
             output_ids = [output_ids[-1]] if len(output_ids) > 0 else []
         out = {

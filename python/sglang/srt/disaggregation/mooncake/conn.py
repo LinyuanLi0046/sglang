@@ -12,6 +12,7 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
+import torch
 import zmq
 from prometheus_client import Counter
 
@@ -1573,6 +1574,7 @@ class MooncakeKVManager(CommonKVManager):
         if self.pd_timings is not None:
             executor = TimingExecutor(executor)
         staging_strategy = None
+        device_bound = False
         if self.enable_trace:
             trace_set_thread_info(
                 f"mooncake transfer worker {worker_index}",
@@ -1595,10 +1597,21 @@ class MooncakeKVManager(CommonKVManager):
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
                     )
 
-                if (
-                    kv_chunk.room not in self.request_status
-                    or self.check_status(kv_chunk.room) == KVPoll.Failed
-                ):
+                room_status = self.request_status.get(kv_chunk.room)
+                if kv_chunk.wait_event is not None:
+                    # The previous forward can still be writing this cached prefix.
+                    if room_status not in (None, KVPoll.Failed):
+                        if not device_bound:
+                            torch.get_device_module(self.server_args.device).set_device(
+                                self.kv_args.gpu_id
+                            )
+                            device_bound = True
+                        kv_chunk.wait_event.synchronize()
+                        # The scheduler may have aborted the room during the wait.
+                        room_status = self.request_status.get(kv_chunk.room)
+                    kv_chunk.wait_event = None
+
+                if room_status in (None, KVPoll.Failed):
                     timing_error = "skipped_failed_or_cleared"
                     logger.debug(
                         f"Skipping chunk for room {kv_chunk.room} because it has already failed or been aborted"
@@ -2097,6 +2110,7 @@ class MooncakeKVManager(CommonKVManager):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
+        wait_event: Optional[object] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -2156,6 +2170,7 @@ class MooncakeKVManager(CommonKVManager):
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=trace_ctx,
                 pd_timing=chunk_timing,
+                wait_event=wait_event,
             )
         )
 
@@ -2273,6 +2288,8 @@ class MooncakeKVSender(CommonKVSender):
         kv_indices, index_slice, is_last_chunk, should_skip = (
             self._prepare_send_indices(kv_indices, state_indices)
         )
+        wait_event = getattr(self, "_early_send_wait_event", None)
+        self._early_send_wait_event = None
         if should_skip:
             return
 
@@ -2284,6 +2301,7 @@ class MooncakeKVSender(CommonKVSender):
                 False,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
+                wait_event=wait_event,
             )
         else:
             self.kv_mgr.add_transfer_request(
@@ -2295,6 +2313,7 @@ class MooncakeKVSender(CommonKVSender):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
+                wait_event=wait_event,
             )
         self._record_transfer_indices(kv_indices, state_indices)
 

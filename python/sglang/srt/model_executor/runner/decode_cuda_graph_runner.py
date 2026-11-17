@@ -61,6 +61,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
     build_welm_dp_moe_row_layout,
+    build_welm_local_ll_row_layout,
     compute_local_num_token_non_padded,
     enable_num_token_non_padded,
     get_required_capture_hidden_mode,
@@ -394,19 +395,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_topk_size=self.model_runner.get_pp_proxy_topk_size(),
         )
         self.buffers.share_buffers()
-        self.welm_dp_real_rows_gpu = None
-        self.welm_dp_capture_row_layouts = {}
-        self.welm_decode_tp_capture_batches = {}
-        target_plan = _welm_target_plan(model_runner)
-        if target_plan is not None:
-            # This buffer is deliberately runner-private: the registry-owned
-            # global_num_tokens_gpu stores padded rows and has different
-            # semantics.  Every captured target variant closes over this one
-            # fixed address, which replay updates with physical B_i*K rows.
-            outer_dp_size = int(target_plan.outer_target_dp_size)
-            self.welm_dp_real_rows_gpu = torch.empty(
-                (outer_dp_size,), dtype=torch.int32, device=self.device
-            )
+        self._init_welm_graph_rows(_welm_target_plan(model_runner))
         # FB-shared slot registry adopting DecodeInputBuffers storage (same
         # physical tensors, stable data_ptr for capture vs replay). Provides
         # the unified fill_from / slot access surface, replacing
@@ -487,32 +476,80 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return "lora"
         return "nolora"
 
-    def _welm_target_request_bs(
-        self, forward_batch: ForwardBatch
-    ) -> Optional[int]:
-        """Return the synchronized target request count used by all graph paths.
+    def _init_welm_graph_rows(self, plan) -> None:
+        self.welm_graph_plan = plan
+        self.welm_local_decode_rows = getattr(
+            self.model_runner, "welm_local_decode_rows", False
+        )
+        self.welm_dp_real_rows_gpu = None
+        self.welm_capture_scratch = {}
+        if self.welm_local_decode_rows or plan is not None:
+            # Each runner captures a different width. Its physical row counts
+            # must never alias pooled padding buffers or another runner's count.
+            size = 1 if self.welm_local_decode_rows else int(plan.outer_target_dp_size)
+            self.welm_dp_real_rows_gpu = torch.empty(
+                size, dtype=torch.int32, device=self.device
+            )
 
-        Keeping this in one helper prevents can_run_graph and load_batch from
-        choosing different buckets.  Non-WeLM runners return None and retain
-        their original logic byte-for-byte below.
-        """
+    def _bind_welm_capture_rows(self, forward_batch: ForwardBatch, bs: int) -> None:
+        plan = self.welm_graph_plan
+        if self.welm_local_decode_rows:
+            slot_rows = bs * self.captured_req_width
+            real_rows = self.welm_dp_real_rows_gpu
+            real_rows.fill_(slot_rows)
+            forward_batch.welm_ll_real_rows = real_rows
+            if plan is not None:
+                forward_batch.welm_dp_moe_row_layout = build_welm_local_ll_row_layout(
+                    slot_rows, slot_rows, real_rows
+                )
+        elif plan is not None:
+            capture_requests = [bs] * int(plan.outer_target_dp_size)
+            forward_batch.welm_dp_raw_rows_cpu = list(capture_requests)
+            forward_batch.global_num_requests_cpu = list(capture_requests)
+            forward_batch.welm_dp_moe_row_layout = build_welm_dp_moe_row_layout(
+                raw_rows_cpu=capture_requests,
+                request_rows_cpu=None,
+                local_dp_rank=int(plan.outer_target_dp_rank),
+                device=self.device,
+                padding_mode=forward_batch.dp_padding_mode,
+                current_width=self.captured_req_width,
+                current_real_rows_gpu=self.welm_dp_real_rows_gpu,
+                current_slot_rows_cpu=capture_requests,
+            )
 
-        target_plan = _welm_target_plan(self.model_runner)
-        if target_plan is None:
+    def _retain_welm_capture_scratch(self, key, forward_batch: ForwardBatch) -> None:
+        # Warmup allocates route-mask scratch on the layout (DP) or batch
+        # (pure TP). Captured kernels reference those addresses during replay.
+        if forward_batch.welm_dp_moe_row_layout is not None:
+            self.welm_capture_scratch[key] = forward_batch.welm_dp_moe_row_layout
+        elif self.welm_local_decode_rows or getattr(
+            self.model_runner, "welm_decode_rs_ag_enabled", False
+        ):
+            self.welm_capture_scratch[key] = forward_batch
+
+    def _welm_request_bs(self, forward_batch: ForwardBatch) -> Optional[int]:
+        plan = self.welm_graph_plan
+        if plan is None:
             return None
+        if self.welm_local_decode_rows:
+            return forward_batch.batch_size
         counts = forward_batch.global_num_requests_cpu
-        outer_dp_size = int(target_plan.outer_target_dp_size)
-        if counts is None or len(counts) != outer_dp_size:
+        if counts is None or len(counts) != int(plan.outer_target_dp_size):
             raise RuntimeError(
-                "WeLM TARGET_DP graph requires synchronized global_num_requests_cpu"
+                "WeLM DP graph requires synchronized outer request counts"
             )
         return max(int(x) for x in counts)
 
-    def _update_welm_target_real_rows(self, forward_batch: ForwardBatch) -> None:
-        if getattr(self, "welm_dp_real_rows_gpu", None) is None:
+    def _update_welm_real_rows(self, forward_batch: ForwardBatch) -> None:
+        if self.welm_dp_real_rows_gpu is None:
             return
-        request_bs = self._welm_target_request_bs(forward_batch)
-        assert request_bs is not None
+        if self.welm_local_decode_rows:
+            # init_new recorded this phase's unpadded B*width (zero on idle).
+            # Fill on the replay stream so plan-stream staging cannot overwrite
+            # a count still in use by the preceding replay.
+            self.welm_dp_real_rows_gpu.fill_(forward_batch.num_token_non_padded_cpu)
+            return
+        self._welm_request_bs(forward_batch)
         counts = forward_batch.global_num_requests_cpu
         # Do not reuse one pinned host buffer across asynchronous replays: the
         # next scheduler round may overwrite it before the preceding H2D DMA
@@ -569,6 +606,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     def can_run_graph(self, forward_batch: ForwardBatch):
+        if self.welm_local_decode_rows and forward_batch.welm_ll_real_rows is None:
+            return False
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
@@ -594,7 +633,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ):
             return False
 
-        welm_request_bs = self._welm_target_request_bs(forward_batch)
+        welm_request_bs = self._welm_request_bs(forward_batch)
         if welm_request_bs is not None:
             cuda_graph_bs = welm_request_bs
         elif self.require_mlp_tp_gather:
@@ -860,22 +899,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
 
-        if self.welm_dp_real_rows_gpu is not None:
-            target_plan = _welm_target_plan(self.model_runner)
-            assert target_plan is not None
-            capture_requests = [bs] * int(target_plan.outer_target_dp_size)
-            forward_batch.welm_dp_raw_rows_cpu = list(capture_requests)
-            forward_batch.global_num_requests_cpu = list(capture_requests)
-            forward_batch.welm_dp_moe_row_layout = build_welm_dp_moe_row_layout(
-                raw_rows_cpu=capture_requests,
-                request_rows_cpu=None,
-                local_dp_rank=int(target_plan.outer_target_dp_rank),
-                device=self.device,
-                padding_mode=forward_batch.dp_padding_mode,
-                current_width=self.captured_req_width,
-                current_real_rows_gpu=self.welm_dp_real_rows_gpu,
-                current_slot_rows_cpu=capture_requests,
-            )
+        self._bind_welm_capture_rows(forward_batch, bs)
 
         # Trip the coordinator so the hisparse code path is captured into the
         # graph; backends read it from self.model_runner.hisparse_coordinator.
@@ -1084,20 +1108,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # wires no buffer here. (SWA write loc rides the `swa_out_cache_loc` rail.)
 
             with canary_ctx:
-                if (
-                    getattr(self.model_runner, "welm_decode_rs_ag_enabled", False)
-                    and _welm_target_plan(self.model_runner) is None
-                ):
-                    # Warmup below allocates the pure-TP mask scratch on this
-                    # batch. Retain its tensors across every graph replay.
-                    self.welm_decode_tp_capture_batches[shape_key] = forward_batch
-                if forward_batch.welm_dp_moe_row_layout is not None:
-                    # Keep every captured shape's batch-owned transport
-                    # scratch alive for the graph lifetime.  Different target,
-                    # draft, and draft-extend runners never share this state.
-                    self.welm_dp_capture_row_layouts[shape_key] = (
-                        forward_batch.welm_dp_moe_row_layout
-                    )
+                self._retain_welm_capture_scratch(shape_key, forward_batch)
                 post_warmup_hook = getattr(
                     self.model_runner.attn_backend,
                     "on_after_cuda_graph_warmup",
@@ -1138,7 +1149,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         is_ragged = ragged_layout is not None
 
         self.deepep_adapter.replay()
-        self._update_welm_target_real_rows(forward_batch)
+        if not self.welm_local_decode_rows:
+            self._update_welm_real_rows(forward_batch)
 
         if not forward_batch.needs_forward_metadata_init():
             # Pre-planned (plan-stream load_batch already ran).
@@ -1193,7 +1205,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             padded_num_tokens = graph_size_key
         else:
             raw_num_token = raw_bs * self.captured_req_width
-            welm_request_bs = self._welm_target_request_bs(forward_batch)
+            welm_request_bs = self._welm_request_bs(forward_batch)
             if welm_request_bs is not None:
                 bs = self._pad_to_bucket(welm_request_bs, self.capture_bs)
             elif self.require_mlp_tp_gather:
@@ -1306,6 +1318,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
+            if self.welm_local_decode_rows:
+                self._update_welm_real_rows(forward_batch)
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(
                     "Decode graph replay: worker=%s key_size=%s (%s) mode=%s raw_bs=%d%s",

@@ -3628,16 +3628,17 @@ class Qwen2MoeDecoderLayer(nn.Module):
         # must not become eligible just because decode also uses LOCAL rows.
         return (
             use_welm_decode_rs_ag(
-                getattr(self, "welm_decode_rs_ag_enabled", False), forward_batch
+                getattr(self, "welm_decode_rs_ag_enabled", False),
+                forward_batch,
+                is_draft=self.is_nextn,
             )
             and self._welm_dp_executor is None
-            and not self.is_nextn
         )
 
     def _prepare_npu_decode_rs_ag_scratch(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:
-        """Refresh batch-owned pure-TP masks from the existing local scalar."""
+        """Refresh the TP shard mask from the batch's replayable row count."""
         tp_size = get_tensor_model_parallel_world_size()
         full_rows = hidden_states.shape[0]
         if full_rows % tp_size:
@@ -3655,15 +3656,19 @@ class Qwen2MoeDecoderLayer(nn.Module):
             raise RuntimeError("WeLM decode RS/AG requires DeepEP LOW_LATENCY")
         if forward_batch.can_run_tbo:
             raise RuntimeError("WeLM decode RS/AG does not support TBO")
-        count = forward_batch.num_token_non_padded
+        full_count = getattr(forward_batch, "welm_ll_real_rows", None)
+        count = (
+            full_count if full_count is not None else forward_batch.num_token_non_padded
+        )
         if count is None or count.device != hidden_states.device:
             raise RuntimeError(
-                "WeLM pure-TP decode requires its localized non-padded row scalar"
+                "WeLM pure-TP decode requires a device non-padded row count"
             )
         positions = forward_batch.welm_decode_tp_positions
         if positions is None:
+            start = self.attn_tp_rank * local_rows if full_count is not None else 0
             positions = torch.arange(
-                local_rows, device=hidden_states.device, dtype=torch.int32
+                start, start + local_rows, device=hidden_states.device, dtype=torch.int32
             )
             forward_batch.welm_decode_tp_positions = positions
             forward_batch.welm_decode_tp_valid_mask = torch.empty(
@@ -3771,10 +3776,14 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 f"{global_shape}/{local_shape}"
             )
         if local_residual.dtype != torch.float32:
-            raise RuntimeError(
-                "WeLMv4 NPU DeepEP scattered residual must be FP32 before "
-                f"post-attention norm, got {local_residual.dtype}"
-            )
+            if not self.is_nextn:
+                raise RuntimeError(
+                    "WeLMv4 NPU DeepEP scattered residual must be FP32 before "
+                    f"post-attention norm, got {local_residual.dtype}"
+                )
+            # NextN prenorm with no input residual returns the eh_proj dtype.
+            # Promote only this rank's rows before the FP32 residual add.
+            local_residual = local_residual.float()
 
         if use_mmq_norm_after_attn:
             return mmq_style_norm_after_attn(
@@ -4013,6 +4022,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         # mirror layer consumes and produces the same exact [B, D] FULL rows.
         input_hidden_is_scattered = (
             (use_npu_prefill_deepep_scattered or use_npu_decode_deepep_scattered)
+            and not self.is_nextn
             and self.layer_id > 0
             and not already_full_mirror
         )
@@ -4339,20 +4349,20 @@ class Qwen2MoeDecoderLayer(nn.Module):
             and forward_batch.welmv4_npu_deepep_full_mirror
             and not use_welm_local_ep_moe
         )
-        # Spec-V2 DRAFT_EXTEND_V2 is a multi-token extend even though it is
-        # launched from a decode ScheduleBatch.  In the eager path the copied
-        # ``is_extend_in_batch`` flag therefore still selects DeepEP LL.  That
-        # disagrees with both the padded-row routing above (normal mode uses
-        # expert id -1 for dummy rows) and the draft-extend graph adapter,
-        # which captures DeepEP as an extend batch.  Keep the correction local
-        # to the WeLM NextN physical MTP layer. The local-EP path does not
-        # dispatch through DeepEP, but retains this override because TopK uses
-        # it to select the correct graph-padding id rule.
-        use_nextn_draft_extend_normal = (
+        # Draft-extend is launched by decode but is captured as an extend by
+        # DeepEP AUTO. Keep eager dispatch, captured dispatch and TopK padding
+        # on the same protocol for the selected NextN row layout.
+        deepep_mode_override = None
+        if use_kv_mirror_prefill_ll or (
+            self.is_nextn and use_npu_decode_deepep_scattered
+        ):
+            deepep_mode_override = DeepEPMode.LOW_LATENCY
+        elif (
             _is_npu
             and self.is_nextn
             and forward_batch.forward_mode.is_draft_extend_v2()
-        )
+        ):
+            deepep_mode_override = DeepEPMode.NORMAL
         mirror_ll_capacity = None
         if use_kv_mirror_prefill_ll:
             mirror_ll_capacity = self._get_kv_mirror_prefill_ll_capacity()
@@ -4386,13 +4396,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             if hidden_states_fp32 is not None:
                 hidden_states_fp32.masked_fill_(invalid_mask[:, None], 0)
         with get_forward().scoped(
-            deepep_mode_override=(
-                DeepEPMode.LOW_LATENCY
-                if use_kv_mirror_prefill_ll
-                else (
-                    DeepEPMode.NORMAL if use_nextn_draft_extend_normal else None
-                )
-            ),
+            deepep_mode_override=deepep_mode_override,
             deepep_num_max_dispatch_tokens_override=mirror_ll_capacity,
         ):
             mlp_output = self.mlp(

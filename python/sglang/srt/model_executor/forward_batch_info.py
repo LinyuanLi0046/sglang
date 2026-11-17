@@ -185,6 +185,7 @@ def _welm_build_row_view(
     real_rows_gpu: Optional[torch.Tensor] = None,
     slot_rows_cpu: Optional[List[int]] = None,
     pin_memory: bool = False,
+    borrow_real_rows_gpu: bool = False,
 ) -> WelmDpRowView:
     rows = [int(x) for x in real_rows_cpu]
     if not rows:
@@ -218,7 +219,9 @@ def _welm_build_row_view(
             "WeLM DP fixed real-row buffer has the wrong capacity: "
             f"{real_rows_gpu.numel()} != {len(rows)}"
         )
-    if pin_memory:
+    if borrow_real_rows_gpu:
+        assert real_rows_gpu is not None
+    elif pin_memory:
         # Fresh staging lets the NPU pinned allocator protect in-flight H2D
         # reads; a shared host buffer could be overwritten by the next batch.
         rows_host = torch.tensor(
@@ -249,6 +252,23 @@ def _welm_build_row_view(
         global_slot_rows=cursor,
         slot_stride=slot_stride,
         padding_mode=padding_mode,
+    )
+
+
+def build_welm_local_ll_row_layout(
+    real_rows: int, slot_rows: int, real_rows_gpu: torch.Tensor
+) -> WelmDpMoeRowLayout:
+    """LL dispatch consumes this attention group's input slot and real count."""
+    return WelmDpMoeRowLayout(
+        current=_welm_build_row_view(
+            real_rows_cpu=[real_rows],
+            local_dp_rank=0,
+            device=real_rows_gpu.device,
+            padding_mode=DpPaddingMode.SUM_LEN,
+            real_rows_gpu=real_rows_gpu,
+            slot_rows_cpu=[slot_rows],
+            borrow_real_rows_gpu=True,
+        )
     )
 
 
@@ -943,11 +963,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
 
     # WeLM DP attention: exact full-group rows retained from the scheduler's
-    # existing MLP-sync collective.  They never replace the generic fields
-    # above.  The row-layout object is built before the idle early return.
+    # existing MLP-sync collective, independent of the generic fields above.
     welm_dp_raw_rows_cpu: Optional[List[int]] = None
     global_num_requests_cpu: Optional[List[int]] = None
     welm_dp_moe_row_layout: Optional[WelmDpMoeRowLayout] = None
+    # Physical rows before padding / attention-TP sharding in an LL phase.
+    welm_ll_real_rows: Optional[torch.Tensor] = None
     # Pure attention-TP decode RS/AG: batch-owned masks refreshed at model
     # entry, shared by layers and retained by each captured decode graph.
     welm_decode_tp_positions: Optional[torch.Tensor] = None
@@ -1278,6 +1299,25 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
+        welm_ll_width = None
+        if getattr(model_runner, "welm_local_decode_rows", False):
+            from sglang.srt.models.welmv4_dp_attention import use_welm_decode_rs_ag
+
+            if use_welm_decode_rs_ag(
+                True, ret, is_draft=model_runner.is_draft_worker
+            ):
+                # These positions belong to the previous prompt chunk. Reused
+                # ScheduleBatches can retain them when transitioning to decode.
+                ret.replace_embeds = None
+                ret.replace_positions = None
+                # Draft inputs can be populated after init_new. Take B from the
+                # unpadded requests and expand exactly once for this phase.
+                welm_ll_width = max(
+                    1, int(getattr(ret.spec_info, "num_tokens_per_req", 1))
+                )
+                num_tokens = (
+                    0 if ret.forward_mode.is_idle() else ret.batch_size * welm_ll_width
+                )
         if enable_num_token_non_padded():
             ret.num_token_non_padded = torch.tensor(
                 num_tokens,
@@ -1326,7 +1366,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # scheduler counts are already physical tokens for ordinary prefill,
         # but are request-unit values on speculative decode rounds; only the
         # latter therefore carries a uniform physical width greater than one.
-        if ret.welm_dp_raw_rows_cpu is not None:
+        if welm_ll_width is not None:
+            ret.welm_ll_real_rows = ret.num_token_non_padded.view(1)
+        elif ret.welm_dp_raw_rows_cpu is not None:
             current_width = 1
             if (
                 ret.spec_info is not None
@@ -1532,7 +1574,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             num_tokens_per_dp = self.global_num_tokens_cpu[0]
 
         self.num_token_non_padded = compute_local_num_token_non_padded(
-            global_num_token_non_padded=self.num_token_non_padded,
+            global_num_token_non_padded=(
+                self.welm_ll_real_rows.view(())
+                if self.welm_ll_real_rows is not None
+                else self.num_token_non_padded
+            ),
             num_tokens_per_dp=num_tokens_per_dp,
         )
 
@@ -1795,19 +1841,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # physical draft runner may intentionally publish a different domain
         # (including a one-element list), and logits/other generic consumers
         # must continue to see that original contract.
-        welm_current_view = (
-            self.welm_dp_moe_row_layout.current
-            if self.welm_dp_moe_row_layout is not None
-            else None
-        )
         slot_alignment = attn_tp_size
         if (
-            welm_current_view is None
+            (self.welm_dp_moe_row_layout is None or self.welm_ll_real_rows is not None)
             and getattr(model_runner, "welm_decode_rs_ag_enabled", False)
         ):
             from sglang.srt.models.welmv4_dp_attention import use_welm_decode_rs_ag
 
-            if use_welm_decode_rs_ag(True, self):
+            if self.welm_ll_real_rows is not None or use_welm_decode_rs_ag(True, self):
                 width = max(1, int(getattr(self.spec_info, "num_tokens_per_req", 1)))
                 slot_alignment = _welm_current_slot_alignment(
                     model_runner, current_width=width
@@ -1874,6 +1915,24 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mlp_sync_num_tokens = global_num_tokens[get_parallel().attn_dp_rank]
         else:
             mlp_sync_num_tokens = global_num_tokens[0]
+
+        if (
+            self.welm_ll_real_rows is not None
+            and self.welm_dp_moe_row_layout is None
+            and _welm_runner_uses_dp_row_layout(model_runner)
+        ):
+            # The generic singleton slot already includes this phase's TP/width
+            # alignment. Graph replay uses the view bound during capture.
+            self.welm_dp_moe_row_layout = build_welm_local_ll_row_layout(
+                self.num_token_non_padded_cpu,
+                mlp_sync_num_tokens,
+                self.welm_ll_real_rows,
+            )
+        welm_current_view = (
+            self.welm_dp_moe_row_layout.current
+            if self.welm_dp_moe_row_layout is not None
+            else None
+        )
 
         self.global_dp_buffer_len = buffer_len
         set_dp_buffer_len(

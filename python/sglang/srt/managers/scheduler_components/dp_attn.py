@@ -257,6 +257,7 @@ def prepare_mlp_sync_batch_raw(
     disable_overlap_schedule: bool,
     offload_tags: set[str],
     dwdp: bool = False,
+    decode_round: bool = False,
 ):
     # Check if other DP workers have running batches
     if (
@@ -288,6 +289,18 @@ def prepare_mlp_sync_batch_raw(
         )
 
     skip_all_gather = envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+    runner_plan = getattr(model_runner, "runner_parallel_plan", None)
+    runner_role = getattr(runner_plan, "role", None)
+    welm_target_dp = getattr(runner_role, "name", runner_role) == "TARGET_DP"
+    if welm_target_dp:
+        # A local DECODE/IDLE does not establish the phase of the other DP
+        # ranks. Only the dedicated D loop or a synchronized empty prefill
+        # probe establishes that LL can dispatch without global row counts.
+        skip_all_gather = (
+            skip_all_gather
+            and decode_round
+            and getattr(model_runner, "welm_local_decode_rows", False)
+        )
     can_run_decode_cuda_graph = (
         local_batch is None
         or local_batch.forward_mode.is_decode_or_idle()
@@ -402,15 +415,12 @@ def prepare_mlp_sync_batch_raw(
         # request counts even when the generic require_mlp_tp_gather predicate
         # is false.  Preserve them from this same MLP-sync collective without
         # changing the generic global_num_tokens contract.
-        runner_plan = getattr(model_runner, "runner_parallel_plan", None)
-        runner_role = getattr(runner_plan, "role", None)
-        runner_role_name = getattr(runner_role, "name", str(runner_role))
-        if runner_role_name == "TARGET_DP" and not skip_all_gather:
-            batch_to_gather.welm_dp_raw_rows = list(
-                mlp_sync_info.global_num_tokens
+        if welm_target_dp:
+            batch_to_gather.welm_dp_raw_rows = (
+                None if skip_all_gather else list(mlp_sync_info.global_num_tokens)
             )
-            batch_to_gather.global_num_requests = list(
-                mlp_sync_info.global_num_requests
+            batch_to_gather.global_num_requests = (
+                None if skip_all_gather else list(mlp_sync_info.global_num_requests)
             )
 
     # Set on `local_batch`, not `batch_to_gather`: for PREBUILT batches the
@@ -421,6 +431,10 @@ def prepare_mlp_sync_batch_raw(
                 mlp_sync_info.tp0_info[:, 5].tolist()
             )
         )
+    elif local_batch is not None and welm_target_dp:
+        # Running batches are reused across rounds. An earlier global phase
+        # must not affect when a rank next services scheduler input.
+        local_batch.recv_skipper_forward_mode = None
 
     if _ENABLE_METRICS_DP_ATTENTION and local_batch is not None:
         local_batch.dp_cooperation_info = mlp_sync_info.dp_cooperation_info
@@ -443,7 +457,9 @@ class SchedulerDPAttnAdapter:
     spec_algorithm: SpeculativeAlgorithm
     get_require_mlp_sync: Callable[[], bool]
 
-    def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
+    def prepare_mlp_sync_batch(
+        self, local_batch: ScheduleBatch, *, decode_round: bool = False
+    ):
         return prepare_mlp_sync_batch_raw(
             local_batch,
             model_runner=self.model_runner,
@@ -457,12 +473,15 @@ class SchedulerDPAttnAdapter:
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             offload_tags=self.offload_tags,
             dwdp=get_parallel().dwdp_size > 1,
+            decode_round=decode_round,
         )
 
     def maybe_prepare_mlp_sync_batch(
         self,
         batch: Optional[ScheduleBatch],
         need_sync: Optional[bool] = None,
+        *,
+        decode_round: bool = False,
     ) -> Optional[ScheduleBatch]:
         """
         Helper to prepare MLP sync batch for DP attention.
@@ -473,7 +492,7 @@ class SchedulerDPAttnAdapter:
             need_sync: If specified, overrides self.get_require_mlp_sync() for prepare_mlp_sync_batch decision
         """
         if need_sync if need_sync is not None else self.get_require_mlp_sync():
-            batch = self.prepare_mlp_sync_batch(batch)
+            batch = self.prepare_mlp_sync_batch(batch, decode_round=decode_round)
         return batch
 
     def get_idle_batch(self) -> ScheduleBatch:

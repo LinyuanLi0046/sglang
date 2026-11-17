@@ -181,6 +181,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         target_plan,
                         ps,
                         outer_dp_bridge_group=target_worker.model_runner.tp_group,
+                        decode_rs_ag_enabled=(
+                            target_worker.model_runner.welm_local_decode_rows
+                        ),
                     )
                 )
                 self._apply_welm_draft_server_args(
@@ -258,6 +261,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         outer_ps: ParallelState,
         *,
         outer_dp_bridge_group,
+        decode_rs_ag_enabled: bool = False,
     ):
         """Derive the physical NextN topology from target-owned groups."""
 
@@ -336,6 +340,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             outer_dp_bridge_group=outer_dp_bridge_group,
             outer_target_dp_rank=target_plan.outer_target_dp_rank,
             outer_target_dp_size=target_plan.outer_target_dp_size,
+            decode_rs_ag_enabled=decode_rs_ag_enabled,
+            decode_ll_dispatch_capacity=(
+                target_plan.decode_ll_dispatch_capacity if decode_rs_ag_enabled else None
+            ),
             # Module-backed capabilities are finalized after model loading.
             local_ep_kernel_available=False,
             shared_expert_ep_replicated=False,
@@ -572,7 +580,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
-        if _is_cpu or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
+        if (
+            _is_cpu
+            or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
+            or self.draft_runner.welm_ll_graph_rows == 0
+        ):
             return
 
         if get_model().model_impl == "mindspore":
@@ -586,8 +598,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         }
         # Capture draft
         decode_backend = get_exec().graph.cuda_graph_config.decode.backend
-        capture_bs, _ = get_batch_sizes_to_capture(self.draft_runner)
-        if self.speculative_num_steps > 1:
+        # IndexShare may decline replay locally when a seed is absent. Keep
+        # that recurrent phase eager on all communicating DP replicas.
+        local_ll_index_share = (
+            self.draft_runner.welm_local_decode_rows
+            and self.draft_parallel_plan is not None
+            and self.seed_dsa_topk_from_draft_extend
+        )
+        if self.speculative_num_steps > 1 and not local_ll_index_share:
+            capture_bs, _ = get_batch_sizes_to_capture(self.draft_runner)
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             log_info_on_rank0(
@@ -1322,6 +1341,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         plan = getattr(self._draft_worker, "draft_parallel_plan", None)
         if plan is None or not plan.has_moe_ep:
+            return None
+        if (
+            plan.decode_rs_ag_enabled
+            and batch.forward_mode.is_decode_or_idle()
+            and not batch.is_extend_in_batch
+        ):
+            # All three decode-family phases derive token rows from the local B.
             return None
 
         raw_rows = batch.welm_dp_raw_rows

@@ -1,4 +1,4 @@
-"""Regression test for EAGLE draft CUDA graph seq_lens_sum padding.
+"""Regression tests for EAGLE draft graph padding and WeLM local row counts.
 
 This is a white-box unit test: it constructs a bare ``EAGLEDraftCudaGraphRunner``
 via ``__new__`` and stubs the fields/methods that ``execute()`` touches, so the
@@ -70,6 +70,7 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
             bootstrap_room_ids_int=None,
             topk_p=torch.empty(CAPTURE_BS, 1, dtype=torch.float32),
             topk_index=torch.empty(CAPTURE_BS, 1, dtype=torch.int64),
+            bonus_tokens=torch.empty(CAPTURE_BS, dtype=torch.int32),
             draft_probs=None,
             hidden_states=torch.empty(CAPTURE_BS, 2, dtype=torch.float32),
             req_pool_indices=torch.empty(CAPTURE_BS, dtype=torch.int32),
@@ -89,6 +90,7 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
             draft_attn_backend=backend,
         )
         runner.draft_attn_backend = backend
+        runner._init_welm_graph_rows(None)
         runner._postprocess_output_to_raw_bs = lambda out, raw_bs: out
 
         def replay_graph_stub(shape_key, forward_batch):
@@ -115,6 +117,7 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
             spec_info=SimpleNamespace(
                 topk_p=torch.ones(raw_bs, 1, dtype=torch.float32),
                 topk_index=torch.zeros(raw_bs, 1, dtype=torch.int64),
+                bonus_tokens=torch.zeros(raw_bs, dtype=torch.int32),
                 draft_probs=None,
                 hidden_states=torch.zeros(raw_bs, 2, dtype=torch.float32),
             ),
@@ -167,6 +170,32 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         # The raw batch shape is restored once replay finishes.
         self.assertEqual(forward_batch.batch_size, len(raw_seq_lens))
         self.assertEqual(forward_batch.seq_lens_sum, sum(raw_seq_lens))
+
+    def test_welm_local_replay_uses_local_bucket_and_refreshes_captured_count(self):
+        runner = self._build_runner(_RecordingDraftBackend())
+        runner.model_runner.welm_local_decode_rows = True
+        runner.device = "cpu"
+        runner.captured_req_width = 3
+        runner._init_welm_graph_rows(SimpleNamespace(outer_target_dp_size=2))
+        capture_batch = SimpleNamespace(welm_dp_moe_row_layout=None)
+        runner._bind_welm_capture_rows(capture_batch, CAPTURE_BS)
+        view = capture_batch.welm_dp_moe_row_layout.current
+        self.assertEqual(view.local_slot_rows, CAPTURE_BS * 3)
+        self.assertEqual(
+            view.real_rows_gpu.data_ptr(), capture_batch.welm_ll_real_rows.data_ptr()
+        )
+
+        for local_bs, expected_bucket in [(2, 4), (0, 1), (1, 1), (3, 4)]:
+            # Outer request counts are intentionally absent on SKIP rounds.
+            batch = SimpleNamespace(
+                batch_size=local_bs, num_token_non_padded_cpu=local_bs * 3
+            )
+            replay_bs = runner._welm_request_bs(batch)
+            self.assertEqual(
+                runner._pad_to_bucket(replay_bs, runner.capture_bs), expected_bucket
+            )
+            runner._update_welm_real_rows(batch)
+            self.assertEqual(view.real_rows_gpu.tolist(), [local_bs * 3])
 
     def test_unpadded_replay_leaves_seq_lens_sum_untouched(self):
         # raw_bs == CAPTURE_BS: no fake rows, so the padding branch is skipped

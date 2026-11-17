@@ -2,6 +2,7 @@
 # Licensed under the Apache License, Version 2.0
 """Inference-only WeLMV4 NextN model for Spec V2 MTP."""
 
+from contextlib import nullcontext
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -13,6 +14,7 @@ from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.welmv4 import (
@@ -25,6 +27,7 @@ from sglang.srt.models.welmv4_dp_attention import (
     DraftSharedModulePlan,
     WelmRunnerParallelPlan,
 )
+from sglang.srt.runtime_context import get_forward
 from sglang.srt.utils import add_prefix, is_npu
 
 
@@ -244,16 +247,16 @@ class WeLMV4ModelNextN(nn.Module):
         # exactly the real rows or their fixed slot padding; graph capture uses
         # the latter and replay relies on the view's segmented valid-row mask.
         runner_plan = self.runner_parallel_plan
-        uses_draft_ep_bridge = bool(
+        uses_draft_dp_ep = bool(
             runner_plan is not None
             and getattr(runner_plan.role, "name", None) == "DRAFT"
             and runner_plan.has_moe_ep
         )
-        if uses_draft_ep_bridge:
+        if uses_draft_dp_ep:
             row_layout = forward_batch.welm_dp_moe_row_layout
             if row_layout is None:
                 raise RuntimeError(
-                    "WeLMV4 NextN DRAFT+EP requires outer-DP row metadata."
+                    "WeLMV4 NextN DRAFT+EP requires row metadata."
                 )
             active_view = row_layout.current
             if is_kv_mirror_prefill:
@@ -274,16 +277,14 @@ class WeLMV4ModelNextN(nn.Module):
                     f"capacity={active_view.local_slot_rows}."
                 )
 
-        # Eager MLP-sync localizes this scalar as if DRAFT_EXTEND_V2 rows were
-        # sequence-sharded across attention-TP ranks.  The NextN decoder does
-        # not enter WeLM's target-only scattered-prefill path, so every rank in
-        # fact owns the same complete row set.  Restore the global real count
-        # before routing; unlike disabling the mask entirely, eager execution
-        # still keeps suffix rows added for TP alignment inactive. Graph replay
-        # uses its fixed bucket width and slices dummy results afterwards.
+        # Legacy FULL draft-extend consumes every row on every rank. Restore
+        # its real count after generic MLP-sync localization. LL instead uses
+        # the immutable full-slot count to mask its attention-TP shard.
+        local_ll = getattr(forward_batch, "welm_ll_real_rows", None) is not None
         if (
             is_npu()
             and forward_batch.forward_mode.is_draft_extend_v2()
+            and not local_ll
             and forward_batch.num_token_non_padded is not None
         ):
             num_real_rows = forward_batch.num_token_non_padded_cpu
@@ -307,7 +308,7 @@ class WeLMV4ModelNextN(nn.Module):
                 "WeLMV4 NextN token/target-hidden row mismatch: "
                 f"{hidden_states.shape[0]} vs {main_hidden_states.shape[0]}."
             )
-        if hidden_states.shape[0] == 0 and not uses_draft_ep_bridge:
+        if hidden_states.shape[0] == 0 and not uses_draft_dp_ep:
             return hidden_states, hidden_states
         if hidden_states.shape[0] > 0:
             hidden_states = self.eh_proj(
@@ -318,16 +319,28 @@ class WeLMV4ModelNextN(nn.Module):
             )
 
         residual = None
-        dp_executor = getattr(
-            self.decoder_layers[0], "_welm_dp_executor", None
-        )
+        layer = self.decoder_layers[0]
+        dp_executor = layer._welm_dp_executor
+        pure_tp_ll = layer._use_npu_decode_deepep_scattered(forward_batch)
         if dp_executor is not None:
             dp_executor.prepare_forward_scratch(
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,
             )
-        with get_global_expert_distribution_recorder().disable_this_region():
-            hidden_states, residual = self.decoder_layers[0](
+        elif pure_tp_ll:
+            layer._prepare_npu_decode_rs_ag_scratch(hidden_states, forward_batch)
+        # The draft-extend graph sets the generic DeepEP context to extend.
+        # Select LL for its DP executor and TopK together during this layer.
+        dp_ll_context = (
+            get_forward().scoped(deepep_mode_override=DeepEPMode.LOW_LATENCY)
+            if dp_executor is not None and local_ll
+            else nullcontext()
+        )
+        with (
+            get_global_expert_distribution_recorder().disable_this_region(),
+            dp_ll_context,
+        ):
+            hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
             )
 
@@ -356,6 +369,14 @@ class WeLMV4ModelNextN(nn.Module):
             )
             hidden_states_for_next_mtp = residual_out.to(
                 self.shared_head.norm.weight.dtype
+            )
+        if pure_tp_ll:
+            # The DP executor restores its rows at layer exit. In pure TP the
+            # final norm consumes the sharded FP32 residual before publishing
+            # both full-row tensors for logits and the next MTP step.
+            norm_output = layer._all_gather_tp_rows(norm_output)
+            hidden_states_for_next_mtp = layer._all_gather_tp_rows(
+                hidden_states_for_next_mtp
             )
         return norm_output, hidden_states_for_next_mtp
 

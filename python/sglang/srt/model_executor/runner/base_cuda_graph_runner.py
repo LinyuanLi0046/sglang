@@ -59,7 +59,7 @@ def freeze_gc(enable_cudagraph_gc: bool):
 
 
 def get_batch_sizes_to_capture(
-    model_runner: ModelRunner, captured_req_width: int = 1
+    model_runner: ModelRunner, captured_req_width: int = 1, *, allow_empty: bool = False
 ) -> Tuple[List[int], List[int]]:
     """Build the (capture_bs, compile_bs) lists for the decode runner.
 
@@ -80,7 +80,7 @@ def get_batch_sizes_to_capture(
 
     # pad `num_max_requests` to avoid being filtered out
     num_max_requests = get_cuda_graph_max_batch_size(server_args, num_max_requests)
-    if max(capture_bs) > num_max_requests:
+    if capture_bs and max(capture_bs) > num_max_requests:
         # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
         # is very small. We add more values here to make sure we capture the maximum bs.
         capture_bs += [num_max_requests]
@@ -90,6 +90,8 @@ def get_batch_sizes_to_capture(
     capture_bs = [bs for bs in capture_bs if bs <= num_max_requests]
     capture_bs = list(sorted(set(capture_bs)))
 
+    if allow_empty and not capture_bs:
+        return [], []
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
     compile_bs = (
         [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]

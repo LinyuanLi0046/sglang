@@ -18,7 +18,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
     NgramEmbeddingInfo,
-    build_welm_dp_moe_row_layout,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
@@ -313,14 +312,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # alias them with a same-sized runner configured with a different D.
         self.buffers.extend_start_loc = extend_start_loc
         self._init_model_specific_buffers()
-        self.welm_dp_real_rows_gpu = None
-        self.welm_dp_capture_row_layouts = {}
-        bridge_plan = _welm_draft_bridge_plan(model_runner)
-        if bridge_plan is not None:
-            outer_dp_size = int(bridge_plan.outer_target_dp_size)
-            self.welm_dp_real_rows_gpu = torch.empty(
-                (outer_dp_size,), dtype=torch.int32, device=self.device
-            )
+        self._init_welm_graph_rows(_welm_draft_bridge_plan(model_runner))
 
         self.backend = resolve_decode_backend(self)
 
@@ -359,34 +351,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
         return ShapeKey(size=bs)
 
-    def _welm_outer_request_bs(self, forward_batch: ForwardBatch) -> Optional[int]:
-        plan = _welm_draft_bridge_plan(self.model_runner)
-        if plan is None:
-            return None
-        counts = forward_batch.global_num_requests_cpu
-        outer_dp_size = int(plan.outer_target_dp_size)
-        if counts is None or len(counts) != outer_dp_size:
-            raise RuntimeError(
-                "WeLM DRAFT+EP extend graph requires synchronized outer request counts"
-            )
-        return max(int(x) for x in counts)
-
-    def _update_welm_outer_real_rows(self, forward_batch: ForwardBatch) -> None:
-        if getattr(self, "welm_dp_real_rows_gpu", None) is None:
-            return
-        counts = forward_batch.global_num_requests_cpu
-        self._welm_outer_request_bs(forward_batch)
-        # The H2D copy is asynchronous. Keep each host source immutable for
-        # its transfer lifetime instead of mutating one persistent staging
-        # buffer from the following replay.
-        real_rows_pinned = torch.tensor(
-            [int(count) * self.captured_req_width for count in counts],
-            dtype=torch.int32,
-            pin_memory=True,
-        )
-        self.welm_dp_real_rows_gpu.copy_(real_rows_pinned, non_blocking=True)
-
     def can_run_graph(self, forward_batch: ForwardBatch):
+        if self.welm_local_decode_rows and forward_batch.welm_ll_real_rows is None:
+            return False
         # Uniform-width replay invariant: the batch's actual per-request width
         # must match this runner's capture width; anything else falls back to
         # eager. (Unset widths pass: not every path fills the field yet.)
@@ -398,7 +365,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         ):
             return False
 
-        welm_request_bs = self._welm_outer_request_bs(forward_batch)
+        welm_request_bs = self._welm_request_bs(forward_batch)
         if welm_request_bs is not None:
             cuda_graph_bs = welm_request_bs
         elif self.require_mlp_tp_gather:
@@ -512,21 +479,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             spec_info=spec_info,
             capture_hidden_mode=CaptureHiddenMode.LAST,
         )
-        bridge_plan = _welm_draft_bridge_plan(self.model_runner)
-        if bridge_plan is not None:
-            capture_requests = [bs] * int(bridge_plan.outer_target_dp_size)
-            forward_batch.welm_dp_raw_rows_cpu = list(capture_requests)
-            forward_batch.global_num_requests_cpu = list(capture_requests)
-            forward_batch.welm_dp_moe_row_layout = build_welm_dp_moe_row_layout(
-                raw_rows_cpu=capture_requests,
-                request_rows_cpu=None,
-                local_dp_rank=int(bridge_plan.outer_target_dp_rank),
-                device=self.device,
-                padding_mode=forward_batch.dp_padding_mode,
-                current_width=self.captured_req_width,
-                current_real_rows_gpu=self.welm_dp_real_rows_gpu,
-                current_slot_rows_cpu=capture_requests,
-            )
+        self._bind_welm_capture_rows(forward_batch, bs)
         if self.model_runner.ngram_embedding_manager.enabled:
             ngram_embedding_info = NgramEmbeddingInfo.create(
                 self.model_runner.ngram_embedding_manager.table,
@@ -580,7 +533,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             self.draft_extend_attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=True
             )
-            self.deepep_adapter.capture(is_extend_in_batch=True)
+            # NextN local-row draft-extend dispatches LL, including in auto mode.
+            self.deepep_adapter.capture(
+                is_extend_in_batch=not self.welm_local_decode_rows
+            )
             canary_ctx = (
                 c.with_active_single_forward_manager(0)
                 if (c := self.model_runner.canary_manager) is not None
@@ -588,10 +544,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             )
             with canary_ctx:
                 shape_key = self._make_graph_key(bs)
-                if forward_batch.welm_dp_moe_row_layout is not None:
-                    self.welm_dp_capture_row_layouts[shape_key] = (
-                        forward_batch.welm_dp_moe_row_layout
-                    )
+                self._retain_welm_capture_scratch(shape_key, forward_batch)
                 post_warmup_hook = getattr(
                     self.draft_extend_attn_backend,
                     "on_after_cuda_graph_warmup",
@@ -617,8 +570,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         raw_bs = forward_batch.batch_size
         num_tokens = forward_batch.input_ids.shape[0]
-        self._update_welm_outer_real_rows(forward_batch)
-        welm_request_bs = self._welm_outer_request_bs(forward_batch)
+        self._update_welm_real_rows(forward_batch)
+        welm_request_bs = self._welm_request_bs(forward_batch)
         if welm_request_bs is not None:
             bs = self._pad_to_bucket(welm_request_bs, self.capture_bs)
         elif self.require_mlp_tp_gather:

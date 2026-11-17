@@ -88,6 +88,15 @@ class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
             return
         from sglang.srt.models.welmv4 import WELMV4_MTP_MIRROR_STATES_KEY
 
+        padded_tokens = padded_bs * self.captured_req_width
+        if padded_tokens > num_tokens:
+            self._welm_mirror_k[num_tokens:padded_tokens].zero_()
+            self._welm_mirror_v[num_tokens:padded_tokens].zero_()
+            self._welm_mirror_indices[num_tokens:padded_tokens].zero_()
+        if self.welm_local_decode_rows and raw_bs == 0 and num_tokens == 0:
+            # An idle LL participant replays padded rows without a target KV snapshot.
+            return
+
         logical_layer_id = int(
             self.model_runner.model_config.hf_config.num_target_hidden_layers
         )
@@ -114,11 +123,6 @@ class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
             self._welm_mirror_indices[:num_tokens].copy_(
                 indices.to(torch.int64).clamp(min=0)
             )
-        padded_tokens = padded_bs * self.captured_req_width
-        if padded_tokens > num_tokens:
-            self._welm_mirror_k[num_tokens:padded_tokens].zero_()
-            self._welm_mirror_v[num_tokens:padded_tokens].zero_()
-            self._welm_mirror_indices[num_tokens:padded_tokens].zero_()
 
     def _replay_graph(self, shape_key, forward_batch):
         hf_config = self.model_runner.model_config.hf_config

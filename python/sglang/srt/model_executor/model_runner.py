@@ -364,13 +364,42 @@ class ModelRunner:
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().
         self.init_torch_distributed()
-        self.welm_decode_rs_ag_enabled = bool(
+        architectures = getattr(self.model_config.hf_config, "architectures", None) or ()
+        target = not self.is_draft_worker and "WeLMV4MoeForCausalLM" in architectures
+        physical_draft = (
+            self.is_draft_worker and "WeLMV4MoeForCausalLMNextN" in architectures
+        )
+        skip_ag = envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+        rs_ag = (
             envs.SGLANG_WELMV4_DECODE_RS_AG.get()
-            and not self.is_draft_worker
             and self.device == "npu"
             and self.server_args.disaggregation_mode in ("null", "decode")
-            and "WeLMV4MoeForCausalLM"
-            in (self.model_config.hf_config.architectures or [])
+        )
+        linear_mtp = (
+            rs_ag
+            and skip_ag
+            and (target or physical_draft)
+            and self.spec_algorithm is SpeculativeAlgorithm.EAGLE
+            and not self.server_args.enable_multi_layer_eagle
+            and not self.server_args.speculative_adaptive
+            and self.server_args.speculative_eagle_topk == 1
+            and self.server_args.speculative_num_steps is not None
+            and self.server_args.speculative_num_draft_tokens
+            == self.server_args.speculative_num_steps + 1
+        )
+        physical_mtp = False
+        if linear_mtp:
+            if target:
+                physical_mtp = self.server_args._uses_welm_physical_nextn_draft()
+            else:
+                target_config = self.server_args.get_model_config().hf_config
+                physical_mtp = "WeLMV4MoeForCausalLM" in (target_config.architectures or ())
+        self.welm_decode_rs_ag_enabled = rs_ag and (target or physical_mtp)
+        self.welm_ll_graph_rows: Optional[int] = None
+        self.welm_local_decode_rows = (
+            self.welm_decode_rs_ag_enabled
+            and skip_ag
+            and (self.spec_algorithm.is_none() or physical_mtp)
         )
         self.welm_decode_ll_dispatch_capacity = None
         if self.welm_decode_rs_ag_enabled:
@@ -770,6 +799,8 @@ class ModelRunner:
 
     def max_decode_logits_rows(self) -> int:
         """Rows the shared logits buffer needs."""
+        if self.welm_ll_graph_rows is not None:
+            return self.welm_ll_graph_rows
         num_tokens_per_req = self.decode_num_tokens_per_req()
         capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_req)
         return max(capture_bs) * num_tokens_per_req
@@ -970,8 +1001,17 @@ class ModelRunner:
         )
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
+        if self.welm_local_decode_rows:
+            from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import (
+                resolve_welm_ll_graph_rows,
+            )
+
+            self.welm_ll_graph_rows = resolve_welm_ll_graph_rows(self)
         capture = capture_cuda_graphs(
-            model_runner=self, capture_decode_cuda_graph=capture_decode_cuda_graph
+            model_runner=self,
+            capture_decode_cuda_graph=(
+                capture_decode_cuda_graph and self.welm_ll_graph_rows != 0
+            ),
         )
         self.eager_runner = capture.eager_runner
         self.prefill_cuda_graph_runner = capture.prefill_runner
@@ -1143,7 +1183,7 @@ class ModelRunner:
         self.runner_parallel_plan = final_plan
 
     def _bind_welm_decode_rs_ag(self) -> None:
-        """Bind target-only decode capabilities without changing module sharding."""
+        """Verify the loaded layers before enabling decode row sharding."""
         if not self.welm_decode_rs_ag_enabled:
             return
         from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
@@ -1159,6 +1199,22 @@ class ModelRunner:
                 "WeLMv4 decode RS/AG requires initialized DeepEP LL and MoE-TP=1"
             )
         inner_model = self.model.model
+        if self.welm_local_decode_rows and self.runner_parallel_plan is not None:
+            from sglang.srt.utils import require_mlp_tp_gather
+
+            plan = self.runner_parallel_plan
+            if parallel.moe_ep_size != plan.attn_tp_size * plan.outer_target_dp_size:
+                raise ValueError("WeLM local LL rows require EP to span the outer TP group.")
+            if (
+                self.server_args.disaggregation_mode == "null"
+                and not get_deepep_mode().enable_normal()
+            ):
+                raise ValueError("Mixed WeLM DP serving needs --deepep-mode auto for prefill.")
+            if require_mlp_tp_gather(self.server_args):
+                raise ValueError(
+                    "WeLM local DeepEP LL rows require a DP-local LM head and "
+                    "dense MLP group (--enable-dp-lm-head --moe-dense-tp-size 1)."
+                )
         if self.runner_parallel_plan is None and (
             parallel.attn_tp_size != self.ps.tp_size
             or parallel.moe_ep_size != self.ps.tp_size
@@ -1166,7 +1222,10 @@ class ModelRunner:
             raise RuntimeError(
                 "WeLMv4 pure-TP decode RS/AG requires attention-TP=EP=TP"
             )
-        for layer in inner_model.layers:
+        layers = (
+            inner_model.decoder_layers if self.is_draft_worker else inner_model.layers
+        )
+        for layer in layers:
             if int(layer.self_attn.o_proj.tp_size) != parallel.attn_tp_size:
                 raise RuntimeError(
                     "WeLMv4 decode RS/AG OProj does not match attention-TP"
@@ -1180,6 +1239,12 @@ class ModelRunner:
                 raise RuntimeError(
                     "WeLMv4 decode RS/AG requires an initialized LL dispatcher"
                 )
+            if self.welm_local_decode_rows and any(
+                inner._low_latency_dispatcher.group
+                is not parallel.moe_ep_group.device_group
+                for inner in inner_dispatchers
+            ):
+                raise RuntimeError("WeLM local LL dispatcher must use the physical MoE EP group.")
             shared = layer.mlp.shared_expert
             if shared is not None and (
                 shared.gate_up_proj.tp_size != 1 or shared.down_proj.tp_size != 1
@@ -1791,6 +1856,7 @@ class ModelRunner:
                 )
             elif (
                 forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+                and forward_batch.welm_ll_real_rows is None
                 and not isinstance(self.prefill_cuda_graph_runner, EagerRunner)
                 and self.prefill_cuda_graph_runner is not None
                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)

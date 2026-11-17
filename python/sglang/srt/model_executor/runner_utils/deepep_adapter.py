@@ -92,6 +92,9 @@ class DeepEPCudaGraphRunnerAdapter:
     def for_draft_runner(
         cls, model_runner: ModelRunner
     ) -> DeepEPCudaGraphRunnerAdapter:
+        if getattr(model_runner, "welm_local_decode_rows", False):
+            # The physical NextN graph uses DeepEP LL in all decode phases.
+            return cls()
         return cls(enabled=not _welm_draft_graph_uses_local_ep_only(model_runner))
 
     def capture(self, is_extend_in_batch: bool) -> None:

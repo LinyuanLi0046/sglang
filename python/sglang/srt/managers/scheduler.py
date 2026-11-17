@@ -3110,6 +3110,7 @@ class Scheduler(
             running_batch = prefill_plan.running_batch
 
         need_mlp_sync = self.require_mlp_sync
+        confirmed_decode_round = False
         if (
             need_mlp_sync
             and not self.spec_algorithm.is_none()
@@ -3121,6 +3122,7 @@ class Scheduler(
             # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
             new_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(new_batch)
             need_mlp_sync = new_batch is None
+            confirmed_decode_round = need_mlp_sync
 
         if new_batch is not None:
             # Run prefill first if possible
@@ -3139,7 +3141,7 @@ class Scheduler(
 
         # Handle DP attention and log stats
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
-            ret, need_sync=need_mlp_sync
+            ret, need_sync=need_mlp_sync, decode_round=confirmed_decode_round
         )
 
         # Handle ngram embedding

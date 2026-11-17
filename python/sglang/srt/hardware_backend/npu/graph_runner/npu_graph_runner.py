@@ -27,6 +27,7 @@ capture/replay mechanics live in the backend. This class adds:
 from __future__ import annotations
 
 import logging
+import math
 import os
 from contextlib import contextmanager
 from pathlib import Path
@@ -42,8 +43,14 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
+from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.runner import (
+    DecodeCudaGraphRunner,
+    get_batch_sizes_to_capture,
+)
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
+    ceil_align,
     empty_context,
     get_bool_env_var,
     get_compiler_backend,
@@ -79,6 +86,69 @@ def _slice_welm_mirror_states(states, num_rows: int):
         for layer_id, (k, v) in mirror_states.items()
     }
     return sliced
+
+
+def resolve_welm_ll_graph_rows(model_runner: ModelRunner) -> int:
+    """Validate EP capacity and return the largest captured row count (0 for eager)."""
+    args = model_runner.server_args
+    width = args.speculative_num_draft_tokens if args.speculative_algorithm else 1
+    widths = [width]
+    if model_runner.is_draft_worker and args.speculative_num_steps > 1:
+        widths.append(1)  # recurrent NextN, topk=1
+    attn_tp = model_runner.ps.attn_tp_size
+    max_bs = model_runner.max_running_requests
+    capacity = model_runner.welm_decode_ll_dispatch_capacity
+    required = max(
+        ceil_align(max_bs * w, math.lcm(attn_tp, w)) // attn_tp for w in widths
+    )
+    graph_widths = widths
+    if (
+        model_runner.is_draft_worker
+        and envs.SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH.get()
+    ):
+        graph_widths = widths[1:]
+    capture_shapes = ()
+    if args.cuda_graph_config.decode.backend != Backend.DISABLED:
+        capture_shapes = tuple(
+            (w, get_batch_sizes_to_capture(model_runner, w, allow_empty=True)[0])
+            for w in graph_widths
+        )
+    multi_dp = model_runner.runner_parallel_plan is not None
+    eager_only = any(
+        not buckets
+        or buckets[-1] * w > capacity * attn_tp
+        or (multi_dp and (args.disable_cuda_graph_padding or buckets[-1] < max_bs))
+        for w, buckets in capture_shapes
+    )
+    # Physical NextN's private DP size is one, but it shares the target EP group.
+    # Memory pool limits and therefore the filtered capture tables can vary by rank.
+    peers = get_parallel().moe_ep_group.all_gather_object(
+        {
+            "capacity": capacity,
+            "required": required,
+            "widths": widths,
+            "shapes": capture_shapes,
+            "eager_only": eager_only,
+        }
+    )
+    if any(peer["widths"] != widths for peer in peers):
+        raise ValueError(
+            "WeLM local LL requires identical MTP widths across the EP group."
+        )
+    max_required = max(peer["required"] for peer in peers)
+    if any(peer["capacity"] != capacity for peer in peers) or max_required > capacity:
+        raise ValueError(
+            f"WeLM local LL needs one EP-wide dispatch capacity >= {max_required} "
+            f"rows per rank (local capacity {capacity}). Adjust --max-running-requests "
+            "or SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK."
+        )
+    if any(peer["shapes"] != capture_shapes or peer["eager_only"] for peer in peers):
+        logger.warning(
+            "Using eager WeLM LL decode for the entire EP group: graph buckets "
+            "or padding do not cover all admitted batches within LL capacity."
+        )
+        return 0
+    return max((bs[-1] * w for w, bs in capture_shapes), default=0)
 
 
 def welmv4_graph_uses_device_attention_metadata(model_runner: ModelRunner) -> bool:
@@ -292,6 +362,8 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
 
         graph_key = self._make_graph_key(self.bs)
 
+        if self.welm_local_decode_rows:
+            self._update_welm_real_rows(forward_batch)
         if self.welmv4_device_attention_metadata:
             if self.model_runner.welm_graph_read_done_enabled:
                 owner = self.welm_read_done_by_key[graph_key]

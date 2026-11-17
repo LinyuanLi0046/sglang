@@ -69,7 +69,9 @@ class WelmMoeTransport(Enum):
         )
 
 
-def use_welm_decode_rs_ag(enabled: bool, forward_batch: "ForwardBatch") -> bool:
+def use_welm_decode_rs_ag(
+    enabled: bool, forward_batch: "ForwardBatch", *, is_draft: bool = False
+) -> bool:
     """Select only pure decode rounds, including their idle participants.
 
     Keep the group-wide prefill predicate intact: a locally decoding/idle
@@ -84,10 +86,10 @@ def use_welm_decode_rs_ag(enabled: bool, forward_batch: "ForwardBatch") -> bool:
         getattr(forward_batch, "_original_forward_mode", None)
         or forward_batch.forward_mode
     )
-    return original_mode in (
-        ForwardMode.DECODE,
-        ForwardMode.TARGET_VERIFY,
-        ForwardMode.IDLE,
+    if original_mode in (ForwardMode.DECODE, ForwardMode.IDLE):
+        return True
+    return original_mode == (
+        ForwardMode.DRAFT_EXTEND_V2 if is_draft else ForwardMode.TARGET_VERIFY
     )
 
 
@@ -219,6 +221,8 @@ def build_provisional_welm_draft_runner_plan(
     outer_dp_bridge_group: Optional["GroupCoordinator"] = None,
     outer_target_dp_rank: int,
     outer_target_dp_size: int,
+    decode_rs_ag_enabled: bool = False,
+    decode_ll_dispatch_capacity: Optional[int] = None,
     local_ep_kernel_available: bool = False,
     shared_expert_ep_replicated: bool = False,
     o_proj_returns_partial: bool = False,
@@ -245,6 +249,8 @@ def build_provisional_welm_draft_runner_plan(
         outer_dp_bridge_group=outer_dp_bridge_group,
         outer_target_dp_rank=int(outer_target_dp_rank),
         outer_target_dp_size=int(outer_target_dp_size),
+        decode_rs_ag_enabled=decode_rs_ag_enabled,
+        decode_ll_dispatch_capacity=decode_ll_dispatch_capacity,
         local_ep_kernel_available=local_ep_kernel_available,
         shared_expert_ep_replicated=shared_expert_ep_replicated,
         o_proj_returns_partial=o_proj_returns_partial,
@@ -297,8 +303,8 @@ def validate_welm_runner_plan(
     if require_finalized and not plan.finalized:
         raise RuntimeError("WeLMv4 runner plan has not been finalized")
     if plan.decode_rs_ag_enabled:
-        if plan.role is not WelmRunnerRole.TARGET_DP or not plan.has_moe_ep:
-            raise RuntimeError("WeLMv4 DP decode RS/AG requires a target EP plan")
+        if not plan.has_moe_ep:
+            raise RuntimeError("WeLMv4 DP decode RS/AG requires an EP plan")
         capacity = plan.decode_ll_dispatch_capacity
         if (
             not isinstance(capacity, int)
@@ -647,6 +653,18 @@ class WelmDpExecutionPlanner:
         use_decode_ll_rs_ag: bool = False,
     ) -> WelmBatchExecutionPlan:
         plan = self.runner_plan
+        if use_decode_ll_rs_ag:
+            if not plan.decode_rs_ag_enabled or has_ordinary_prefill:
+                raise RuntimeError("WeLMv4 LL RS/AG selected outside a decode round")
+            finish = (
+                AttentionFinishKind.ATTN_TP_REDUCE_SCATTER
+                if plan.attn_tp_size > 1
+                else AttentionFinishKind.IDENTITY
+            )
+            return WelmBatchExecutionPlan(
+                finish, WelmMoeTransport.DEEPEP_LOW_LATENCY_SCATTERED
+            )
+
         if plan.role is WelmRunnerRole.DRAFT:
             if not plan.has_moe_ep:
                 raise RuntimeError("A no-EP WeLMv4 draft must use _forward_non_dp()")
@@ -666,18 +684,6 @@ class WelmDpExecutionPlanner:
                 else AttentionFinishKind.IDENTITY
             )
             return WelmBatchExecutionPlan(finish, transport)
-
-        if use_decode_ll_rs_ag:
-            if not plan.decode_rs_ag_enabled or has_ordinary_prefill:
-                raise RuntimeError("WeLMv4 LL RS/AG selected outside a decode round")
-            finish = (
-                AttentionFinishKind.ATTN_TP_REDUCE_SCATTER
-                if plan.o_proj_returns_partial and plan.attn_tp_size > 1
-                else AttentionFinishKind.IDENTITY
-            )
-            return WelmBatchExecutionPlan(
-                finish, WelmMoeTransport.DEEPEP_LOW_LATENCY_SCATTERED
-            )
 
         in_scattered_prefill_prefix = (
             has_ordinary_prefill
@@ -745,9 +751,12 @@ class WelmDpAttentionExecutor:
             raise RuntimeError("WeLMv4 DP scratch requires row-major hidden states")
 
         use_decode_ll_rs_ag = use_welm_decode_rs_ag(
-            plan.decode_rs_ag_enabled, forward_batch
+            plan.decode_rs_ag_enabled,
+            forward_batch,
+            is_draft=plan.role is WelmRunnerRole.DRAFT,
         )
-        if use_decode_ll_rs_ag:
+        local_row_view = getattr(forward_batch, "welm_ll_real_rows", None) is not None
+        if use_decode_ll_rs_ag and not local_row_view:
             # Check synchronized CPU slot metadata before any layer collective.
             # All EP ranks must reject an oversized eager batch/capture bucket
             # together; no device readback or extra synchronization is needed.
@@ -774,7 +783,11 @@ class WelmDpAttentionExecutor:
             and plan.first_mirror_consumer is not None
         )
         requirements = []
-        if plan.role is WelmRunnerRole.DRAFT:
+        if use_decode_ll_rs_ag:
+            requirements.append(
+                (row_layout.current, WelmMoeTransport.DEEPEP_LOW_LATENCY_SCATTERED)
+            )
+        elif plan.role is WelmRunnerRole.DRAFT:
             active_view = (
                 row_layout.request
                 if forward_batch.is_extend_in_batch
@@ -806,10 +819,6 @@ class WelmDpAttentionExecutor:
                         WelmMoeTransport.EXPLICIT_AG_LOCAL_SORT_EP_AR,
                     )
                 )
-        elif use_decode_ll_rs_ag:
-            requirements.append(
-                (row_layout.current, WelmMoeTransport.DEEPEP_LOW_LATENCY_SCATTERED)
-            )
         else:
             requirements.append(
                 (
@@ -832,7 +841,7 @@ class WelmDpAttentionExecutor:
                 welm_dp_prepare_attn_scattered_transport_scratch(
                     row_view,
                     hidden_states,
-                    dp_rank=plan.outer_target_dp_rank,
+                    dp_rank=0 if local_row_view else plan.outer_target_dp_rank,
                     attn_tp_rank=plan.attn_tp_rank,
                     attn_tp_size=plan.attn_tp_size,
                 )
@@ -860,7 +869,9 @@ class WelmDpAttentionExecutor:
             )
 
         use_decode_ll_rs_ag = use_welm_decode_rs_ag(
-            plan.decode_rs_ag_enabled, forward_batch
+            plan.decode_rs_ag_enabled,
+            forward_batch,
+            is_draft=plan.role is WelmRunnerRole.DRAFT,
         )
         has_ordinary_prefill = bool(
             forward_batch.is_extend_in_batch
@@ -1007,7 +1018,11 @@ class WelmDpAttentionExecutor:
                 hidden_states=state.hidden_states,
                 forward_batch=forward_batch,
                 skip_o_norm=True,
-                skip_o_proj_all_reduce=plan.o_proj_returns_partial,
+                # Physical NextN normally reduces inside its OProj. When the
+                # executor owns the sum (AR or RS), request partials instead.
+                skip_o_proj_all_reduce=(
+                    batch_plan.attention_finish is not AttentionFinishKind.IDENTITY
+                ),
                 use_o_proj_matmul_reduce_scatter=use_fused_oproj_rs,
                 o_proj_rs_pipeline_chunks=oproj_rs_pipeline_chunks,
                 o_proj_rs_group=(
@@ -1111,7 +1126,7 @@ class WelmDpAttentionExecutor:
     ) -> bool:
         plan = self.runner_plan
         if use_decode_ll_rs_ag:
-            return layer_id > 0
+            return plan.role is WelmRunnerRole.TARGET_DP and layer_id > 0
         if (
             plan.role is not WelmRunnerRole.TARGET_DP
             or not plan.has_moe_ep
@@ -1648,7 +1663,11 @@ class WelmDpAttentionExecutor:
             raise RuntimeError("WeLMv4 DeepEP LL requires scattered hidden rows")
         valid_mask = welm_dp_attn_scattered_valid_mask(
             active_view,
-            dp_rank=plan.outer_target_dp_rank,
+            dp_rank=(
+                0
+                if getattr(forward_batch, "welm_ll_real_rows", None) is not None
+                else plan.outer_target_dp_rank
+            ),
             attn_tp_rank=plan.attn_tp_rank,
             attn_tp_size=plan.attn_tp_size,
             local_rows=state.hidden_states.shape[0],

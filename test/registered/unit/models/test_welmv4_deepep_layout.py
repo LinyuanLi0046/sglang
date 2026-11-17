@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -14,6 +14,11 @@ from sglang.srt.models.welmv4 import (
     Qwen2MoeModel,
     Qwen2MoeSparseMoeBlock,
 )
+from sglang.srt.models.welmv4_dp_attention import (
+    WelmDpAttentionExecutor,
+    WelmRunnerParallelPlan,
+    WelmRunnerRole,
+)
 from sglang.srt.utils.common import ceil_align
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -22,6 +27,124 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestWeLMv4DeepEPLayout(unittest.TestCase):
+    def test_nextn_dp_ll_replaces_oproj_allreduce_with_one_reduce_scatter(self):
+        attn_group = Mock(world_size=2, rank_in_group=1)
+        attn_group.all_reduce.side_effect = lambda x: x * 2
+        attn_group.reduce_scatter_tensor.side_effect = (
+            lambda out, x: out.copy_(x.chunk(2)[1] * 2)
+        )
+        ep_group = SimpleNamespace(world_size=4, rank_in_group=3)
+        plan = WelmRunnerParallelPlan(
+            role=WelmRunnerRole.DRAFT,
+            attn_tp_group=attn_group,
+            moe_tp_group=SimpleNamespace(world_size=1, rank_in_group=0),
+            moe_ep_group=ep_group,
+            outer_dp_bridge_group=ep_group,
+            outer_target_dp_rank=1,
+            outer_target_dp_size=2,
+            decode_rs_ag_enabled=True,
+            decode_ll_dispatch_capacity=4,
+            local_ep_kernel_available=True,
+            shared_expert_ep_replicated=True,
+            o_proj_returns_partial=False,
+            finalized=True,
+        )
+        executor = WelmDpAttentionExecutor(plan)
+        partial = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+        layout = forward_batch_info.build_welm_local_ll_row_layout(
+            4, 4, torch.tensor([4], dtype=torch.int32)
+        )
+
+        def attention(*, hidden_states, skip_o_proj_all_reduce, **kwargs):
+            # Physical NextN OProj has reduce_results=True with A>1.
+            self.assertFalse(kwargs["use_o_proj_matmul_reduce_scatter"])
+            self.assertEqual(kwargs["o_proj_rs_pipeline_chunks"], 0)
+            self.assertIsNone(kwargs["o_proj_rs_group"])
+            if skip_o_proj_all_reduce:
+                return hidden_states
+            return attn_group.all_reduce(hidden_states)
+
+        layer = SimpleNamespace(
+            layer_id=48,
+            is_final_layer=True,
+            kv_mirror_layers=(48,),
+            ppln=False,
+            self_attn=Mock(side_effect=attention, use_o_norm=False),
+            input_layernorm=lambda x, residual, **kwargs: (x, residual),
+            post_attention_layernorm=lambda x, residual, **kwargs: (x, residual, None),
+        )
+        modes = forward_batch_info.ForwardMode
+        for mode in (modes.EXTEND, modes.DRAFT_EXTEND_V2):
+            ll = mode == modes.DRAFT_EXTEND_V2
+            batch = SimpleNamespace(
+                forward_mode=mode,
+                is_extend_in_batch=not ll,
+                enable_kv_mirror=False,
+                welm_dp_moe_row_layout=layout,
+            )
+            attn_group.reset_mock()
+            with patch.object(
+                executor, "_run_moe_transport", side_effect=lambda *, state, **kw: state
+            ):
+                hidden, residual = executor.forward(
+                    layer=layer,
+                    positions=torch.arange(4),
+                    hidden_states=partial,
+                    forward_batch=batch,
+                    residual=partial,
+                )
+            self.assertEqual(attn_group.all_reduce.call_count, int(not ll))
+            self.assertEqual(attn_group.reduce_scatter_tensor.call_count, int(ll))
+            expected = partial[2:] if ll else partial
+            torch.testing.assert_close(hidden, expected * 2)
+            torch.testing.assert_close(residual, expected)
+
+    def test_nextn_ll_masks_use_full_local_count_on_pure_tp_and_dp_attention(self):
+        # Rank 1 owns [4:8] of the attention group's eight rows. In DP it
+        # also belongs to outer shard 1, whose local row view has one entry.
+        count = torch.tensor([8], dtype=torch.int32)
+        batch = SimpleNamespace(
+            forward_mode=forward_batch_info.ForwardMode.DRAFT_EXTEND_V2,
+            is_extend_in_batch=False,
+            enable_kv_mirror=False,
+            can_run_tbo=False,
+            welm_ll_real_rows=count,
+            welm_decode_tp_positions=None,
+            welm_dp_moe_row_layout=forward_batch_info.build_welm_local_ll_row_layout(
+                8, 8, count
+            ),
+        )
+        plan = SimpleNamespace(
+            finalized=True,
+            role=WelmRunnerRole.DRAFT,
+            decode_rs_ag_enabled=True,
+            attn_tp_rank=1,
+            attn_tp_size=2,
+            outer_target_dp_rank=1,
+        )
+        layer = SimpleNamespace(attn_tp_rank=1, welm_decode_ll_dispatch_capacity=4)
+        hidden = torch.empty((8, 2))
+        with (
+            patch.object(welmv4, "get_tensor_model_parallel_world_size", return_value=2),
+            patch.object(welmv4, "get_deepep_mode", return_value=DeepEPMode.AUTO),
+        ):
+            for real_rows in (5, 0, 8):
+                count.fill_(real_rows)
+                Qwen2MoeDecoderLayer._prepare_npu_decode_rs_ag_scratch(
+                    layer, hidden, batch
+                )
+                WelmDpAttentionExecutor.prepare_forward_scratch(
+                    SimpleNamespace(runner_plan=plan),
+                    forward_batch=batch,
+                    hidden_states=hidden,
+                )
+                expected = torch.arange(4, 8) < real_rows
+                torch.testing.assert_close(batch.welm_decode_tp_valid_mask, expected)
+                torch.testing.assert_close(
+                    batch.welm_dp_moe_row_layout.current._attn_scattered_valid_mask,
+                    expected,
+                )
+
     def test_prompt_padding_localizes_real_rows_for_tp4(self):
         real_rows = 16489
         padded_rows = ceil_align(real_rows, 4)

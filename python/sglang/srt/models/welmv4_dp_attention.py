@@ -719,12 +719,6 @@ class WelmDpAttentionExecutor:
         validate_welm_runner_plan(runner_plan)
         self.runner_plan = runner_plan
         self.planner = WelmDpExecutionPlanner(runner_plan)
-        self.megamoe = None
-
-    def _use_megamoe(self, row_view: "WelmDpRowView") -> bool:
-        return self.megamoe is not None and self.megamoe.use_for_rows(
-            max(row_view.slot_rows_cpu), self.runner_plan.attn_tp_size
-        )
 
     def bind_finalized_runner_plan(self, runner_plan: WelmRunnerParallelPlan) -> None:
         """Atomically replace the constructor-time provisional plan."""
@@ -762,11 +756,7 @@ class WelmDpAttentionExecutor:
             is_draft=plan.role is WelmRunnerRole.DRAFT,
         )
         local_row_view = getattr(forward_batch, "welm_ll_real_rows", None) is not None
-        if (
-            use_decode_ll_rs_ag
-            and not local_row_view
-            and not self._use_megamoe(row_layout.current)
-        ):
+        if use_decode_ll_rs_ag and not local_row_view:
             # Check synchronized CPU slot metadata before any layer collective.
             # All EP ranks must reject an oversized eager batch/capture bucket
             # together; no device readback or extra synchronization is needed.
@@ -847,10 +837,6 @@ class WelmDpAttentionExecutor:
             if key in prepared:
                 continue
             prepared.add(key)
-            # Check the selected Mega capacity before layer collectives. FULL
-            # reuses its segmented mask and full-size idle buffer; only the MoE
-            # boundary slices them, so no second scratch layout is necessary.
-            self._use_megamoe(row_view)
             if transport.uses_scattered_rows:
                 welm_dp_prepare_attn_scattered_transport_scratch(
                     row_view,
@@ -1480,16 +1466,14 @@ class WelmDpAttentionExecutor:
         batch_plan: WelmBatchExecutionPlan,
         active_view: "WelmDpRowView",
     ) -> WelmDpLayerState:
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
         plan = self.runner_plan
         transport = batch_plan.moe_transport
-        use_megamoe = self._use_megamoe(active_view)
         layer.final_mlp_experts_output = None
         layer.final_mlp_shared_output = None
 
-        if (
-            transport is WelmMoeTransport.DEEPEP_LOW_LATENCY_SCATTERED
-            and not use_megamoe
-        ):
+        if transport is WelmMoeTransport.DEEPEP_LOW_LATENCY_SCATTERED:
             return self._run_decode_low_latency_moe(
                 layer=layer,
                 state=state,
@@ -1497,62 +1481,51 @@ class WelmDpAttentionExecutor:
                 active_view=active_view,
             )
 
-        if use_megamoe or transport is WelmMoeTransport.DEEPEP_NORMAL_AG_SCATTERED:
-            assert state.residual is not None
-            restore_full = (
-                use_megamoe
-                and state.hidden_layout is WelmDpLayout.DP_LOCAL_TP_ATTN_FULL
+        if transport is WelmMoeTransport.DEEPEP_NORMAL_AG_SCATTERED:
+            if state.hidden_layout is not WelmDpLayout.EP_SCATTERED:
+                raise RuntimeError(
+                    "WeLMv4 DeepEP NORMAL received a non-scattered hidden layout"
+                )
+            valid_mask = welm_dp_attn_scattered_valid_mask(
+                active_view,
+                dp_rank=plan.outer_target_dp_rank,
+                attn_tp_rank=plan.attn_tp_rank,
+                attn_tp_size=plan.attn_tp_size,
+                local_rows=state.hidden_states.shape[0],
+                device=state.hidden_states.device,
             )
-            full_output_rows = state.hidden_states.shape[0]
-            if restore_full:
-                slot_rows = active_view.local_slot_rows
-                local_rows = (slot_rows + plan.attn_tp_size - 1) // plan.attn_tp_size
-                padded_rows = local_rows * plan.attn_tp_size
-                local_start = active_view.slot_offsets_cpu[plan.outer_target_dp_rank]
-                full_mask = welm_dp_segmented_valid_mask(active_view).narrow(
-                    0, local_start, slot_rows
+            invalid_mask = welm_dp_attn_scattered_invalid_mask(active_view)
+            assert state.residual is not None
+            megamoe = layer.mlp.welm_prefill_megamoe
+            megamoe_length_matched = (
+                megamoe is not None
+                # Ordinary-prefill EP uses equal padded slots across DP ranks,
+                # including idle participants. Never select by local real rows.
+                and megamoe.meets_prefill_threshold(active_view.local_slot_rows)
+            )
+            use_megamoe = (
+                megamoe_length_matched
+                and forward_batch.welm_dp_all_active_ordinary_prefill
+                and megamoe.can_run(active_view.local_slot_rows // plan.attn_tp_size)
+            )
+            megamoe_num_valid_rows = None
+            if use_megamoe:
+                # Use the row view, not generic num_token_non_padded_cpu: the
+                # latter can count fabricated idle tokens as real after sync.
+                megamoe_num_valid_rows = megamoe.local_valid_rows(
+                    state.hidden_states.shape[0],
+                    active_view.local_real_rows,
+                    plan.attn_tp_rank,
                 )
-                state.residual.masked_fill_(
-                    ~full_mask[: state.residual.shape[0], None], 0
-                )
-                # FULL already includes the OProj sum. Slice its rows locally,
-                # before the fallback's cross-DP gather, without another sum.
-                if full_output_rows < padded_rows:
-                    state.hidden_states = torch.nn.functional.pad(
-                        state.hidden_states, (0, 0, 0, padded_rows - full_output_rows)
-                    )
-                if slot_rows < padded_rows:
-                    full_mask = torch.nn.functional.pad(
-                        full_mask, (0, padded_rows - slot_rows), value=False
-                    )
-                start = plan.attn_tp_rank * local_rows
-                state.hidden_states = state.hidden_states.narrow(
-                    0, start, local_rows
-                ).contiguous()
-                valid_mask = full_mask.narrow(0, start, local_rows)
-                invalid_mask = ~valid_mask
+                if megamoe_num_valid_rows < state.hidden_states.shape[0]:
+                    state.hidden_states[megamoe_num_valid_rows:].zero_()
+                    state.residual[megamoe_num_valid_rows:].zero_()
             else:
-                if state.hidden_layout is not WelmDpLayout.EP_SCATTERED:
-                    raise RuntimeError("WeLM MoE expected attention-TP scattered rows")
-                valid_mask = welm_dp_attn_scattered_valid_mask(
-                    active_view,
-                    dp_rank=(
-                        0
-                        if forward_batch.welm_ll_real_rows is not None
-                        else plan.outer_target_dp_rank
-                    ),
-                    attn_tp_rank=plan.attn_tp_rank,
-                    attn_tp_size=plan.attn_tp_size,
-                    local_rows=state.hidden_states.shape[0],
-                    device=state.hidden_states.device,
-                )
-                invalid_mask = welm_dp_attn_scattered_invalid_mask(active_view)
+                state.hidden_states.masked_fill_(invalid_mask[:, None], 0)
                 state.residual.masked_fill_(invalid_mask[:, None], 0)
-            state.hidden_states.masked_fill_(invalid_mask[:, None], 0)
-            empty_megamoe = use_megamoe and state.hidden_states.shape[0] == 0
-            if empty_megamoe:
-                state.hidden_states = self.megamoe.empty_hidden
-                valid_mask = self.megamoe.empty_valid_mask
+            original_mode = forward_batch._original_forward_mode
+            if original_mode is None:
+                original_mode = forward_batch.forward_mode
             mlp_output = layer.mlp(
                 state.hidden_states,
                 None,
@@ -1561,21 +1534,23 @@ class WelmDpAttentionExecutor:
                 return_components=False,
                 use_welm_prefill_normal_stream_policy=True,
                 use_welm_prefill_megamoe=use_megamoe,
-                force_serial_shared_expert=use_megamoe,
+                megamoe_num_valid_rows=megamoe_num_valid_rows,
+                force_serial_shared_expert=(
+                    megamoe_length_matched
+                    and (original_mode == ForwardMode.EXTEND or use_megamoe)
+                ),
                 valid_row_mask=valid_mask,
                 invalid_row_mask=invalid_mask,
                 invalid_topk_id=-1,
                 allow_inplace_expert_shared_merge=True,
             )
             state.hidden_states = self._store_final_components(layer, mlp_output)
-            if empty_megamoe:
-                state.hidden_states = state.hidden_states[:0]
-            state.hidden_states.masked_fill_(invalid_mask[:, None], 0)
-            if restore_full:
-                state.hidden_states = welm_attn_all_gather_rows(
-                    state.hidden_states, attn_tp_group=plan.attn_tp_group
-                )[:full_output_rows]
-            elif layer.is_final_layer:
+            if use_megamoe:
+                if megamoe_num_valid_rows < state.hidden_states.shape[0]:
+                    state.hidden_states[megamoe_num_valid_rows:].zero_()
+            else:
+                state.hidden_states.masked_fill_(invalid_mask[:, None], 0)
+            if layer.is_final_layer:
                 # A mirror-disabled ordinary prefill ends while still in the
                 # NORMAL scattered layout. Restore this DP shard before model
                 # output/norm publication.

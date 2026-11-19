@@ -400,13 +400,6 @@ class ModelRunner:
             self.welm_decode_rs_ag_enabled
             and skip_ag
             and (self.spec_algorithm.is_none() or physical_mtp)
-            # Dynamic Mega/LL selection must agree across outer DP ranks.
-            # Restore the existing synchronized row/bucket path in this case.
-            and not (
-                envs.WELM_NPU_USE_MEGAMOE.get()
-                and envs.WELM_NPU_MEGAMOE_PREFILL_TOKEN_THRESHOLD.get() > 1
-                and self.ps.moe_ep_size > self.ps.attn_tp_size
-            )
         )
         self.welm_decode_ll_dispatch_capacity = None
         if self.welm_decode_rs_ag_enabled:
@@ -452,9 +445,9 @@ class ModelRunner:
         # Load model weights and configure
         self.initialize()
         self.finalize_welm_runner_plan()
+        self._bind_welm_decode_rs_ag()
         self.check_quantized_moe_compatibility()
         self.maybe_init_welm_prefill_megamoe()
-        self._bind_welm_decode_rs_ag()
 
         self._initialize_elastic_ep_joiner()
 
@@ -1196,11 +1189,9 @@ class ModelRunner:
         from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
 
         parallel = get_parallel()
-        megamoe = self.welm_prefill_megamoe
-        megamoe_only = megamoe is not None and megamoe.prefill_token_threshold <= 1
         if (
             not get_moe_a2a_backend().is_deepep()
-            or (not megamoe_only and not get_deepep_mode().enable_low_latency())
+            or not get_deepep_mode().enable_low_latency()
             or parallel.moe_tp_size != 1
             or parallel.moe_ep_size <= 1
         ):
@@ -1216,7 +1207,6 @@ class ModelRunner:
                 raise ValueError("WeLM local LL rows require EP to span the outer TP group.")
             if (
                 self.server_args.disaggregation_mode == "null"
-                and not megamoe_only
                 and not get_deepep_mode().enable_normal()
             ):
                 raise ValueError("Mixed WeLM DP serving needs --deepep-mode auto for prefill.")
@@ -1242,24 +1232,17 @@ class ModelRunner:
                 )
             dispatcher = layer.mlp.experts.dispatcher
             inner_dispatchers = getattr(dispatcher, "_inners", (dispatcher,))
-            if not megamoe_only and (
-                not inner_dispatchers
-                or any(
-                    getattr(inner, "_low_latency_dispatcher", None) is None
-                    for inner in inner_dispatchers
-                )
+            if not inner_dispatchers or any(
+                getattr(inner, "_low_latency_dispatcher", None) is None
+                for inner in inner_dispatchers
             ):
                 raise RuntimeError(
                     "WeLMv4 decode RS/AG requires an initialized LL dispatcher"
                 )
-            if (
-                self.welm_local_decode_rows
-                and not megamoe_only
-                and any(
-                    inner._low_latency_dispatcher.group
-                    is not parallel.moe_ep_group.device_group
-                    for inner in inner_dispatchers
-                )
+            if self.welm_local_decode_rows and any(
+                inner._low_latency_dispatcher.group
+                is not parallel.moe_ep_group.device_group
+                for inner in inner_dispatchers
             ):
                 raise RuntimeError("WeLM local LL dispatcher must use the physical MoE EP group.")
             shared = layer.mlp.shared_expert
@@ -1283,13 +1266,12 @@ class ModelRunner:
         if (
             not envs.WELM_NPU_USE_MEGAMOE.get()
             or self.device != "npu"
+            or self.is_draft_worker
             or self.dtype != torch.bfloat16
             or self.ps.moe_ep_size <= 1
             or get_parallel().moe_tp_size != 1
-            or not any(
-                arch in ("WeLMV4MoeForCausalLM", "WeLMV4MoeForCausalLMNextN")
-                for arch in (self.model_config.hf_config.architectures or [])
-            )
+            or "WeLMV4MoeForCausalLM"
+            not in (self.model_config.hf_config.architectures or [])
         ):
             return
         from sglang.srt.hardware_backend.npu.moe.welmv4_megamoe import (

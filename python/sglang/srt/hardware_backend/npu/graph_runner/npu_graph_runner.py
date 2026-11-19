@@ -98,16 +98,6 @@ def resolve_welm_ll_graph_rows(model_runner: ModelRunner) -> int:
     attn_tp = model_runner.ps.attn_tp_size
     max_bs = model_runner.max_running_requests
     capacity = model_runner.welm_decode_ll_dispatch_capacity
-    megamoe = getattr(model_runner, "welm_prefill_megamoe", None)
-    if megamoe is not None:
-        # Local rows are enabled across DP only for an always-Mega policy.
-        # Pure TP may retain a threshold; admit only a contiguous safe range,
-        # so intermediate eager batches cannot fall into an oversized LL call.
-        first_mega_rows = max(
-            1, (megamoe.prefill_token_threshold + attn_tp - 1) // attn_tp
-        )
-        if first_mega_rows <= capacity + 1:
-            capacity = megamoe.max_local_rows
     required = max(
         ceil_align(max_bs * w, math.lcm(attn_tp, w)) // attn_tp for w in widths
     )
@@ -143,19 +133,19 @@ def resolve_welm_ll_graph_rows(model_runner: ModelRunner) -> int:
     )
     if any(peer["widths"] != widths for peer in peers):
         raise ValueError(
-            "WeLM local MoE requires identical MTP widths across the EP group."
+            "WeLM local LL requires identical MTP widths across the EP group."
         )
     max_required = max(peer["required"] for peer in peers)
     if any(peer["capacity"] != capacity for peer in peers) or max_required > capacity:
         raise ValueError(
-            f"WeLM local MoE needs one EP-wide dispatch capacity >= {max_required} "
+            f"WeLM local LL needs one EP-wide dispatch capacity >= {max_required} "
             f"rows per rank (local capacity {capacity}). Adjust --max-running-requests "
-            "or the selected MoE dispatch capacity."
+            "or SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK."
         )
     if any(peer["shapes"] != capture_shapes or peer["eager_only"] for peer in peers):
         logger.warning(
-            "Using eager WeLM decode for the entire EP group: graph buckets "
-            "or padding do not cover all admitted batches within MoE capacity."
+            "Using eager WeLM LL decode for the entire EP group: graph buckets "
+            "or padding do not cover all admitted batches within LL capacity."
         )
         return 0
     return max((bs[-1] * w for w, bs in capture_shapes), default=0)

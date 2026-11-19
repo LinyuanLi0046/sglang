@@ -5890,11 +5890,7 @@ class ServerArgs:
                 raise ValueError(
                     "WeLMv4 decode RS/AG requires DeepEP with EP > 1."
                 )
-            megamoe_only = (
-                envs.WELM_NPU_USE_MEGAMOE.get()
-                and envs.WELM_NPU_MEGAMOE_PREFILL_TOKEN_THRESHOLD.get() <= 1
-            )
-            if not megamoe_only and self.deepep_mode not in ("auto", "low_latency"):
+            if self.deepep_mode not in ("auto", "low_latency"):
                 raise ValueError(
                     "WeLMv4 decode RS/AG requires DeepEP LOW_LATENCY; "
                     "use --deepep-mode auto or low_latency."

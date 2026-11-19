@@ -652,13 +652,13 @@ class Envs:
     SGLANG_NPU_ALLREDUCE_OUTPLACE = EnvBool(False)
     # Keep BF16/MXFP8 routed expert weights in ND for every WeLM layer.
     WELM_NPU_MOE_USE_ND = EnvBool(False)
-    # BF16/MXFP8 WeLM EP, including mirror, decode, verify and physical NextN.
+    # BF16/MXFP8 WeLM target prefill, non-consumer EP.
     WELM_NPU_USE_MEGAMOE = EnvBool(False)
     # Fuse shared experts on selected MegaMoE calls, including prefill BCG.
     WELM_NPU_MEGAMOE_FUSE_SHARED_EXPERT = EnvBool(False)
-    # With MegaMoE enabled, require padded rows before attention-TP scattering
-    # in every phase (request rows for mirror). Non-positive values disable
-    # this threshold check. Keep the historical variable name for compatibility.
+    # With MegaMoE enabled, require padded prefill rows before attention-TP
+    # scattering to meet or exceed this threshold. Non-positive values disable
+    # this threshold check.
     WELM_NPU_MEGAMOE_PREFILL_TOKEN_THRESHOLD = EnvInt(0)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
     # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2

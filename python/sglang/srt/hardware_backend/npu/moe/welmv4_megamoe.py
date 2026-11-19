@@ -1,7 +1,7 @@
-"""BF16/MXFP8 MegaMoE for WeLM target and physical NextN EP shards.
+"""BF16/MXFP8 MegaMoE for WeLM ordinary-prefill EP shards, not a global backend.
 
-Runners bind one registered buffer per group before KV-cache sizing. Every
-phase uses the same token threshold and the group's existing communication domain.
+The target runner creates one registered buffer before KV-cache sizing. All
+eligible layers share it; decode, mirror consumers and NextN keep their backend.
 The custom npu_ops_transformer wheel is imported only during initialization.
 """
 
@@ -38,17 +38,6 @@ def _weight_mode(experts):
     return None
 
 
-def _runtime_config(config, device, weight_mode):
-    return (
-        device,
-        config.num_experts,
-        config.top_k,
-        config.hidden_size,
-        weight_mode,
-        0 if weight_mode == _MODE_MXFP8 else config.intermediate_size_per_partition,
-    )
-
-
 def _prepare_shared_expert_kwargs(shared, weight_mode):
     """Reuse this WeLM layer's replicated shared weights without changing them."""
     kwargs = {}
@@ -78,7 +67,6 @@ class WelmPrefillMegaMoE:
 
         self.group = group
         self.weight_mode = weight_mode
-        self.config = _runtime_config(config, device, weight_mode)
         self.max_local_rows = _MAX_LOCAL_ROWS
         self.prefill_token_threshold = (
             envs.WELM_NPU_MEGAMOE_PREFILL_TOKEN_THRESHOLD.get()
@@ -110,12 +98,6 @@ class WelmPrefillMegaMoE:
             comm_alg="",
             **quant_args,
         )
-        # SUM_LEN may leave an idle DP participant with no physical rows. It
-        # still enters dispatch/combine, using one inert row from this workspace.
-        self.empty_hidden = torch.zeros(
-            (1, config.hidden_size), dtype=torch.bfloat16, device=device
-        )
-        self.empty_valid_mask = torch.zeros(1, dtype=torch.bool, device=device)
 
     def meets_prefill_threshold(self, num_tokens: int) -> bool:
         # Match OProj's padded MM rows before attention-TP ReduceScatter, not
@@ -128,19 +110,6 @@ class WelmPrefillMegaMoE:
     def can_run(self, num_rows: int) -> bool:
         # DP callers pass the common physical slot, not local real-token count.
         return 0 < num_rows <= self.max_local_rows
-
-    def use_for_rows(self, full_rows: int, attn_tp_size: int) -> bool:
-        # Compare padded rows before attention-TP slicing. Empty participants
-        # use a dummy slot; DP callers use the EP-wide maximum, not local counts.
-        local_rows = max(1, (full_rows + attn_tp_size - 1) // attn_tp_size)
-        if not self.meets_prefill_threshold(local_rows * attn_tp_size):
-            return False
-        if not self.can_run(local_rows):
-            raise ValueError(
-                f"WeLM MegaMoE needs {local_rows} rows per rank, exceeding its "
-                f"registered capacity {self.max_local_rows}"
-            )
-        return True
 
     @staticmethod
     def local_valid_rows(shard_rows: int, real_rows: int, attn_tp_rank: int) -> int:
@@ -209,7 +178,7 @@ class WelmPrefillMegaMoE:
 
 
 def init_welm_prefill_megamoe(model_runner):
-    """Bind loaded target/NextN layers, reusing compatible per-group resources."""
+    """Bind loaded BF16/MXFP8 target layers without modifying their weights."""
     from sglang.srt.distributed import (
         get_moe_ep_group,
         get_moe_ep_normal_comm_group,
@@ -220,27 +189,17 @@ def init_welm_prefill_megamoe(model_runner):
         return None
 
     eligible = []
-    inner_model = model_runner.model.model
-    layers = (
-        inner_model.decoder_layers if model_runner.is_draft_worker else inner_model.layers
-    )
-    for layer in layers:
+    for layer in model_runner.model.model.layers:
         mlp = getattr(layer, "mlp", None)
         experts = getattr(mlp, "experts", None)
-        if experts is None:
-            continue
         # Bind only layers whose weights were prepared for MegaMoE at load time.
         if not getattr(experts, "welm_megamoe_keep_nd", False):
-            raise ValueError(
-                f"WeLM MegaMoE weights were not prepared for layer {mlp.layer_id}"
-            )
+            continue
         if _weight_mode(experts) is None:
-            raise ValueError(
-                f"Unsupported WeLM MegaMoE weight layout in layer {mlp.layer_id}"
-            )
+            continue
         config = experts.moe_runner_config
         if config.gemm1_clamp_limit is not None and config.gemm1_clamp_limit > 0:
-            raise ValueError("WeLM MegaMoE does not support routed SwiGLU clamp")
+            continue  # This custom ABI has no routed SwiGLU clamp argument.
         eligible.append(mlp)
     if not eligible:
         return None
@@ -260,47 +219,23 @@ def init_welm_prefill_megamoe(model_runner):
         coordinator = get_moe_ep_normal_comm_group()
     else:
         coordinator = get_moe_ep_group()
-    ep_group = plan.moe_ep_group if plan is not None else get_moe_ep_group()
-    if coordinator.ranks != ep_group.ranks:
-        raise ValueError("WeLM MegaMoE group must preserve expert rank ordering")
     group = coordinator.device_group
-    configs = {
-        _runtime_config(
-            mlp.experts.moe_runner_config, mlp.experts.w13_weight.device, weight_mode
-        )
-        for mlp in eligible
-    }
-    if len(configs) != 1:
-        raise ValueError("WeLM MegaMoE layers must share one buffer configuration")
-    runtime = _RUNTIMES.get(group)
-    if runtime is None:
-        runtime = WelmPrefillMegaMoE(
-            group,
-            config=eligible[0].experts.moe_runner_config,
-            device=eligible[0].experts.w13_weight.device,
-            weight_mode=weight_mode,
-        )
-        _RUNTIMES[group] = runtime
-    elif runtime._closed or runtime.config not in configs:
-        raise ValueError("Incompatible WeLM MegaMoE runtime for this EP group")
+    if group in _RUNTIMES:
+        raise RuntimeError("WeLM MegaMoE context already initialized for this EP group")
+    runtime = WelmPrefillMegaMoE(
+        group,
+        config=eligible[0].experts.moe_runner_config,
+        device=eligible[0].experts.w13_weight.device,
+        weight_mode=weight_mode,
+    )
+    _RUNTIMES[group] = runtime
     fuse_shared = envs.WELM_NPU_MEGAMOE_FUSE_SHARED_EXPERT.get()
     for mlp in eligible:
         mlp.welm_prefill_megamoe = runtime
-        if (
-            fuse_shared
-            and mlp.shared_expert is not None
-            and mlp.shared_expert_gate is None
-            and mlp.shared_expert.swiglu_clamp_limit is None
-        ):
-            # The shared ABI has no gate/clamp arguments. Such layers still use
-            # routed MegaMoE and keep their existing external shared expert.
+        if fuse_shared and mlp.shared_expert is not None:
             mlp.welm_megamoe_shared_kwargs = _prepare_shared_expert_kwargs(
                 mlp.shared_expert, weight_mode
             )
-    for layer in layers:
-        executor = getattr(layer, "_welm_dp_executor", None)
-        if executor is not None:
-            executor.megamoe = runtime
     return runtime
 
 

@@ -874,7 +874,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         ) + int(config.num_hidden_layers)
         self.last_final_experts_output: Optional[torch.Tensor] = None
         self.last_final_shared_output: Optional[torch.Tensor] = None
-        # Bound by the target runner after loading, never by a draft forward.
+        # Bound once by the owning target/NextN runner after weight loading.
         self.welm_prefill_megamoe = None
         self.welm_megamoe_shared_kwargs = None
         self.alt_stream = alt_stream
@@ -1017,9 +1017,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.experts.welm_megamoe_keep_nd = (
             envs.WELM_NPU_USE_MEGAMOE.get()
             and self.welm_local_ep_kernel_available
-            and get_disagg().disaggregation_mode in ("null", "prefill")
-            and not self.is_nextn
-            and not self.is_kv_mirror_consumer
             and moe_clamp_limit is None
         )
 
@@ -1216,7 +1213,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # Routed-only MegaMoE overlaps shared gate/up with TopK. Shared fusion
         # skips this external work; the operator produces the complete MoE sum.
         # Use the actual per-batch selector, not merely the bound runtime, so
-        # capacity/mixed-phase fallback retains its existing stream policy.
+        # calls below the threshold retain their existing stream policy.
         enable_npu_megamoe_shared_gate_up_overlap = (
             _is_npu
             and use_welm_prefill_megamoe
@@ -1274,9 +1271,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # mask (Bcap can even exceed Tcap). Dummy outputs are trimmed
             # before the eager LM head; Flash has its own request mask.
             num_token_non_padded = None
-            valid_row_mask = None
+            if not use_welm_prefill_megamoe:
+                valid_row_mask = None
         if use_welm_prefill_megamoe:
-            if forward_batch.welm_prefill_graph is not None:
+            if valid_row_mask is None and forward_batch.welm_prefill_graph is not None:
                 # The CPU real-row count belongs to the capture dummy. Use
                 # the refreshed device scalar for every replay in this bucket.
                 valid_row_mask = (
@@ -1285,7 +1283,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 )
                 hidden_states = torch.where(valid_row_mask[:, None], hidden_states, 0)
                 megamoe_num_valid_rows = num_tokens
-            if valid_row_mask is None:
+            if valid_row_mask is not None:
+                megamoe_num_valid_rows = num_tokens
+            elif megamoe_num_valid_rows is None:
                 # Non-DP scattered prefill. The CPU count is still the full
                 # prompt count, unlike the already-localized device scalar.
                 megamoe_num_valid_rows = self.welm_prefill_megamoe.local_valid_rows(
@@ -1297,7 +1297,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     # Only unused rows are modified. Clear before shared/router
                     # computation: zero route weights cannot neutralize NaNs.
                     hidden_states[megamoe_num_valid_rows:].zero_()
-            # DP already supplies its local count and sanitizes hidden/residual.
+            # Callers with row masks already sanitize hidden states.
             # Keep legal TopK IDs instead of applying DeepEP's -1 convention.
             num_token_non_padded = None
         if moe_a2a_backend.is_deepep() and hidden_states.shape[0] == 0:
@@ -1427,11 +1427,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     valid_row_mask is None
                     or forward_batch.welm_prefill_graph is not None
                 ),
-                valid_row_mask=(
-                    valid_row_mask
-                    if forward_batch.welm_prefill_graph is not None
-                    else None
-                ),
+                valid_row_mask=valid_row_mask,
                 shared_kwargs=shared_kwargs,
             )
             # Fused output already contains shared; shared_output stays None,
@@ -3647,22 +3643,31 @@ class Qwen2MoeDecoderLayer(nn.Module):
             )
         local_rows = full_rows // tp_size
         capacity = self.welm_decode_ll_dispatch_capacity
-        if capacity is None or local_rows > capacity:
-            raise RuntimeError(
-                "WeLM decode LL capacity does not cover the padded TP shard: "
-                f"rows={local_rows}, capacity={capacity}"
-            )
-        if get_deepep_mode().resolve(False) is not DeepEPMode.LOW_LATENCY:
-            raise RuntimeError("WeLM decode RS/AG requires DeepEP LOW_LATENCY")
+        megamoe = self.mlp.welm_prefill_megamoe
+        use_megamoe = megamoe is not None and megamoe.use_for_rows(full_rows, tp_size)
+        if not use_megamoe:
+            if capacity is None or local_rows > capacity:
+                raise RuntimeError(
+                    "WeLM decode LL capacity does not cover the padded TP shard: "
+                    f"rows={local_rows}, capacity={capacity}"
+                )
+            if get_deepep_mode().resolve(False) is not DeepEPMode.LOW_LATENCY:
+                raise RuntimeError("WeLM decode RS/AG requires DeepEP LOW_LATENCY")
         if forward_batch.can_run_tbo:
             raise RuntimeError("WeLM decode RS/AG does not support TBO")
         full_count = getattr(forward_batch, "welm_ll_real_rows", None)
+        if full_count is None and use_megamoe:
+            # Eager MegaMoE also needs the full count when B < TP. Graphs bind
+            # the replayable scalar above; the generic device count is TP-local.
+            full_count = forward_batch.num_token_non_padded_cpu
         count = (
             full_count if full_count is not None else forward_batch.num_token_non_padded
         )
-        if count is None or count.device != hidden_states.device:
+        if count is None or (
+            isinstance(count, torch.Tensor) and count.device != hidden_states.device
+        ):
             raise RuntimeError(
-                "WeLM pure-TP decode requires a device non-padded row count"
+                "WeLM pure-TP decode requires a valid non-padded row count"
             )
         positions = forward_batch.welm_decode_tp_positions
         if positions is None:
@@ -4323,6 +4328,11 @@ class Qwen2MoeDecoderLayer(nn.Module):
         )
         self.final_mlp_experts_output = None
         self.final_mlp_shared_output = None
+        megamoe = self.mlp.welm_prefill_megamoe
+        use_megamoe = megamoe is not None and megamoe.use_for_rows(
+            hidden_states.shape[0] * (tp_size if output_hidden_is_scattered else 1),
+            tp_size,
+        )
         has_full_replicated_moe_input = (
             forward_batch.welmv4_npu_deepep_full_mirror
             or forward_batch.forward_mode.is_decode()
@@ -4337,6 +4347,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         )
         use_welm_local_ep_moe = (
             self.mlp.supports_welm_local_ep_moe
+            and not use_megamoe
             and has_full_replicated_moe_input
             and not use_npu_decode_deepep_scattered
         )
@@ -4346,6 +4357,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             )
         use_kv_mirror_prefill_ll = (
             use_full_mirror_layout
+            and not use_megamoe
             and forward_batch.welmv4_npu_deepep_full_mirror
             and not use_welm_local_ep_moe
         )
@@ -4372,14 +4384,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
                     f"FULL request-row count: {mirror_ll_capacity} < "
                     f"{hidden_states.shape[0]}"
                 )
-        megamoe = self.mlp.welm_prefill_megamoe
-        use_megamoe_prefill = (
-            megamoe is not None
-            and forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
-            and output_hidden_is_scattered
-            # MoE input is already scattered; recover OProj's padded MM rows.
-            and megamoe.meets_prefill_threshold(hidden_states.shape[0] * tp_size)
-        )
         valid_mask = invalid_mask = None
         if use_npu_decode_deepep_scattered:
             valid_mask = forward_batch.welm_decode_tp_valid_mask
@@ -4395,6 +4399,52 @@ class Qwen2MoeDecoderLayer(nn.Module):
             residual.masked_fill_(invalid_mask[:, None], 0)
             if hidden_states_fp32 is not None:
                 hidden_states_fp32.masked_fill_(invalid_mask[:, None], 0)
+        restore_megamoe_full = use_megamoe and not output_hidden_is_scattered
+        full_output_rows = hidden_states.shape[0]
+        if restore_megamoe_full:
+            # FULL already contains the OProj sum. Give each attention-TP rank
+            # unique rows; restore the caller's exact B/T shape after combine.
+            shard_rows = max(1, (full_output_rows + tp_size - 1) // tp_size)
+            padded_rows = shard_rows * tp_size
+            start = self.attn_tp_rank * shard_rows
+            if padded_rows != full_output_rows:
+                hidden_states = F.pad(
+                    hidden_states, (0, 0, 0, padded_rows - full_output_rows)
+                )
+            hidden_states = hidden_states.narrow(0, start, shard_rows).contiguous()
+            # The NPU router consumes BF16 directly; no FP32 auxiliary input is
+            # needed by this MegaMoE call. The FP32 residual remains FULL.
+            hidden_states_fp32 = None
+            graph = forward_batch.welm_prefill_graph
+            if (
+                graph is not None
+                and graph.pad_mirror
+                and forward_batch.welm_prefill_graph_phase == "mirror"
+            ):
+                full_mask = graph.mirror_q_used[:full_output_rows].bool()
+                if padded_rows != full_output_rows:
+                    full_mask = F.pad(
+                        full_mask, (0, padded_rows - full_output_rows), value=False
+                    )
+                valid_mask = full_mask.narrow(0, start, shard_rows)
+            else:
+                full_count = forward_batch.welm_ll_real_rows
+                if full_count is None:
+                    full_count = (
+                        full_output_rows
+                        if is_kv_mirror_prefill
+                        else forward_batch._original_num_tokens
+                    )
+                    if full_count is None:
+                        full_count = forward_batch.num_token_non_padded_cpu
+                    if full_count is None:
+                        full_count = full_output_rows
+                valid_mask = torch.arange(
+                    start, start + shard_rows, device=hidden_states.device
+                ) < full_count
+            invalid_mask = ~valid_mask
+            hidden_states.masked_fill_(invalid_mask[:, None], 0)
+            use_reduce_scatter = False
         with get_forward().scoped(
             deepep_mode_override=deepep_mode_override,
             deepep_num_max_dispatch_tokens_override=mirror_ll_capacity,
@@ -4409,12 +4459,14 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 valid_row_mask=valid_mask,
                 invalid_row_mask=invalid_mask,
                 allow_inplace_expert_shared_merge=use_npu_decode_deepep_scattered,
-                use_welm_prefill_megamoe=(
-                    use_megamoe_prefill and megamoe.can_run(hidden_states.shape[0])
-                ),
-                force_serial_shared_expert=use_megamoe_prefill,
+                use_welm_prefill_megamoe=use_megamoe,
+                force_serial_shared_expert=use_megamoe,
                 return_components=(
-                    self.is_final_layer and not use_npu_decode_deepep_scattered
+                    self.is_final_layer
+                    and not use_npu_decode_deepep_scattered
+                    # Only TP=1 rebuilds the final sum from components. FULL
+                    # Mega shards restore the merged output used by TP/EP>1.
+                    and not (restore_megamoe_full and tp_size > 1)
                 ),
                 skip_component_output=(
                     self.is_final_layer
@@ -4429,8 +4481,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
         else:
             hidden_states = mlp_output
 
-        if use_npu_decode_deepep_scattered:
+        if use_npu_decode_deepep_scattered or restore_megamoe_full:
             hidden_states.masked_fill_(invalid_mask[:, None], 0)
+        if restore_megamoe_full:
+            hidden_states = self._all_gather_tp_rows(hidden_states)[:full_output_rows]
 
         if self.is_final_layer:
             self.final_mlp_experts_output = experts_output

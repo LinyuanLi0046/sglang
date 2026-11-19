@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 from sgl_kernel_npu.norm.l1_norm import l1_norm
 
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
 from sglang.srt.layers.moe.topk import (
@@ -10,11 +11,14 @@ from sglang.srt.layers.moe.topk import (
     capture_routed_experts_if_allowed,
     select_experts,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
 
 _USE_SIGMOID_NO_RENORM_OUTPUT = get_bool_env_var(
     "SGLANG_NPU_MOE_GATING_TOPK_SIGMOID_NO_RENORM", "false"
 )
+_SIMULATE_ROUND_ROBIN_EXPERTS = envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+_SIMULATE_UNIFORM_EXPERTS = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -108,6 +112,30 @@ def fused_expert_bias_topk_npu(
         topk_weights = torch.sigmoid(selected_logits)
 
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+
+def _make_ep_balanced_physical_expert_ids(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    ep_size: int,
+    layer_id: Optional[int],
+) -> torch.Tensor:
+    """Benchmark routing: interleave physical EP owners across token/top-k slots.
+
+    The generic round-robin helper spreads logical IDs; it does not guarantee
+    balanced physical owners for a small decode batch. Consecutive slots here
+    visit consecutive EP ranks, then advance the rank-local expert index.
+    Replicated FULL inputs must use the same IDs on every rank.
+    """
+    if num_experts % ep_size:
+        raise ValueError("EP-balanced routing requires equal expert counts per rank")
+    num_tokens, top_k = topk_ids.shape
+    slots = torch.arange(
+        num_tokens * top_k, device=topk_ids.device, dtype=topk_ids.dtype
+    )
+    slots = (slots + (layer_id or 0) * top_k) % num_experts
+    physical_ids = (slots % ep_size) * (num_experts // ep_size) + slots // ep_size
+    return physical_ids.reshape(num_tokens, top_k)
 
 
 def fused_topk_npu(
@@ -217,7 +245,29 @@ def fused_topk_npu(
             expert_location_dispatch_info=expert_location_dispatch_info,
         )
 
-    if expert_location_dispatch_info is not None:
+    if expert_bias is not None and _SIMULATE_ROUND_ROBIN_EXPERTS:
+        if _SIMULATE_UNIFORM_EXPERTS:
+            raise ValueError(
+                "SGLANG_SIMULATE_UNIFORM_EXPERTS and "
+                "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS are mutually exclusive"
+            )
+        num_experts = router_logits.shape[1]
+        if (
+            expert_location_dispatch_info is not None
+            and expert_location_dispatch_info.num_physical_experts != num_experts
+        ):
+            raise ValueError(
+                "WeLM EP-balanced benchmark routing requires no redundant experts"
+            )
+        # Benchmark-only: replace the native router result with physical IDs.
+        # Skip logical-to-physical remapping so an EPLB placement cannot undo
+        # rank balance. The corresponding weights are already loaded by slot.
+        topk_ids = _make_ep_balanced_physical_expert_ids(
+            topk_ids, num_experts, get_parallel().moe_ep_size, layer_id
+        )
+        if topk_config.top_k > 0:
+            topk_weights = torch.full_like(topk_weights, 1.0 / topk_config.top_k)
+    elif expert_location_dispatch_info is not None:
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
     capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)

@@ -260,7 +260,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled()
         )
 
-        self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
+        megamoe = getattr(model_runner, "welm_prefill_megamoe", None)
+        self.deepep_adapter = DeepEPCudaGraphRunnerAdapter(
+            enabled=not (megamoe is not None and megamoe.prefill_token_threshold <= 1)
+        )
 
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm = self.dllm_config is not None
@@ -481,19 +484,29 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.welm_local_decode_rows = getattr(
             self.model_runner, "welm_local_decode_rows", False
         )
+        # FULL MegaMoE also needs the immutable full-row count: the generic
+        # EP count may already be TP-localized, including to zero for small B.
+        self.welm_megamoe_full_rows = (
+            plan is None
+            and getattr(self.model_runner, "welm_prefill_megamoe", None) is not None
+        )
         self.welm_dp_real_rows_gpu = None
         self.welm_capture_scratch = {}
-        if self.welm_local_decode_rows or plan is not None:
+        if self.welm_local_decode_rows or self.welm_megamoe_full_rows or plan is not None:
             # Each runner captures a different width. Its physical row counts
             # must never alias pooled padding buffers or another runner's count.
-            size = 1 if self.welm_local_decode_rows else int(plan.outer_target_dp_size)
+            size = (
+                1
+                if self.welm_local_decode_rows or self.welm_megamoe_full_rows
+                else int(plan.outer_target_dp_size)
+            )
             self.welm_dp_real_rows_gpu = torch.empty(
                 size, dtype=torch.int32, device=self.device
             )
 
     def _bind_welm_capture_rows(self, forward_batch: ForwardBatch, bs: int) -> None:
         plan = self.welm_graph_plan
-        if self.welm_local_decode_rows:
+        if self.welm_local_decode_rows or self.welm_megamoe_full_rows:
             slot_rows = bs * self.captured_req_width
             real_rows = self.welm_dp_real_rows_gpu
             real_rows.fill_(slot_rows)
@@ -522,7 +535,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # (pure TP). Captured kernels reference those addresses during replay.
         if forward_batch.welm_dp_moe_row_layout is not None:
             self.welm_capture_scratch[key] = forward_batch.welm_dp_moe_row_layout
-        elif self.welm_local_decode_rows or getattr(
+        elif self.welm_local_decode_rows or self.welm_megamoe_full_rows or getattr(
             self.model_runner, "welm_decode_rs_ag_enabled", False
         ):
             self.welm_capture_scratch[key] = forward_batch
@@ -543,11 +556,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _update_welm_real_rows(self, forward_batch: ForwardBatch) -> None:
         if self.welm_dp_real_rows_gpu is None:
             return
-        if self.welm_local_decode_rows:
-            # init_new recorded this phase's unpadded B*width (zero on idle).
+        if self.welm_local_decode_rows or self.welm_megamoe_full_rows:
             # Fill on the replay stream so plan-stream staging cannot overwrite
             # a count still in use by the preceding replay.
-            self.welm_dp_real_rows_gpu.fill_(forward_batch.num_token_non_padded_cpu)
+            if self.welm_megamoe_full_rows:
+                # Draft input_ids may still belong to the previous phase at
+                # init_new. Use this runner's actual request width, as load_batch
+                # does, rather than treating that old token count as draft rows.
+                real_rows = (
+                    0 if forward_batch.forward_mode.is_idle()
+                    else forward_batch.batch_size * self.captured_req_width
+                )
+            else:
+                real_rows = forward_batch.num_token_non_padded_cpu
+            self.welm_dp_real_rows_gpu.fill_(real_rows)
             return
         self._welm_request_bs(forward_batch)
         counts = forward_batch.global_num_requests_cpu
@@ -1149,7 +1171,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         is_ragged = ragged_layout is not None
 
         self.deepep_adapter.replay()
-        if not self.welm_local_decode_rows:
+        if not (self.welm_local_decode_rows or self.welm_megamoe_full_rows):
             self._update_welm_real_rows(forward_batch)
 
         if not forward_batch.needs_forward_metadata_init():
@@ -1318,7 +1340,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
-            if self.welm_local_decode_rows:
+            if self.welm_local_decode_rows or self.welm_megamoe_full_rows:
                 self._update_welm_real_rows(forward_batch)
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(

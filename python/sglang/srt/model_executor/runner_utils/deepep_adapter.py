@@ -92,6 +92,9 @@ class DeepEPCudaGraphRunnerAdapter:
     def for_draft_runner(
         cls, model_runner: ModelRunner
     ) -> DeepEPCudaGraphRunnerAdapter:
+        megamoe = getattr(model_runner, "welm_prefill_megamoe", None)
+        if megamoe is not None and megamoe.prefill_token_threshold <= 1:
+            return cls(enabled=False)
         if getattr(model_runner, "welm_local_decode_rows", False):
             # The physical NextN graph uses DeepEP LL in all decode phases.
             return cls()

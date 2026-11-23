@@ -208,6 +208,13 @@ class DeepEPBuffer:
             buffers["deepep_ep_state"] = state
         return state
 
+    @classmethod
+    def is_npu_low_latency_mte(cls) -> bool:
+        # Query the initialized strategy, not DEEP_USE_MODE. Older kernels or
+        # the first warmup before Buffer creation retain the padding mask.
+        strategy = getattr(cls._state().buffer, "low_latency_strategy", None)
+        return _is_npu and bool(getattr(strategy, "_use_950dt_mte", False))
+
     @staticmethod
     def _requested_normal_strategy(deepep_mode: DeepEPMode) -> Optional[str]:
         use_alltoall = envs.SGLANG_DEEPEP_NORMAL_USE_ALLTOALL.get()
@@ -493,6 +500,16 @@ class DeepEPBuffer:
         cls._maybe_enable_separate_normal_strategy(
             buffer, deepep_mode, normal_comm_group
         )
+        if _is_npu and deepep_mode.enable_low_latency():
+            prepare_mask = getattr(
+                getattr(buffer, "low_latency_strategy", None),
+                "prepare_low_latency_mask",
+                None,
+            )
+            if prepare_mask is not None:
+                default_capacity, _ = _get_deepep_ll_token_capacities()
+                for capacity in {default_capacity, num_max_dispatch_tokens_per_rank}:
+                    prepare_mask(capacity)
         state.buffer = buffer
         state.base_group = group
         state.normal_strategy_name = requested_normal_strategy

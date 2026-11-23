@@ -1675,12 +1675,10 @@ class WelmDpAttentionExecutor:
         )
         invalid_mask = welm_dp_attn_scattered_invalid_mask(active_view)
         assert state.residual is not None
-        state.hidden_states.masked_fill_(invalid_mask[:, None], 0)
-        state.residual.masked_fill_(invalid_mask[:, None], 0)
 
         # AUTO already resolves this group-wide non-extend round to LL.
-        # Retain legal, distinct TopK IDs for dummy rows and zero only their
-        # weights; NORMAL's -1 sentinel is not part of the LL contract.
+        # Retain legal, distinct dummy TopK IDs. MTE can leave their weights
+        # untouched because the merged MoE output is masked below.
         mlp_output = layer.mlp(
             state.hidden_states,
             None,
@@ -1693,6 +1691,7 @@ class WelmDpAttentionExecutor:
             invalid_row_mask=invalid_mask,
             invalid_topk_id=None,
             allow_inplace_expert_shared_merge=True,
+            padded_output_is_masked=True,
         )
         state.hidden_states = self._store_final_components(layer, mlp_output)
         state.hidden_states.masked_fill_(invalid_mask[:, None], 0)

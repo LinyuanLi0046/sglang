@@ -118,6 +118,7 @@ if is_npu():
         process_shared_expert,
         wait_share_stream,
     )
+    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
     from sglang.srt.layers.welmv4_npu_op import (
         build_welmv4_rope_segment_tile_starts,
         inplace_sigmoid_mul_npu,
@@ -1140,6 +1141,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         invalid_row_mask: Optional[torch.Tensor] = None,
         invalid_topk_id: Optional[int] = None,
         allow_inplace_expert_shared_merge: bool = False,
+        padded_output_is_masked: bool = False,
         resolved_moe_tp_group=None,
         resolved_moe_ep_group=None,
     ) -> torch.Tensor:
@@ -1382,20 +1384,32 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # NPU DeepEP normal AllGather consumes -1 as an inactive route. The
             # legacy low-latency kernels do not unless their optional negative-ID
             # mode is enabled, so keep the router's valid, distinct expert IDs
-            # there and make dummy routes numerically inert via zero weights.
+            # there. Only MTE with caller-side output masking may keep weights.
             preserve_padded_ids = (
                 moe_a2a_backend.is_deepep()
                 and self._resolve_deepep_mode_for_topk(is_prefill_batch)
                 == DeepEPMode.LOW_LATENCY
             )
-            topk_output = self._mask_npu_padded_topk(
-                topk_output,
-                num_token_non_padded,
-                preserve_padded_ids=preserve_padded_ids,
-                valid_row_mask=valid_row_mask,
-                invalid_row_mask=invalid_row_mask,
-                invalid_topk_id=invalid_topk_id,
-            )
+            skip_padding_weight_mask = False
+            if (
+                preserve_padded_ids
+                and padded_output_is_masked
+                and valid_row_mask is not None
+                and invalid_row_mask is not None
+                and invalid_topk_id is None
+            ):
+                # These scattered LL callers mask the merged MoE output. MTE
+                # applies weights only to the source token's combine result.
+                skip_padding_weight_mask = DeepEPBuffer.is_npu_low_latency_mte()
+            if not skip_padding_weight_mask:
+                topk_output = self._mask_npu_padded_topk(
+                    topk_output,
+                    num_token_non_padded,
+                    preserve_padded_ids=preserve_padded_ids,
+                    valid_row_mask=valid_row_mask,
+                    invalid_row_mask=invalid_row_mask,
+                    invalid_topk_id=invalid_topk_id,
+                )
         if enable_npu_prefill_normal_shared_overlap:
             # Ordinary non-mirror prefill keeps LOCAL token rows and DeepEP
             # NORMAL+AllGather starts with communication. Launch only after
@@ -4391,10 +4405,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 or invalid_mask.shape != valid_mask.shape
             ):
                 raise RuntimeError("WeLM decode scattered scratch was not prepared")
-            hidden_states.masked_fill_(invalid_mask[:, None], 0)
-            residual.masked_fill_(invalid_mask[:, None], 0)
-            if hidden_states_fp32 is not None:
-                hidden_states_fp32.masked_fill_(invalid_mask[:, None], 0)
         with get_forward().scoped(
             deepep_mode_override=deepep_mode_override,
             deepep_num_max_dispatch_tokens_override=mirror_ll_capacity,
@@ -4409,6 +4419,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 valid_row_mask=valid_mask,
                 invalid_row_mask=invalid_mask,
                 allow_inplace_expert_shared_merge=use_npu_decode_deepep_scattered,
+                padded_output_is_masked=use_npu_decode_deepep_scattered,
                 use_welm_prefill_megamoe=(
                     use_megamoe_prefill and megamoe.can_run(hidden_states.shape[0])
                 ),

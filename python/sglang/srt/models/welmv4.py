@@ -37,7 +37,10 @@ from sglang.srt.distributed.communication_op import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.eplb.expert_location import (
+    ModelConfigForExpertLocation,
+    get_global_expert_location_metadata,
+)
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
@@ -150,6 +153,24 @@ _WELMV4_FUSED_QKV_MX_PROGRAMS: Dict[Tuple[Any, int, int, int, bool, bool], Any] 
 # Keep in sync with PAIR_M in fused_qkv_proj_norm_rope_cache. Aligning each
 # rank's packed segment prevents a bulk-RoPE AIV tile from crossing ranks.
 _WELMV4_FUSED_QKV_TILE_ROWS = 256
+
+
+def _welm_static_prefill_round(forward_batch: ForwardBatch) -> bool:
+    """Choose one bank across EP ranks, including locally idle/decode peers."""
+    mode = forward_batch.forward_mode
+    global_mode = forward_batch.global_forward_mode
+    spec_info = forward_batch.spec_info
+    if (
+        mode in (ForwardMode.TARGET_VERIFY, ForwardMode.DRAFT_EXTEND_V2)
+        or global_mode == ForwardMode.TARGET_VERIFY
+        or (spec_info is not None and spec_info.is_verify_input())
+    ):
+        return False
+    return (
+        forward_batch.is_extend_in_batch
+        or mode == ForwardMode.EXTEND
+        or global_mode == ForwardMode.EXTEND
+    )
 
 
 def _get_welm_prefill_ag_qkv_slices(
@@ -888,6 +909,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # Bound by the target runner after loading, never by a draft forward.
         self.welm_prefill_megamoe = None
         self.welm_megamoe_shared_kwargs = None
+        self._prefill_expert_weights = None
+        self._prefill_expert_dispatch = None
         self.alt_stream = alt_stream
         if self.tp_size > config.num_experts:
             raise ValueError(
@@ -1173,6 +1196,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 "WeLMv4 in-place expert/shared merge cannot publish separate "
                 "MLP components"
             )
+        prefill_weights = (
+            self._prefill_expert_weights
+            if self._prefill_expert_weights is not None
+            and _welm_static_prefill_round(forward_batch)
+            else None
+        )
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         shared_output = None
@@ -1363,7 +1392,20 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # Ascend's generic fused TopK dispatch ignores custom routing callbacks.
             # Route WeLM's expert-bias callback through MoeGatingTopK explicitly;
             # it uses the native TopK tie order rather than MMQ's tie_rank order.
-            if _is_npu and self.custom_routing_function is not None:
+            if prefill_weights is not None:
+                # Also covers direct model calls during graph capture. P uses
+                # a frozen mapping, so its physical counts cannot enter D EPLB.
+                with get_global_expert_distribution_recorder().disable_this_region():
+                    topk_output = self.topk.forward_npu(
+                        hidden_states,
+                        router_logits,
+                        num_token_non_padded=num_token_non_padded,
+                        invalid_row_mask=invalid_row_mask,
+                        expert_location_dispatch_info=self._prefill_expert_dispatch,
+                        expert_bias=self.expert_bias,
+                        scoring_func_override=self.router_score_func,
+                    )
+            elif _is_npu and self.custom_routing_function is not None:
                 if (
                     getattr(self.custom_routing_function, "func", None)
                     is expert_bias_routing
@@ -1455,7 +1497,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     hidden_states, gate_up=shared_gate_up
                 )
             experts_output = self.welm_prefill_megamoe.forward_layer(
-                self.experts,
+                prefill_weights if prefill_weights is not None else self.experts,
                 hidden_states,
                 topk_output,
                 megamoe_num_valid_rows,
@@ -1478,6 +1520,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             if (
                 not self.is_nextn
                 and self.experts.num_experts > self.expert_bias.shape[0]
+                and prefill_weights is None
             ):
                 # This private path replicates rows and sums partial outputs.
                 # Rank-local replica selection can count one expert repeatedly.
@@ -1496,9 +1539,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     "WeLMv4 local EP MoE requires a FULL replicated token "
                     "layout, but use_reduce_scatter is enabled."
                 )
-            experts_output = self.experts.forward_local_ep_partial(
-                hidden_states, topk_output
-            )
+            if prefill_weights is None:
+                experts_output = self.experts.forward_local_ep_partial(
+                    hidden_states, topk_output
+                )
+            else:
+                experts_output = self.experts.forward_local_ep_partial(
+                    hidden_states, topk_output, quant_info=prefill_weights
+                )
             # Only routed experts are partial across EP ranks. The shared
             # expert below is fully replicated under DeepEP and must be added
             # after this sum, otherwise it would be multiplied by EP size.
@@ -1506,6 +1554,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 resolved_moe_ep_group.all_reduce(experts_output)
                 if resolved_moe_ep_group is not None
                 else moe_expert_parallel_all_reduce(experts_output)
+            )
+        elif prefill_weights is not None:
+            experts_output = self.experts(
+                hidden_states, topk_output, quant_info=prefill_weights
             )
         else:
             experts_output = self.experts(hidden_states, topk_output)
@@ -5351,6 +5403,83 @@ class WeLMV4MoeForCausalLM(nn.Module):
     @property
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
+
+    @staticmethod
+    def use_static_prefill_experts(forward_batch: ForwardBatch) -> bool:
+        return _welm_static_prefill_round(forward_batch)
+
+    @torch.no_grad()
+    def prepare_decode_only_experts(self) -> None:
+        """Freeze the initial P bank before EPLB owns the live D storage."""
+        from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+        from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
+        from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+
+        mlps = [layer.mlp for layer in self.model.layers]
+        if self.quant_config is not None or any(
+            mlp.is_nextn
+            or getattr(mlp.custom_routing_function, "func", None)
+            is not expert_bias_routing
+            or not isinstance(mlp.experts.quant_method, UnquantizedFusedMoEMethod)
+            or not mlp.experts.quant_method.runner.runner_backend.is_ascend()
+            or any(
+                weight.dtype != torch.bfloat16 or weight.device.type != "npu"
+                for weight in (mlp.experts.w13_weight, mlp.experts.w2_weight)
+            )
+            for mlp in mlps
+        ):
+            raise ValueError(
+                "--enable-welm-decode-only-experts requires BF16 WeLM target "
+                "experts with expert-bias routing and the Ascend runner"
+            )
+        metadata = get_global_expert_location_metadata()
+        for layer_id, mlp in enumerate(mlps):
+            experts = mlp.experts
+            for name in ("w13_weight", "w2_weight"):
+                weight = getattr(experts, name)
+                # Preserve P's ND/NZ layout and own storage, even if clone's
+                # format differs. These buffers are not EPLB parameters.
+                frozen = torch_npu.npu_format_cast(
+                    weight.detach().clone(), torch_npu.get_npu_format(weight)
+                )
+                mlp.register_buffer(f"_prefill_{name}", frozen, persistent=False)
+                # Match standalone D postprocessing. MegaMoE's P-only ND
+                # requirement must not produce mixed layouts in D migration.
+                if not experts.welm_moe_use_nd:
+                    weight.data = npu_format_cast(weight.data)
+            mlp._prefill_expert_weights = AscendQuantInfo(
+                w13_weight=mlp._prefill_w13_weight,
+                w2_weight=mlp._prefill_w2_weight,
+            )
+
+            # The rank-local dispatch table can prefer a different replica on
+            # each rank. Derive a common primary from the full initial layout
+            # so FULL local-EP + AllReduce counts each logical expert once.
+            primary = [-1] * metadata.num_logical_experts
+            for slot, logical in enumerate(
+                metadata.physical_to_logical_map_cpu[layer_id].tolist()
+            ):
+                if primary[logical] == -1:
+                    primary[logical] = slot
+            if -1 in primary:
+                raise ValueError("WeLM prefill placement is missing a logical expert")
+            fixed_map = torch.tensor(
+                primary, dtype=torch.int32, device=experts.w13_weight.device
+            )
+            mlp.register_buffer("_prefill_expert_map", fixed_map, persistent=False)
+            mlp._prefill_expert_dispatch = ExpertLocationDispatchInfo(
+                ep_dispatch_algorithm="static",
+                partial_logical_to_rank_dispatch_physical_map=fixed_map,
+                partial_logical_to_all_physical_map=fixed_map[:, None],
+                partial_logical_to_all_physical_map_num_valid=torch.ones_like(fixed_map),
+                num_physical_experts=metadata.num_physical_experts,
+                rank_invariant=True,
+            )
+        if getattr(self, "_derived_weight_cache_error", None) is None:
+            self._derived_weight_cache_error = (
+                "Online weight updates are unsupported with "
+                "--enable-welm-decode-only-experts: prefill owns fixed copies."
+            )
 
     def bind_finalized_runner_plan(
         self, runner_plan: WelmRunnerParallelPlan

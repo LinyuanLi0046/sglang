@@ -686,8 +686,14 @@ def _make_planning_spec(
         physical_count_mode = "unique"
     # AllGather moves the same rows regardless of expert placement. A unified
     # recorder window can include both AllGather prefill and routed decode.
+    # A fixed P bank excludes those samples, retaining D's locality score.
     score_locality = True
-    if nodes > 1 and moe.moe_a2a_backend == "deepep" and not decode_worker:
+    if (
+        nodes > 1
+        and moe.moe_a2a_backend == "deepep"
+        and not decode_worker
+        and not server_args.enable_welm_decode_only_experts
+    ):
         from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
         from sglang.srt.layers.moe.utils import DeepEPMode
 

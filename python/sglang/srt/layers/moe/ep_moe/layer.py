@@ -45,6 +45,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.moe_runner.base import MoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher import (
         DeepEPLLDispatchOutput,
         DeepEPNormalDispatchOutput,
@@ -210,6 +211,8 @@ class DeepEPMoE(FusedMoE):
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
+        *,
+        quant_info: Optional[MoeQuantInfo] = None,
     ):
         # Keep the generic DeepEP eager protection. Only the explicitly
         # selected WeLM NPU BF16 NORMAL AllGather implementation opts in.
@@ -231,7 +234,13 @@ class DeepEPMoE(FusedMoE):
                             "WeLM graph NORMAL capability changed during capture; "
                             "refusing to move decoder communication into eager"
                         )
-                    return self.forward_impl(hidden_states, topk_output)
+                    return self.forward_impl(
+                        hidden_states, topk_output, quant_info=quant_info
+                    )
+            if quant_info is not None:
+                raise RuntimeError(
+                    "Fixed WeLM prefill weights require the WeLM NORMAL graph path"
+                )
             assert TopKOutputChecker.format_is_standard(
                 topk_output
             ), "Only standard topk output is supported for breakable cuda graph"
@@ -245,6 +254,10 @@ class DeepEPMoE(FusedMoE):
             )
             return output
         if is_in_tc_piecewise_cuda_graph():
+            if quant_info is not None:
+                raise RuntimeError(
+                    "Fixed WeLM prefill weights do not support piecewise CUDA graphs"
+                )
             assert TopKOutputChecker.format_is_standard(
                 topk_output
             ), "Only standard topk output is supported for piecewise cuda graph"
@@ -256,20 +269,24 @@ class DeepEPMoE(FusedMoE):
                 self.layer_id,
             )
         else:
-            return self.forward_impl(hidden_states, topk_output)
+            return self.forward_impl(hidden_states, topk_output, quant_info=quant_info)
 
     def forward_impl(
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
+        *,
+        quant_info: Optional[MoeQuantInfo] = None,
     ):
 
         if self.deprecate_flag:
             return super().forward_impl(
                 hidden_states,
                 topk_output,
+                quant_info=quant_info,
             )
 
+        assert quant_info is None, "Expert weight overrides require the Ascend runner"
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
@@ -289,11 +306,14 @@ class DeepEPMoE(FusedMoE):
     def run_moe_core(
         self,
         dispatch_output: DispatchOutput,
+        *,
+        quant_info: Optional[MoeQuantInfo] = None,
     ):
 
         if self.deprecate_flag:
-            return super().run_moe_core(dispatch_output)
+            return super().run_moe_core(dispatch_output, quant_info=quant_info)
 
+        assert quant_info is None, "Expert weight overrides require the Ascend runner"
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 
         if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):

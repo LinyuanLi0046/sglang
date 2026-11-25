@@ -632,6 +632,11 @@ class ModelRunner:
     def initialize(self):
         create_recorder = ExpertDistributionRecorder.init_new
         create_eplb_manager = EPLBManager
+        self._welm_decode_only_experts = (
+            self.server_args.enable_welm_decode_only_experts
+            and self.device == "npu"
+            and not self.is_draft_worker
+        )
         async_eplb = (
             self.device == "npu"
             and not self.is_draft_worker
@@ -686,6 +691,10 @@ class ModelRunner:
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
+        if self._welm_decode_only_experts:
+            # Own both banks before EPLB captures storage views and before KV
+            # sizing/graph capture. Draft runners never create a second bank.
+            self.model.prepare_decode_only_experts()
         if async_eplb:
             # Match the stream used by scheduler forwards. Reserve staging and
             # initialize HCCL before the later KV-cache capacity calculation.
@@ -1708,12 +1717,17 @@ class ModelRunner:
             else contextlib.nullcontext()
         )
 
+        static_prefill_experts = (
+            self._welm_decode_only_experts
+            and self.model.use_static_prefill_experts(forward_batch)
+        )
         with (
             canary_ctx,
             step_span_ctx,
             (
                 get_global_expert_distribution_recorder().disable_this_region()
-                if self.device == "npu" and self.is_draft_worker
+                if (self.device == "npu" and self.is_draft_worker)
+                or static_prefill_experts
                 else contextlib.nullcontext()
             ),
             get_global_expert_distribution_recorder().with_forward_pass(
@@ -1757,7 +1771,11 @@ class ModelRunner:
                 no_copy_to_cpu=no_copy_to_cpu,
             )
 
-        if self.eplb_manager is not None:
+        if self.eplb_manager is not None and (
+            not static_prefill_experts or self.server_args.eplb_async_rebalance
+        ):
+            # Async migration must keep draining across prefill boundaries.
+            # Its existing recorder-window vote admits only decode samples.
             self.eplb_manager.on_forward_pass_end()
 
         if dumper.may_enable:

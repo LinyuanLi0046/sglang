@@ -11,7 +11,7 @@ from threading import Event
 
 _PATH = (
     Path(__file__).resolve().parents[4]
-    / "python/sglang/srt/hardware_backend/npu/eplb_coordinator.py"
+    / "python/sglang/srt/hardware_backend/npu/eplb/coordinator.py"
 )
 _SPEC = importlib.util.spec_from_file_location("npu_eplb_coordinator", _PATH)
 protocol = importlib.util.module_from_spec(_SPEC)

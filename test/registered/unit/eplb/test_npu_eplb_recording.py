@@ -60,7 +60,7 @@ class TestNpuEplbRecording(unittest.TestCase):
         self.assertFalse(recorder._disable_all)
 
     def test_async_counts_keep_old_mapping_across_ring_wrap(self):
-        from sglang.srt.hardware_backend.npu.eplb_manager import _AsyncStatAccumulator
+        from sglang.srt.hardware_backend.npu.eplb.manager import _AsyncStatAccumulator
 
         accumulator = object.__new__(_AsyncStatAccumulator)
         accumulator._expert_location_metadata = SimpleNamespace(
@@ -123,7 +123,7 @@ class TestNpuEplbRecording(unittest.TestCase):
                     self.assertIs(result, expected.return_value)
 
     def test_async_snapshot_checks_threshold_before_reductions(self):
-        from sglang.srt.hardware_backend.npu.eplb_manager import AsyncEplbRecorder
+        from sglang.srt.hardware_backend.npu.eplb.manager import AsyncEplbRecorder
 
         recorder = object.__new__(AsyncEplbRecorder)
         recorder._accumulator = Mock()
@@ -144,7 +144,7 @@ class TestNpuEplbRecording(unittest.TestCase):
         recorder._reset.assert_called_once_with()
 
     def test_async_snapshot_owns_counts_and_preserves_source_group(self):
-        from sglang.srt.hardware_backend.npu import eplb_manager
+        from sglang.srt.hardware_backend.npu.eplb import manager as eplb_manager
 
         accumulator = object.__new__(eplb_manager._AsyncStatAccumulator)
         accumulator._previous_layouts = {}
@@ -175,7 +175,7 @@ class TestNpuEplbRecording(unittest.TestCase):
         )
 
     def test_routing_only_update_does_not_pack_or_transfer_weights(self):
-        from sglang.srt.hardware_backend.npu import eplb_async
+        from sglang.srt.hardware_backend.npu.eplb import runtime as eplb_async
 
         runtime = object.__new__(eplb_async.NpuEplbRuntime)
         physical = torch.tensor([[0, 1, 0, 1]])

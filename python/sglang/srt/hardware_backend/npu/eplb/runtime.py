@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import time
 from collections import defaultdict
 from concurrent.futures import Future
@@ -22,23 +23,19 @@ from sglang.srt.eplb.expert_location import (
     get_eplb_group,
 )
 from sglang.srt.eplb.expert_location_updater import update_expert_weights_single_layer
-from sglang.srt.hardware_backend.npu.distributed import (
-    eplb_hccl_options,
-    eplb_reuses_world_group,
-)
-from sglang.srt.hardware_backend.npu.eplb import (
-    _ExpertWeightAdapter,
-    _validate_migration_topology,
-    prewarm_eplb_communication,
-)
-from sglang.srt.hardware_backend.npu.eplb_coordinator import (
+from sglang.srt.hardware_backend.npu.eplb.coordinator import (
     AsyncEplbCoordinator,
     WeightWriteback,
 )
-from sglang.srt.hardware_backend.npu.eplb_placement import (
+from sglang.srt.hardware_backend.npu.eplb.placement import (
     MigrationPlacement,
     PlanningSpec,
     plan_migration,
+)
+from sglang.srt.hardware_backend.npu.eplb.weights import (
+    _ExpertWeightAdapter,
+    _validate_migration_topology,
+    prewarm_eplb_communication,
 )
 from sglang.srt.utils import get_bool_env_var
 
@@ -364,7 +361,6 @@ class NpuEplbRuntime:
         world_size: int,
         ranks_per_node: int,
         plan_group: dist.ProcessGroup,
-        world_group: dist.ProcessGroup,
         *,
         order_submissions: bool = False,
         use_prefill_admission: bool = False,
@@ -379,8 +375,8 @@ class NpuEplbRuntime:
         self.world_size = world_size
         self.ranks_per_node = ranks_per_node
         self.plan_group = plan_group
-        self._world_group = world_group
-        self.p2p_group = world_group
+        # Assigned after all ranks validate the startup configuration.
+        self.p2p_group: dist.ProcessGroup
         self.log_metrics = get_bool_env_var(
             "SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS"
         )
@@ -411,6 +407,13 @@ class NpuEplbRuntime:
         live = metadata.logical_to_all_physical_map_cpu
         occupied = (live != -1).any(dim=(0, 1)).nonzero()
         self._replica_width = int(occupied[-1, 0]) + 1 if occupied.numel() else 0
+        # An initial mapping may expose only nearby replicas on this rank.
+        # Startup takes the union across ranks; install clears one layer at a time.
+        self.narrowed_replica_layers: set[int] = set()
+        if spec.physical_count_mode == "random":
+            visible_slots = (self._replica_map >= 0).sum(dim=(1, 2))
+            narrowed = (visible_slots < spec.physical_experts).nonzero().flatten()
+            self.narrowed_replica_layers.update(narrowed.tolist())
         self.device = self.staging[0].device
         self.device_module = torch.get_device_module(self.device)
         self._p2p_stream = self.device_module.Stream(device=self.device)
@@ -421,6 +424,12 @@ class NpuEplbRuntime:
         self._routing_plan: _RoutingPlan | None = None
         self.stage_seconds = self.install_enqueue_seconds = 0.0
         self.interleaved_layers = 0
+
+    @property
+    def _replica_map(self) -> torch.Tensor:
+        return self.metadata.logical_to_all_physical_map_cpu[
+            :, :, : self._replica_width
+        ]
 
     def planner(self, counts, sources=None):
         self.stage_seconds = self.install_enqueue_seconds = 0.0
@@ -457,11 +466,9 @@ class NpuEplbRuntime:
                             self.ranks_per_node,
                             self.layer_ids,
                             source_totals=host_sources,
-                            narrowed_layers=self._narrowed_layers,
+                            narrowed_layers=self.narrowed_replica_layers,
                             current_replicas=(
-                                self.metadata.logical_to_all_physical_map_cpu[
-                                    :, :, : self._replica_width
-                                ]
+                                self._replica_map
                                 if self.spec.physical_count_mode is not None
                                 else None
                             ),
@@ -643,7 +650,7 @@ class NpuEplbRuntime:
         _install_routing_layer(
             self.metadata, routing.host_rows[layer], layer, routing.device_rows
         )
-        self._narrowed_layers.discard(layer)
+        self.narrowed_replica_layers.discard(layer)
         if layer == routing.last_layer:
             self._routing_plan = None
         self.install_enqueue_seconds += time.perf_counter() - start
@@ -655,22 +662,18 @@ class NpuEplbRuntime:
         self._routing_plan = None
 
     def close(self):
-        if self.p2p_group is not self._world_group:
-            dist.destroy_process_group(self.p2p_group)
+        dist.destroy_process_group(self.p2p_group)
 
 
-def create_npu_async_eplb(server_args, model_config, weights, metadata):
+def _make_planning_spec(
+    server_args, model_config, metadata, moe, nodes, *, decode_worker
+):
+    """Choose the recorder counts and placement policy for this dispatcher."""
     from sglang.srt.eplb.eplb_algorithms import compute_algorithm
-    from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel
 
-    parallel = get_parallel()
-    world_size = dist.get_world_size()
-    _validate_migration_topology(world_size)
     common = ExpertLocationMetadata._init_common(server_args, model_config)
     groups = common["model_config_for_expert_location"].num_groups
-    moe = get_exec().moe
-    algorithm = compute_algorithm(moe.eplb_algorithm, groups, parallel.nnodes)
-    decode_worker = get_disagg().disaggregation_mode == "decode"
+    algorithm = compute_algorithm(moe.eplb_algorithm, groups, nodes)
     if algorithm.name.startswith("elasticity"):
         raise ValueError("Async EPLB requires a non-elastic CPU placement algorithm")
     physical_count_mode = None
@@ -679,16 +682,12 @@ def create_npu_async_eplb(server_args, model_config, weights, metadata):
             physical_count_mode = "static"
         else:
             physical_count_mode = "row" if moe.moe_a2a_backend == "none" else "random"
-    elif parallel.nnodes > 1 and moe.moe_a2a_backend != "none":
+    elif nodes > 1 and moe.moe_a2a_backend != "none":
         physical_count_mode = "unique"
     # AllGather moves the same rows regardless of expert placement. A unified
     # recorder window can include both AllGather prefill and routed decode.
     score_locality = True
-    if (
-        parallel.nnodes > 1
-        and moe.moe_a2a_backend == "deepep"
-        and not decode_worker
-    ):
+    if nodes > 1 and moe.moe_a2a_backend == "deepep" and not decode_worker:
         from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
         from sglang.srt.layers.moe.utils import DeepEPMode
 
@@ -697,14 +696,33 @@ def create_npu_async_eplb(server_args, model_config, weights, metadata):
             DeepEPBuffer._requested_normal_strategy(DeepEPMode(moe.deepep_mode))
             != "allgather"
         )
-    spec = PlanningSpec(
-        metadata.num_physical_experts,
-        metadata.num_local_physical_experts,
-        groups,
-        parallel.nnodes,
-        algorithm,
+    return PlanningSpec(
+        physical_experts=metadata.num_physical_experts,
+        local_experts=metadata.num_local_physical_experts,
+        groups=groups,
+        nodes=nodes,
+        algorithm=algorithm,
         physical_count_mode=physical_count_mode,
         score_locality=score_locality,
+    )
+
+
+def create_npu_async_eplb(server_args, model_config, weights, metadata):
+    from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel
+
+    parallel = get_parallel()
+    world_size = dist.get_world_size()
+    _validate_migration_topology(world_size)
+    moe = get_exec().moe
+    serving_mode = get_disagg().disaggregation_mode
+    decode_worker = serving_mode == "decode"
+    spec = _make_planning_spec(
+        server_args,
+        model_config,
+        metadata,
+        moe,
+        parallel.nnodes,
+        decode_worker=decode_worker,
     )
     # Fixed PP=1 TP=EP=WORLD: group construction order is identical on all ranks.
     timeout = timedelta(seconds=90)
@@ -713,9 +731,13 @@ def create_npu_async_eplb(server_args, model_config, weights, metadata):
     error = None
     setup = None
     try:
-        p2p_options = eplb_hccl_options()
-        p2p_buffer_mib = p2p_options.hccl_config["hccl_buffer_size"]
-        borrow_world_group = eplb_reuses_world_group()
+        import torch_npu
+
+        p2p_buffer_mib = int(os.environ.get("HCCL_BUFFSIZE") or 64)
+        if p2p_buffer_mib < 1:
+            raise ValueError("HCCL_BUFFSIZE must be positive")
+        p2p_options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+        p2p_options.hccl_config = {"hccl_buffer_size": p2p_buffer_mib}
         runtime = NpuEplbRuntime(
             weights,
             metadata,
@@ -724,7 +746,6 @@ def create_npu_async_eplb(server_args, model_config, weights, metadata):
             world_size,
             world_size // parallel.nnodes,
             plan_group,
-            parallel.world_group.device_group,
             order_submissions=decode_worker,
             # The local scheduler has no unified-prefill admission hook.
             use_prefill_admission=False,
@@ -737,8 +758,7 @@ def create_npu_async_eplb(server_args, model_config, weights, metadata):
         signature = (
             runtime.layer_ids,
             runtime.weight_format_digest,
-            borrow_world_group,
-            decode_worker,
+            serving_mode,
             runtime.use_prefill_admission,
             runtime._p2p_batch_size,
             p2p_buffer_mib,
@@ -752,21 +772,7 @@ def create_npu_async_eplb(server_args, model_config, weights, metadata):
             moe.ep_dispatch_algorithm,
             hashlib.sha256(initial_layout.numpy().tobytes()).digest(),
         )
-        # init_by_mapping can narrow only a non-root rank's replica choices.
-        # Include those layers in the existing startup exchange. Once a layer
-        # is installed all ranks use the solver's complete replica table.
-        narrowed = []
-        if spec.physical_count_mode == "random":
-            replicas = metadata.logical_to_all_physical_map_cpu[
-                :, :, : runtime._replica_width
-            ]
-            narrowed = (
-                ((replicas >= 0).sum(dim=(1, 2)) < spec.physical_experts)
-                .nonzero()
-                .flatten()
-                .tolist()
-            )
-        setup = (signature, narrowed)
+        setup = (signature, sorted(runtime.narrowed_replica_layers))
     except Exception as exc:
         error = exc
     peers = [None] * world_size
@@ -778,12 +784,13 @@ def create_npu_async_eplb(server_args, model_config, weights, metadata):
             "Async EPLB ranks disagree on transport, placement, expert weight format, "
             "batching, scheduling or recorder configuration"
         )
-    runtime._narrowed_layers = {layer for _, layers in peers for layer in layers}
-    # All ranks must agree before any enters a conditional HCCL group creation.
-    if not borrow_world_group:
-        runtime.p2p_group = dist.new_group(
-            backend="hccl", timeout=timeout, pg_options=p2p_options
-        )
+    for _, narrowed_layers in peers:
+        runtime.narrowed_replica_layers.update(narrowed_layers)
+    # Background P2P and foreground TP collectives can be submitted in different
+    # orders across ranks. Give migrations their own communicator for all layers.
+    runtime.p2p_group = dist.new_group(
+        backend="hccl", timeout=timeout, pg_options=p2p_options
+    )
     # The recorder reduces int32 counts on TP. Initialize its HCCL collective
     # before KV sizing and before prewarm_eplb_communication releases the cache.
     dist.all_reduce(
@@ -797,11 +804,10 @@ def create_npu_async_eplb(server_args, model_config, weights, metadata):
         weight_staging_bytes += packed_fields.send.nbytes
     logger.info(
         "Async NPU EPLB ready: weight_staging_bytes=%d routing_staging_bytes=%d "
-        "hccl_buffer_mib=%d reuse_world_group=%s layers_per_chunk=1 packed_fields=%d",
+        "hccl_buffer_mib=%d layers_per_chunk=1 packed_fields=%d",
         weight_staging_bytes,
         sum(row.nbytes for row in runtime._routing_buffers.values()),
         p2p_buffer_mib,
-        borrow_world_group,
         len(packed_fields.small) if packed_fields is not None else 0,
     )
     return AsyncEplbCoordinator(EplbControl(control_group), runtime)

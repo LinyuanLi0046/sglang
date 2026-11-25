@@ -15,12 +15,12 @@ from sglang.srt.eplb.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-from sglang.srt.hardware_backend.npu.eplb_async import create_npu_async_eplb
-from sglang.srt.hardware_backend.npu.eplb_coordinator import (
+from sglang.srt.hardware_backend.npu.eplb.coordinator import (
     ControlPoint,
     Phase,
     RebalanceAborted,
 )
+from sglang.srt.hardware_backend.npu.eplb.runtime import create_npu_async_eplb
 from sglang.srt.runtime_context import get_exec
 
 logger = logging.getLogger(__name__)

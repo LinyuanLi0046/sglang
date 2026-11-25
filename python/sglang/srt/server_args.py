@@ -7124,7 +7124,9 @@ class ServerArgs:
 
     def _handle_eplb_and_dispatch(self):
         if self.eplb_async_rebalance:
-            from sglang.srt.hardware_backend.npu.eplb import validate_async_eplb_args
+            from sglang.srt.hardware_backend.npu.eplb.config import (
+                validate_async_eplb_args,
+            )
 
             validate_async_eplb_args(self._resolved())
         if self.enable_eplb and self._resolved().device == "npu":

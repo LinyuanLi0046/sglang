@@ -25,8 +25,6 @@ from typing import TYPE_CHECKING, Callable, NamedTuple
 import torch
 import torch.distributed as dist
 
-from sglang.srt.eplb.expert_location import get_eplb_group
-
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
 
@@ -70,6 +68,8 @@ def migrate_expert_weights(
     )
     if not changed_layer_ids:
         return {}
+
+    from sglang.srt.eplb.expert_location import get_eplb_group
 
     group = get_eplb_group()
     world_size = dist.get_world_size(group)
@@ -426,48 +426,12 @@ class _ExpertWeightAdapter:
         ]
 
 
-def validate_async_eplb_args(cfg) -> None:
-    if cfg.device != "npu" or not cfg.enable_eplb:
-        raise ValueError("--eplb-async-rebalance requires --enable-eplb and --device npu")
-    if cfg.ep_dispatch_algorithm not in (None, "static", "dynamic"):
-        raise ValueError("Async NPU EPLB supports static or dynamic dispatch")
-    if cfg.expert_distribution_recorder_mode not in (None, "stat", "stat_approx"):
-        raise ValueError("Async NPU EPLB requires stat or stat_approx recording")
-    if cfg.weight_cache_mode != "off":
-        raise ValueError("Async NPU EPLB requires --weight-cache-mode off")
-    if cfg.remote_instance_weight_loader_start_seed_via_transfer_engine:
-        raise ValueError("Async NPU EPLB cannot serve as a transfer-engine weight seed")
-    if (
-        cfg.pp_size != 1
-        or cfg.elastic_ep_backend is not None
-        or cfg.enable_memory_saver
-        or cfg.cpu_offload_gb
-        or cfg.offload_group_size > 0
-        or cfg.enable_two_batch_overlap
-        or cfg.enable_single_batch_overlap
-    ):
-        raise ValueError(
-            "Async NPU EPLB requires fixed PP=1 resident weights and single-batch execution"
-        )
-    if cfg.eplb_rebalance_layers_per_chunk not in (None, 1):
-        raise ValueError("Async NPU EPLB stages one layer per forward boundary")
-    window = cfg.expert_distribution_recorder_buffer_size
-    interval = cfg.eplb_rebalance_num_iterations
-    if interval <= 0 or (window is not None and not 0 < window <= interval):
-        raise ValueError(
-            "Async NPU EPLB requires a positive recorder window no longer than "
-            "--eplb-rebalance-num-iterations"
-        )
-    if cfg.eplb_algorithm.startswith("elasticity"):
-        raise ValueError("Async NPU EPLB does not support elastic placement")
-
-
 def prewarm_eplb_communication(group: dist.ProcessGroup | None = None) -> None:
     """Warm the migration communicator before KV sizing."""
     if group is None:
         from sglang.srt.runtime_context import get_exec, get_parallel
 
-        # Async resources are initialized after final model weights exist.
+        # The async runtime warms its dedicated group after weight loading.
         if get_exec().moe.eplb_async_rebalance:
             return
         group = get_parallel().tp_group.device_group

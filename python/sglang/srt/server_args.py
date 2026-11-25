@@ -2331,13 +2331,6 @@ class ServerArgs:
         "Overlap NPU EPLB expert transfers with forward (experimental).",
         NS("exec.moe"),
     ] = False
-    enable_welm_decode_only_experts: A[
-        bool,
-        "Keep fixed prefill expert weights and routing for BF16 WeLM on NPU. "
-        "EPLB updates only decode weights and records only decode/verify rounds. "
-        "Requires unified DeepEP deployment without mixed chunk.",
-        NS("exec.moe"),
-    ] = False
     eplb_algorithm: A[str, "Chosen EPLB algorithm", NS("exec.moe")] = "auto"
     eplb_rebalance_num_iterations: A[
         int,
@@ -7130,68 +7123,6 @@ class ServerArgs:
         return required
 
     def _handle_eplb_and_dispatch(self):
-        if self.enable_welm_decode_only_experts:
-            cfg = self._resolved()
-            if self.enable_mixed_chunk:
-                raise ValueError(
-                    "--enable-welm-decode-only-experts does not support "
-                    "--enable-mixed-chunk"
-                )
-            if (
-                cfg.device != "npu"
-                or not self.enable_eplb
-                or cfg.disaggregation_mode != "null"
-                or cfg.moe_a2a_backend != "deepep"
-                or cfg.tp_size != cfg.ep_size
-                or cfg.ep_size <= 1
-            ):
-                raise ValueError(
-                    "--enable-welm-decode-only-experts requires NPU EPLB, "
-                    "unified deployment and DeepEP with TP=EP>1"
-                )
-            if (
-                self.pp_size != 1
-                or self.attn_cp_size != 1
-                or self.dcp_size != 1
-                or self.moe_dp_size != 1
-                or self.elastic_ep_backend is not None
-                or self.enable_two_batch_overlap
-                or self.enable_single_batch_overlap
-                or self.enable_memory_saver
-                or self.cpu_offload_gb
-                or self.offload_group_size > 0
-                or self.enable_lora
-                or self.remote_instance_weight_loader_start_seed_via_transfer_engine
-            ):
-                raise ValueError(
-                    "--enable-welm-decode-only-experts requires fixed resident "
-                    "weights, PP=CP=DCP=1, and no DWDP, LoRA, batch overlap "
-                    "or transfer-engine weight seed"
-                )
-            if (
-                self.ep_dispatch_algorithm not in (None, "static", "dynamic")
-                or (
-                    self.expert_distribution_recorder_mode not in (None, "stat")
-                    and not (
-                        self.eplb_async_rebalance
-                        and self.expert_distribution_recorder_mode == "stat_approx"
-                    )
-                )
-                or not envs.SGLANG_WELMV4_DECODE_RS_AG.get()
-                or self.deepep_mode not in ("auto", "low_latency")
-            ):
-                raise ValueError(
-                    "--enable-welm-decode-only-experts requires static/dynamic "
-                    "dispatch, stat (or async stat_approx) recording and "
-                    "WeLM decode RS/AG with DeepEP LL"
-                )
-            if "WeLMV4MoeForCausalLM" not in (
-                self.get_model_config().hf_config.architectures or []
-            ):
-                raise ValueError(
-                    "--enable-welm-decode-only-experts supports only "
-                    "WeLMV4MoeForCausalLM"
-                )
         if self.eplb_async_rebalance:
             from sglang.srt.hardware_backend.npu.eplb.config import (
                 validate_async_eplb_args,

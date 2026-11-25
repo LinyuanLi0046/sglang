@@ -33,7 +33,6 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
     KTEPWrapperMethod,
     create_kt_config_from_server_args,
 )
-from sglang.srt.layers.moe.moe_runner.base import MoeQuantInfo
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
     AscendLocalEPDispatcher,
@@ -1416,8 +1415,6 @@ class FusedMoE(torch.nn.Module):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
         pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        *,
-        quant_info: Optional[MoeQuantInfo] = None,
     ):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
@@ -1442,10 +1439,8 @@ class FusedMoE(torch.nn.Module):
                 hidden_states_pre_quant=pre_quant_input
             )
 
-        combine_input = (
-            self.run_moe_core(dispatch_output=dispatch_output)
-            if quant_info is None
-            else self.run_moe_core(dispatch_output=dispatch_output, quant_info=quant_info)
+        combine_input = self.run_moe_core(
+            dispatch_output=dispatch_output,
         )
 
         if self._dwdp_bound:
@@ -1484,11 +1479,7 @@ class FusedMoE(torch.nn.Module):
         return self.dispatcher.combine(combine_input=combine_input)
 
     def forward_local_ep_partial(
-        self,
-        hidden_states: torch.Tensor,
-        topk_output: TopKOutput,
-        *,
-        quant_info: Optional[MoeQuantInfo] = None,
+        self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> torch.Tensor:
         """Run locally owned experts for an already-replicated token layout.
 
@@ -1513,11 +1504,7 @@ class FusedMoE(torch.nn.Module):
             hidden_states=hidden_states,
             topk_output=topk_output,
         )
-        combine_input = (
-            self.run_moe_core(dispatch_output=dispatch_output)
-            if quant_info is None
-            else self.run_moe_core(dispatch_output=dispatch_output, quant_info=quant_info)
-        )
+        combine_input = self.run_moe_core(dispatch_output=dispatch_output)
 
         if self._dwdp_bound:
             dwdp_mgr.record_compute_and_prefetch_next(self.layer_id)
@@ -1527,17 +1514,7 @@ class FusedMoE(torch.nn.Module):
         )
         return final_hidden_states[..., :origin_hidden_states_dim].contiguous()
 
-    def run_moe_core(
-        self,
-        dispatch_output: DispatchOutput,
-        *,
-        quant_info: Optional[MoeQuantInfo] = None,
-    ) -> CombineInput:
-        if quant_info is not None:
-            # WeLM's fixed BF16 prefill bank uses the same Ascend runner,
-            # dispatch and combine; only the GMM weight references differ.
-            assert _is_npu
-            return self.quant_method.runner.run(dispatch_output, quant_info)
+    def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
         # TODO: consider using symmetric memory
         return self.quant_method.apply(
             layer=self,

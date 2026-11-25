@@ -641,9 +641,10 @@ def compute_logical_to_rank_dispatch_physical_map(
     logical_to_all_physical_map: torch.Tensor,
     ep_size: int,
     num_physical_experts: int,
-    ep_rank: int,
+    ep_rank: int | None,
     seed: int = 42,
 ):
+    """Return one rank's picks, or [layer, expert, rank] when ep_rank is None."""
     from sglang.srt.runtime_context import get_parallel
 
     r = random.Random(seed)
@@ -698,6 +699,10 @@ def compute_logical_to_rank_dispatch_physical_map(
     logical_to_rank_dispatch_physical_map = torch.tensor(result_list, dtype=dtype)
     assert torch.all(logical_to_rank_dispatch_physical_map != -1)
 
+    if ep_rank is None:
+        return (
+            logical_to_rank_dispatch_physical_map.permute(1, 2, 0).contiguous().to(device)
+        )
     return logical_to_rank_dispatch_physical_map[ep_rank, :, :].to(device)
 
 

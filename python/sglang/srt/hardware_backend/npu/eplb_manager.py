@@ -3,6 +3,8 @@
 import logging
 import time
 
+import torch
+import torch.distributed as dist
 from torch.profiler import record_function
 
 from sglang.srt.eplb.eplb_manager import EPLBManager
@@ -46,6 +48,29 @@ class _AsyncStatAccumulator(_StatAccumulator):
         super().reset()
         self.window_samples = 0
         self._previous_layouts.clear()
+
+    def snapshot_counts(self, spec):
+        # A completed migration resets the window before the next epoch.
+        assert not self._previous_layouts
+        buffered = self._global_physical_count_of_buffered_step.get_all()
+        counts = (
+            buffered.clone()
+            if spec.physical_count_mode
+            else self._logical_counts(buffered)
+        )
+        sources = None
+        source_groups = spec.source_groups
+        if source_groups:
+            group = self._communication_group
+            ranks_per_group = dist.get_world_size(group) // source_groups
+            source = dist.get_rank(group) // ranks_per_group
+            sources = counts.new_zeros(
+                (source_groups, *counts.shape[1:]), dtype=torch.int64
+            )
+            torch.sum(counts, dim=0, out=sources[source])
+            dist.reduce(sources, dst=0, group=group)
+        dist.all_reduce(counts, group=self._communication_group)
+        return counts, sources
 
     def _logical_counts(self, physical_counts):
         logical = super()._logical_counts(physical_counts)
@@ -93,9 +118,17 @@ class AsyncEplbRecorder(_ExpertDistributionRecorderReal):
         # NPU startup already warmed TP and emptied the allocator cache.
         self._accumulator._first_dump = False
 
-    def snapshot_for_rebalance(self):
+    def snapshot_for_rebalance(self, spec, rebalance_needed):
         with record_function("npu_eplb.snapshot"):
-            return self.dump_record(output_mode="object")
+            utilization = self._accumulator._get_global_average_utilization_rate()
+            # Every rank gets the same decision before entering the count reductions.
+            snapshot = (
+                self._accumulator.snapshot_counts(spec)
+                if rebalance_needed(utilization)
+                else None
+            )
+            self._reset()
+            return snapshot
 
 
 class NpuAsyncEPLBManager(EPLBManager):
@@ -165,14 +198,14 @@ class NpuAsyncEPLBManager(EPLBManager):
         if not ready:
             return
         start = time.perf_counter()
-        snapshot = recorder.snapshot_for_rebalance()
+        snapshot = recorder.snapshot_for_rebalance(
+            coordinator.runtime.spec, self._check_rebalance_needed
+        )
         snapshot_seconds = time.perf_counter() - start
-        if not self._check_rebalance_needed(
-            snapshot["average_utilization_rate_over_window"]
-        ):
+        if snapshot is None:
             return
         coordinator.control.wait_seconds = 0.0
-        coordinator.start(coordinator.runtime.planner(snapshot["logical_count"]))
+        coordinator.start(coordinator.runtime.planner(*snapshot))
         del snapshot
         try:
             while True:

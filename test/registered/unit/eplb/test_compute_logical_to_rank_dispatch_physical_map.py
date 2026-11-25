@@ -103,6 +103,20 @@ class TestComputeLogicalToRankDispatchPhysicalMap(CustomTestCase):
         result = self._call(ep_rank=0)
         self.assertEqual(result.shape, (self.NUM_LAYERS, self.NUM_LOGICAL))
 
+    def test_full_table_matches_existing_rank_picks(self):
+        for seed in (7, 42):
+            with self.subTest(seed=seed):
+                full = self._call(ep_rank=None, seed=seed)
+                expected = torch.stack(
+                    [self._call(ep_rank=r, seed=seed) for r in range(self.EP_SIZE)],
+                    dim=-1,
+                )
+                self.assertEqual(
+                    full.shape, (self.NUM_LAYERS, self.NUM_LOGICAL, self.EP_SIZE)
+                )
+                self.assertTrue(full.is_contiguous())
+                torch.testing.assert_close(full, expected)
+
     def test_all_values_are_valid_physical_expert_ids(self):
         """Every entry is a valid physical expert ID in [0, num_physical_experts)."""
         for ep_rank in range(self.EP_SIZE):

@@ -353,6 +353,16 @@ class _SinglePassGatherer(ABC):
             return _DeepepLowLatencySinglePassGatherer(expert_location_metadata, rank)
 
         if server_args.expert_distribution_recorder_mode == "stat_approx":
+            # Async Ascend scores source locality, so count before dispatch.
+            # Receive-side counts no longer identify the source rank or node.
+            if server_args.device == "npu" and (
+                server_args.moe_a2a_backend == "ascend_fuseep"
+                or (
+                    server_args.moe_a2a_backend == "deepep"
+                    and server_args.eplb_async_rebalance
+                )
+            ):
+                return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
             if server_args.moe_a2a_backend != "none" and (
                 server_args.deepep_mode == "normal"
             ):

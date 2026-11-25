@@ -97,6 +97,98 @@ class TestNpuEplbRecording(unittest.TestCase):
                 result = distribution._SinglePassGatherer.init_new(args, Mock(), 0)
                 self.assertIs(result, (topk if device == "npu" else receive).return_value)
 
+    def test_async_approximate_counts_preserve_sources(self):
+        with (
+            patch.object(distribution, "_SelectExpertsSinglePassGatherer") as topk,
+            patch.object(distribution, "_DeepepNormalSinglePassGatherer") as receive,
+        ):
+            for device, backend, mode, asynchronous, expect_topk in (
+                ("npu", "deepep", "normal", True, True),
+                ("npu", "deepep", "low_latency", True, True),
+                ("npu", "deepep", "auto", True, True),
+                ("npu", "ascend_fuseep", "auto", False, True),
+                ("npu", "deepep", "normal", False, False),
+                ("cuda", "deepep", "normal", False, False),
+            ):
+                with self.subTest(device=device, backend=backend, mode=mode):
+                    args = SimpleNamespace(
+                        device=device,
+                        expert_distribution_recorder_mode="stat_approx",
+                        moe_a2a_backend=backend,
+                        deepep_mode=mode,
+                        eplb_async_rebalance=asynchronous,
+                    )
+                    result = distribution._SinglePassGatherer.init_new(args, Mock(), 0)
+                    expected = topk if expect_topk else receive
+                    self.assertIs(result, expected.return_value)
+
+    def test_async_snapshot_checks_threshold_before_reductions(self):
+        from sglang.srt.hardware_backend.npu.eplb_manager import AsyncEplbRecorder
+
+        recorder = object.__new__(AsyncEplbRecorder)
+        recorder._accumulator = Mock()
+        recorder._reset = Mock()
+        recorder._accumulator._get_global_average_utilization_rate.return_value = 0.96
+        spec = SimpleNamespace()
+        decision = Mock(return_value=False)
+        self.assertIsNone(recorder.snapshot_for_rebalance(spec, decision))
+        decision.assert_called_once_with(0.96)
+        recorder._accumulator.snapshot_counts.assert_not_called()
+        recorder._reset.assert_called_once_with()
+
+        recorder._reset.reset_mock()
+        decision.return_value = True
+        snapshot = recorder.snapshot_for_rebalance(spec, decision)
+        self.assertIs(snapshot, recorder._accumulator.snapshot_counts.return_value)
+        recorder._accumulator.snapshot_counts.assert_called_once_with(spec)
+        recorder._reset.assert_called_once_with()
+
+    def test_async_snapshot_owns_counts_and_preserves_source_group(self):
+        from sglang.srt.hardware_backend.npu import eplb_manager
+
+        accumulator = object.__new__(eplb_manager._AsyncStatAccumulator)
+        accumulator._previous_layouts = {}
+        accumulator._communication_group = object()
+        buffered = torch.tensor([[[1, 2]], [[3, 4]]], dtype=torch.int32)
+        accumulator._global_physical_count_of_buffered_step = Mock()
+        accumulator._global_physical_count_of_buffered_step.get_all.return_value = buffered
+        spec = SimpleNamespace(physical_count_mode="static", source_groups=2)
+        with (
+            patch.object(eplb_manager.dist, "get_world_size", return_value=4),
+            patch.object(eplb_manager.dist, "get_rank", return_value=2),
+            patch.object(eplb_manager.dist, "reduce") as reduce_sources,
+            patch.object(eplb_manager.dist, "all_reduce") as reduce_counts,
+        ):
+            counts, sources = accumulator.snapshot_counts(spec)
+            reduce_sources.assert_called_once_with(
+                sources, dst=0, group=accumulator._communication_group
+            )
+            reduce_counts.assert_called_once_with(
+                counts, group=accumulator._communication_group
+            )
+        buffered.zero_()
+        torch.testing.assert_close(
+            counts, torch.tensor([[[1, 2]], [[3, 4]]], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            sources, torch.tensor([[[0, 0]], [[4, 6]]], dtype=torch.int64)
+        )
+
+    def test_routing_only_update_does_not_pack_or_transfer_weights(self):
+        from sglang.srt.hardware_backend.npu import eplb_async
+
+        runtime = object.__new__(eplb_async.NpuEplbRuntime)
+        physical = torch.tensor([[0, 1, 0, 1]])
+        runtime.metadata = SimpleNamespace(physical_to_logical_map_cpu=physical)
+        routing = SimpleNamespace(
+            host_rows={0: {"physical_to_logical_map": physical[0].clone()}}
+        )
+        # No weight views or staging buffers are needed on this path.
+        with patch.object(eplb_async, "update_expert_weights_single_layer") as update:
+            writeback = runtime._stage_weights(0, routing, [])
+            writeback()
+            update.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

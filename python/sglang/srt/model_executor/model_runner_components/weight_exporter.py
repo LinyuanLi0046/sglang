@@ -32,6 +32,8 @@ class WeightExporter:
         group_name,
         backend="nccl",
     ):
+        if reason := getattr(self.get_model(), "_weight_export_error", None):
+            return False, reason
         assert (
             torch.distributed.is_initialized()
         ), "Default torch process group must be initialized"
@@ -78,6 +80,8 @@ class WeightExporter:
         ports,
         group_name,
     ):
+        if reason := getattr(self.get_model(), "_weight_export_error", None):
+            return False, reason
         assert (
             torch.distributed.is_initialized()
         ), "Default torch process group must be initialized"
@@ -121,6 +125,8 @@ class WeightExporter:
         return success, message
 
     def save_remote_model(self: WeightExporter, url: str):
+        if reason := getattr(self.get_model(), "_weight_export_error", None):
+            raise RuntimeError(reason)
         from sglang.srt.model_loader.loader import RemoteModelLoader
 
         logger.info(f"Saving model to {url}")
@@ -132,6 +138,8 @@ class WeightExporter:
         pattern: Optional[str] = None,
         max_size: Optional[int] = None,
     ):
+        if reason := getattr(self.get_model(), "_weight_export_error", None):
+            raise RuntimeError(reason)
         from sglang.srt.model_loader.loader import ShardedStateLoader
 
         logger.info(

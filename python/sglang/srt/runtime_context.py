@@ -827,6 +827,10 @@ class RuntimeContext:
         self._overrides_log = []
         self._publish_role = None
 
+    def is_config_namespace_published(self, name: str) -> bool:
+        """Allow early process-group setup to query optional configuration."""
+        return self._config_bags is not None and name in self._config_bags
+
     def config_bag(self, name: str) -> _ConfigBag:
         """Return the top-level config namespace bag (``device`` / ``model`` /
         ``exec`` / ``schedule`` / ``memory`` / ``spec`` / ``lora`` / ``mm`` /

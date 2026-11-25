@@ -13,7 +13,7 @@
 # ==============================================================================
 import logging
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import einops
 import torch
@@ -211,7 +211,13 @@ def update_expert_weights_single_layer(
     debug: bool = False,
     log_metrics: bool = False,
     group: Optional[torch.distributed.ProcessGroup] = None,
+    *,
+    get_comm_ranks: Optional[Callable[[int], Tuple[List[int], List[int]]]] = None,
+    stage_transfers: Optional[
+        Callable[[List[Tuple[int, List[P2POp]]], List[Tuple[int, int]]], None]
+    ] = None,
 ):
+    """Use common expert selection; optional callbacks own staging and writeback."""
     assert all(
         tensor.shape[0] == num_local_physical_experts
         for tensor in routed_experts_weights
@@ -253,8 +259,17 @@ def update_expert_weights_single_layer(
         _handle_recv(buffer2weight_copy_infos, p2p_op_infos)
         _create_isend_ops(p2p_op_infos)
         _filter_p2p_ops(p2p_op_infos)
-        _execute_p2p_ops(p2p_op_infos)
-        _execute_buffer2weight_copies(buffer2weight_copy_infos)
+        if stage_transfers is None:
+            _execute_p2p_ops(p2p_op_infos)
+            _execute_buffer2weight_copies(buffer2weight_copy_infos)
+        else:
+            stage_transfers(
+                p2p_op_infos,
+                [
+                    (_get_local_expert_location(src), _get_local_expert_location(dst))
+                    for src, dst in buffer2weight_copy_infos
+                ],
+            )
 
         if log_metrics:
             _log_p2p_op_metrics(
@@ -433,26 +448,29 @@ def update_expert_weights_single_layer(
         )
 
     def _compute_comm_info(logical_expert_id: int):
-        all_src_ranks = _deduplicate_ordered(
-            [
-                x // num_local_physical_experts
-                for x in range(num_physical_experts)
-                if old_physical_to_logical_map[x] == logical_expert_id
-            ]
-        )
+        if get_comm_ranks is None:
+            all_src_ranks = _deduplicate_ordered(
+                [
+                    x // num_local_physical_experts
+                    for x in range(num_physical_experts)
+                    if old_physical_to_logical_map[x] == logical_expert_id
+                ]
+            )
+            need_comm_dst_ranks = _deduplicate_ordered(
+                [
+                    x // num_local_physical_experts
+                    for x in range(num_physical_experts)
+                    if new_physical_to_logical_map[x] == logical_expert_id
+                    and x // num_local_physical_experts not in all_src_ranks
+                ]
+            )
+        else:
+            all_src_ranks, need_comm_dst_ranks = get_comm_ranks(logical_expert_id)
         all_src_nodes = [x // num_gpu_per_node for x in all_src_ranks]
         self_node_src_ranks = [
             x for x in all_src_ranks if x // num_gpu_per_node == self_node_id
         ]
 
-        need_comm_dst_ranks = _deduplicate_ordered(
-            [
-                x // num_local_physical_experts
-                for x in range(num_physical_experts)
-                if new_physical_to_logical_map[x] == logical_expert_id
-                and x // num_local_physical_experts not in all_src_ranks
-            ]
-        )
         need_comm_self_node_dst_ranks = (
             [x for x in need_comm_dst_ranks if x // num_gpu_per_node == self_node_id]
             if len(self_node_src_ranks) > 0

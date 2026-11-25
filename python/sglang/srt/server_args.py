@@ -2326,6 +2326,11 @@ class ServerArgs:
         "trivial"
     )
     enable_eplb: A[bool, "Enable EPLB algorithm", NS("exec.moe")] = False
+    eplb_async_rebalance: A[
+        bool,
+        "Overlap NPU EPLB expert transfers with forward (experimental).",
+        NS("exec.moe"),
+    ] = False
     eplb_algorithm: A[str, "Chosen EPLB algorithm", NS("exec.moe")] = "auto"
     eplb_rebalance_num_iterations: A[
         int,
@@ -7118,6 +7123,10 @@ class ServerArgs:
         return required
 
     def _handle_eplb_and_dispatch(self):
+        if self.eplb_async_rebalance:
+            from sglang.srt.hardware_backend.npu.eplb import validate_async_eplb_args
+
+            validate_async_eplb_args(self._resolved())
         if self.enable_eplb and self._resolved().device == "npu":
             if self.weight_cache_mode != "off":
                 raise ValueError(

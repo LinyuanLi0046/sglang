@@ -630,11 +630,25 @@ class ModelRunner:
             )
 
     def initialize(self):
+        create_recorder = ExpertDistributionRecorder.init_new
+        create_eplb_manager = EPLBManager
+        async_eplb = (
+            self.device == "npu"
+            and not self.is_draft_worker
+            and get_exec().moe.eplb_async_rebalance
+        )
+        if async_eplb:
+            from sglang.srt.hardware_backend.npu.eplb_manager import (
+                AsyncEplbRecorder,
+                NpuAsyncEPLBManager,
+            )
+
+            create_recorder, create_eplb_manager = AsyncEplbRecorder, NpuAsyncEPLBManager
         self.init_memory_saver_adapter()
         self.maybe_init_remote_instance_transfer_engine()
-        self.maybe_init_expert_location_metadata()
+        self.maybe_init_expert_location_metadata(create_recorder)
         self.maybe_init_lplb_solvers()
-        self.maybe_init_eplb_manager()
+        self.maybe_init_eplb_manager(create_eplb_manager)
         self.expert_location_updater = ExpertLocationUpdater()
         self.maybe_init_elastic_ep()
         self.init_token_oracle()
@@ -672,6 +686,13 @@ class ModelRunner:
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
+        if async_eplb:
+            # Match the stream used by scheduler forwards. Reserve staging and
+            # initialize HCCL before the later KV-cache capacity calculation.
+            device_module = torch.get_device_module(self.device)
+            self.forward_stream.wait_stream(device_module.current_stream())
+            with device_module.stream(self.forward_stream):
+                self.eplb_manager.init_after_model_load()
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -682,7 +703,9 @@ class ModelRunner:
         if self.server_args.remote_instance_weight_loader_use_transfer_engine():
             self.remote_instance_weight_transporter.init_engine()
 
-    def maybe_init_expert_location_metadata(self):
+    def maybe_init_expert_location_metadata(
+        self, create_recorder=ExpertDistributionRecorder.init_new
+    ):
         if self.is_draft_worker:
             return
         expert_rank = self.ps.moe_ep_rank + (
@@ -703,7 +726,7 @@ class ModelRunner:
                 format_expert_location_layout(get_global_expert_location_metadata()),
             )
         set_global_expert_distribution_recorder(
-            ExpertDistributionRecorder.init_new(
+            create_recorder(
                 self.server_args,
                 get_global_expert_location_metadata(),
                 rank=expert_rank,
@@ -714,9 +737,9 @@ class ModelRunner:
         if get_exec().moe.ep_dispatch_algorithm == "lp" and not self.is_draft_worker:
             init_lplb_solvers(model_config=self.model_config)
 
-    def maybe_init_eplb_manager(self):
+    def maybe_init_eplb_manager(self, manager_cls=EPLBManager):
         self.eplb_manager = (
-            EPLBManager(
+            manager_cls(
                 server_args=self.server_args,
                 model_config=self.model_config,
                 ps=self.ps,

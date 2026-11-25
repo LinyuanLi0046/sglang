@@ -4840,6 +4840,10 @@ class Scheduler(
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
         action = recv_req.action
+        if _is_npu and get_exec().moe.eplb_async_rebalance:
+            # The WeLM read-done fence covers shared inputs, not EPLB installs.
+            # Manual recorder control must see the entire preceding forward.
+            self.schedule_stream.wait_stream(self.forward_stream)
         if action == ExpertDistributionReqType.START_RECORD:
             get_global_expert_distribution_recorder().start_record()
         elif action == ExpertDistributionReqType.STOP_RECORD:
@@ -5137,6 +5141,7 @@ def run_scheduler_process(
 
     # Create a scheduler and run the event loop
     scheduler = None
+    async_eplb_drained = False
     try:
         if pd_affinity_error is not None:
             raise pd_affinity_error
@@ -5218,6 +5223,11 @@ def run_scheduler_process(
 
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
         scheduler.run_event_loop()
+        if scheduler.gracefully_exit and _is_npu and get_exec().moe.eplb_async_rebalance:
+            manager = scheduler.tp_worker.model_runner.eplb_manager
+            if manager is not None:
+                manager.close()
+            async_eplb_drained = True
 
     except Exception:
         traceback = get_exception_traceback()
@@ -5237,7 +5247,10 @@ def run_scheduler_process(
             scheduler.metrics_reporter._shutdown_fpm()
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
-            if scheduler.gracefully_exit:
+            if scheduler.gracefully_exit and (
+                not (_is_npu and get_exec().moe.eplb_async_rebalance)
+                or async_eplb_drained
+            ):
                 welm_megamoe = sys.modules.get(
                     "sglang.srt.hardware_backend.npu.moe.welmv4_megamoe"
                 )

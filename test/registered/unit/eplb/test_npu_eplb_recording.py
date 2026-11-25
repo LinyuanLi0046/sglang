@@ -59,6 +59,25 @@ class TestNpuEplbRecording(unittest.TestCase):
         recorder._on_hook.assert_not_called()
         self.assertFalse(recorder._disable_all)
 
+    def test_async_counts_keep_old_mapping_across_ring_wrap(self):
+        from sglang.srt.hardware_backend.npu.eplb_manager import _AsyncStatAccumulator
+
+        accumulator = object.__new__(_AsyncStatAccumulator)
+        accumulator._expert_location_metadata = SimpleNamespace(
+            num_layers=1,
+            num_logical_experts=3,
+            physical_to_logical_map=torch.tensor([[0, 1, 2]]),
+        )
+        accumulator.window_samples = 6
+        accumulator._previous_layouts = {0: (4, torch.tensor([1, 0, 2]))}
+        accumulator._global_physical_count_of_buffered_step = SimpleNamespace(
+            _curr_index=2
+        )
+        # The last two writes wrapped to slots 0/1 under the new placement.
+        physical = torch.tensor([[[1, 10, 0]], [[2, 20, 0]], [[3, 30, 0]], [[4, 40, 0]]])
+        expected = torch.tensor([[[1, 10, 0]], [[2, 20, 0]], [[30, 3, 0]], [[40, 4, 0]]])
+        torch.testing.assert_close(accumulator._logical_counts(physical), expected)
+
     def test_npu_uses_valid_topk_counts_cuda_ll_keeps_receive_counts(self):
         with (
             patch.object(distribution, "_SelectExpertsSinglePassGatherer") as topk,

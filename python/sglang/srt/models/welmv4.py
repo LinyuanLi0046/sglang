@@ -100,7 +100,7 @@ from sglang.srt.models.welmv4_dp_attention import (
     get_welm_runner_build_plan_for_init,
     use_welm_decode_rs_ag,
 )
-from sglang.srt.runtime_context import get_disagg, get_forward, get_parallel
+from sglang.srt.runtime_context import get_disagg, get_exec, get_forward, get_parallel
 from sglang.srt.server_args import get_global_server_args
 
 # from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
@@ -970,7 +970,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.experts = get_moe_impl_class(quant_config)(
             layer_id=self.layer_id,
             top_k=config.num_experts_per_tok,
-            num_experts=config.num_experts,
+            # Match the upstream MoE models: storage/dispatch use physical
+            # slots, while the router and checkpoint names stay logical.
+            num_experts=config.num_experts + get_exec().moe.ep_num_redundant_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,
@@ -1473,6 +1475,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # Fused output already contains shared; shared_output stays None,
             # so the existing external shared wait/add below is skipped.
         elif use_welm_local_ep_moe:
+            if (
+                not self.is_nextn
+                and self.experts.num_experts > self.expert_bias.shape[0]
+            ):
+                # This private path replicates rows and sums partial outputs.
+                # Rank-local replica selection can count one expert repeatedly.
+                raise ValueError(
+                    "WeLM redundant experts require DeepEP dispatch, not the "
+                    "replicated local-sort/AllReduce path. For decode, enable "
+                    "SGLANG_WELMV4_DECODE_RS_AG=1."
+                )
             if not self.welm_local_ep_kernel_available:
                 raise RuntimeError(
                     "WeLMv4 local EP MoE was selected for an unsupported "
@@ -5298,13 +5311,6 @@ class WeLMV4MoeForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        server_args = get_global_server_args()
-        if (
-            _is_npu
-            and server_args.enable_eplb
-            and server_args.ep_num_redundant_experts
-        ):
-            raise ValueError("WeLM NPU EPLB currently requires zero redundant experts")
         # These managers are process-global because a source and its consumer
         # are ordinary layers in one serial forward.  Reset them when a new
         # model instance is constructed so stale state cannot survive reloads.

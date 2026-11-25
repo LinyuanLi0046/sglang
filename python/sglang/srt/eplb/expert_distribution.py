@@ -29,6 +29,7 @@ import torch
 import torch.distributed
 
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_location import get_eplb_group
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_EXPERT_DISPATCH,
@@ -95,7 +96,13 @@ class ExpertDistributionRecorder(ABC):
     def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
         yield {}
 
-    def on_select_experts(self, topk_ids: torch.Tensor):
+    def on_select_experts(
+        self,
+        topk_ids: torch.Tensor,
+        *,
+        num_token_non_padded: Optional[torch.Tensor] = None,
+        invalid_row_mask: Optional[torch.Tensor] = None,
+    ):
         pass
 
     def on_deepep_dispatch_normal(
@@ -172,6 +179,10 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
     @contextmanager
     def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
+        # Draft passes must not reset or publish the target's counters either.
+        if self._disable_all:
+            yield {}
+            return
         outputs = {}
         with self._current_forward_pass_id.with_value(forward_pass_id):
             self._on_forward_pass_start(forward_batch)
@@ -206,7 +217,27 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
                 forward_pass_id, gatherer_key, single_pass_data, outputs
             )
 
-    def on_select_experts(self, topk_ids: torch.Tensor):
+    def on_select_experts(
+        self,
+        topk_ids: torch.Tensor,
+        *,
+        num_token_non_padded: Optional[torch.Tensor] = None,
+        invalid_row_mask: Optional[torch.Tensor] = None,
+    ):
+        if invalid_row_mask is not None or num_token_non_padded is not None:
+            if self._disable_all or not (
+                self._recording
+                or torch.get_device_module().is_current_stream_capturing()
+            ):
+                return
+            # This copy is only for statistics. LL dispatch retains legal IDs
+            # and its existing weights; DP supplies its prebuilt segmented mask.
+            if invalid_row_mask is None:
+                invalid_row_mask = (
+                    torch.arange(topk_ids.shape[0], device=topk_ids.device)
+                    >= num_token_non_padded
+                )
+            topk_ids = topk_ids.masked_fill(invalid_row_mask[:, None], -1)
         self._on_hook("on_select_experts", topk_ids=topk_ids)
 
     def on_deepep_dispatch_normal(
@@ -327,7 +358,8 @@ class _SinglePassGatherer(ABC):
                 raise NotImplementedError
 
         if server_args.moe_a2a_backend == "deepep":
-            if server_args.deepep_mode == "normal":
+            # Receive-side LL counts can include graph padding on NPU.
+            if server_args.device == "npu" or server_args.deepep_mode == "normal":
                 return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
             elif server_args.deepep_mode == "low_latency":
                 return _DeepepLowLatencySinglePassGatherer(
@@ -536,7 +568,9 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
     # can optimize (e.g. fuse / compile)
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
         topk_ids = topk_ids.flatten()
-        mask = topk_ids != -1
+        mask = (topk_ids >= 0) & (
+            topk_ids < self._expert_location_metadata.num_physical_experts
+        )
         self._data[layer_idx, :].scatter_add_(
             dim=0, index=topk_ids.masked_fill(~mask, 0).long(), src=mask.int()
         )
@@ -671,6 +705,7 @@ class _Accumulator(ABC):
         self._server_args = server_args
         self._expert_location_metadata = expert_location_metadata
         self._rank = rank
+        self._communication_group = get_eplb_group()
 
     def get_single_pass_gatherer_keys(self):
         return [_SINGLE_PASS_GATHERER_KEY_PRIMARY]
@@ -744,7 +779,10 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         )
         gpu_physical_count = gpu_physical_count.to(self._server_args.device)
         torch.distributed.reduce(
-            gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM
+            gpu_physical_count,
+            dst=0,
+            op=torch.distributed.ReduceOp.SUM,
+            group=self._communication_group,
         )
 
         if self._rank == 0:
@@ -917,7 +955,9 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             torch.get_device_module().empty_cache()
 
         torch.distributed.all_reduce(
-            logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
+            logical_count_of_buffered_step,
+            op=torch.distributed.ReduceOp.SUM,
+            group=self._communication_group,
         )
 
         output = dict(
@@ -952,11 +992,15 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             avg_rate_tensor = torch.tensor(
                 [average_utilization_rate_over_window],
                 dtype=torch.float32,
-                device="cuda",
+                device=self._server_args.device,
             )
         else:
-            avg_rate_tensor = torch.empty(1, dtype=torch.float32, device="cuda")
-        torch.distributed.broadcast(avg_rate_tensor, src=0)
+            avg_rate_tensor = torch.empty(
+                1, dtype=torch.float32, device=self._server_args.device
+            )
+        torch.distributed.broadcast(
+            avg_rate_tensor, src=0, group=self._communication_group
+        )
         return avg_rate_tensor.item()
 
 

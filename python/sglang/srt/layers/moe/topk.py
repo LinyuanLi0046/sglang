@@ -581,6 +581,7 @@ class TopK(MultiPlatformOp):
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
         expert_bias: Optional[torch.Tensor] = None,
         scoring_func_override: Optional[str] = None,
+        invalid_row_mask: Optional[torch.Tensor] = None,
     ) -> TopKOutput:
 
         from sglang.srt.hardware_backend.npu.moe.topk import fused_topk_npu
@@ -594,6 +595,7 @@ class TopK(MultiPlatformOp):
             layer_id=self.layer_id,
             expert_bias=expert_bias,
             scoring_func_override=scoring_func_override,
+            invalid_row_mask=invalid_row_mask,
         )
 
     def empty_topk_output(

@@ -105,6 +105,17 @@ def init_torch_distributed(
                 tp_size=ps.tp_size, pp_size=ps.pp_size, moe_ep_size=ps.moe_ep_size
             )
 
+    if (
+        device == "npu"
+        and not is_draft_worker
+        and server_args.enable_eplb
+        and server_args.elastic_ep_backend is None
+    ):
+        from sglang.srt.hardware_backend.npu.eplb import prewarm_eplb_communication
+
+        # Include lazy HCCL transport allocations in the later KV-cache budget.
+        prewarm_eplb_communication()
+
     pre_model_load_memory = get_available_gpu_memory(
         device,
         ps.gpu_id,

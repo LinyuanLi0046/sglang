@@ -32,6 +32,22 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def get_eplb_group() -> torch.distributed.ProcessGroup | None:
+    """Reuse NPU TP when it covers the fixed, non-pipelined EPLB world."""
+    from sglang.srt.utils import is_npu
+
+    if not is_npu():
+        return None
+    from sglang.srt.runtime_context import get_device, get_exec, get_parallel
+
+    if get_device().device != "npu" or get_exec().moe.elastic_ep_backend is not None:
+        return None
+    parallel = get_parallel()
+    if parallel.pp_size != 1 or parallel.tp_size != torch.distributed.get_world_size():
+        return None
+    return parallel.tp_group.device_group
+
+
 def _prefer_same_node_experts() -> bool:
     from sglang.srt.elastic_ep.elastic_ep import elastic_expanded_world_enabled
     from sglang.srt.runtime_context import get_exec

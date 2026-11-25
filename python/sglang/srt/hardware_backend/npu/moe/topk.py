@@ -119,6 +119,7 @@ def fused_topk_npu(
     layer_id: Optional[int] = None,
     expert_bias: Optional[torch.Tensor] = None,
     scoring_func_override: Optional[str] = None,
+    invalid_row_mask: Optional[torch.Tensor] = None,
 ) -> "TopKOutput":
 
     use_grouped_topk = topk_config.use_grouped_topk
@@ -219,7 +220,13 @@ def fused_topk_npu(
 
     if expert_location_dispatch_info is not None:
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
-    get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
+    # Statistics exclude graph/DP padding without changing dispatch IDs or
+    # restoring the removed padding-weight/hidden-state zeroing operations.
+    get_global_expert_distribution_recorder().on_select_experts(
+        topk_ids=topk_ids,
+        num_token_non_padded=num_token_non_padded,
+        invalid_row_mask=invalid_row_mask,
+    )
     capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
 
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)

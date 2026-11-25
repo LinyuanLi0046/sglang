@@ -60,7 +60,10 @@ from sglang.srt.layers.moe import get_deepep_mode, get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
-from sglang.srt.layers.moe.utils import DeepEPMode
+from sglang.srt.layers.moe.utils import (
+    DeepEPMode,
+    filter_moe_weight_param_global_expert,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import (
@@ -101,7 +104,14 @@ from sglang.srt.runtime_context import get_disagg, get_forward, get_parallel
 from sglang.srt.server_args import get_global_server_args
 
 # from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
-from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_npu, make_layers
+from sglang.srt.utils import (
+    LazyValue,
+    add_prefix,
+    get_bool_env_var,
+    is_cuda,
+    is_npu,
+    make_layers,
+)
 
 if is_npu():
     import torch_npu
@@ -1024,6 +1034,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and moe_clamp_limit is None
         )
 
+    def get_moe_weights(self):
+        # Only physical routed experts move. Router/bias and the independent
+        # shared expert are outside self.experts and retain their logical order.
+        return [
+            parameter.data
+            for name, parameter in self.experts.named_parameters()
+            if filter_moe_weight_param_global_expert(
+                name, parameter, self.experts.num_local_experts
+            )
+        ]
+
     def _forward_shared_expert(
         self,
         hidden_states: torch.Tensor,
@@ -1349,6 +1370,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         hidden_states,
                         router_logits,
                         num_token_non_padded=num_token_non_padded,
+                        invalid_row_mask=invalid_row_mask,
                         expert_location_dispatch_info=(
                             ExpertLocationDispatchInfo.init_new(
                                 layer_id=self.layer_id
@@ -5276,6 +5298,13 @@ class WeLMV4MoeForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
+        server_args = get_global_server_args()
+        if (
+            _is_npu
+            and server_args.enable_eplb
+            and server_args.ep_num_redundant_experts
+        ):
+            raise ValueError("WeLM NPU EPLB currently requires zero redundant experts")
         # These managers are process-global because a source and its consumer
         # are ordinary layers in one serial forward.  Reset them when a new
         # model instance is constructed so stale state cannot survive reloads.
@@ -5302,8 +5331,20 @@ class WeLMV4MoeForCausalLM(nn.Module):
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+        # Resolve after quantization has installed the final NZ/transpose views.
+        self._routed_experts_weights_of_layer = LazyValue(
+            lambda: {
+                layer_id: layer.mlp.get_moe_weights()
+                for layer_id, layer in enumerate(self.model.layers)
+                if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock)
+            }
+        )
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self._routed_experts_weights_of_layer.value
 
     def bind_finalized_runner_plan(
         self, runner_plan: WelmRunnerParallelPlan

@@ -24,6 +24,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -50,6 +51,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         enable_memory_saver: bool = False,
     ) -> None:
         self._graphs: Dict[Any, Any] = {}
+        self._is_draft_worker = cuda_graph_runner.model_runner.is_draft_worker
         self._outputs: Dict[Any, Any] = {}
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
@@ -79,6 +81,22 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             self._capture_stream = None
 
     def capture_one(
+        self,
+        shape_key: ShapeKey,
+        forward_fn: Callable[[], Any],
+        capture_inputs: Optional[Any] = None,
+        post_warmup_hook: Optional[Callable[[], None]] = None,
+    ) -> None:
+        # Direct model callbacks bypass ModelRunner.forward during warmup/capture.
+        record_ctx = (
+            get_global_expert_distribution_recorder().disable_this_region()
+            if self._is_draft_worker
+            else empty_context()
+        )
+        with record_ctx:
+            self._capture_one(shape_key, forward_fn, capture_inputs, post_warmup_hook)
+
+    def _capture_one(
         self,
         shape_key: ShapeKey,
         forward_fn: Callable[[], Any],

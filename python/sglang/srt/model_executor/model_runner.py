@@ -1688,6 +1688,11 @@ class ModelRunner:
         with (
             canary_ctx,
             step_span_ctx,
+            (
+                get_global_expert_distribution_recorder().disable_this_region()
+                if self.device == "npu" and self.is_draft_worker
+                else contextlib.nullcontext()
+            ),
             get_global_expert_distribution_recorder().with_forward_pass(
                 self.forward_pass_id,
                 forward_batch,

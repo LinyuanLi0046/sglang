@@ -7118,6 +7118,21 @@ class ServerArgs:
         return required
 
     def _handle_eplb_and_dispatch(self):
+        if self.enable_eplb and self._resolved().device == "npu":
+            if self.weight_cache_mode != "off":
+                raise ValueError(
+                    "NPU EPLB writes expert storage in place and requires "
+                    "--weight-cache-mode off"
+                )
+            window = self.expert_distribution_recorder_buffer_size
+            if self.eplb_rebalance_num_iterations <= 0 or (
+                window is not None
+                and not 0 < window <= self.eplb_rebalance_num_iterations
+            ):
+                raise ValueError(
+                    "NPU EPLB requires a positive recorder window no longer than "
+                    "--eplb-rebalance-num-iterations"
+                )
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
             self.expert_distribution_recorder_mode = "stat"
             logger.warning(

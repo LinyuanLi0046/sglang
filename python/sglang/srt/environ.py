@@ -648,6 +648,10 @@ class Envs:
     # Explicit model regions only; independent of whole-model torch.compile.
     SGLANG_NPU_ENABLE_STATIC_KERNEL = EnvBool(False)
     SGLANG_NPU_ENABLE_SUPERKERNEL = EnvBool(False)
+    # WeLM regional compilation; require SGLANG_NPU_ENABLE_STATIC_KERNEL.
+    # Only selected target Decode/Verify graph buckets use these regions.
+    WELM_NPU_SUPERKERNEL_FLASH_GATE_OPROJ = EnvBool(False)
+    WELM_NPU_SUPERKERNEL_ROUTED_FFN = EnvBool(False)
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     # Use separate HCCL send/receive buffers for ordinary NPU all-reduce.

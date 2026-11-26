@@ -136,7 +136,9 @@ class TestNpuRegionalCapture(unittest.TestCase):
                 current_device=lambda: 0, synchronize=lambda: None
             ),
             enable_torch_compile=False,
-            capture_forward_mode=SimpleNamespace(is_decode=lambda: True),
+            capture_forward_mode=SimpleNamespace(
+                is_decode=lambda: True, is_target_verify=lambda: False
+            ),
             capture_bs=[1, 4],
             model_runner=SimpleNamespace(
                 model=SimpleNamespace(npu_compile_regions=(self.region,)),
@@ -245,12 +247,12 @@ class TestNpuRegionalCapture(unittest.TestCase):
 
     def test_missing_registration_bucket_and_actual_execution_are_errors(self):
         config = cb.NpuCompileConfig(True)
-        self.runner.model_runner.model.npu_compile_regions = ()
+        del self.runner.model_runner.model.npu_compile_regions
         with self.assertRaisesRegex(ValueError, "no npu_compile_regions"):
             self.make_backend(config)
         self.runner.model_runner.model.npu_compile_regions = (self.region,)
         self.runner.model_runner.server_args.torch_compile_max_bs = 0
-        with self.assertRaisesRegex(ValueError, "No Decode capture bucket"):
+        with self.assertRaisesRegex(ValueError, "No Decode/Verify capture bucket"):
             self.make_backend(config)
         self.runner.model_runner.server_args.torch_compile_max_bs = 2
         backend = self.make_backend(config)
@@ -261,14 +263,83 @@ class TestNpuRegionalCapture(unittest.TestCase):
 
     def test_unsupported_mode_and_superkernel_api_fail_before_compilation(self):
         self.runner.model_runner.is_draft_worker = True
-        with self.assertRaisesRegex(ValueError, "Decode only"):
-            self.make_backend(cb.NpuCompileConfig(True))
+        initializer = Mock()
+        self.runner.model_runner.model.init_npu_compile_regions = initializer
+        backend = self.make_backend(cb.NpuCompileConfig(True))
+        self.assertFalse(backend._compile_bs)
+        initializer.assert_not_called()
         self.runner.model_runner.is_draft_worker = False
         with patch.object(self.torch.npu, "super_kernel_scope_begin", None):
             with self.assertRaisesRegex(RuntimeError, "scope APIs"):
                 self.make_backend(cb.NpuCompileConfig(True, True))
         self.backend_factory.assert_not_called()
         self.configure_cache.assert_not_called()
+
+    def test_explicit_model_opt_out_skips_compilation_with_global_flags(self):
+        self.runner.model_runner.model.npu_compile_regions = ()
+        backend = self.make_backend(cb.NpuCompileConfig(True, True))
+        self.assertFalse(backend._compile_bs)
+        self.backend_factory.assert_not_called()
+        self.configure_cache.assert_not_called()
+        self.torch.compile.assert_not_called()
+
+    def test_target_verify_is_compiled_but_prefill_is_not(self):
+        mode = self.runner.capture_forward_mode
+        mode.is_decode = lambda: False
+        mode.is_target_verify = lambda: True
+        initializer = Mock()
+        self.runner.model_runner.model.init_npu_compile_regions = initializer
+        backend = self.make_backend(cb.NpuCompileConfig(True, True))
+        initializer.assert_called_once_with()
+        backend.capture_one(type("Key", (), {"size": 1})(), lambda: self.region(2))
+        self.assertIn("optimize", self.events)
+        self.events.clear()
+        mode.is_target_verify = lambda: False
+        initializer.reset_mock()
+        backend = self.make_backend(cb.NpuCompileConfig(True, True))
+        initializer.assert_not_called()
+        backend.capture_one(type("Key", (), {"size": 1})(), lambda: self.region(2))
+        self.assertEqual(self.events, ["capture_begin", "capture_end"])
+
+    def test_external_scope_uses_compile_only_callable_and_restores_eager(self):
+        eager = Mock(return_value=3)
+        native = Mock(return_value=7)
+        region = cb.NpuCompileRegion(
+            "flash_gate_oproj", eager, compile_fn=native, external_scope=True
+        )
+        self.runner.model_runner.model.npu_compile_regions = (region,)
+        backend = self.make_backend(cb.NpuCompileConfig(True, True))
+        self.assertFalse(region.is_active)
+        self.assertEqual(region(1), 3)
+        native.assert_not_called()
+
+        def forward():
+            with region.scope():
+                return region(1)
+
+        self.events.clear()
+        key = type("Key", (), {"size": 1})()
+        backend.capture_one(key, forward)
+        self.assertEqual(self.events.count("scope_begin"), 1)
+        self.assertEqual(self.events.count("scope_end"), 1)
+        self.assertEqual(native.call_count, 3)
+        self.assertEqual(eager.call_count, 1)
+        self.assertEqual(backend.replay(key, None), 7)
+        self.assertEqual(native.call_count, 3)
+        self.assertFalse(region.is_active)
+        self.assertEqual(region(1), 3)
+
+    def test_scope_is_closed_and_session_cleared_on_failure(self):
+        region = cb.NpuCompileRegion("attention", lambda: None, external_scope=True)
+        session = cb.NpuCompileSession((region,), cb.NpuCompileConfig(True, True))
+        with self.assertRaisesRegex(RuntimeError, "inside"), session.activate():
+            with session.capture(), region.scope():
+                with region.scope(exclude=True):
+                    raise RuntimeError("inside")
+        self.assertFalse(region.is_active)
+        self.assertEqual(
+            self.events, ["scope_begin", "scope_begin", "scope_end", "scope_end"]
+        )
 
 
 if __name__ == "__main__":

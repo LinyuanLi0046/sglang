@@ -48,7 +48,9 @@ def validate_npugraph_ex_config(
     if not config.static_kernel:
         return
     if device != "npu" or not graph_enabled:
-        raise ValueError("Regional static kernel compilation requires NPU Decode Graph")
+        raise ValueError(
+            "Regional static kernel compilation requires NPU Decode/Verify Graph"
+        )
     if enable_torch_compile:
         raise ValueError(
             "Regional static kernel compilation cannot be combined with "
@@ -107,14 +109,43 @@ class NpuCompileRegion:
     The owning model must retain this object for the lifetime of its graphs.
     """
 
-    def __init__(self, name: str, fn: Callable):
+    def __init__(
+        self,
+        name: str,
+        fn: Callable,
+        *,
+        compile_fn: Callable | None = None,
+        external_scope: bool = False,
+    ):
         if not name.strip():
             raise ValueError("An NPU compile region needs a nonempty scope name")
         self.name = name
         self._eager = fn
+        self._compile_fn = compile_fn if compile_fn is not None else fn
+        self._external_scope = external_scope
         self._compiled = None
         self._config = None
         self._session = None
+
+    @property
+    def is_active(self):
+        return self._session is not None
+
+    @contextmanager
+    def scope(self, *, exclude: bool = False):
+        """Mark a group of tensor calls without putting stream waits into FX."""
+        session = self._session
+        if session is None or not session.capturing or not session.config.super_kernel:
+            yield
+            return
+        import torch
+
+        name = None if exclude else self.name
+        torch.npu.super_kernel_scope_begin(name)
+        try:
+            yield
+        finally:
+            torch.npu.super_kernel_scope_end(name)
 
     def prepare(self, config: NpuCompileConfig, backend):
         if self._compiled is not None:
@@ -124,7 +155,7 @@ class NpuCompileRegion:
         import torch
 
         self._compiled = torch.compile(
-            torch.no_grad()(self._eager),
+            torch.no_grad()(self._compile_fn),
             backend=backend,
             fullgraph=True,
             dynamic=False,
@@ -144,16 +175,9 @@ class NpuCompileRegion:
         else:
             session.warmed.add(self)
 
-        if session.capturing and session.config.super_kernel:
-            import torch
-
-            # Scope markers stay outside the FX graph and are emitted only
-            # during outer capture, not during compilation/warmup or replay.
-            torch.npu.super_kernel_scope_begin(self.name)
-            try:
+        if not self._external_scope:
+            with self.scope():
                 return self._compiled(*args, **kwargs)
-            finally:
-                torch.npu.super_kernel_scope_end(self.name)
         return self._compiled(*args, **kwargs)
 
 

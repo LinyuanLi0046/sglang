@@ -30,10 +30,14 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
     get_tp_group,
+    split_tensor_along_last_dim,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.communication_op import (
     moe_expert_parallel_all_reduce,
+)
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -46,6 +50,7 @@ from sglang.srt.layers.communicator import (
     ScatterMode,
 )
 from sglang.srt.layers.dp_attention import (
+    is_allocation_symmetric,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.linear import (
@@ -60,7 +65,7 @@ from sglang.srt.layers.moe import get_deepep_mode, get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
-from sglang.srt.layers.moe.utils import DeepEPMode
+from sglang.srt.layers.moe.utils import DeepEPMode, should_skip_mlp_all_reduce
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import (
@@ -123,6 +128,7 @@ if is_npu():
         build_welmv4_rope_segment_tile_starts,
         inplace_sigmoid_mul_npu,
         mmq_style_router_linear_npu,
+        sigmoid_mul_ref,
         welmv4_oe_hash_decode_4way_npu,
         welmv4_oe_hash_explicit_history_4way_npu,
         welmv4_oe_hash_prefill_4way_npu,
@@ -1988,6 +1994,125 @@ class Qwen2MoeAttention(nn.Module):
             and not is_nextn
             and self.kv_mirror_layer_idx not in self.kv_mirror_layers
         )
+        self._npu_flash_region = None
+        self._npu_gate_oproj_region = None
+
+    def enable_npu_flash_gate_oproj_regions(self, name: str):
+        from sglang.srt.hardware_backend.npu.compile_backend import NpuCompileRegion
+
+        if self._npu_flash_region is None:
+            self._npu_flash_region = NpuCompileRegion(
+                name,
+                self._npu_flash_attention,
+                external_scope=True,
+            )
+            self._npu_gate_oproj_region = NpuCompileRegion(
+                name + ".tail", self._npu_gate_oproj, external_scope=True
+            )
+        return self._npu_flash_region, self._npu_gate_oproj_region
+
+    @staticmethod
+    def _npu_flash_attention(flash_op, query, key, value, *, padded_tokens, **kwargs):
+        output, _ = flash_op(query, key, value, **kwargs)
+        # Decode/verify graph metadata describes every padded graph row.
+        return output.reshape(padded_tokens, -1)
+
+    def _npu_gate_oproj(self, attn_output, gate):
+        attn_shape = attn_output.shape
+        if self.gated_self_attention_headwise:
+            by_head = attn_output.view(attn_shape[0], self.num_heads, -1)
+            attn_output = sigmoid_mul_ref(gate, by_head).view(attn_shape)
+        # Keep RowParallelLinear's tensor/bias rules and original quantized
+        # implementation; its allocator context and collective stay out of FX.
+        if not self.o_proj.input_is_parallel:
+            attn_output = split_tensor_along_last_dim(
+                attn_output, num_partitions=self.o_proj.tp_size
+            )[self.o_proj.tp_rank].contiguous()
+        bias = (
+            None
+            if self.o_proj.tp_rank > 0 or self.o_proj.skip_bias_add
+            else self.o_proj.bias
+        )
+        return self.o_proj.quant_method.apply(self.o_proj, attn_output, bias=bias)
+
+    def _forward_npu_flash_gate_oproj(
+        self,
+        q,
+        k,
+        v,
+        hidden_states,
+        gate,
+        forward_batch,
+        *,
+        save_kv_cache,
+        enable_gate_alt_stream,
+        skip_o_proj_all_reduce,
+        skip_o_norm,
+        attn_kwargs,
+    ):
+        backend = get_attn_backend()
+        if not (
+            getattr(backend, "use_welm_flash_attn", False)
+            and getattr(backend, "graph_mode", False)
+        ):
+            raise RuntimeError(
+                "WeLM Flash/gate/OProj regional compilation requires the "
+                "Ascend native FlashAttention graph backend"
+            )
+
+        def execute_flash(flash_op, query, key, value, **kwargs):
+            with self._npu_flash_region.scope():
+                attn_output = self._npu_flash_region(
+                    flash_op, query, key, value, **kwargs
+                )
+                local_gate = gate
+                if self.gated_self_attention_headwise:
+                    if local_gate is None:
+                        # Keep the existing post-Flash projection position. It
+                        # is outside the requested region even on one stream.
+                        with self._npu_flash_region.scope(exclude=True):
+                            local_gate = self.gate_proj(hidden_states)[0].unsqueeze(-1)
+                    if enable_gate_alt_stream:
+                        # First consume the side-stream gate after Flash, as in
+                        # the ordinary path. Do not pull this wait into FX.
+                        torch.get_device_module().current_stream().wait_stream(
+                            self.alt_stream
+                        )
+                if self.o_proj.use_dp_attention_reduce:
+                    symm_ctx = use_symmetric_memory(get_parallel().attn_tp_group)
+                else:
+                    symm_ctx = use_symmetric_memory(
+                        get_tp_group(), disabled=not is_allocation_symmetric()
+                    )
+                with symm_ctx:
+                    return self._npu_gate_oproj_region(attn_output, local_gate)
+
+        output = self.attn(
+            q,
+            k,
+            v,
+            forward_batch,
+            save_kv_cache=save_kv_cache,
+            welm_flash_executor=execute_flash,
+            **attn_kwargs,
+        )
+        # This is RowParallelLinear's ordinary reduction condition. The caller
+        # can still own ReduceScatter (pure TP or DP attention), and O-norm.
+        if (
+            (
+                (self.o_proj.reduce_results and self.o_proj.tp_size > 1)
+                or self.o_proj.use_decode_attn_tp
+            )
+            and not skip_o_proj_all_reduce
+            and not should_skip_mlp_all_reduce()
+        ):
+            if self.o_proj.use_dp_attention_reduce:
+                output = get_parallel().attn_tp_group.all_reduce(output)
+            else:
+                output = tensor_model_parallel_all_reduce(output)
+        if self.o_norm is not None and not skip_o_norm:
+            output, _ = self.o_norm(output)
+        return output
 
     def prepare_graph_mirror_key(self, positions, key, batch):
         """Prepare the consumer's K in the T graph; Q belongs to the B graph."""
@@ -3323,6 +3448,29 @@ class Qwen2MoeAttention(nn.Module):
         attn_kwargs = {}
         if self.attn_sink is not None:
             attn_kwargs["sinks"] = self.attn_sink
+        if (
+            self._npu_flash_region is not None
+            and self._npu_flash_region.is_active
+            and not self.is_nextn
+            and q.shape[0] > 0
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+        ):
+            return self._forward_npu_flash_gate_oproj(
+                q,
+                k,
+                v,
+                hidden_states,
+                gate,
+                forward_batch,
+                save_kv_cache=not frozen_mtp_decode and fused_qkv is None,
+                enable_gate_alt_stream=enable_npu_gate_alt_stream,
+                skip_o_proj_all_reduce=skip_o_proj_all_reduce,
+                skip_o_norm=skip_o_norm,
+                attn_kwargs=attn_kwargs,
+            )
         if forward_batch.welm_prefill_graph is not None:
             attn_output = forward_batch.welm_prefill_graph.flash(
                 self.attn,
@@ -5304,6 +5452,41 @@ class WeLMV4MoeForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
+        # An explicit empty tuple opts out when both WeLM region switches are
+        # off. Bind callables only after loader/quantization postprocessing.
+        self.npu_compile_regions = ()
+        self._npu_compile_regions_initialized = False
+
+    def init_npu_compile_regions(self):
+        if self._npu_compile_regions_initialized:
+            return
+        if not (_is_npu and envs.SGLANG_NPU_ENABLE_STATIC_KERNEL.get()):
+            return
+        flash_enabled = envs.WELM_NPU_SUPERKERNEL_FLASH_GATE_OPROJ.get()
+        ffn_enabled = envs.WELM_NPU_SUPERKERNEL_ROUTED_FFN.get()
+        if flash_enabled and not get_bool_env_var("WELM_NPU_USE_FLASH_ATTN", "False"):
+            raise ValueError(
+                "WELM_NPU_SUPERKERNEL_FLASH_GATE_OPROJ requires "
+                "WELM_NPU_USE_FLASH_ATTN=1"
+            )
+        regions = []
+        for layer_id in range(self.model.start_layer, self.model.end_layer):
+            layer = self.model.layers[layer_id]
+            if flash_enabled:
+                regions.extend(
+                    layer.self_attn.enable_npu_flash_gate_oproj_regions(
+                        f"welm.layer_{layer_id}.flash_gate_oproj"
+                    )
+                )
+            if ffn_enabled:
+                runner_core = layer.mlp.experts.quant_method.runner.runner_core
+                regions.append(
+                    runner_core.enable_welm_compile_region(
+                        f"welm.layer_{layer_id}.routed_ffn"
+                    )
+                )
+        self.npu_compile_regions = tuple(regions)
+        self._npu_compile_regions_initialized = True
 
     def bind_finalized_runner_plan(
         self, runner_plan: WelmRunnerParallelPlan

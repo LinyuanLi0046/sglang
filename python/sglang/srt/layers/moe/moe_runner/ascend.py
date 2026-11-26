@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -18,6 +19,7 @@ from sglang.srt.hardware_backend.npu.moe.activation import (
 )
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUMXFP8MoEMethod,
+    NPUUnquantMoEMethod,
     NPUW4A8Int8MoEMethod,
     NPUW8A8Int8MoEMethod,
 )
@@ -88,6 +90,8 @@ class AscendRunnerCore(MoeRunnerCore):
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
 
+        self._welm_compile_region = None
+
         kernel = config.layer.w2_kernel
 
         if isinstance(kernel, NPUMXFP8MoEMethod):
@@ -130,6 +134,65 @@ class AscendRunnerCore(MoeRunnerCore):
             else:
                 self.activation = inner
 
+    def enable_welm_compile_region(self, name: str):
+        """Bind the WeLM FFN region without changing the ordinary runner path."""
+        if self._welm_compile_region is not None:
+            return self._welm_compile_region
+
+        w13_kernel = self.config.layer.w13_kernel
+        w2_kernel = self.config.layer.w2_kernel
+        use_swiglu_group = isinstance(w13_kernel, NPUUnquantMoEMethod) and isinstance(
+            w2_kernel, NPUUnquantMoEMethod
+        )
+        is_mxfp8 = isinstance(w13_kernel, NPUMXFP8MoEMethod) and isinstance(
+            w2_kernel, NPUMXFP8MoEMethod
+        )
+        if not (use_swiglu_group or is_mxfp8):
+            raise ValueError(
+                "WeLM routed FFN regional compilation supports unquantized "
+                "and MXFP8 Ascend GMMs only"
+            )
+        if is_mxfp8:
+            from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+                _require_e8m0_dtype,
+            )
+
+            # Resolve the lazy dtype before entering a fullgraph FX trace.
+            _require_e8m0_dtype()
+        if use_swiglu_group:
+            # DeepEP's existing activation does not apply the configured clamp.
+            # A TP post-SiLU clamp cannot be replaced by SwigluGroup's pre-clamp.
+            if not isinstance(self.activation, (NPUSwiglu, NPUSwigluDeepEPKernel)):
+                raise ValueError(
+                    "WeLM SwigluGroup compilation requires an unclamped SwiGLU "
+                    "without activation AllGather"
+                )
+            import torch_npu
+
+            if not torch_npu.npu.get_device_name().startswith("Ascend950"):
+                raise ValueError("WeLM SwigluGroup compilation requires Ascend 950")
+            if not hasattr(torch.ops.cann_ops_nn, "swiglu_group"):
+                try:
+                    import cann_ops_nn.ops  # noqa: F401
+                except ImportError as exc:
+                    raise RuntimeError(
+                        "WeLM routed FFN compilation requires the 950 "
+                        "cann_ops_nn.swiglu_group extension"
+                    ) from exc
+            if not hasattr(torch.ops.cann_ops_nn, "swiglu_group"):
+                raise RuntimeError("cann_ops_nn.swiglu_group is not registered")
+
+        from sglang.srt.hardware_backend.npu.compile_backend import NpuCompileRegion
+
+        self._welm_compile_region = NpuCompileRegion(
+            name,
+            self._run_tensor_inputs,
+            compile_fn=partial(
+                self._run_tensor_inputs, use_swiglu_group=use_swiglu_group
+            ),
+        )
+        return self._welm_compile_region
+
     def run(
         self,
         runner_input: AscendRunnerInput,
@@ -140,10 +203,87 @@ class AscendRunnerCore(MoeRunnerCore):
         """
         Execute the MoE layer using NPU‑specific grouped matmul ops.
         """
-        x = runner_input.hidden_states
+        region = self._welm_compile_region
+        if region is not None and region.is_active:
+            hidden_states = region(
+                runner_input.hidden_states,
+                runner_input.expert_tokens,
+                runner_input.hidden_states_scale,
+                runner_input.group_list_type,
+                quant_info.w13_weight,
+                quant_info.w2_weight,
+                quant_info.w13_weight_scale,
+                quant_info.w2_weight_scale,
+                quant_info.w13_weight_offset,
+                quant_info.w2_weight_offset,
+                quant_info.w13_weight_bias,
+                quant_info.w2_weight_bias,
+                quant_info.w13_scale_bias,
+                quant_info.w2_scale_bias,
+            )
+        else:
+            hidden_states = self._run_experts(
+                runner_input.hidden_states,
+                runner_input.expert_tokens,
+                runner_input.hidden_states_scale,
+                runner_input.group_list_type,
+                quant_info,
+            )
+        return AscendRunnerOutput(hidden_states=hidden_states)
+
+    def _run_tensor_inputs(
+        self,
+        x,
+        expert_tokens,
+        hidden_states_scale,
+        group_list_type,
+        w13_weight,
+        w2_weight,
+        w13_weight_scale,
+        w2_weight_scale,
+        w13_weight_offset,
+        w2_weight_offset,
+        w13_weight_bias,
+        w2_weight_bias,
+        w13_scale_bias,
+        w2_scale_bias,
+        *,
+        use_swiglu_group=False,
+    ):
+        # Only tensors and the static group-list format cross the FX boundary.
+        # Rebuild the lightweight payload here to reuse the existing GMM methods.
+        quant_info = AscendQuantInfo(
+            w13_weight=w13_weight,
+            w2_weight=w2_weight,
+            w13_weight_scale=w13_weight_scale,
+            w2_weight_scale=w2_weight_scale,
+            w13_weight_offset=w13_weight_offset,
+            w2_weight_offset=w2_weight_offset,
+            w13_weight_bias=w13_weight_bias,
+            w2_weight_bias=w2_weight_bias,
+            w13_scale_bias=w13_scale_bias,
+            w2_scale_bias=w2_scale_bias,
+        )
+        return self._run_experts(
+            x,
+            expert_tokens,
+            hidden_states_scale,
+            group_list_type,
+            quant_info,
+            use_swiglu_group=use_swiglu_group,
+        )
+
+    def _run_experts(
+        self,
+        x,
+        expert_tokens,
+        hidden_states_scale,
+        group_list_type,
+        quant_info,
+        *,
+        use_swiglu_group=False,
+    ):
         original_dtype = torch.float16 if x.dtype == torch.float16 else torch.bfloat16
-        expert_tokens = runner_input.expert_tokens
-        group_list_type = runner_input.group_list_type
 
         w13_kernel = self.config.layer.w13_kernel
 
@@ -155,7 +295,7 @@ class AscendRunnerCore(MoeRunnerCore):
                 quant_info,
                 x,
                 expert_tokens,
-                pertoken_scale=runner_input.hidden_states_scale,
+                pertoken_scale=hidden_states_scale,
                 group_list_type=group_list_type,
             )
         else:
@@ -164,7 +304,7 @@ class AscendRunnerCore(MoeRunnerCore):
                 quant_info,
                 x,
                 expert_tokens,
-                pertoken_scale=runner_input.hidden_states_scale,
+                pertoken_scale=hidden_states_scale,
                 output_dtype=original_dtype,
                 weight_prefix="w13",
                 group_list_type=group_list_type,
@@ -172,7 +312,27 @@ class AscendRunnerCore(MoeRunnerCore):
 
             # --- Activation ---
             # The DeepEP kernel expects extra dispatch metadata
-            if isinstance(self.activation, NPUSwigluDeepEPKernel):
+            if use_swiglu_group:
+                if group_list_type == 0:
+                    counts = torch.cat(
+                        (expert_tokens[:1], expert_tokens[1:] - expert_tokens[:-1])
+                    )
+                elif group_list_type == 1:
+                    counts = expert_tokens
+                elif group_list_type == 2:
+                    # ascend_tp may use [expert index, count] metadata. GMMs
+                    # retain that format; SwigluGroup only needs its counts.
+                    counts = expert_tokens[:, 1].contiguous()
+                else:
+                    raise ValueError("Unsupported SwigluGroup group-list format")
+                hidden_states = torch.ops.cann_ops_nn.swiglu_group(
+                    hidden_states,
+                    weight=None,
+                    group_index=counts.to(torch.int64),
+                    clamp_limit=-1.0,
+                )
+                pertoken_scale = None
+            elif isinstance(self.activation, NPUSwigluDeepEPKernel):
                 hidden_states, pertoken_scale = self.activation._apply_activation(
                     hidden_states,
                     group_list=expert_tokens,
@@ -193,7 +353,7 @@ class AscendRunnerCore(MoeRunnerCore):
             weight_prefix="w2",
             group_list_type=group_list_type,
         )
-        return AscendRunnerOutput(hidden_states=hidden_states)
+        return hidden_states
 
 
 # ---------------------------------------------------------------------------

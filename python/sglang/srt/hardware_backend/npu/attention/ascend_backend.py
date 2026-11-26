@@ -708,6 +708,7 @@ class AscendAttnBackend(AttentionBackend):
         *,
         mirror_prefill: bool = False,
         graph_metadata: Optional[ForwardMetadata] = None,
+        welm_flash_executor=None,
     ) -> torch.Tensor:
         """Paged Full/SWA attention with native FP32 sinks, eager or graph.
 
@@ -792,6 +793,23 @@ class AscendAttnBackend(AttentionBackend):
                 **common,
             )
             metadata.welm_flash_schedules[schedule_key] = schedule
+        if welm_flash_executor is not None:
+            # The model-owned region starts after KV writes and schedule
+            # production, and also owns the post-Flash gate/OProj computation.
+            return welm_flash_executor(
+                self._welm_flash_attn,
+                query,
+                key,
+                value,
+                padded_tokens=padded_tokens,
+                block_table=block_table,
+                sinks=sinks.float() if sinks is not None else None,
+                attn_mask=self.welm_flash_attn_mask,
+                metadata=schedule,
+                softmax_scale=layer.scaling,
+                return_softmax_lse=False,
+                **common,
+            )
         output, _ = self._welm_flash_attn(
             query,
             key,
@@ -2548,6 +2566,7 @@ class AscendAttnBackend(AttentionBackend):
         topk_indices: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
         slopes: Optional[torch.Tensor] = None,
+        welm_flash_executor=None,
     ):
         if is_mla_preprocess_enabled() and self.use_mla:
             # MLAPO and MLAPROLOG do save kv_cache
@@ -2589,6 +2608,7 @@ class AscendAttnBackend(AttentionBackend):
                 q_rope=q_rope,
                 k_rope=k_rope,
                 sinks=sinks,
+                welm_flash_executor=welm_flash_executor,
             )
 
         if not self.use_mla:
@@ -3417,6 +3437,7 @@ class AscendAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        welm_flash_executor=None,
     ):
         if save_kv_cache:
             if self.use_mla:
@@ -3449,7 +3470,12 @@ class AscendAttnBackend(AttentionBackend):
             if self.use_welm_flash_attn:
                 self._check_welm_mtp()
                 return self._forward_welm_flash_attention(
-                    query, k_cache, v_cache, layer, sinks
+                    query,
+                    k_cache,
+                    v_cache,
+                    layer,
+                    sinks,
+                    welm_flash_executor=welm_flash_executor,
                 )
 
             is_swa_layer = self._has_layerwise_sliding_window(layer)
@@ -3727,6 +3753,7 @@ class AscendAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        welm_flash_executor=None,
     ):
         if save_kv_cache:
             if self.use_mla:
@@ -3754,6 +3781,7 @@ class AscendAttnBackend(AttentionBackend):
                 self.token_to_kv_pool.get_value_buffer(layer.layer_id),
                 layer,
                 sinks,
+                welm_flash_executor=welm_flash_executor,
             )
 
         if (
@@ -4050,6 +4078,7 @@ class AscendAttnBackend(AttentionBackend):
         topk_indices: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
         slopes: Optional[torch.Tensor] = None,
+        welm_flash_executor=None,
         **kwargs,
     ):
         if is_mla_preprocess_enabled() and self.use_mla:
@@ -4079,6 +4108,7 @@ class AscendAttnBackend(AttentionBackend):
                 q_rope=q_rope,
                 k_rope=k_rope,
                 sinks=sinks,
+                welm_flash_executor=welm_flash_executor,
             )
 
         if not self.use_mla:

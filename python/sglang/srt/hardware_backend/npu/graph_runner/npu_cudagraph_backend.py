@@ -72,16 +72,31 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._compile_config = NpuCompileConfig.from_env()
         self._compile_bs = set()
         self._compile_regions = ()
-        if self._compile_config.static_kernel:
+        model_runner = cuda_graph_runner.model_runner
+        compile_target = self._compile_config.static_kernel and (
+            not model_runner.is_draft_worker
+            and (
+                cuda_graph_runner.capture_forward_mode.is_decode()
+                or cuda_graph_runner.capture_forward_mode.is_target_verify()
+            )
+        )
+        if compile_target:
+            # Bind after weight postprocessing, and never initialize target-model
+            # regions on the NextN worker which inherits the same model class.
+            initialize = getattr(model_runner.model, "init_npu_compile_regions", None)
+            if initialize is not None:
+                initialize()
+            # An explicit empty declaration is a model's opt-out (e.g. both
+            # WeLM region switches are off). Unintegrated models still error.
+            compile_target = (
+                getattr(model_runner.model, "npu_compile_regions", None) != ()
+            )
+        if compile_target:
             from sglang.srt.distributed.parallel_state import get_world_group
 
-            model_runner = cuda_graph_runner.model_runner
             args = model_runner.server_args
-            if (
-                model_runner.is_draft_worker
-                or not cuda_graph_runner.capture_forward_mode.is_decode()
-            ):
-                raise ValueError("Regional NPU compilation currently supports Decode only")
+            if getattr(cuda_graph_runner, "ragged_verify_mode", False):
+                raise ValueError("Regional NPU compilation requires fixed-width Verify")
             validate_npugraph_ex_config(
                 config=self._compile_config,
                 device=model_runner.device,
@@ -97,7 +112,9 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                 if bs <= args.torch_compile_max_bs
             }
             if not self._compile_bs:
-                raise ValueError("No Decode capture bucket fits --torch-compile-max-bs")
+                raise ValueError(
+                    "No Decode/Verify capture bucket fits --torch-compile-max-bs"
+                )
             self._compile_regions = prepare_npu_compile_regions(
                 model_runner.model, self._compile_config
             )

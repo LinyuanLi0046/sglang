@@ -8880,6 +8880,23 @@ class ServerArgs:
             )
 
     def check_server_args(self):
+        if (
+            envs.SGLANG_NPU_ENABLE_STATIC_KERNEL.get()
+            or envs.SGLANG_NPU_ENABLE_SUPERKERNEL.get()
+        ):
+            from sglang.srt.hardware_backend.npu.compile_backend import (
+                NpuCompileConfig,
+                validate_npugraph_ex_config,
+            )
+
+            validate_npugraph_ex_config(
+                config=NpuCompileConfig.from_env(),
+                device=self.device,
+                graph_enabled=self.cuda_graph_config.decode.backend != Backend.DISABLED,
+                enable_torch_compile=self.enable_torch_compile,
+                world_size=self.tp_size * self.pp_size,
+            )
+
         # Check parallel size constraints
         if self.ep_join_mode != "scale":
             assert (

@@ -1812,6 +1812,14 @@ SGLang supports various environment variables that can be used to configure its 
 
 ## NPU (Ascend)
 
+Regional compilation is infrastructure-only: no model, including WeLM, opts in yet.
+Enabling the following switches requires an explicit `model.npu_compile_regions`
+integration; otherwise initialization fails. Keep `--enable-torch-compile` off.
+The regional path selects existing Decode capture buckets up to
+`--torch-compile-max-bs`, independently of the whole-model compiler switch.
+Multi-rank compilation requires `LOCAL_WORLD_SIZE` to describe this job's ranks
+on the local node. Restart workers after changing either switch.
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "33.3%"}} />
@@ -1826,6 +1834,16 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
   </thead>
   <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_NPU_ENABLE_STATIC_KERNEL</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Compile explicitly integrated Decode regions with npugraph_ex static kernels. Requires NPU Decode Graph; incompatible with whole-model torch.compile.</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_NPU_ENABLE_SUPERKERNEL</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable SuperKernel compilation and post-capture optimization for those regions. Requires static kernels and torch_npu scope/graph optimization APIs. Uses default optimization options.</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Disable ACL-format weight conversion on NPU.</td>

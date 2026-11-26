@@ -24,6 +24,12 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.hardware_backend.npu.compile_backend import (
+    NpuCompileConfig,
+    NpuCompileSession,
+    prepare_npu_compile_regions,
+    validate_npugraph_ex_config,
+)
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -63,6 +69,38 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._enable_torch_compile = getattr(
             cuda_graph_runner, "enable_torch_compile", False
         )
+        self._compile_config = NpuCompileConfig.from_env()
+        self._compile_bs = set()
+        self._compile_regions = ()
+        if self._compile_config.static_kernel:
+            from sglang.srt.distributed.parallel_state import get_world_group
+
+            model_runner = cuda_graph_runner.model_runner
+            args = model_runner.server_args
+            if (
+                model_runner.is_draft_worker
+                or not cuda_graph_runner.capture_forward_mode.is_decode()
+            ):
+                raise ValueError("Regional NPU compilation currently supports Decode only")
+            validate_npugraph_ex_config(
+                config=self._compile_config,
+                device=model_runner.device,
+                graph_enabled=True,
+                enable_torch_compile=self._enable_torch_compile,
+                world_size=get_world_group().world_size,
+            )
+            # compile_bs is empty when whole-model compilation is disabled.
+            # Select local buckets directly from the actual capture table.
+            self._compile_bs = {
+                bs
+                for bs in cuda_graph_runner.capture_bs
+                if bs <= args.torch_compile_max_bs
+            }
+            if not self._compile_bs:
+                raise ValueError("No Decode capture bucket fits --torch-compile-max-bs")
+            self._compile_regions = prepare_npu_compile_regions(
+                model_runner.model, self._compile_config
+            )
         # Event of the last replay; the next rebind waits on it so the device is
         # done reading the host-side seq_lens array before we rewrite it.
         self._rebind_fence = None
@@ -84,6 +122,21 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         forward_fn: Callable[[], Any],
         capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
+    ) -> None:
+        compile_session = (
+            NpuCompileSession(self._compile_regions, self._compile_config)
+            if shape_key.size in self._compile_bs
+            else None
+        )
+        with compile_session.activate() if compile_session else empty_context():
+            self._capture_one(shape_key, forward_fn, post_warmup_hook, compile_session)
+
+    def _capture_one(
+        self,
+        shape_key: ShapeKey,
+        forward_fn: Callable[[], Any],
+        post_warmup_hook: Optional[Callable[[], None]],
+        compile_session: Optional[NpuCompileSession],
     ) -> None:
         import torch_npu  # noqa: F401  (verifies NPU availability)
 
@@ -123,8 +176,12 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                 stream=self._capture_stream,
                 auto_dispatch_capture=True,
             ),
+            compile_session.capture() if compile_session else empty_context(),
         ):
             out = forward_fn()
+
+        if compile_session is not None:
+            compile_session.optimize(graph)
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out

@@ -645,6 +645,9 @@ class Envs:
     SGLANG_MLX_CLEAR_CACHE_STEPS = EnvInt(256)
 
     # NPU
+    # Explicit model regions only; independent of whole-model torch.compile.
+    SGLANG_NPU_ENABLE_STATIC_KERNEL = EnvBool(False)
+    SGLANG_NPU_ENABLE_SUPERKERNEL = EnvBool(False)
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     # Use separate HCCL send/receive buffers for ordinary NPU all-reduce.

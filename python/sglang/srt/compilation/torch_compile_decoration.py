@@ -68,16 +68,21 @@ def patch_model(
             tp_group.ca_comm = backup_ca_comm
 
 
-def set_torch_compile_config() -> None:
+def set_torch_compile_cache_config() -> None:
+    """Size Dynamo's caches for the fixed shapes captured by graph runners."""
     import torch._dynamo.config
+
+    torch._dynamo.config.accumulated_cache_size_limit = 1024
+    if hasattr(torch._dynamo.config, "cache_size_limit"):
+        torch._dynamo.config.cache_size_limit = 1024
+
+
+def set_torch_compile_config() -> None:
     import torch._inductor.config
 
     torch._inductor.config.coordinate_descent_tuning = True
     torch._inductor.config.triton.unique_kernel_names = True
     torch._inductor.config.fx_graph_cache = True
 
-    torch._dynamo.config.accumulated_cache_size_limit = 1024
-    if hasattr(torch._dynamo.config, "cache_size_limit"):
-        torch._dynamo.config.cache_size_limit = 1024
-
+    set_torch_compile_cache_config()
     monkey_patch_torch_compile()

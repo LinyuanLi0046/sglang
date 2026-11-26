@@ -2061,6 +2061,12 @@ class Qwen2MoeAttention(nn.Module):
             )
 
         def execute_flash(flash_op, query, key, value, **kwargs):
+            wait_gate_before_scope = (
+                enable_gate_alt_stream and envs.SGLANG_NPU_ENABLE_SUPERKERNEL.get()
+            )
+            if wait_gate_before_scope:
+                # Keep the gate dependency outside the SuperKernel fusion range.
+                torch.get_device_module().current_stream().wait_stream(self.alt_stream)
             with self._npu_flash_region.scope():
                 attn_output = self._npu_flash_region(
                     flash_op, query, key, value, **kwargs
@@ -2072,9 +2078,8 @@ class Qwen2MoeAttention(nn.Module):
                         # is outside the requested region even on one stream.
                         with self._npu_flash_region.scope(exclude=True):
                             local_gate = self.gate_proj(hidden_states)[0].unsqueeze(-1)
-                    if enable_gate_alt_stream:
-                        # First consume the side-stream gate after Flash, as in
-                        # the ordinary path. Do not pull this wait into FX.
+                    if enable_gate_alt_stream and not wait_gate_before_scope:
+                        # Static-only compilation keeps the ordinary post-Flash wait.
                         torch.get_device_module().current_stream().wait_stream(
                             self.alt_stream
                         )

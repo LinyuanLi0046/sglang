@@ -215,6 +215,8 @@ class AscendRunnerCore(MoeRunnerCore):
         """
         region = self._welm_compile_region
         if region is not None and region.is_active:
+            # Unquantized callers pass the layer itself, which may not define
+            # the optional quantization or bias attributes.
             hidden_states = region(
                 runner_input.hidden_states,
                 runner_input.expert_tokens,
@@ -222,14 +224,14 @@ class AscendRunnerCore(MoeRunnerCore):
                 runner_input.group_list_type,
                 quant_info.w13_weight,
                 quant_info.w2_weight,
-                quant_info.w13_weight_scale,
-                quant_info.w2_weight_scale,
-                quant_info.w13_weight_offset,
-                quant_info.w2_weight_offset,
-                quant_info.w13_weight_bias,
-                quant_info.w2_weight_bias,
-                quant_info.w13_scale_bias,
-                quant_info.w2_scale_bias,
+                getattr(quant_info, "w13_weight_scale", None),
+                getattr(quant_info, "w2_weight_scale", None),
+                getattr(quant_info, "w13_weight_offset", None),
+                getattr(quant_info, "w2_weight_offset", None),
+                getattr(quant_info, "w13_weight_bias", None),
+                getattr(quant_info, "w2_weight_bias", None),
+                getattr(quant_info, "w13_scale_bias", None),
+                getattr(quant_info, "w2_scale_bias", None),
             )
         else:
             hidden_states = self._run_experts(

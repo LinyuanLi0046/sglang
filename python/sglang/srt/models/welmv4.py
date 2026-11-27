@@ -62,6 +62,7 @@ from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
 from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import (
     RotaryEmbedding,
@@ -127,6 +128,10 @@ if is_npu():
         welmv4_oe_hash_explicit_history_4way_npu,
         welmv4_oe_hash_prefill_4way_npu,
     )
+    from sglang.srt.layers.welmv4_qkv_layout import (
+        qkv_cache_view,
+        qkv_tensor_is_nd,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +183,10 @@ def _get_welm_fused_qkv_program(
     )
     program = _WELMV4_FUSED_QKV_PROGRAMS.get(key)
     if program is None:
+        if torch.npu.is_current_stream_capturing():
+            # Warmup selects/loads programs. Never compile a missing dynamic
+            # variant from inside the serving graph capture.
+            return None
         from sglang.srt.layers.fused_qkv_proj_norm_rope_cache import (
             compile_aot,
             compile_aot_rank_chunk,
@@ -1980,14 +1989,119 @@ class Qwen2MoeAttention(nn.Module):
             )
         self.is_nextn = is_nextn
 
+        fused_qkv_enabled = _is_npu and get_bool_env_var(
+            "SGLANG_NPU_WELMV4_FUSED_QKV", "0"
+        )
+        self.fused_qkv_attn_tp_size = attn_tp_size
         self.use_npu_fused_qkv = (
-            _is_npu
-            and os.environ.get("SGLANG_NPU_WELMV4_FUSED_QKV", "0") == "1"
-            and get_tensor_model_parallel_world_size() == 4
-            and not is_dp_attention_enabled()
+            fused_qkv_enabled
+            and attn_tp_size in (1, 2, 4)
             and not is_nextn
             and self.kv_mirror_layer_idx not in self.kv_mirror_layers
         )
+        # MXFP8 and the legacy dynamic Decode/Verify path still have their
+        # original TP4 contract. Do not extend them by widening the BF16 gate.
+        self.use_legacy_npu_fused_qkv = (
+            self.use_npu_fused_qkv
+            and attn_tp_size == 4
+            and get_tensor_model_parallel_world_size() == 4
+            and not is_dp_attention_enabled()
+        )
+        self.static_decode_qkv = None
+        if fused_qkv_enabled and attn_tp_size in (1, 2, 4) and not is_nextn:
+            # Load the binding before capture. The DSL kernel is compiled and
+            # first launched during ordinary eager execution / graph warmup.
+            from sglang.srt.layers.welmv4_static_decode_qkv import StaticDecodeQKV
+
+            self.static_decode_qkv = StaticDecodeQKV(attn_tp_size)
+
+    def _try_static_decode_qkv(self, positions, hidden_states, forward_batch):
+        if self.static_decode_qkv is None:
+            return None
+        return self.static_decode_qkv.try_run(
+            self, positions, hidden_states, forward_batch, get_attn_backend()
+        )
+
+    def _npu_bf16_fused_qkv_parameters(self):
+        """Validate the shared Plain/Source tensor ABI without device work.
+
+        The same check runs before deferring a prefill AllGather. A rejected
+        projection must retain the original gather and projection path.
+        """
+        if (
+            type(self.qkv_proj.quant_method) is not UnquantizedLinearMethod
+            or self.hidden_size != 2048
+            or self.head_dim != 256
+            or self.qk_rope_head_dim != 64
+            or self.q_norm is not None
+            or self.k_norm is None
+            or not isinstance(self.rotary_emb, WelmV4InplaceRotaryEmbedding)
+            or not self.rotary_emb.is_neox_style
+        ):
+            return None
+        tp = self.fused_qkv_attn_tp_size
+        if tp not in (1, 2, 4):
+            return None
+        qw, kvw = (24 // tp) * 256, max(1, 2 // tp) * 256
+        if (self.q_size, self.kv_size) != (qw, kvw):
+            return None
+        if self.kv_mirror_layer_idx in self.kv_mirror_layers:
+            return None
+        source = getattr(
+            self,
+            "_kv_mirror_active_source",
+            self.kv_mirror_layer_idx in self.kv_mirror_imitated_layers,
+        )
+        if source and not hasattr(self, "qkv_proj_weight"):
+            return None
+        weight = self.qkv_proj_weight if source else self.qkv_proj.weight
+        bias = self.qkv_proj_bias if source else self.qkv_proj.bias
+        if bias is not None:
+            return None
+        gamma, table = self.k_norm.weight, self.rotary_emb.cos_sin_cache
+        device = weight.device
+        if device.type != "npu" or table.ndim != 2 or table.shape[0] < 1:
+            return None
+        backend = get_attn_backend()
+        tensors = (
+            (
+                weight,
+                (qw + (4 if source else 2) * kvw, 2048),
+                torch.bfloat16,
+            ),
+            (gamma, (256,), torch.bfloat16),
+            (table, (table.shape[0], 64), torch.float32),
+        )
+        if any(
+            tuple(t.shape) != shape
+            or t.dtype != dtype
+            or t.device != device
+            or not t.is_contiguous()
+            or not qkv_tensor_is_nd(t)
+            for t, shape, dtype in tensors
+        ):
+            return None
+        k_cache, v_cache = backend.token_to_kv_pool.get_kv_buffer(self.attn.layer_id)
+        if k_cache.shape != v_cache.shape or any(
+            t.dtype != torch.bfloat16
+            or t.device != device
+            or not t.is_contiguous()
+            or t.ndim < 3
+            or tuple(t.shape[-2:]) != (kvw // 256, 256)
+            for t in (k_cache, v_cache)
+        ):
+            return None
+        # TP1 has two KV heads per physical token slot; never flatten heads
+        # into separate slots or write a contiguous copy of the actual cache.
+        k_cache = qkv_cache_view(k_cache, kvw)
+        if k_cache is None:
+            return None
+        v_cache = qkv_cache_view(v_cache, kvw)
+        if v_cache is None:
+            return None
+        if k_cache.shape[0] < 1 or k_cache.data_ptr() == v_cache.data_ptr():
+            return None
+        return weight.data, gamma.data.view(1, 256), table, k_cache, v_cache, source
 
     def prepare_graph_mirror_key(self, positions, key, batch):
         """Prepare the consumer's K in the T graph; Q belongs to the B graph."""
@@ -2018,15 +2132,51 @@ class Qwen2MoeAttention(nn.Module):
             Optional[torch.Tensor],
         ]
     ]:
-        """Use the fixed WeLM BF16 ABI for target prefill, decode or verify."""
+        """Use dynamic BF16 prefill for TP1/2/4; retain legacy TP4 decode."""
         num_tokens = hidden_states.shape[0]
         if num_tokens == 0:
             return None
         mode = forward_batch.forward_mode
-        cos_sin_cache = self.rotary_emb.cos_sin_cache
+        original_mode = getattr(forward_batch, "_original_forward_mode", None) or mode
+        # The new Decode kernel has deliberately narrow, independently tested
+        # admission. A rejected TP1/TP2/DP invocation must not bypass it via
+        # the unvalidated dynamic Decode kernel (including DP's synthetic EXTEND).
+        if (
+            not self.use_legacy_npu_fused_qkv
+            and (
+                mode not in (ForwardMode.EXTEND, ForwardMode.MIXED)
+                or original_mode not in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            )
+        ):
+            return None
+        backend = get_attn_backend()
+        if (
+            mode != ForwardMode.TARGET_VERIFY
+            and not getattr(backend, "use_welm_static_decode_qkv", False)
+        ):
+            # Keep the shared BF16 server/pool guards effective after a static
+            # fallback; TARGET_VERIFY retains only its legacy TP4 selection.
+            return None
+        params = self._npu_bf16_fused_qkv_parameters()
+        if params is None:
+            return None
+        weight, gamma, cos_sin_cache, k_cache, v_cache, has_mirror = params
+        if (
+            tuple(hidden_states.shape) != (num_tokens, 2048)
+            or hidden_states.dtype != torch.bfloat16
+            or hidden_states.device != weight.device
+            or not hidden_states.is_contiguous()
+            or not qkv_tensor_is_nd(hidden_states)
+            or positions.shape != (num_tokens,)
+            or positions.device != weight.device
+            or positions.dtype not in (torch.int32, torch.int64)
+            or not positions.is_contiguous()
+        ):
+            return None
         if mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
             if (
                 mode == ForwardMode.EXTEND
+                and not is_dp_attention_enabled()
                 and forward_batch.batch_size == 1
                 and forward_batch.welm_prefill_graph is None
             ):
@@ -2051,19 +2201,6 @@ class Qwen2MoeAttention(nn.Module):
             # Draft-extend stays on its existing external-mirror KV path.
             return None
 
-        has_mirror = (
-            self.kv_mirror_layer_idx in self.kv_mirror_imitated_layers
-            and hasattr(self, "qkv_proj_weight")
-        )
-        weight = self.qkv_proj_weight if has_mirror else self.qkv_proj.weight
-        # CANNBotDSL accepts plain tensors; do not bind/copy loader Parameters.
-        weight = weight.data
-        gamma = self.k_norm.weight.data.view(1, self.head_dim)
-        backend = get_attn_backend()
-        pool = backend.token_to_kv_pool
-        k_cache, v_cache = pool.get_kv_buffer(self.attn.layer_id)
-        k_cache = k_cache.view(-1, self.head_dim)
-        v_cache = v_cache.view(-1, self.head_dim)
         slot_mapping = (
             (
                 forward_batch.welm_prefill_swa_write_locs
@@ -2077,6 +2214,14 @@ class Qwen2MoeAttention(nn.Module):
                 else forward_batch.out_cache_loc
             )
         )
+        if (
+            slot_mapping is None
+            or slot_mapping.shape != (num_tokens,)
+            or slot_mapping.device != weight.device
+            or slot_mapping.dtype not in (torch.int32, torch.int64)
+            or not slot_mapping.is_contiguous()
+        ):
+            return None
 
         program = _get_welm_fused_qkv_program(
             hidden_states.device,
@@ -2085,6 +2230,8 @@ class Qwen2MoeAttention(nn.Module):
             cos_sin_cache.shape[0],
             positions_contiguous,
         )
+        if program is None:
+            return None
 
         q = hidden_states.new_empty((num_tokens, self.q_size))
         k = hidden_states.new_empty((num_tokens, self.kv_size))
@@ -2137,6 +2284,8 @@ class Qwen2MoeAttention(nn.Module):
         ]
     ]:
         """Fuse MXFP8 QKV using the existing activation/scale and Gate AGs."""
+        if not self.use_legacy_npu_fused_qkv:
+            return None
         local_rows = hidden_states.shape[0]
         if local_rows == 0:
             return None
@@ -2446,19 +2595,12 @@ class Qwen2MoeAttention(nn.Module):
         tp_size = group.world_size
         local_rows, hidden_size = local_hidden.shape
         num_tokens = tp_size * local_rows
-        has_mirror = (
-            self.kv_mirror_layer_idx in self.kv_mirror_imitated_layers
-            and hasattr(self, "qkv_proj_weight")
-        )
-        weight = self.qkv_proj_weight if has_mirror else self.qkv_proj.weight
-        weight = weight.data
-        gamma = self.k_norm.weight.data.view(1, self.head_dim)
+        params = self._npu_bf16_fused_qkv_parameters()
+        if params is None:
+            raise RuntimeError("Deferred WeLM BF16 QKV gather has an unsupported ABI")
+        weight, gamma, cos_sin_cache, k_cache, v_cache, has_mirror = params
         epsilon = float(self.k_norm.eps)
-        cos_sin_cache = self.rotary_emb.cos_sin_cache
         backend = get_attn_backend()
-        k_cache, v_cache = backend.token_to_kv_pool.get_kv_buffer(self.attn.layer_id)
-        k_cache = k_cache.view(-1, self.head_dim)
-        v_cache = v_cache.view(-1, self.head_dim)
         # These are physical slots in this layer's pool, not token positions.
         # The backend has already translated Full -> SWA when needed.
         slots = (
@@ -2474,6 +2616,23 @@ class Qwen2MoeAttention(nn.Module):
                 else forward_batch.out_cache_loc
             )
         )
+        if (
+            is_dp_attention_enabled()
+            or tp_size != self.fused_qkv_attn_tp_size
+            or local_hidden.dtype != torch.bfloat16
+            or local_hidden.device != weight.device
+            or not qkv_tensor_is_nd(local_hidden)
+            or positions.shape != (num_tokens,)
+            or slots is None
+            or slots.shape != (num_tokens,)
+            or any(
+                t.device != weight.device
+                or not t.is_contiguous()
+                or t.dtype not in (torch.int32, torch.int64)
+                for t in (positions, slots)
+            )
+        ):
+            raise RuntimeError("Deferred WeLM BF16 QKV gather has incompatible rows")
         full_positions = positions.to(torch.int64)
         full_slots = slots.to(torch.int64)
 
@@ -2506,6 +2665,10 @@ class Qwen2MoeAttention(nn.Module):
             for mode in dict.fromkeys(rope_modes)
         }
 
+        if any(program is None for program in programs.values()):
+            raise RuntimeError(
+                "WeLM BF16 QKV AG program was not prepared before capture"
+            )
         send_hidden = local_hidden.contiguous()
         receive_storage = local_hidden.new_empty((num_tokens, hidden_size))
         widths = [self.q_size, self.kv_size, self.kv_size]
@@ -2964,8 +3127,15 @@ class Qwen2MoeAttention(nn.Module):
                 "active draft decode."
             )
 
+        static_qkv = self._try_static_decode_qkv(
+            positions, hidden_states, forward_batch
+        )
         fused_qkv = None
-        if prefill_ag_qkv_slices is not None:
+        if static_qkv is not None:
+            # Q-only keeps the original mirror consumer and backend KV store.
+            # Keep it separate from the legacy tuple's Gate scheduling policy.
+            pass
+        elif prefill_ag_qkv_slices is not None:
             # Only Gate consumes this chunk-major arena. Attention and mirror
             # consumers continue to use the fused outputs in original row order.
             prefill_gate_hidden_states, fused_qkv = self._npu_prefill_ag_fused_qkv(
@@ -3001,8 +3171,14 @@ class Qwen2MoeAttention(nn.Module):
                 fused_qkv = self._try_npu_fused_qkv(
                     positions, hidden_states, forward_batch
                 )
-        if fused_qkv is not None:
-            q, k, v, mirror_k, mirror_v = fused_qkv
+        prepared_qkv = (
+            static_qkv.full_outputs()
+            if static_qkv is not None and not static_qkv.query_only
+            else fused_qkv
+        )
+        kv_store_owned = prepared_qkv is not None
+        if prepared_qkv is not None:
+            q, k, v, mirror_k, mirror_v = prepared_qkv
             if mirror_k is not None:
                 consumer_layer_id = self.kv_mirror_layers[
                     self.kv_mirror_imitated_layers.index(self.kv_mirror_layer_idx)
@@ -3152,9 +3328,12 @@ class Qwen2MoeAttention(nn.Module):
                 elif getattr(self, "_kv_mirror_mxfp8_query_projection", False):
                     q, _ = self.qkv_proj(hidden_states)
                 else:
-                    q = F.linear(
-                        hidden_states, self.qkv_proj_weight, self.qkv_proj_bias
-                    )
+                    if static_qkv is not None:
+                        q = static_qkv.q
+                    else:
+                        q = F.linear(
+                            hidden_states, self.qkv_proj_weight, self.qkv_proj_bias
+                        )
         else:
             if reuse_prefill_mxfp8_input:
                 (
@@ -3213,7 +3392,7 @@ class Qwen2MoeAttention(nn.Module):
             with device_module.stream(self.alt_stream):
                 gate = self.gate_proj(hidden_states)[0].unsqueeze(-1)
 
-        if fused_qkv is None:
+        if not kv_store_owned:
             q_shape = q.shape
             k_shape = None if k is None else k.shape
 
@@ -3251,7 +3430,11 @@ class Qwen2MoeAttention(nn.Module):
             )
 
             qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
-            if forward_batch.welm_prefill_graph_phase == "mirror":
+            if static_qkv is not None:
+                # The Q-only kernel already rotated Q. The consumer still owns
+                # its K normalization, K-only rotation, and ordinary cache write.
+                k = self.rotary_emb.forward_npu_single(positions, k)
+            elif forward_batch.welm_prefill_graph_phase == "mirror":
                 q = self.rotary_emb.forward_npu_single(positions, q)
             elif k is None:
                 # WeLM RoPE updates Q and K in place. They must not alias: passing
@@ -3330,7 +3513,7 @@ class Qwen2MoeAttention(nn.Module):
                 k,
                 v,
                 mirror=is_kv_mirror_prefill,
-                save_kv_cache=not frozen_mtp_decode and fused_qkv is None,
+                save_kv_cache=not frozen_mtp_decode and not kv_store_owned,
                 **attn_kwargs,
             )
         else:
@@ -3339,7 +3522,7 @@ class Qwen2MoeAttention(nn.Module):
                 k,
                 v,
                 forward_batch,
-                save_kv_cache=not frozen_mtp_decode and fused_qkv is None,
+                save_kv_cache=not frozen_mtp_decode and not kv_store_owned,
                 **attn_kwargs,
             )
         if self.gated_self_attention_headwise:
@@ -4064,6 +4247,9 @@ class Qwen2MoeDecoderLayer(nn.Module):
         if (
             input_hidden_is_scattered
             and self.self_attn.use_npu_fused_qkv
+            # This pipeline gathers on global TP. The DP executor owns a
+            # different attention TP group and keeps its existing input AG.
+            and not is_dp_attention_enabled()
             and forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
             and is_non_consumer_attention_layer
         ):
@@ -4085,25 +4271,23 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 if swa_max_ag_chunks is not None:
                     max_ag_chunks = swa_max_ag_chunks
             if max_ag_chunks >= 2:
-                if reuse_prefill_mxfp8_input:
+                if (
+                    reuse_prefill_mxfp8_input
+                    and self.self_attn.use_legacy_npu_fused_qkv
+                ):
                     prefill_mxfp8_ag_qkv_slices = _get_welm_prefill_ag_qkv_slices(
                         hidden_states.shape[0],
                         get_tensor_model_parallel_world_size(),
                         min_ag_chunk_tokens,
                         max_ag_chunks,
                     )
-                else:
-                    has_mirror = (
-                        self.self_attn.kv_mirror_layer_idx
-                        in self.self_attn.kv_mirror_imitated_layers
-                        and hasattr(self.self_attn, "qkv_proj_weight")
-                    )
-                    qkv_weight = (
-                        self.self_attn.qkv_proj_weight
-                        if has_mirror
-                        else self.self_attn.qkv_proj.weight
-                    )
-                    if qkv_weight.dtype == torch.bfloat16:
+                elif not reuse_prefill_mxfp8_input:
+                    if (
+                        getattr(
+                            get_attn_backend(), "use_welm_static_decode_qkv", False
+                        )
+                        and self.self_attn._npu_bf16_fused_qkv_parameters() is not None
+                    ):
                         prefill_ag_qkv_slices = _get_welm_prefill_ag_qkv_slices(
                             hidden_states.shape[0],
                             get_tensor_model_parallel_world_size(),
@@ -5781,6 +5965,29 @@ class WeLMV4MoeForCausalLM(nn.Module):
         LayerManager.post_init(
             kv_mirror_layer_ids, kv_mirror_imitated_layers, is_nextn=is_nextn
         )
+        # The checkpoint can declare a target->MTP pair (for example 0->48)
+        # even when only the target model is loaded. Its absent consumer does
+        # not contribute extra K/V rows, so fused QKV must use the plain ABI.
+        # Retain sources prepared via MTP staging even after those temporary
+        # consumer modules have been released. An active pair still requires
+        # its derived weights; do not infer inactivity from missing weights.
+        active_source_ids = set(kv_mirror_imitated_layers)
+        active_source_ids.update(
+            source
+            for consumer, source in zip(
+                total_kv_mirror_layers, total_kv_mirror_imitated_layers
+            )
+            if (int(source), int(consumer))
+            in LayerManager.prepared_cross_model_pairs
+        )
+        local_decoder_layers = (
+            self.model.decoder_layers if is_nextn else self.model.layers
+        )
+        for decoder_layer in local_decoder_layers:
+            attention = decoder_layer.self_attn
+            attention._kv_mirror_active_source = (
+                attention.kv_mirror_layer_idx in active_source_ids
+            )
         if not is_nextn and hasattr(self.model, "mtp_mirror_staging_layers"):
             for logical_layer_id, staging_layer in list(
                 self.model.mtp_mirror_staging_layers.items()

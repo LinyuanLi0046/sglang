@@ -66,7 +66,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     enable_num_token_non_padded,
     get_required_capture_hidden_mode,
 )
-from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
+    get_attn_backend,
+)
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
@@ -520,7 +524,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _retain_welm_capture_scratch(self, key, forward_batch: ForwardBatch) -> None:
         # Warmup allocates route-mask scratch on the layout (DP) or batch
         # (pure TP). Captured kernels reference those addresses during replay.
-        if forward_batch.welm_dp_moe_row_layout is not None:
+        if getattr(get_attn_backend(), "use_welm_static_decode_qkv", False):
+            # Static QKV outputs are allocated during warmup, outside the graph
+            # pool. Retain the whole batch, including the DP layout, per graph.
+            forward_batch.welm_static_decode_graph_owner = True
+            self.welm_capture_scratch[key] = forward_batch
+        elif forward_batch.welm_dp_moe_row_layout is not None:
             self.welm_capture_scratch[key] = forward_batch.welm_dp_moe_row_layout
         elif self.welm_local_decode_rows or getattr(
             self.model_runner, "welm_decode_rs_ag_enabled", False

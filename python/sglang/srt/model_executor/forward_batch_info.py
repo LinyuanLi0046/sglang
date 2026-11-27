@@ -1038,6 +1038,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Capture-only owner; never copied to the device or reused by eager batches.
     welm_graph_read_done: Optional[Any] = None
 
+    # Private static-decode outputs. Capture batches are retained by the graph
+    # runner; eager batches own only their current forward's tensors.
+    welm_static_decode_graph_owner: bool = False
+    welm_static_decode_qkv_outputs: Optional[Dict[Any, Any]] = None
+
     # Target BF16 breakable prefill only. Tensor storage, including native
     # Flash metadata, is runner-owned; request history is prepared before replay.
     welm_prefill_graph: Optional[Any] = None

@@ -38,6 +38,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     _reshape_kv_for_fia_nz,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 
 class TestExpandDsaSparseIndices(unittest.TestCase):
@@ -489,13 +490,21 @@ class TestForwardMetadata(unittest.TestCase):
     def test_is_dataclass(self):
         self.assertTrue(is_dataclass(ForwardMetadata))
 
-    def test_all_fields_default_none(self):
+    def test_field_defaults(self):
         metadata = ForwardMetadata()
+        non_none_defaults = {
+            "welm_flash_max_seqlen_q": -1,
+            "welm_decode_metadata_in_graph": False,
+            "welm_flash_schedules": {},
+        }
         for f in fields(ForwardMetadata):
-            self.assertIsNone(
-                getattr(metadata, f.name),
-                f"Field '{f.name}' should default to None",
-            )
+            if f.name in non_none_defaults:
+                self.assertEqual(getattr(metadata, f.name), non_none_defaults[f.name])
+            else:
+                self.assertIsNone(
+                    getattr(metadata, f.name),
+                    f"Field '{f.name}' should default to None",
+                )
 
     def test_create_with_values(self):
         block_tables = torch.tensor([[1, 2], [3, 4]])
@@ -521,6 +530,8 @@ class TestForwardMetadata(unittest.TestCase):
             "block_tables",
             "block_tables_swa",
             "swa_out_cache_loc",
+            "welm_static_decode_full_slots",
+            "welm_static_decode_swa_slots",
             "extend_seq_lens_cpu_int",
             "seq_lens_cpu_int",
             "seq_lens_cpu_list",
@@ -535,8 +546,415 @@ class TestForwardMetadata(unittest.TestCase):
             "full_sink_prefill_cu_q_lens",
             "full_sink_prefill_schedule",
             "full_sink_prefill_schedule_key",
+            "welm_flash_cu_seqlens_q",
+            "welm_flash_seqused_q",
+            "welm_flash_seqused_kv",
+            "welm_flash_max_seqlen_q",
+            "welm_decode_metadata_in_graph",
+            "welm_flash_schedules",
+            "welm_flash_mirror_q_lengths",
         }
         self.assertEqual(names, expected)
+
+
+class TestWelmStaticDecodeSlots(unittest.TestCase):
+    """CPU checks of the production metadata producers, without kernel launch."""
+
+    class NativePool:
+        def __init__(self, dtype=torch.bfloat16):
+            self.store_dtype = dtype
+
+    def evaluate_gate(
+        self,
+        *,
+        tp=2,
+        pp=1,
+        env=None,
+        flags=None,
+        backend_changes=None,
+        runner_changes=None,
+        pool=None,
+    ):
+        backend = self.make_backend(swa=False)
+        backend.use_mla = False
+        backend.model_dtype = torch.bfloat16
+        backend.dllm_config = None
+        backend.enable_torch_compile = False
+        backend.attn_cp_size = 1
+        backend.token_to_kv_pool = self.NativePool() if pool is None else pool
+        vars(backend).update(backend_changes or {})
+        runner = SimpleNamespace(
+            server_args=SimpleNamespace(**(flags or {})),
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            is_draft_worker=False,
+        )
+        vars(runner).update(runner_changes or {})
+        env_values = {"SGLANG_NPU_WELMV4_FUSED_QKV": True}
+        env_values.update(env or {})
+        module = AscendAttnBackend.__module__
+        pool_module = "sglang.srt.hardware_backend.npu.memory_pool_npu"
+        with (
+            patch(
+                f"{module}.get_bool_env_var",
+                side_effect=lambda name, default: env_values.get(name, False),
+            ),
+            patch(
+                f"{module}.get_parallel",
+                return_value=SimpleNamespace(attn_tp_size=tp, pp_size=pp),
+            ),
+            patch.dict(
+                sys.modules,
+                {pool_module: SimpleNamespace(NPUMHATokenToKVPool=self.NativePool)},
+            ),
+        ):
+            backend._init_welm_static_decode_qkv(runner)
+        return backend.use_welm_static_decode_qkv
+
+    def make_backend(self, *, swa=True):
+        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.device = "cpu"
+        backend.use_welm_static_decode_qkv = True
+        backend.use_sliding_window_kv_pool = swa
+        backend.is_hybrid_swa = swa
+        backend.use_welm_flash_attn = False
+        backend.capture_welm_decode_metadata = False
+        backend.is_welm_v4 = True
+        backend.max_context_len = 256
+        backend.page_size = 64
+        backend.speculative_num_draft_tokens = None
+        backend.q_head_num_padding = None
+        backend.forward_metadata = ForwardMetadata()
+        return backend
+
+    def make_batch(self, locs=(11, 0, -1, 9), lengths=(12, 7, 0, 0)):
+        return SimpleNamespace(
+            batch_size=len(locs),
+            forward_mode=ForwardMode.DECODE,
+            spec_info=None,
+            is_extend_in_batch=False,
+            out_cache_loc=torch.tensor(locs, dtype=torch.int32),
+            seq_lens=torch.tensor(lengths, dtype=torch.int64),
+            positions=torch.zeros(len(locs), dtype=torch.int64),
+        )
+
+    def test_gate_default_off_does_not_import_npu_pool(self):
+        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        module = AscendAttnBackend.__module__
+        with (
+            patch(f"{module}.get_bool_env_var", return_value=False) as get_env,
+            patch.dict(
+                sys.modules,
+                {"sglang.srt.hardware_backend.npu.memory_pool_npu": None},
+            ),
+        ):
+            backend._init_welm_static_decode_qkv(SimpleNamespace())
+        self.assertFalse(backend.use_welm_static_decode_qkv)
+        get_env.assert_called_once_with(
+            "SGLANG_NPU_WELMV4_FUSED_QKV", "False"
+        )
+
+    def test_retired_static_decode_flag_does_not_enable_slots(self):
+        self.assertFalse(
+            self.evaluate_gate(
+                env={
+                    "SGLANG_NPU_WELMV4_FUSED_QKV": False,
+                    "SGLANG_NPU_WELMV4_STATIC_DECODE_QKV": True,
+                }
+            )
+        )
+
+    def test_gate_accepts_native_full_and_swa_pools_for_attention_tp_1_2_4(self):
+        swa_pool = SWAKVPool.__new__(SWAKVPool)
+        swa_pool.full_kv_pool = self.NativePool()
+        swa_pool.swa_kv_pool = self.NativePool()
+        for tp in (1, 2, 4):
+            for pool in (self.NativePool(), swa_pool):
+                with self.subTest(tp=tp, pool_type=type(pool).__name__):
+                    self.assertTrue(self.evaluate_gate(tp=tp, pool=pool))
+
+    def test_gate_rejects_unvalidated_execution_modes(self):
+        changes = (
+            {"tp": 8},
+            {"pp": 2},
+            {"backend_changes": {"attn_cp_size": 2}},
+            {"backend_changes": {"is_welm_v4": False}},
+            {"backend_changes": {"use_mla": True}},
+            {"backend_changes": {"model_dtype": torch.float16}},
+            {"backend_changes": {"dllm_config": object()}},
+            {"backend_changes": {"enable_torch_compile": True}},
+            {"runner_changes": {"is_draft_worker": True}},
+            {
+                "runner_changes": {
+                    "spec_algorithm": SimpleNamespace(is_none=lambda: False)
+                }
+            },
+        )
+        for change in changes:
+            with self.subTest(change=change):
+                self.assertFalse(self.evaluate_gate(**change))
+        for name in (
+            "enable_two_batch_overlap",
+            "enable_single_batch_overlap",
+            "enable_pdmux",
+            "enable_hierarchical_cache",
+            "disaggregation_decode_enable_offload_kvcache",
+            "enable_memory_saver",
+            "enable_lora",
+            "lora_paths",
+            "cpu_offload_gb",
+        ):
+            with self.subTest(flag=name):
+                self.assertFalse(self.evaluate_gate(flags={name: True}))
+        for name in (
+            "SGLANG_NPU_ENABLE_STATIC_KERNEL",
+            "SGLANG_NPU_ENABLE_SUPERKERNEL",
+        ):
+            with self.subTest(env=name):
+                self.assertFalse(self.evaluate_gate(env={name: True}))
+
+    def test_gate_rejects_unvalidated_pool_subclasses_and_storage_dtype(self):
+        class UnvalidatedPool(self.NativePool):
+            pass
+
+        for pool in (
+            object(),
+            UnvalidatedPool(),
+            self.NativePool(dtype=torch.float16),
+        ):
+            with self.subTest(pool_type=type(pool).__name__):
+                self.assertFalse(self.evaluate_gate(pool=pool))
+        swa_pool = SWAKVPool.__new__(SWAKVPool)
+        swa_pool.full_kv_pool = self.NativePool()
+        swa_pool.swa_kv_pool = UnvalidatedPool()
+        self.assertFalse(self.evaluate_gate(pool=swa_pool))
+
+    def test_eager_slots_are_private_int64_and_skip_dummy_and_inactive_rows(self):
+        backend = self.make_backend()
+        batch = self.make_batch()
+        # A translated dummy value must not become a write even if nonzero.
+        swa = torch.tensor([21, 22, -1, 29], dtype=torch.int64)
+        backend.forward_metadata.swa_out_cache_loc = swa
+        original_full, original_swa = batch.out_cache_loc.clone(), swa.clone()
+        backend._prepare_welm_static_decode_slots(batch, allocate=True)
+        metadata = backend.forward_metadata
+        torch.testing.assert_close(
+            metadata.welm_static_decode_full_slots,
+            torch.tensor([11, -1, -1, -1], dtype=torch.int64),
+        )
+        torch.testing.assert_close(
+            metadata.welm_static_decode_swa_slots,
+            torch.tensor([21, -1, -1, -1], dtype=torch.int64),
+        )
+        torch.testing.assert_close(batch.out_cache_loc, original_full)
+        torch.testing.assert_close(swa, original_swa)
+        self.assertNotEqual(
+            metadata.welm_static_decode_swa_slots.data_ptr(), swa.data_ptr()
+        )
+        self.assertNotEqual(
+            metadata.welm_static_decode_full_slots.data_ptr(),
+            batch.out_cache_loc.data_ptr(),
+        )
+
+    def test_graph_buffers_are_preallocated_and_bucket_views_keep_addresses(self):
+        backend = self.make_backend()
+        backend.init_cuda_graph_state(max_bs=64, max_num_tokens=64)
+        backing = backend.graph_metadata["welm_static_decode_full_slots"]
+        swa_backing = backend.graph_metadata["welm_static_decode_swa_slots"]
+        self.assertEqual(backing.shape, (64,))
+        self.assertEqual(swa_backing.shape, (64,))
+        for rows in (1, 2, 4, 8, 16, 32, 64):
+            metadata = backend._init_cuda_graph_metadata(
+                rows,
+                ForwardMode.DECODE,
+                torch.zeros(rows, dtype=torch.int64),
+                torch.zeros(rows, dtype=torch.int32),
+            )
+            self.assertEqual(metadata.welm_static_decode_full_slots.shape, (rows,))
+            self.assertEqual(metadata.welm_static_decode_full_slots.dtype, torch.int64)
+            self.assertEqual(
+                metadata.welm_static_decode_full_slots.data_ptr(), backing.data_ptr()
+            )
+            self.assertEqual(metadata.welm_static_decode_swa_slots.shape, (rows,))
+            self.assertEqual(metadata.welm_static_decode_swa_slots.dtype, torch.int64)
+            self.assertEqual(
+                metadata.welm_static_decode_swa_slots.data_ptr(),
+                swa_backing.data_ptr(),
+            )
+
+    def test_eager_32_and_64_row_full_and_swa_slots(self):
+        for rows in (32, 64):
+            with self.subTest(rows=rows):
+                backend = self.make_backend()
+                locs = list(range(11, 11 + rows))
+                locs[0] = 0
+                lengths = [20] * (rows - 1) + [0]
+                batch = self.make_batch(locs, lengths)
+                swa_locs = list(range(1011, 1011 + rows))
+                swa = torch.tensor(swa_locs, dtype=torch.int64)
+                backend.forward_metadata.swa_out_cache_loc = swa
+                original_full = batch.out_cache_loc.clone()
+                original_swa = swa.clone()
+                backend._prepare_welm_static_decode_slots(batch, allocate=True)
+                metadata = backend.forward_metadata
+                for slots, source, expected in (
+                    (
+                        metadata.welm_static_decode_full_slots,
+                        batch.out_cache_loc,
+                        [-1] + locs[1:-1] + [-1],
+                    ),
+                    (
+                        metadata.welm_static_decode_swa_slots,
+                        swa,
+                        [-1] + swa_locs[1:-1] + [-1],
+                    ),
+                ):
+                    self.assertEqual(slots.shape, (rows,))
+                    self.assertEqual(slots.dtype, torch.int64)
+                    self.assertNotEqual(slots.data_ptr(), source.data_ptr())
+                    torch.testing.assert_close(
+                        slots, torch.tensor(expected, dtype=torch.int64)
+                    )
+                torch.testing.assert_close(batch.out_cache_loc, original_full)
+                torch.testing.assert_close(swa, original_swa)
+
+    def test_unsupported_rows_do_not_offer_eager_or_graph_slots(self):
+        for rows in (3, 128):
+            with self.subTest(rows=rows):
+                backend = self.make_backend()
+                batch = self.make_batch(list(range(1, rows + 1)), [20] * rows)
+                backend.forward_metadata.swa_out_cache_loc = (
+                    batch.out_cache_loc.to(torch.int64) + 1000
+                )
+                with patch.object(
+                    torch,
+                    "empty_like",
+                    side_effect=AssertionError("unsupported eager allocation"),
+                ):
+                    backend._prepare_welm_static_decode_slots(batch, allocate=True)
+                self.assertIsNone(
+                    backend.forward_metadata.welm_static_decode_full_slots
+                )
+                self.assertIsNone(
+                    backend.forward_metadata.welm_static_decode_swa_slots
+                )
+                # Both shapes fit the backing storage: rejection is the ABI
+                # allowlist, rather than an undersized graph allocation.
+                backend.init_cuda_graph_state(max_bs=128, max_num_tokens=128)
+                metadata = backend._init_cuda_graph_metadata(
+                    rows, ForwardMode.DECODE, batch.seq_lens, batch.out_cache_loc
+                )
+                self.assertIsNone(metadata.welm_static_decode_full_slots)
+                self.assertIsNone(metadata.welm_static_decode_swa_slots)
+
+    def test_graph_prologue_updates_after_translation_and_handles_idle_reuse(self):
+        for rows, captured_translation in (
+            (rows, captured) for rows in (4, 32, 64) for captured in (False, True)
+        ):
+            with self.subTest(rows=rows, captured_translation=captured_translation):
+                backend = self.make_backend()
+                backend.init_cuda_graph_state(max_bs=64, max_num_tokens=64)
+                batch = self.make_batch([0] * rows, [0] * rows)
+                metadata = backend._init_cuda_graph_metadata(
+                    rows,
+                    ForwardMode.DECODE,
+                    batch.seq_lens,
+                    batch.out_cache_loc,
+                    welm_decode_metadata_in_graph=captured_translation,
+                )
+                backend.forward_metadata = metadata
+                full_slots = metadata.welm_static_decode_full_slots
+                swa_slots = metadata.welm_static_decode_swa_slots
+                pointers = (full_slots.data_ptr(), swa_slots.data_ptr())
+
+                def translate(_):
+                    metadata.swa_out_cache_loc.copy_(batch.out_cache_loc * 2)
+
+                backend._prepare_welm_decode_metadata_device = MagicMock(
+                    side_effect=translate
+                )
+                # The same captured DECODE prologue later sees IDLE's all-zero
+                # registry inputs; Python forward_mode remains DECODE throughout.
+                for locs, lengths, expected in (
+                    (
+                        list(range(1, rows + 1)),
+                        [10] * rows,
+                        list(range(1, rows + 1)),
+                    ),
+                    (
+                        [3, 7] + [0] * (rows - 2),
+                        [8, 9] + [0] * (rows - 2),
+                        [3, 7] + [-1] * (rows - 2),
+                    ),
+                    ([0] * rows, [0] * rows, [-1] * rows),
+                    (
+                        [5] + [0] * (rows - 1),
+                        [20] + [0] * (rows - 1),
+                        [5] + [-1] * (rows - 1),
+                    ),
+                ):
+                    batch.out_cache_loc.copy_(torch.tensor(locs, dtype=torch.int32))
+                    batch.seq_lens.copy_(torch.tensor(lengths, dtype=torch.int64))
+                    if not captured_translation:
+                        translate(batch)  # legacy out_graph translation
+                    with patch.object(
+                        torch,
+                        "empty_like",
+                        side_effect=AssertionError("graph allocation"),
+                    ):
+                        backend.init_forward_metadata_in_graph(batch)
+                    torch.testing.assert_close(
+                        full_slots, torch.tensor(expected, dtype=torch.int64)
+                    )
+                    torch.testing.assert_close(
+                        swa_slots,
+                        torch.tensor(
+                            [2 * x if x > 0 else -1 for x in expected],
+                            dtype=torch.int64,
+                        ),
+                    )
+                    self.assertEqual(
+                        pointers, (full_slots.data_ptr(), swa_slots.data_ptr())
+                    )
+                self.assertEqual(
+                    backend._prepare_welm_decode_metadata_device.call_count,
+                    4 if captured_translation else 0,
+                )
+
+    def test_non_decode_speculative_and_misaligned_inputs_do_not_offer_slots(self):
+        changes = (
+            {"forward_mode": ForwardMode.EXTEND},
+            {"forward_mode": ForwardMode.TARGET_VERIFY},
+            {"forward_mode": ForwardMode.IDLE},
+            {"spec_info": object()},
+            {"is_extend_in_batch": True},
+            {"batch_size": 2},
+            {"positions": torch.zeros(2, dtype=torch.int64)},
+            {"positions": torch.zeros(4, dtype=torch.int32)},
+            {"positions": torch.zeros(8, dtype=torch.int64)[::2]},
+            {"seq_lens": torch.zeros(2, dtype=torch.int64)},
+            {"seq_lens": torch.zeros(4, dtype=torch.float32)},
+            {"out_cache_loc": torch.zeros(3, dtype=torch.int32)},
+        )
+        for change in changes:
+            with self.subTest(change=change):
+                backend = self.make_backend(swa=False)
+                batch = self.make_batch()
+                vars(batch).update(change)
+                backend._prepare_welm_static_decode_slots(batch, allocate=True)
+                self.assertIsNone(backend.forward_metadata.welm_static_decode_full_slots)
+                self.assertIsNone(backend.forward_metadata.welm_static_decode_swa_slots)
+
+    def test_missing_swa_translation_and_disabled_feature_do_not_offer_slots(self):
+        backend = self.make_backend()
+        backend._prepare_welm_static_decode_slots(self.make_batch(), allocate=True)
+        self.assertIsNone(backend.forward_metadata.welm_static_decode_full_slots)
+        backend.use_welm_static_decode_qkv = False
+        backend.forward_metadata.swa_out_cache_loc = torch.ones(4, dtype=torch.int64)
+        with patch.object(
+            torch, "empty_like", side_effect=AssertionError("disabled allocation")
+        ):
+            backend._prepare_welm_static_decode_slots(self.make_batch(), allocate=True)
+        self.assertIsNone(backend.forward_metadata.welm_static_decode_full_slots)
 
 
 class TestGenerateMaskFlag(unittest.TestCase):

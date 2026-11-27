@@ -110,6 +110,11 @@ class ForwardMetadata:
     # pre-translated full->SWA write target for SWAKVPool.set_kv_buffer
     swa_out_cache_loc: Optional[torch.Tensor] = None
 
+    # Private int64 ABI for static decode QKV. Shared attention locs retain
+    # their existing dtype and dummy zero; these buffers use -1 to skip writes.
+    welm_static_decode_full_slots: Optional[torch.Tensor] = None
+    welm_static_decode_swa_slots: Optional[torch.Tensor] = None
+
     # seq len inputs
     extend_seq_lens_cpu_int: Optional[torch.Tensor] = None
     seq_lens_cpu_int: Optional[torch.Tensor] = None
@@ -470,6 +475,131 @@ class AscendAttnBackend(AttentionBackend):
             and not model_runner.is_draft_worker
             and not self.is_dllm_model
         )
+        self._init_welm_static_decode_qkv(model_runner)
+
+    def _init_welm_static_decode_qkv(self, model_runner: ModelRunner) -> None:
+        """Gate BF16 fusion and the private Decode slot ABI before capture.
+
+        The model also uses this configuration/pool guard for ordinary BF16
+        Prefill. Its existing per-token metadata stays on the Prefill path.
+        """
+        self.use_welm_static_decode_qkv = False
+        if not get_bool_env_var("SGLANG_NPU_WELMV4_FUSED_QKV", "False"):
+            return
+        args = model_runner.server_args
+        if (
+            not self.is_welm_v4
+            or self.use_mla
+            or self.model_dtype != torch.bfloat16
+            or not model_runner.spec_algorithm.is_none()
+            or model_runner.is_draft_worker
+            or self.dllm_config is not None
+            or self.enable_torch_compile
+            or self.attn_cp_size != 1
+            or get_parallel().attn_tp_size not in (1, 2, 4)
+            or get_parallel().pp_size != 1
+            or get_bool_env_var("SGLANG_NPU_ENABLE_STATIC_KERNEL", "False")
+            or get_bool_env_var("SGLANG_NPU_ENABLE_SUPERKERNEL", "False")
+            or any(
+                bool(getattr(args, name, False))
+                for name in (
+                    "enable_two_batch_overlap",
+                    "enable_single_batch_overlap",
+                    "enable_pdmux",
+                    "enable_hierarchical_cache",
+                    "disaggregation_decode_enable_offload_kvcache",
+                    "enable_memory_saver",
+                    "enable_lora",
+                    "lora_paths",
+                    "cpu_offload_gb",
+                )
+            )
+        ):
+            return
+
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMHATokenToKVPool
+
+        pool = self.token_to_kv_pool
+        # Exact types deliberately exclude Unified subclasses and unvalidated
+        # remapping/offload pools. Per-layer tensor layout is checked by QKV.
+        pools = (
+            (pool.full_kv_pool, pool.swa_kv_pool)
+            if type(pool) is SWAKVPool
+            else (pool,)
+        )
+        self.use_welm_static_decode_qkv = all(
+            type(child) is NPUMHATokenToKVPool and child.store_dtype == torch.bfloat16
+            for child in pools
+        )
+
+    def _prepare_welm_static_decode_slots(
+        self, forward_batch: ForwardBatch, *, allocate: bool = False
+    ) -> None:
+        """Prepare once per eager forward or in the captured decode prologue.
+
+        Ordinary decode has one physical row per request, including graph/DP
+        padding. A layer additionally checks that its gathered hidden M matches
+        these buffers. No device value is inspected on the host here.
+        """
+        if not getattr(self, "use_welm_static_decode_qkv", False):
+            return
+        metadata = self.forward_metadata
+        full_locs = forward_batch.out_cache_loc
+        seq_lens = forward_batch.seq_lens
+        positions = forward_batch.positions
+        swa_locs = metadata.swa_out_cache_loc
+        valid_input = (
+            forward_batch.forward_mode == ForwardMode.DECODE
+            and forward_batch.spec_info is None
+            and not getattr(forward_batch, "is_extend_in_batch", False)
+            and full_locs is not None
+            and seq_lens is not None
+            and positions is not None
+        )
+        if valid_input:
+            rows = full_locs.numel()
+            inputs = (full_locs, seq_lens, positions)
+            valid_input = (
+                rows in (1, 2, 4, 8, 16, 32, 64)
+                and forward_batch.batch_size == rows
+                and all(x.shape == (rows,) and x.is_contiguous() for x in inputs)
+                and all(x.device == full_locs.device for x in inputs)
+                and full_locs.dtype in (torch.int32, torch.int64)
+                and seq_lens.dtype in (torch.int32, torch.int64)
+                and positions.dtype == torch.int64
+            )
+            if self.use_sliding_window_kv_pool:
+                valid_input = valid_input and (
+                    swa_locs is not None
+                    and swa_locs.shape == (rows,)
+                    and swa_locs.is_contiguous()
+                    and swa_locs.device == full_locs.device
+                    and swa_locs.dtype in (torch.int32, torch.int64)
+                )
+        if not valid_input:
+            # This decision runs during eager/warmup/capture, never replay.
+            # An unsupported capture shape therefore records the original path.
+            metadata.welm_static_decode_full_slots = None
+            metadata.welm_static_decode_swa_slots = None
+            return
+        if allocate:
+            metadata.welm_static_decode_full_slots = torch.empty_like(
+                full_locs, dtype=torch.int64
+            )
+            if self.use_sliding_window_kv_pool:
+                metadata.welm_static_decode_swa_slots = torch.empty_like(
+                    full_locs, dtype=torch.int64
+                )
+        full_slots = metadata.welm_static_decode_full_slots
+        if full_slots is None:
+            return
+        valid_rows = (seq_lens > 0) & (full_locs > 0)
+        full_slots.copy_(full_locs)
+        full_slots.masked_fill_(~valid_rows, -1)
+        if self.use_sliding_window_kv_pool:
+            swa_slots = metadata.welm_static_decode_swa_slots
+            swa_slots.copy_(swa_locs)
+            swa_slots.masked_fill_(~valid_rows | (swa_locs <= 0), -1)
 
     def _is_swa_layer(self, layer: RadixAttention) -> bool:
         if not self.is_hybrid_swa:
@@ -1462,6 +1592,11 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         if self.forward_metadata.welm_decode_metadata_in_graph:
             self._prepare_welm_decode_metadata_device(forward_batch)
+        # Native metadata translates SWA immediately above; legacy metadata
+        # translated it in out_graph before replay. Both now expose stable
+        # capture inputs. Record this producer on every warmup and capture so
+        # replay updates the private slots, including an all-padding IDLE batch.
+        self._prepare_welm_static_decode_slots(forward_batch)
         if self.use_welm_flash_attn:
             # run_once invokes this for each warmup AND the actual capture.
             # Capture must record fresh producers, not reuse warmup schedules.
@@ -1678,6 +1813,7 @@ class AscendAttnBackend(AttentionBackend):
                 )
             )
 
+        self._prepare_welm_static_decode_slots(forward_batch, allocate=True)
         self.graph_mode = False
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
@@ -1691,6 +1827,14 @@ class AscendAttnBackend(AttentionBackend):
                 device=self.device,
             ),
         }
+        if getattr(self, "use_welm_static_decode_qkv", False):
+            self.graph_metadata["welm_static_decode_full_slots"] = torch.full(
+                (max_num_tokens,), -1, dtype=torch.int64, device=self.device
+            )
+            if self.use_sliding_window_kv_pool:
+                self.graph_metadata["welm_static_decode_swa_slots"] = torch.full(
+                    (max_num_tokens,), -1, dtype=torch.int64, device=self.device
+                )
         if self.capture_welm_decode_metadata:
             page_starts = (
                 torch.arange(
@@ -1763,6 +1907,22 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             num_tokens = out_cache_loc.shape[0]
             metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[:num_tokens]
+        if (
+            getattr(self, "use_welm_static_decode_qkv", False)
+            and forward_mode == ForwardMode.DECODE
+            and bs in (1, 2, 4, 8, 16, 32, 64)
+            and out_cache_loc is not None
+            and out_cache_loc.shape == (bs,)
+        ):
+            # Graph buckets share these addresses only in the supported serial
+            # replay mode; overlap/pdmux configurations are disabled above.
+            metadata.welm_static_decode_full_slots = self.graph_metadata[
+                "welm_static_decode_full_slots"
+            ][:bs]
+            if self.use_sliding_window_kv_pool:
+                metadata.welm_static_decode_swa_slots = self.graph_metadata[
+                    "welm_static_decode_swa_slots"
+                ][:bs]
         if not welm_decode_metadata_in_graph:
             metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
         metadata.seq_lens = seq_lens

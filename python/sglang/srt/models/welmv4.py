@@ -2167,9 +2167,15 @@ class Qwen2MoeAttention(nn.Module):
         # Decode/verify graph metadata describes every padded graph row.
         return output.reshape(padded_tokens, -1)
 
-    def _npu_gate_oproj(self, attn_output, gate):
+    def _npu_gate_oproj(self, attn_output, gate, gate_hidden_states=None):
         attn_shape = attn_output.shape
         if self.gated_self_attention_headwise:
+            if gate_hidden_states is not None:
+                # The gate projection is bias-free and does not gather its TP
+                # output. Keep its existing matmul in this compiled tensor tail.
+                gate = self.gate_proj.quant_method.apply(
+                    self.gate_proj, gate_hidden_states, bias=None
+                ).unsqueeze(-1)
             by_head = attn_output.view(attn_shape[0], self.num_heads, -1)
             # The functional schema avoids custom in-place aliasing in FX.
             attn_output = torch.ops.npu.welm_sigmoid_mul(gate, by_head).view(
@@ -2199,6 +2205,7 @@ class Qwen2MoeAttention(nn.Module):
         *,
         save_kv_cache,
         enable_gate_alt_stream,
+        fuse_gate_projection,
         skip_o_proj_all_reduce,
         skip_o_norm,
         attn_kwargs,
@@ -2226,7 +2233,7 @@ class Qwen2MoeAttention(nn.Module):
                 )
                 local_gate = gate
                 if self.gated_self_attention_headwise:
-                    if local_gate is None:
+                    if local_gate is None and not fuse_gate_projection:
                         # Keep the existing post-Flash projection position. It
                         # is outside the requested region even on one stream.
                         with self._npu_flash_region.scope(exclude=True):
@@ -2243,6 +2250,10 @@ class Qwen2MoeAttention(nn.Module):
                         get_tp_group(), disabled=not is_allocation_symmetric()
                     )
                 with symm_ctx:
+                    if fuse_gate_projection:
+                        return self._npu_gate_oproj_region(
+                            attn_output, local_gate, gate_hidden_states=hidden_states
+                        )
                     return self._npu_gate_oproj_region(attn_output, local_gate)
 
         output = self.attn(
@@ -3625,6 +3636,14 @@ class Qwen2MoeAttention(nn.Module):
                 forward_batch,
                 save_kv_cache=not frozen_mtp_decode and fused_qkv is None,
                 enable_gate_alt_stream=enable_npu_gate_alt_stream,
+                # Fused QKV disables gate overlap. In Decode SK capture, compile
+                # that main-stream matmul with sigmoid/mul/OProj instead of
+                # placing an excluded eager gate between Flash and the tail.
+                fuse_gate_projection=(
+                    fused_qkv is not None
+                    and forward_batch.forward_mode.is_decode()
+                    and envs.SGLANG_NPU_ENABLE_SUPERKERNEL.get()
+                ),
                 skip_o_proj_all_reduce=skip_o_proj_all_reduce,
                 skip_o_norm=skip_o_norm,
                 attn_kwargs=attn_kwargs,

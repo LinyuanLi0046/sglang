@@ -119,6 +119,8 @@ def fused_topk_npu(
     layer_id: Optional[int] = None,
     expert_bias: Optional[torch.Tensor] = None,
     scoring_func_override: Optional[str] = None,
+    routing_executor=None,
+    mapping_executor=None,
 ) -> "TopKOutput":
 
     use_grouped_topk = topk_config.use_grouped_topk
@@ -128,7 +130,8 @@ def fused_topk_npu(
     # WeLM opt-in path: top-k over (scores + expert_bias); weights from the
     # un-biased scores. This bypasses its custom callback without changing it.
     if expert_bias is not None:
-        topk_weights, topk_ids = fused_expert_bias_topk_npu(
+        route = routing_executor or fused_expert_bias_topk_npu
+        topk_weights, topk_ids = route(
             router_logits,
             expert_bias,
             top_k=topk_config.top_k,
@@ -218,8 +221,40 @@ def fused_topk_npu(
         )
 
     if expert_location_dispatch_info is not None:
-        topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+        if mapping_executor is None:
+            topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+        else:
+            # Pass live mapping tensors, not a cached warmup mapping result.
+            info = expert_location_dispatch_info
+            topk_ids = mapping_executor(
+                topk_ids,
+                info.ep_dispatch_algorithm,
+                info.partial_logical_to_rank_dispatch_physical_map,
+                info.partial_logical_to_all_physical_map,
+                info.partial_logical_to_all_physical_map_num_valid,
+                info.num_physical_experts,
+                info.rank_invariant,
+            )
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
     capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
 
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
+
+
+def map_topk_npu(
+    topk_ids, algorithm, rank_map, all_map, num_valid, num_physical_experts, rank_invariant
+):
+    """Tensor boundary for the existing logical-to-physical mapping implementation."""
+    from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+
+    return topk_ids_logical_to_physical(
+        topk_ids,
+        ExpertLocationDispatchInfo(
+            ep_dispatch_algorithm=algorithm,
+            partial_logical_to_rank_dispatch_physical_map=rank_map,
+            partial_logical_to_all_physical_map=all_map,
+            partial_logical_to_all_physical_map_num_valid=num_valid,
+            num_physical_experts=num_physical_experts,
+            rank_invariant=rank_invariant,
+        ),
+    )

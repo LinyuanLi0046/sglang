@@ -651,7 +651,8 @@ class Envs:
     # WeLM regional compilation; require SGLANG_NPU_ENABLE_STATIC_KERNEL.
     # Only selected target Decode/Verify graph buckets use these regions.
     WELM_NPU_SUPERKERNEL_FLASH_GATE_OPROJ = EnvBool(False)
-    WELM_NPU_SUPERKERNEL_ROUTED_FFN = EnvBool(False)
+    # 0: disabled; 1: routed GMM/SwiGLU/GMM; 2: Decode full MoE (950DT BF16 ops).
+    WELM_NPU_SUPERKERNEL_MOE = EnvInt(0)
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     # Use separate HCCL send/receive buffers for ordinary NPU all-reduce.

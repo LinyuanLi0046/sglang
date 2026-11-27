@@ -136,7 +136,7 @@ class AscendRunnerCore(MoeRunnerCore):
             else:
                 self.activation = inner
 
-    def enable_welm_compile_region(self, name: str):
+    def enable_welm_compile_region(self, name: str, *, external_scope: bool = False):
         """Bind the WeLM FFN region without changing the ordinary runner path."""
         if self._welm_compile_region is not None:
             return self._welm_compile_region
@@ -200,6 +200,7 @@ class AscendRunnerCore(MoeRunnerCore):
             compile_fn=partial(
                 self._run_tensor_inputs, use_swiglu_group=use_swiglu_group
             ),
+            external_scope=external_scope,
         )
         return self._welm_compile_region
 

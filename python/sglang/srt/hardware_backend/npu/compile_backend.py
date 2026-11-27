@@ -20,6 +20,7 @@ from sglang.srt.environ import envs
 class NpuCompileConfig:
     static_kernel: bool = False
     super_kernel: bool = False
+    super_kernel_options: tuple[tuple[str, int], ...] = ()
 
     def __post_init__(self):
         if self.super_kernel and not self.static_kernel:
@@ -96,6 +97,8 @@ def get_npugraph_ex_backend(config: NpuCompileConfig):
     if config.super_kernel:
         # Required during static compilation as well as after outer capture.
         options["super_kernel_optimize"] = True
+        if config.super_kernel_options:
+            options["super_kernel_optimize_options"] = dict(config.super_kernel_options)
     process_options(compiler_config, {"options": options})
     # init_npu_backend() already sets jit_compile=False once per worker.
     return npugraph_ex.get_npu_backend(compiler_config=compiler_config)
@@ -104,8 +107,9 @@ def get_npugraph_ex_backend(config: NpuCompileConfig):
 class NpuCompileRegion:
     """A persistent callable, eager except during an opted-in graph capture.
 
-    ``fn`` must contain only the selected tensor computation. Keep mode checks,
-    communication, shared-buffer notifications and cache ownership outside it.
+    ``fn`` must contain only the selected tensor computation, including explicitly
+    bound native communication ops. Keep mode checks, communication setup,
+    handles, shared-buffer notifications and cache ownership outside it.
     The owning model must retain this object for the lifetime of its graphs.
     """
 
@@ -217,7 +221,12 @@ class NpuCompileSession:
         if self.config.super_kernel:
             # In-place optimization of an already captured graph, before it
             # is published for replay. Do not replace graph with the return value.
-            graph.super_kernel_optimize()
+            if self.config.super_kernel_options:
+                graph.super_kernel_optimize(
+                    optimize_options=dict(self.config.super_kernel_options)
+                )
+            else:
+                graph.super_kernel_optimize()
 
 
 def prepare_npu_compile_regions(model, config: NpuCompileConfig):
@@ -246,6 +255,16 @@ def prepare_npu_compile_regions(model, config: NpuCompileConfig):
                 "SuperKernel requires torch_npu scope APIs and "
                 "NPUGraph.super_kernel_optimize"
             )
+        if config.super_kernel_options:
+            from inspect import signature
+
+            if "optimize_options" not in signature(
+                torch.npu.NPUGraph.super_kernel_optimize
+            ).parameters:
+                raise RuntimeError(
+                    "WeLM full MoE requires torch_npu "
+                    "NPUGraph.super_kernel_optimize(optimize_options=...)"
+                )
     from sglang.srt.compilation.torch_compile_decoration import (
         set_torch_compile_cache_config,
     )

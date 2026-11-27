@@ -914,6 +914,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self.return_recv_hook = return_recv_hook
         self.device_module = torch.get_device_module()
         self.quant_config = {}
+        self._npu_compile_adapter = None
 
     def _resolve_num_max_dispatch_tokens_per_rank(self, num_tokens: int) -> int:
         capacity_override = get_forward().deepep_num_max_dispatch_tokens_override
@@ -1056,6 +1057,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
                 **fp8_deepgemm_scale_opts,
+                **(self._npu_compile_kwargs() if _is_npu else {}),
             )
         )
         return packed_recv_hidden, self.packed_recv_count, event, hook
@@ -1128,10 +1130,17 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
                 **overlap_args_dict,
+                **(self._npu_compile_kwargs() if _is_npu else {}),
             )
 
         self.packed_recv_count = self.handle = None
         return combined_hidden_states, event, hook
+
+    def _npu_compile_kwargs(self):
+        adapter = self._npu_compile_adapter
+        if adapter is not None and adapter.dispatch.is_active:
+            return {"compile_adapter": adapter}
+        return {}
 
     def _get_buffer(self):
         DeepEPBuffer.set_dispatch_mode_as_low_latency()
@@ -1155,6 +1164,41 @@ class _Stage(Enum):
 
 
 class DeepEPDispatcher(BaseDispatcher):
+    def enable_welm_full_moe_compile(self, name: str):
+        """Own the layer's compile calls without mutating the shared Buffer."""
+        from types import SimpleNamespace
+
+        from sglang.srt.hardware_backend.npu.compile_backend import NpuCompileRegion
+
+        impl = getattr(self, "_low_latency_dispatcher", None)
+        if not _is_npu or _use_zbal or impl is None:
+            raise ValueError("WeLM full MoE requires NPU DeepEP low-latency ops")
+        if impl.use_fp8 or impl.use_nvfp4 or impl.params_dtype != torch.bfloat16:
+            raise ValueError("WeLM full MoE requires BF16 dispatch")
+        buffer = impl._get_buffer()
+        factory = getattr(
+            getattr(buffer, "low_latency_strategy", None),
+            "get_welm_compile_callables",
+            None,
+        )
+        if factory is None:
+            raise RuntimeError(
+                "WeLM full MoE requires DEEP_USE_MODE=ops and the updated "
+                "sgl-kernel-npu DeepEP compile_adapter interface"
+            )
+        callables = factory(
+            impl.hidden_size,
+            impl.router_topk,
+            impl.params_dtype,
+            impl.num_max_dispatch_tokens_per_rank,
+        )
+        regions = {
+            key: NpuCompileRegion(name + "." + key, fn, external_scope=True)
+            for key, fn in callables.items()
+        }
+        impl._npu_compile_adapter = SimpleNamespace(**regions)
+        return regions
+
     def __init__(
         self,
         group: torch.distributed.ProcessGroup,

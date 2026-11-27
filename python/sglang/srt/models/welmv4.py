@@ -17,6 +17,8 @@
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 import logging
 import os
+from contextlib import nullcontext
+from functools import partial
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -787,6 +789,13 @@ class Qwen2MoeMLP(nn.Module):
         use_reduce_scatter: bool = False,
     ):
         """Finish the MLP after an optionally overlapped gate/up projection."""
+        x = self.activate(gate_up)
+        x, _ = self.down_proj(
+            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+        )
+        return x
+
+    def activate(self, gate_up: torch.Tensor) -> torch.Tensor:
         if self.swiglu_clamp_limit is not None and self.swiglu_clamp_limit > 0:
             d = gate_up.shape[-1] // 2
             gate = F.silu(gate_up[..., :d]).clamp_(max=self.swiglu_clamp_limit)
@@ -794,9 +803,6 @@ class Qwen2MoeMLP(nn.Module):
             x = gate * up
         else:
             x = self.act_fn(gate_up)
-        x, _ = self.down_proj(
-            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
-        )
         return x
 
 
@@ -884,6 +890,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.welm_prefill_megamoe = None
         self.welm_megamoe_shared_kwargs = None
         self.alt_stream = alt_stream
+        self._npu_full_moe_regions = None
         if self.tp_size > config.num_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -1029,6 +1036,99 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and moe_clamp_limit is None
         )
 
+    def enable_npu_full_moe_regions(self, name: str):
+        from sglang.srt.hardware_backend.npu.compile_backend import NpuCompileRegion
+        from sglang.srt.hardware_backend.npu.moe.topk import (
+            fused_expert_bias_topk_npu,
+            fused_topk_npu,
+            map_topk_npu,
+        )
+        from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+            NPUUnquantMoEMethod,
+        )
+        from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPDispatcher
+
+        if self._npu_full_moe_regions is not None:
+            return tuple(self._npu_full_moe_regions.values())
+        if (
+            self.is_nextn
+            or not isinstance(self.experts.dispatcher, DeepEPDispatcher)
+            or get_parallel().moe_tp_size != 1
+            or not isinstance(self.experts.w13_kernel, NPUUnquantMoEMethod)
+            or not isinstance(self.experts.w2_kernel, NPUUnquantMoEMethod)
+            or self.experts.w13_weight.dtype != torch.bfloat16
+            or self.experts.w2_weight.dtype != torch.bfloat16
+        ):
+            raise ValueError("WeLM full MoE requires BF16 low-latency EP with MoE TP=1")
+        if getattr(self.custom_routing_function, "func", None) is not expert_bias_routing:
+            raise ValueError("WeLM full MoE currently requires expert-bias routing")
+        if self.shared_expert is not None and (
+            self.shared_expert.gate_up_proj.tp_size != 1
+            or self.shared_expert.down_proj.tp_size != 1
+        ):
+            raise ValueError("WeLM full MoE requires a replicated shared expert")
+
+        regions = {
+            "router": NpuCompileRegion(name, self._npu_moe_router, external_scope=True),
+            "route": NpuCompileRegion(
+                name + ".route", fused_expert_bias_topk_npu, external_scope=True
+            ),
+            "mapping": NpuCompileRegion(
+                name + ".mapping", map_topk_npu, external_scope=True
+            ),
+            "mask": NpuCompileRegion(
+                name + ".mask", self._mask_npu_padded_topk, external_scope=True
+            ),
+        }
+        if self.shared_expert is not None:
+            regions["shared"] = NpuCompileRegion(
+                name + ".shared",
+                self._forward_shared_expert,
+                compile_fn=self._npu_moe_shared,
+                external_scope=True,
+            )
+            regions["merge"] = NpuCompileRegion(
+                name + ".merge", self._npu_moe_merge, external_scope=True
+            )
+        runner_core = self.experts.quant_method.runner.runner_core
+        regions["ffn"] = runner_core.enable_welm_compile_region(
+            name + ".routed_ffn", external_scope=True
+        )
+        regions.update(self.experts.dispatcher.enable_welm_full_moe_compile(name))
+        self._npu_full_moe_topk = partial(
+            fused_topk_npu,
+            topk_config=self.topk.topk_config,
+            layer_id=self.layer_id,
+            routing_executor=regions["route"],
+            mapping_executor=regions["mapping"],
+        )
+        self._npu_full_moe_regions = regions
+        return tuple(regions.values())
+
+    @staticmethod
+    def _npu_moe_router(hidden_states, weight_t):
+        return torch.mm(hidden_states, weight_t, out_dtype=torch.float32)
+
+    def _npu_moe_shared(self, hidden_states):
+        # TP=1 was checked at initialization. Reuse the loaded linear kernels
+        # and activation, without RowParallelLinear's process-group context in FX.
+        shared = self.shared_expert
+        gate_up = shared.gate_up_proj.quant_method.apply(
+            shared.gate_up_proj, hidden_states, bias=None
+        )
+        output = shared.down_proj.quant_method.apply(
+            shared.down_proj, shared.activate(gate_up), bias=None
+        )
+        if self.shared_expert_gate is not None:
+            output = F.sigmoid(self.shared_expert_gate(hidden_states)) * output
+        return output
+
+    @staticmethod
+    def _npu_moe_merge(experts_output, shared_output, inplace):
+        if inplace:
+            return experts_output.add_(shared_output)
+        return experts_output + shared_output
+
     def _forward_shared_expert(
         self,
         hidden_states: torch.Tensor,
@@ -1155,6 +1255,25 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 "WeLMv4 in-place expert/shared merge cannot publish separate "
                 "MLP components"
             )
+        full_moe = self._npu_full_moe_regions
+        if full_moe is not None and not full_moe["router"].is_active:
+            full_moe = None
+        if full_moe is not None and (
+            forward_batch is None
+            or not forward_batch.forward_mode.is_decode()
+            or get_forward().is_extend_in_batch
+            or use_welm_local_ep_moe
+            or use_welm_prefill_megamoe
+            or self._resolve_deepep_mode_for_topk(False) != DeepEPMode.LOW_LATENCY
+        ):
+            raise RuntimeError(
+                "WeLM full MoE capture requires a pure Decode low-latency batch"
+            )
+        shared_forward = (
+            full_moe.get("shared")
+            if full_moe is not None
+            else self._forward_shared_expert
+        )
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         shared_output = None
@@ -1307,209 +1426,233 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # DP already supplies its local count and sanitizes hidden/residual.
             # Keep legal TopK IDs instead of applying DeepEP's -1 convention.
             num_token_non_padded = None
-        if moe_a2a_backend.is_deepep() and hidden_states.shape[0] == 0:
-            topk_output = self.topk.empty_topk_output(
-                hidden_states.device, layer_id=self.layer_id
-            )
-        else:
-            if (
-                self.shared_expert is not None
-                and not fuse_shared_this_call
-                and not enable_npu_shared_alt_stream
-                and not enable_npu_megamoe_shared_gate_up_overlap
-            ):
-                shared_output = self._forward_shared_expert(hidden_states)
-            if _is_npu:
-                router_logits = torch.mm(
-                    hidden_states,
-                    self.get_npu_router_compute_weight_t(),
-                    out_dtype=torch.float32,
+        # The shared-stream launch and original join stay in their existing
+        # positions. Only the selected capture marks one outer MoE scope.
+        with full_moe["router"].scope() if full_moe is not None else nullcontext():
+            if moe_a2a_backend.is_deepep() and hidden_states.shape[0] == 0:
+                topk_output = self.topk.empty_topk_output(
+                    hidden_states.device, layer_id=self.layer_id
                 )
             else:
-                router_logits = mmq_style_router_linear(
-                    hidden_states, self.gate.weight
+                if (
+                    self.shared_expert is not None
+                    and not fuse_shared_this_call
+                    and not enable_npu_shared_alt_stream
+                    and not enable_npu_megamoe_shared_gate_up_overlap
+                ):
+                    shared_output = shared_forward(hidden_states)
+                if _is_npu:
+                    if full_moe is not None:
+                        router_logits = full_moe["router"](
+                            hidden_states, self.get_npu_router_compute_weight_t()
+                        )
+                    else:
+                        router_logits = torch.mm(
+                            hidden_states,
+                            self.get_npu_router_compute_weight_t(),
+                            out_dtype=torch.float32,
+                        )
+                else:
+                    router_logits = mmq_style_router_linear(
+                        hidden_states, self.gate.weight
+                    )
+                if enable_npu_decode_like_dual_stream:
+                    # Start after the router Cube GEMM. The shared expert overlaps
+                    # routing, dispatch, and the routed-expert path until final add;
+                    # both paths only read the original hidden_states storage.
+                    shared_output = process_shared_expert(
+                        hidden_states, shared_forward
+                    )
+                if enable_npu_megamoe_shared_gate_up_overlap:
+                    # The helper makes the shared stream wait for the router GEMM
+                    # and input sanitization, then returns without blocking TopK.
+                    shared_gate_up, _ = process_shared_expert(
+                        hidden_states, self.shared_expert.gate_up_proj
+                    )
+                # Ascend's generic fused TopK dispatch ignores custom routing callbacks.
+                # Route WeLM's expert-bias callback through MoeGatingTopK explicitly;
+                # it uses the native TopK tie order rather than MMQ's tie_rank order.
+                if _is_npu and self.custom_routing_function is not None:
+                    if (
+                        getattr(self.custom_routing_function, "func", None)
+                        is expert_bias_routing
+                    ):
+                        topk_forward = (
+                            self._npu_full_moe_topk
+                            if full_moe is not None
+                            else self.topk.forward_npu
+                        )
+                        topk_output = topk_forward(
+                            hidden_states,
+                            router_logits,
+                            num_token_non_padded=num_token_non_padded,
+                            expert_location_dispatch_info=(
+                                ExpertLocationDispatchInfo.init_new(
+                                    layer_id=self.layer_id
+                                )
+                                if not self.is_nextn
+                                else None
+                            ),
+                            expert_bias=self.expert_bias,
+                            scoring_func_override=self.router_score_func,
+                        )
+                    else:
+                        topk_output = self.topk.forward_native(
+                            hidden_states,
+                            router_logits,
+                            num_token_non_padded=num_token_non_padded,
+                        )
+                else:
+                    topk_output = self.topk(
+                        hidden_states,
+                        router_logits,
+                        num_token_non_padded=num_token_non_padded,
+                    )
+            if (
+                _is_npu
+                and not use_welm_prefill_megamoe
+                and (num_token_non_padded is not None or valid_row_mask is not None)
+            ):
+                if not isinstance(topk_output, StandardTopKOutput):
+                    raise RuntimeError(
+                        "WeLMv4 NPU padding requires StandardTopKOutput, got "
+                        f"{type(topk_output).__name__}"
+                    )
+                # NPU DeepEP normal AllGather consumes -1 as an inactive route. The
+                # legacy low-latency kernels do not unless their optional negative-ID
+                # mode is enabled, so keep the router's valid, distinct expert IDs
+                # there. Only MTE with caller-side output masking may keep weights.
+                preserve_padded_ids = (
+                    moe_a2a_backend.is_deepep()
+                    and self._resolve_deepep_mode_for_topk(is_prefill_batch)
+                    == DeepEPMode.LOW_LATENCY
                 )
-            if enable_npu_decode_like_dual_stream:
-                # Start after the router Cube GEMM. The shared expert overlaps
-                # routing, dispatch, and the routed-expert path until final add;
-                # both paths only read the original hidden_states storage.
+                skip_padding_weight_mask = False
+                if (
+                    preserve_padded_ids
+                    and padded_output_is_masked
+                    and valid_row_mask is not None
+                    and invalid_row_mask is not None
+                    and invalid_topk_id is None
+                ):
+                    # These scattered LL callers mask the merged MoE output. MTE
+                    # applies weights only to the source token's combine result.
+                    skip_padding_weight_mask = DeepEPBuffer.is_npu_low_latency_mte()
+                if not skip_padding_weight_mask:
+                    mask_topk = (
+                        full_moe["mask"]
+                        if full_moe is not None
+                        else self._mask_npu_padded_topk
+                    )
+                    topk_output = mask_topk(
+                        topk_output,
+                        num_token_non_padded,
+                        preserve_padded_ids=preserve_padded_ids,
+                        valid_row_mask=valid_row_mask,
+                        invalid_row_mask=invalid_row_mask,
+                        invalid_topk_id=invalid_topk_id,
+                    )
+            if enable_npu_prefill_normal_shared_overlap:
+                # Ordinary non-mirror prefill keeps LOCAL token rows and DeepEP
+                # NORMAL+AllGather starts with communication. Launch only after
+                # router/TopK work so the shared expert's primary overlap window
+                # begins at dispatch. The existing final-add wait remains the
+                # consumption boundary, matching decode/mirror behavior.
                 shared_output = process_shared_expert(
                     hidden_states, self._forward_shared_expert
                 )
-            if enable_npu_megamoe_shared_gate_up_overlap:
-                # The helper makes the shared stream wait for the router GEMM
-                # and input sanitization, then returns without blocking TopK.
-                shared_gate_up, _ = process_shared_expert(
-                    hidden_states, self.shared_expert.gate_up_proj
-                )
-            # Ascend's generic fused TopK dispatch ignores custom routing callbacks.
-            # Route WeLM's expert-bias callback through MoeGatingTopK explicitly;
-            # it uses the native TopK tie order rather than MMQ's tie_rank order.
-            if _is_npu and self.custom_routing_function is not None:
-                if (
-                    getattr(self.custom_routing_function, "func", None)
-                    is expert_bias_routing
-                ):
-                    topk_output = self.topk.forward_npu(
-                        hidden_states,
-                        router_logits,
-                        num_token_non_padded=num_token_non_padded,
-                        expert_location_dispatch_info=(
-                            ExpertLocationDispatchInfo.init_new(
-                                layer_id=self.layer_id
-                            )
-                            if not self.is_nextn
-                            else None
-                        ),
-                        expert_bias=self.expert_bias,
-                        scoring_func_override=self.router_score_func,
+            if use_welm_prefill_megamoe:
+                if enable_npu_megamoe_shared_gate_up_overlap:
+                    wait_share_stream()
+                    # Allocated on the shared stream, consumed by SwiGLU on this
+                    # stream: prevent allocator reuse until the consumer finishes.
+                    shared_gate_up.record_stream(
+                        torch.get_device_module().current_stream()
                     )
-                else:
-                    topk_output = self.topk.forward_native(
-                        hidden_states,
-                        router_logits,
-                        num_token_non_padded=num_token_non_padded,
+                    shared_output = self._forward_shared_expert(
+                        hidden_states, gate_up=shared_gate_up
                     )
-            else:
-                topk_output = self.topk(
+                experts_output = self.welm_prefill_megamoe.forward_layer(
+                    self.experts,
                     hidden_states,
-                    router_logits,
-                    num_token_non_padded=num_token_non_padded,
-                )
-        if (
-            _is_npu
-            and not use_welm_prefill_megamoe
-            and (num_token_non_padded is not None or valid_row_mask is not None)
-        ):
-            if not isinstance(topk_output, StandardTopKOutput):
-                raise RuntimeError(
-                    "WeLMv4 NPU padding requires StandardTopKOutput, got "
-                    f"{type(topk_output).__name__}"
-                )
-            # NPU DeepEP normal AllGather consumes -1 as an inactive route. The
-            # legacy low-latency kernels do not unless their optional negative-ID
-            # mode is enabled, so keep the router's valid, distinct expert IDs
-            # there. Only MTE with caller-side output masking may keep weights.
-            preserve_padded_ids = (
-                moe_a2a_backend.is_deepep()
-                and self._resolve_deepep_mode_for_topk(is_prefill_batch)
-                == DeepEPMode.LOW_LATENCY
-            )
-            skip_padding_weight_mask = False
-            if (
-                preserve_padded_ids
-                and padded_output_is_masked
-                and valid_row_mask is not None
-                and invalid_row_mask is not None
-                and invalid_topk_id is None
-            ):
-                # These scattered LL callers mask the merged MoE output. MTE
-                # applies weights only to the source token's combine result.
-                skip_padding_weight_mask = DeepEPBuffer.is_npu_low_latency_mte()
-            if not skip_padding_weight_mask:
-                topk_output = self._mask_npu_padded_topk(
                     topk_output,
-                    num_token_non_padded,
-                    preserve_padded_ids=preserve_padded_ids,
-                    valid_row_mask=valid_row_mask,
-                    invalid_row_mask=invalid_row_mask,
-                    invalid_topk_id=invalid_topk_id,
+                    megamoe_num_valid_rows,
+                    # DP clears the final expert+shared output at its transport
+                    # boundary; do not clear the expert component a second time.
+                    zero_output_padding=(
+                        valid_row_mask is None
+                        or forward_batch.welm_prefill_graph is not None
+                    ),
+                    valid_row_mask=(
+                        valid_row_mask
+                        if forward_batch.welm_prefill_graph is not None
+                        else None
+                    ),
+                    shared_kwargs=shared_kwargs,
                 )
-        if enable_npu_prefill_normal_shared_overlap:
-            # Ordinary non-mirror prefill keeps LOCAL token rows and DeepEP
-            # NORMAL+AllGather starts with communication. Launch only after
-            # router/TopK work so the shared expert's primary overlap window
-            # begins at dispatch. The existing final-add wait remains the
-            # consumption boundary, matching decode/mirror behavior.
-            shared_output = process_shared_expert(
-                hidden_states, self._forward_shared_expert
-            )
-        if use_welm_prefill_megamoe:
-            if enable_npu_megamoe_shared_gate_up_overlap:
-                wait_share_stream()
-                # Allocated on the shared stream, consumed by SwiGLU on this
-                # stream: prevent allocator reuse until the consumer finishes.
-                shared_gate_up.record_stream(
-                    torch.get_device_module().current_stream()
+                # Fused output already contains shared; shared_output stays None,
+                # so the existing external shared wait/add below is skipped.
+            elif use_welm_local_ep_moe:
+                if not self.welm_local_ep_kernel_available:
+                    raise RuntimeError(
+                        "WeLMv4 local EP MoE was selected for an unsupported "
+                        "parallel configuration."
+                    )
+                if use_reduce_scatter:
+                    raise RuntimeError(
+                        "WeLMv4 local EP MoE requires a FULL replicated token "
+                        "layout, but use_reduce_scatter is enabled."
+                    )
+                experts_output = self.experts.forward_local_ep_partial(
+                    hidden_states, topk_output
                 )
-                shared_output = self._forward_shared_expert(
-                    hidden_states, gate_up=shared_gate_up
+                # Only routed experts are partial across EP ranks. The shared
+                # expert below is fully replicated under DeepEP and must be added
+                # after this sum, otherwise it would be multiplied by EP size.
+                experts_output = (
+                    resolved_moe_ep_group.all_reduce(experts_output)
+                    if resolved_moe_ep_group is not None
+                    else moe_expert_parallel_all_reduce(experts_output)
                 )
-            experts_output = self.welm_prefill_megamoe.forward_layer(
-                self.experts,
-                hidden_states,
-                topk_output,
-                megamoe_num_valid_rows,
-                # DP clears the final expert+shared output at its transport
-                # boundary; do not clear the expert component a second time.
-                zero_output_padding=(
-                    valid_row_mask is None
-                    or forward_batch.welm_prefill_graph is not None
-                ),
-                valid_row_mask=(
-                    valid_row_mask
-                    if forward_batch.welm_prefill_graph is not None
-                    else None
-                ),
-                shared_kwargs=shared_kwargs,
-            )
-            # Fused output already contains shared; shared_output stays None,
-            # so the existing external shared wait/add below is skipped.
-        elif use_welm_local_ep_moe:
-            if not self.welm_local_ep_kernel_available:
-                raise RuntimeError(
-                    "WeLMv4 local EP MoE was selected for an unsupported "
-                    "parallel configuration."
-                )
-            if use_reduce_scatter:
-                raise RuntimeError(
-                    "WeLMv4 local EP MoE requires a FULL replicated token "
-                    "layout, but use_reduce_scatter is enabled."
-                )
-            experts_output = self.experts.forward_local_ep_partial(
-                hidden_states, topk_output
-            )
-            # Only routed experts are partial across EP ranks. The shared
-            # expert below is fully replicated under DeepEP and must be added
-            # after this sum, otherwise it would be multiplied by EP size.
-            experts_output = (
-                resolved_moe_ep_group.all_reduce(experts_output)
-                if resolved_moe_ep_group is not None
-                else moe_expert_parallel_all_reduce(experts_output)
-            )
-        else:
-            experts_output = self.experts(hidden_states, topk_output)
-        if return_components and skip_component_output:
-            if enable_npu_shared_alt_stream:
-                # This early return hands shared_output to the caller, so it is
-                # the consumption boundary.
-                wait_share_stream()
-            return (
-                experts_output.view(num_tokens, hidden_dim),
-                experts_output.view(num_tokens, hidden_dim),
-                shared_output.view(num_tokens, hidden_dim)
-                if shared_output is not None
-                else None,
-            )
-        final_hidden_states = experts_output
-        self.last_final_experts_output = None
-        self.last_final_shared_output = None
-        if shared_output is not None:
-            if (
-                self.layer_id == self.num_hidden_layers - 1
-                and self.tp_size == 1
-                and not use_reduce_scatter
-                and not allow_inplace_expert_shared_merge
-            ):
-                self.last_final_experts_output = experts_output
-                self.last_final_shared_output = shared_output
-            if enable_npu_shared_alt_stream:
-                # Normal inference first consumes shared_output in this add.
-                wait_share_stream()
-            if allow_inplace_expert_shared_merge:
-                final_hidden_states.add_(shared_output)
             else:
-                final_hidden_states = final_hidden_states + shared_output
+                experts_output = self.experts(hidden_states, topk_output)
+            if return_components and skip_component_output:
+                if enable_npu_shared_alt_stream:
+                    # This early return hands shared_output to the caller, so it is
+                    # the consumption boundary.
+                    wait_share_stream()
+                return (
+                    experts_output.view(num_tokens, hidden_dim),
+                    experts_output.view(num_tokens, hidden_dim),
+                    shared_output.view(num_tokens, hidden_dim)
+                    if shared_output is not None
+                    else None,
+                )
+            final_hidden_states = experts_output
+            self.last_final_experts_output = None
+            self.last_final_shared_output = None
+            if shared_output is not None:
+                if (
+                    self.layer_id == self.num_hidden_layers - 1
+                    and self.tp_size == 1
+                    and not use_reduce_scatter
+                    and not allow_inplace_expert_shared_merge
+                ):
+                    self.last_final_experts_output = experts_output
+                    self.last_final_shared_output = shared_output
+                if enable_npu_shared_alt_stream:
+                    # Normal inference first consumes shared_output in this add.
+                    wait_share_stream()
+                if full_moe is not None:
+                    final_hidden_states = full_moe["merge"](
+                        final_hidden_states,
+                        shared_output,
+                        allow_inplace_expert_shared_merge,
+                    )
+                elif allow_inplace_expert_shared_merge:
+                    final_hidden_states.add_(shared_output)
+                else:
+                    final_hidden_states = final_hidden_states + shared_output
         if (
             self.tp_size > 1
             and not use_reduce_scatter
@@ -5472,13 +5615,23 @@ class WeLMV4MoeForCausalLM(nn.Module):
         self.npu_compile_regions = ()
         self._npu_compile_regions_initialized = False
 
-    def init_npu_compile_regions(self):
+    def init_npu_compile_regions(self, *, capture_forward_mode=None):
         if self._npu_compile_regions_initialized:
             return
         if not (_is_npu and envs.SGLANG_NPU_ENABLE_STATIC_KERNEL.get()):
             return
         flash_enabled = envs.WELM_NPU_SUPERKERNEL_FLASH_GATE_OPROJ.get()
-        ffn_enabled = envs.WELM_NPU_SUPERKERNEL_ROUTED_FFN.get()
+        ffn_mode = envs.WELM_NPU_SUPERKERNEL_MOE.get()
+        if ffn_mode not in (0, 1, 2):
+            raise ValueError("WELM_NPU_SUPERKERNEL_MOE must be 0, 1 or 2")
+        # Stage 2 is Decode-only. Attention and mode 1 retain their existing
+        # Decode/Verify qualification; P, draft and verify do not enter full MoE.
+        full_moe = (
+            ffn_mode == 2
+            and get_disagg().disaggregation_mode != "prefill"
+            and (capture_forward_mode is None or capture_forward_mode.is_decode())
+        )
+        self.npu_super_kernel_options = (("auto_op_parallel", 1),) if full_moe else ()
         if flash_enabled and not get_bool_env_var("WELM_NPU_USE_FLASH_ATTN", "False"):
             raise ValueError(
                 "WELM_NPU_SUPERKERNEL_FLASH_GATE_OPROJ requires "
@@ -5493,7 +5646,13 @@ class WeLMV4MoeForCausalLM(nn.Module):
                         f"welm.layer_{layer_id}.flash_gate_oproj"
                     )
                 )
-            if ffn_enabled:
+            if full_moe:
+                regions.extend(
+                    layer.mlp.enable_npu_full_moe_regions(
+                        f"welm.layer_{layer_id}.full_moe"
+                    )
+                )
+            elif ffn_mode == 1:
                 runner_core = layer.mlp.experts.quant_method.runner.runner_core
                 regions.append(
                     runner_core.enable_welm_compile_region(

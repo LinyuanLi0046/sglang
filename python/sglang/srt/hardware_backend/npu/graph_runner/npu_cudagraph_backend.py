@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import threading
 from contextlib import AbstractContextManager, contextmanager
+from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -85,7 +86,13 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             # regions on the NextN worker which inherits the same model class.
             initialize = getattr(model_runner.model, "init_npu_compile_regions", None)
             if initialize is not None:
-                initialize()
+                initialize(capture_forward_mode=cuda_graph_runner.capture_forward_mode)
+            self._compile_config = replace(
+                self._compile_config,
+                super_kernel_options=getattr(
+                    model_runner.model, "npu_super_kernel_options", ()
+                ),
+            )
             # An explicit empty declaration is a model's opt-out (e.g. both
             # WeLM region switches are off). Unintegrated models still error.
             compile_target = (

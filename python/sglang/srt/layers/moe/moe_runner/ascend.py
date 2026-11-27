@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from functools import partial
+from importlib import import_module
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -172,13 +174,21 @@ class AscendRunnerCore(MoeRunnerCore):
             if not torch_npu.npu.get_device_name().startswith("Ascend950"):
                 raise ValueError("WeLM SwigluGroup compilation requires Ascend 950")
             if not hasattr(torch.ops.cann_ops_nn, "swiglu_group"):
+                package = os.environ.get(
+                    "WELM_SWIGLU_TORCH_PACKAGE", "cann_ops_nn_welm_swiglu91"
+                )
                 try:
-                    import cann_ops_nn.ops  # noqa: F401
+                    module = import_module(
+                        package + ".ops.activation.swiglu_group.swiglu_group"
+                    )
                 except ImportError as exc:
                     raise RuntimeError(
-                        "WeLM routed FFN compilation requires the 950 "
-                        "cann_ops_nn.swiglu_group extension"
+                        "WeLM routed FFN compilation requires the Ascend 950 "
+                        f"SwigluGroup Torch package {package!r}; source the "
+                        "SwigluGroup installation's env.sh before launching"
                     ) from exc
+                # Load the original Torch bridge outside FX tracing/capture.
+                module.builder.load()
             if not hasattr(torch.ops.cann_ops_nn, "swiglu_group"):
                 raise RuntimeError("cann_ops_nn.swiglu_group is not registered")
 

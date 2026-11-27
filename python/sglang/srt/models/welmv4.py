@@ -128,7 +128,6 @@ if is_npu():
         build_welmv4_rope_segment_tile_starts,
         inplace_sigmoid_mul_npu,
         mmq_style_router_linear_npu,
-        sigmoid_mul_ref,
         welmv4_oe_hash_decode_4way_npu,
         welmv4_oe_hash_explicit_history_4way_npu,
         welmv4_oe_hash_prefill_4way_npu,
@@ -2001,6 +2000,14 @@ class Qwen2MoeAttention(nn.Module):
         from sglang.srt.hardware_backend.npu.compile_backend import NpuCompileRegion
 
         if self._npu_flash_region is None:
+            # Register the direct-launch op before FX tracing or graph capture.
+            import sgl_kernel_npu  # noqa: F401
+
+            if not hasattr(torch.ops.npu, "welm_sigmoid_mul"):
+                raise RuntimeError(
+                    "WeLM Flash/gate/OProj compilation requires the Ascend 950 "
+                    "sgl-kernel-npu wheel with welm_sigmoid_mul"
+                )
             self._npu_flash_region = NpuCompileRegion(
                 name,
                 self._npu_flash_attention,
@@ -2021,7 +2028,10 @@ class Qwen2MoeAttention(nn.Module):
         attn_shape = attn_output.shape
         if self.gated_self_attention_headwise:
             by_head = attn_output.view(attn_shape[0], self.num_heads, -1)
-            attn_output = sigmoid_mul_ref(gate, by_head).view(attn_shape)
+            # The functional schema avoids custom in-place aliasing in FX.
+            attn_output = torch.ops.npu.welm_sigmoid_mul(gate, by_head).view(
+                attn_shape
+            )
         # Keep RowParallelLinear's tensor/bias rules and original quantized
         # implementation; its allocator context and collective stay out of FX.
         if not self.o_proj.input_is_parallel:

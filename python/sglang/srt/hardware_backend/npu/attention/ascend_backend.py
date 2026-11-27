@@ -12,6 +12,7 @@ from sgl_kernel_npu.attention.sinks_attention import (
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
 )
@@ -471,6 +472,61 @@ class AscendAttnBackend(AttentionBackend):
             and not self.is_dllm_model
         )
 
+        self._welm_flash_kv_aliases = {}
+        if (
+            self.use_welm_flash_attn
+            and not model_runner.is_draft_worker
+            and not model_runner.server_args.disable_cuda_graph
+            and envs.SGLANG_NPU_ENABLE_STATIC_KERNEL.get()
+            and envs.SGLANG_NPU_ENABLE_SUPERKERNEL.get()
+            and envs.WELM_NPU_SUPERKERNEL_FLASH_GATE_OPROJ.get()
+        ):
+            self._init_welm_flash_kv_aliases()
+
+    def _init_welm_flash_kv_aliases(self) -> None:
+        """Cache zero-copy, zero-offset KV aliases before compilation/capture."""
+        pool = self.token_to_kv_pool
+        if isinstance(pool, SWAKVPool):
+            layer_pools = {
+                layer_id: (pool.swa_kv_pool if is_swa else pool.full_kv_pool, index)
+                for layer_id, (index, is_swa) in pool.layers_mapping.items()
+            }
+        else:
+            layer_pools = {
+                pool.start_layer + index: (pool, index)
+                for index in range(pool.layer_num)
+            }
+
+        for layer_id, (layer_pool, index) in layer_pools.items():
+            # Inspect the backing allocation directly: the attention getters
+            # can wait for HiCache transfers and must not run at initialization.
+            k_buffer, v_buffer = layer_pool.get_hicache_transfer_buffers()
+            self._welm_flash_kv_aliases[layer_id] = (
+                self._make_welm_flash_kv_alias(k_buffer[index]),
+                self._make_welm_flash_kv_alias(v_buffer[index]),
+            )
+
+    @staticmethod
+    def _make_welm_flash_kv_alias(tensor: torch.Tensor) -> torch.Tensor:
+        if (
+            tensor.dtype != torch.bfloat16
+            or not tensor.is_contiguous()
+            # NCHW, ND and NCDHW are the unpadded base formats used by the pool.
+            or torch_npu.get_npu_format(tensor) not in (0, 2, 30)
+        ):
+            raise ValueError(
+                "WeLM Flash SuperKernel KV aliases require contiguous BF16 "
+                "base-format KV buffers"
+            )
+        start = tensor.storage_offset() * tensor.element_size()
+        nbytes = tensor.numel() * tensor.element_size()
+        # UntypedStorage slices use bytes, share the same memory, and retain
+        # the original storage. Rebase the storage before setting offset=0.
+        storage = tensor.untyped_storage()[start : start + nbytes]
+        return torch.empty(0, dtype=tensor.dtype, device=tensor.device).set_(
+            storage, 0, tensor.size(), tensor.stride()
+        )
+
     def _is_swa_layer(self, layer: RadixAttention) -> bool:
         if not self.is_hybrid_swa:
             return False
@@ -742,6 +798,10 @@ class AscendAttnBackend(AttentionBackend):
         if num_tokens == 0:
             return q.new_zeros((padded_tokens, layer.tp_q_head_num * layer.v_head_dim))
         query = query[:num_tokens]
+        if welm_flash_executor is not None and self._welm_flash_kv_aliases:
+            # Only region A with SuperKernel uses the aliases. The original
+            # getters have already preserved any layer-wise HiCache waits.
+            k_cache, v_cache = self._welm_flash_kv_aliases[layer.layer_id]
         key = k_cache.view(-1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim)
         value = v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.v_head_dim)
         block_table = (

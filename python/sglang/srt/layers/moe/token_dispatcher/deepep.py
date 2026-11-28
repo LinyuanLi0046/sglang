@@ -1176,15 +1176,24 @@ class DeepEPDispatcher(BaseDispatcher):
         if impl.use_fp8 or impl.use_nvfp4 or impl.params_dtype != torch.bfloat16:
             raise ValueError("WeLM full MoE requires BF16 dispatch")
         buffer = impl._get_buffer()
-        factory = getattr(
-            getattr(buffer, "low_latency_strategy", None),
-            "get_welm_compile_callables",
-            None,
-        )
+        strategy = getattr(buffer, "low_latency_strategy", None)
+        factory = getattr(strategy, "get_welm_compile_callables", None)
         if factory is None:
+            import inspect
+
+            strategy_type = type(strategy)
+            strategy_file = getattr(
+                inspect.getmodule(strategy_type), "__file__", "<unknown>"
+            )
             raise RuntimeError(
-                "WeLM full MoE requires DEEP_USE_MODE=ops and the updated "
-                "sgl-kernel-npu DeepEP compile_adapter interface"
+                "WeLM full MoE cannot find get_welm_compile_callables on "
+                f"{strategy_type.__module__}.{strategy_type.__qualname__} "
+                f"(loaded from {strategy_file}; "
+                f"DEEP_USE_MODE={os.getenv('DEEP_USE_MODE', '<unset>')}). "
+                "Ops mode alone does not provide this compile adapter. "
+                "Update both deep_ep/buffer.py and "
+                "deep_ep/strategies/low_latency_strategy.py in the imported "
+                "deep_ep package, then restart the workers."
             )
         callables = factory(
             impl.hidden_size,

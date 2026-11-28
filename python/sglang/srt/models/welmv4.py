@@ -69,6 +69,7 @@ from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
 from sglang.srt.layers.moe.utils import DeepEPMode, should_skip_mlp_all_reduce
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import (
     RotaryEmbedding,
@@ -143,6 +144,7 @@ _is_npu = is_npu()
 # Cache only compiled programs, never per-forward Q/K/V or mirror activations.
 _WELMV4_FUSED_QKV_PROGRAMS: Dict[Tuple[Any, int, int, int, bool, bool], Any] = {}
 _WELMV4_FUSED_QKV_MX_PROGRAMS: Dict[Tuple[Any, int, int, int, bool, bool], Any] = {}
+_WELMV4_FUSED_QKV_DECODE_PROGRAMS: Dict[Tuple[Any, int, int, bool, int, int], Any] = {}
 
 # Keep in sync with PAIR_M in fused_qkv_proj_norm_rope_cache. Aligning each
 # rank's packed segment prevents a bulk-RoPE AIV tile from crossing ranks.
@@ -206,6 +208,41 @@ def _get_welm_fused_qkv_program(
                 positions_contiguous=positions_contiguous,
             )
         _WELMV4_FUSED_QKV_PROGRAMS[key] = program
+    return program
+
+
+def _get_welm_fused_qkv_decode_program(
+    device: Any,
+    attn_tp_size: int,
+    num_tokens: int,
+    has_mirror: bool,
+    num_slots: int,
+    max_pos: int,
+) -> Any:
+    # M is the physical input size (B*D for Verify), not the live request count.
+    # Programs share geometry across layers; weights and activations stay inputs.
+    key = (device, attn_tp_size, num_tokens, has_mirror, num_slots, max_pos)
+    program = _WELMV4_FUSED_QKV_DECODE_PROGRAMS.get(key)
+    if program is None:
+        if torch.npu.is_current_stream_capturing():
+            # Ordinary graph warmup prepares/loads every captured shape.
+            return None
+        from cannbotdsl.ops.info import get_platform_info
+
+        from sglang.srt.layers.welmv4_static_decode_qkv_kernel import compile_qkv
+
+        info = get_platform_info(stream=torch.npu.current_stream(device))
+        if not info.available or info.cube_core_num < 1:
+            raise RuntimeError("WeLM fused QKV requires the DSL NPU core budget")
+        program = compile_qkv(
+            num_slots,
+            max_pos,
+            tp_size=attn_tp_size,
+            has_mirror=has_mirror,
+            static_m=num_tokens,
+            max_blocks=int(info.cube_core_num),
+        )
+        _WELMV4_FUSED_QKV_DECODE_PROGRAMS[key] = program
     return program
 
 
@@ -2128,11 +2165,20 @@ class Qwen2MoeAttention(nn.Module):
             )
         self.is_nextn = is_nextn
 
+        self.fused_qkv_attn_tp_size = attn_tp_size
+        # Keep the existing TP4 Prefill/AG-overlap admission unchanged.
         self.use_npu_fused_qkv = (
             _is_npu
             and os.environ.get("SGLANG_NPU_WELMV4_FUSED_QKV", "0") == "1"
             and get_tensor_model_parallel_world_size() == 4
             and not is_dp_attention_enabled()
+            and not is_nextn
+            and self.kv_mirror_layer_idx not in self.kv_mirror_layers
+        )
+        self.use_npu_decode_verify_fused_qkv = (
+            _is_npu
+            and os.environ.get("SGLANG_NPU_WELMV4_FUSED_QKV", "0") == "1"
+            and attn_tp_size in (1, 2, 4)
             and not is_nextn
             and self.kv_mirror_layer_idx not in self.kv_mirror_layers
         )
@@ -2312,11 +2358,26 @@ class Qwen2MoeAttention(nn.Module):
             Optional[torch.Tensor],
         ]
     ]:
-        """Use the fixed WeLM BF16 ABI for target prefill, decode or verify."""
+        """Keep TP4 dynamic QKV; specialize TP1/TP2 target Decode/Verify."""
         num_tokens = hidden_states.shape[0]
         if num_tokens == 0:
             return None
         mode = forward_batch.forward_mode
+        small_tp = self.fused_qkv_attn_tp_size in (1, 2)
+        if small_tp and (
+            mode not in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY)
+            or not self.use_npu_decode_verify_fused_qkv
+            or forward_batch.welm_prefill_graph is not None
+            or not isinstance(self.qkv_proj.quant_method, UnquantizedLinearMethod)
+            or self.hidden_size != 2048
+            or self.head_dim != 256
+            or self.qk_rope_head_dim != 64
+            or self.q_norm is not None
+            or self.k_norm is None
+            or not isinstance(self.rotary_emb, WelmV4InplaceRotaryEmbedding)
+            or not self.rotary_emb.is_neox_style
+        ):
+            return None
         cos_sin_cache = self.rotary_emb.cos_sin_cache
         if mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
             if (
@@ -2353,11 +2414,47 @@ class Qwen2MoeAttention(nn.Module):
         # CANNBotDSL accepts plain tensors; do not bind/copy loader Parameters.
         weight = weight.data
         gamma = self.k_norm.weight.data.view(1, self.head_dim)
+        if small_tp:
+            tp = self.fused_qkv_attn_tp_size
+            qw, kvw = (24 // tp) * 256, (2 // tp) * 256
+            bias = self.qkv_proj_bias if has_mirror else self.qkv_proj.bias
+            tensors = (
+                (hidden_states, (num_tokens, 2048), torch.bfloat16),
+                (weight, (qw + (4 if has_mirror else 2) * kvw, 2048), torch.bfloat16),
+                (gamma, (1, 256), torch.bfloat16),
+                (cos_sin_cache, (cos_sin_cache.shape[0], 64), torch.float32),
+            )
+            if (
+                (self.q_size, self.kv_size) != (qw, kvw)
+                or bias is not None
+                or any(
+                    tuple(t.shape) != shape
+                    or t.dtype != dtype
+                    or t.device != hidden_states.device
+                    or not t.is_contiguous()
+                    or torch_npu.get_npu_format(t) != 2
+                    for t, shape, dtype in tensors
+                )
+            ):
+                return None
         backend = get_attn_backend()
         pool = backend.token_to_kv_pool
         k_cache, v_cache = pool.get_kv_buffer(self.attn.layer_id)
-        k_cache = k_cache.view(-1, self.head_dim)
-        v_cache = v_cache.view(-1, self.head_dim)
+        if small_tp and (
+            k_cache.shape != v_cache.shape
+            or any(
+                t.dtype != torch.bfloat16
+                or t.device != hidden_states.device
+                or not t.is_contiguous()
+                or tuple(t.shape[-2:]) != (self.num_kv_heads, self.head_dim)
+                or torch_npu.get_npu_format(t) not in (0, 2, 30)
+                for t in (k_cache, v_cache)
+            )
+        ):
+            return None
+        # A TP1 physical slot contains both KV heads, never two token slots.
+        k_cache = k_cache.view(-1, self.kv_size)
+        v_cache = v_cache.view(-1, self.kv_size)
         slot_mapping = (
             (
                 forward_batch.welm_prefill_swa_write_locs
@@ -2372,13 +2469,34 @@ class Qwen2MoeAttention(nn.Module):
             )
         )
 
-        program = _get_welm_fused_qkv_program(
-            hidden_states.device,
-            weight.shape[0],
-            k_cache.shape[0],
-            cos_sin_cache.shape[0],
-            positions_contiguous,
-        )
+        if small_tp:
+            if any(
+                t is None
+                or t.shape != (num_tokens,)
+                or t.device != hidden_states.device
+                or t.dtype not in (torch.int32, torch.int64)
+                or not t.is_contiguous()
+                for t in (positions, slot_mapping)
+            ):
+                return None
+            program = _get_welm_fused_qkv_decode_program(
+                hidden_states.device,
+                self.fused_qkv_attn_tp_size,
+                num_tokens,
+                has_mirror,
+                k_cache.shape[0],
+                cos_sin_cache.shape[0],
+            )
+            if program is None:
+                return None
+        else:
+            program = _get_welm_fused_qkv_program(
+                hidden_states.device,
+                weight.shape[0],
+                k_cache.shape[0],
+                cos_sin_cache.shape[0],
+                positions_contiguous,
+            )
 
         q = hidden_states.new_empty((num_tokens, self.q_size))
         k = hidden_states.new_empty((num_tokens, self.kv_size))
@@ -2431,6 +2549,9 @@ class Qwen2MoeAttention(nn.Module):
         ]
     ]:
         """Fuse MXFP8 QKV using the existing activation/scale and Gate AGs."""
+        # The new TP1/TP2 kernel is BF16. Preserve the existing TP4 MX ABI.
+        if self.fused_qkv_attn_tp_size != 4:
+            return None
         local_rows = hidden_states.shape[0]
         if local_rows == 0:
             return None
@@ -3277,7 +3398,11 @@ class Qwen2MoeAttention(nn.Module):
                 prefill_mxfp8_ag_qkv_slices,
                 prefill_mxfp8_all_gather_group,
             )
-        elif self.use_npu_fused_qkv:
+        elif self.use_npu_fused_qkv or (
+            self.use_npu_decode_verify_fused_qkv
+            and forward_batch.forward_mode
+            in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY)
+        ):
             if self._is_npu_mxfp8_projection(self.qkv_proj):
                 result = self._try_npu_fused_qkv_mxfp8(
                     positions,
@@ -3636,12 +3761,13 @@ class Qwen2MoeAttention(nn.Module):
                 forward_batch,
                 save_kv_cache=not frozen_mtp_decode and fused_qkv is None,
                 enable_gate_alt_stream=enable_npu_gate_alt_stream,
-                # Fused QKV disables gate overlap. In Decode SK capture, compile
-                # that main-stream matmul with sigmoid/mul/OProj instead of
+                # Fused QKV disables gate overlap. In Decode/Verify SK capture,
+                # compile that main-stream matmul with sigmoid/mul/OProj instead of
                 # placing an excluded eager gate between Flash and the tail.
                 fuse_gate_projection=(
                     fused_qkv is not None
-                    and forward_batch.forward_mode.is_decode()
+                    and forward_batch.forward_mode
+                    in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY)
                     and envs.SGLANG_NPU_ENABLE_SUPERKERNEL.get()
                 ),
                 skip_o_proj_all_reduce=skip_o_proj_all_reduce,

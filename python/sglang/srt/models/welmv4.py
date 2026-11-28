@@ -17,7 +17,7 @@
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 import logging
 import os
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from functools import partial
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -1478,9 +1478,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # DP already supplies its local count and sanitizes hidden/residual.
             # Keep legal TopK IDs instead of applying DeepEP's -1 convention.
             num_token_non_padded = None
-        # The shared-stream launch and original join stay in their existing
-        # positions. Only the selected capture marks one outer MoE scope.
-        with full_moe["router"].scope() if full_moe is not None else nullcontext():
+        # Keep the shared-stream launch and join in their original positions,
+        # but allow the multi-stream MoE scope to end before the final join/add.
+        with ExitStack() if full_moe is not None else nullcontext() as moe_scope:
+            if full_moe is not None:
+                moe_scope.enter_context(full_moe["router"].scope())
             if moe_a2a_backend.is_deepep() and hidden_states.shape[0] == 0:
                 topk_output = self.topk.empty_topk_output(
                     hidden_states.device, layer_id=self.layer_id
@@ -1668,6 +1670,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 )
             else:
                 experts_output = self.experts(hidden_states, topk_output)
+            if full_moe is not None and enable_npu_shared_alt_stream:
+                # Shared compute remains inside the scope; its consumption does
+                # not. close() also covers the component-only return below and
+                # removes the exit callback, so the scope ends exactly once.
+                moe_scope.close()
             if return_components and skip_component_output:
                 if enable_npu_shared_alt_stream:
                     # This early return hands shared_output to the caller, so it is

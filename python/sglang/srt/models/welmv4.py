@@ -1074,6 +1074,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )
 
     def enable_npu_full_moe_regions(self, name: str):
+        from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
         from sglang.srt.hardware_backend.npu.compile_backend import NpuCompileRegion
         from sglang.srt.hardware_backend.npu.moe.topk import (
             fused_expert_bias_topk_npu,
@@ -1087,9 +1088,23 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         if self._npu_full_moe_regions is not None:
             return tuple(self._npu_full_moe_regions.values())
+        dispatcher = self.experts.dispatcher
+        if isinstance(dispatcher, MaybeTboDeepEPDispatcher):
+            # Even without TBO, the factory wraps the actual DeepEP dispatcher.
+            # Bind its compile adapter while preserving the outer dispatch hooks.
+            if len(dispatcher._inners) != 1:
+                raise ValueError(
+                    "WeLM full MoE compilation requires a single DeepEP dispatcher; "
+                    "two-batch overlap is not supported"
+                )
+            dispatcher = dispatcher._inners[0]
+        if not isinstance(dispatcher, DeepEPDispatcher):
+            raise ValueError(
+                "WeLM full MoE requires DeepEPDispatcher, got "
+                f"{type(dispatcher).__name__}"
+            )
         if (
             self.is_nextn
-            or not isinstance(self.experts.dispatcher, DeepEPDispatcher)
             or get_parallel().moe_tp_size != 1
             or not isinstance(self.experts.w13_kernel, NPUUnquantMoEMethod)
             or not isinstance(self.experts.w2_kernel, NPUUnquantMoEMethod)
@@ -1131,7 +1146,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         regions["ffn"] = runner_core.enable_welm_compile_region(
             name + ".routed_ffn", external_scope=True
         )
-        regions.update(self.experts.dispatcher.enable_welm_full_moe_compile(name))
+        regions.update(dispatcher.enable_welm_full_moe_compile(name))
         self._npu_full_moe_topk = partial(
             fused_topk_npu,
             topk_config=self.topk.topk_config,

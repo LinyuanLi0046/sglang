@@ -1360,6 +1360,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and not force_serial_shared_expert
             and not use_welm_prefill_megamoe
             and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            # Stage 2 serializes shared experts for Decode/Verify only;
+            # mirror prefill and other multi-stream users retain their policy.
+            and not (
+                envs.WELM_NPU_SUPERKERNEL_MOE.get() == 2
+                and forward_batch is not None
+                and (
+                    forward_batch.forward_mode.is_decode()
+                    or forward_batch.forward_mode.is_target_verify()
+                )
+            )
             and self.shared_expert is not None
             and hidden_states.shape[0] > 0
             and (moe_a2a_backend.is_none() or moe_a2a_backend.is_deepep())
